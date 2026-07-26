@@ -1,6 +1,8 @@
 # Minimal deterministic ANPR test environment (Python 3.13)
 cryptography==49.0.0
 fastapi==0.140.0
+httpx==0.28.1
 numpy==2.5.1
 opencv-python-headless==5.0.0.93
 pytest==9.0.2
+python-multipart==0.0.32
