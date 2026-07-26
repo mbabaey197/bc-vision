@@ -67,7 +67,7 @@ jobs:
           exit 1
 
   ai-runtime:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: windows-latest
     timeout-minutes: 45
 
