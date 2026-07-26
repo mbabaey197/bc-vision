@@ -1,4 +1,4 @@
-"""BC Vision ANPR pipeline with quality scoring and multi-frame consensus."""
+"""BC Vision ANPR pipeline with quality scoring and strict multi-frame consensus."""
 from __future__ import annotations
 
 from collections import defaultdict, deque
@@ -19,7 +19,14 @@ from .vehicle_intelligence import analyze_vehicle
 
 def image_quality(image) -> dict:
     if image is None or getattr(image, "size", 0) == 0:
-        return {"score": 0.0, "blur": 0.0, "brightness": 0.0, "contrast": 0.0, "dark": True, "glare": False}
+        return {
+            "score": 0.0,
+            "blur": 0.0,
+            "brightness": 0.0,
+            "contrast": 0.0,
+            "dark": True,
+            "glare": False,
+        }
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     brightness = float(np.mean(gray))
     contrast = float(np.std(gray))
@@ -30,7 +37,12 @@ def image_quality(image) -> dict:
     contrast_score = min(1.0, contrast / 58.0)
     blur_score = min(1.0, math.log1p(max(0.0, blur_value)) / math.log1p(850.0))
     exposure_score = max(0.0, 1.0 - min(1.0, glare_ratio * 2.7 + dark_ratio * 1.8))
-    score = 0.27 * brightness_score + 0.24 * contrast_score + 0.34 * blur_score + 0.15 * exposure_score
+    score = (
+        0.27 * brightness_score
+        + 0.24 * contrast_score
+        + 0.34 * blur_score
+        + 0.15 * exposure_score
+    )
     return {
         "score": round(min(1.0, max(0.0, score)), 4),
         "blur": round(blur_value, 3),
@@ -41,7 +53,12 @@ def image_quality(image) -> dict:
     }
 
 
-def _combined_confidence(detector_confidence: float, ocr_confidence: float, quality_score: float, valid: bool) -> float:
+def _combined_confidence(
+    detector_confidence: float,
+    ocr_confidence: float,
+    quality_score: float,
+    valid: bool,
+) -> float:
     detector_confidence = min(1.0, max(0.0, float(detector_confidence)))
     ocr_confidence = min(1.0, max(0.0, float(ocr_confidence)))
     quality_score = min(1.0, max(0.0, float(quality_score)))
@@ -60,7 +77,12 @@ def process_frame(frame, min_detection_confidence=0.25):
         quality = image_quality(crop)
         text, ocr_confidence = read_plate(crop)
         valid = plausible_plate(text)
-        combined = _combined_confidence(item["confidence"], ocr_confidence, quality["score"], valid)
+        combined = _combined_confidence(
+            item["confidence"],
+            ocr_confidence,
+            quality["score"],
+            valid,
+        )
         vehicle = analyze_vehicle(frame, item["bbox"])
         results.append({
             "plate": text or "ناخوانا",
@@ -110,16 +132,28 @@ class _Track:
     bbox: tuple
     first_seen: float
     last_seen: float
-    observations: deque = field(default_factory=lambda: deque(maxlen=12))
+    observations: deque = field(default_factory=lambda: deque(maxlen=20))
     emitted_plate: str = ""
     emitted_at: float = 0.0
 
 
 class PlateConsensusTracker:
-    def __init__(self, min_votes=2, max_age_seconds=1.8, emit_cooldown=4.0):
-        self.min_votes = max(1, int(min_votes))
+    """Emit only stable, per-character multi-frame plate consensus."""
+
+    def __init__(
+        self,
+        min_votes=3,
+        max_age_seconds=2.4,
+        emit_cooldown=4.0,
+        min_position_ratio=0.60,
+        min_position_margin=0.18,
+    ):
+        # One or two frames are never enough for a definitive CCTV read.
+        self.min_votes = max(3, int(min_votes))
         self.max_age_seconds = max(0.2, float(max_age_seconds))
         self.emit_cooldown = max(0.0, float(emit_cooldown))
+        self.min_position_ratio = min(0.95, max(0.50, float(min_position_ratio)))
+        self.min_position_margin = min(0.90, max(0.05, float(min_position_margin)))
         self._tracks: dict[int, _Track] = {}
         self._next_track_id = 1
 
@@ -134,51 +168,154 @@ class PlateConsensusTracker:
             if result.get("valid"):
                 for observation in track.observations:
                     if observation.get("valid"):
-                        text_score = max(text_score, plate_similarity(result["plate"], observation["plate"]))
+                        text_score = max(
+                            text_score,
+                            plate_similarity(result["plate"], observation["plate"]),
+                        )
             score = max(overlap, text_score * 0.88)
             if score > best_score and (overlap >= 0.18 or text_score >= 0.74):
                 best, best_score = track, score
         return best
 
     def _expire(self, timestamp: float):
-        stale = [track_id for track_id, track in self._tracks.items() if timestamp - track.last_seen > self.max_age_seconds * 2.2]
+        stale = [
+            track_id
+            for track_id, track in self._tracks.items()
+            if timestamp - track.last_seen > self.max_age_seconds * 2.2
+        ]
         for track_id in stale:
             self._tracks.pop(track_id, None)
 
     @staticmethod
-    def _consensus(track: _Track) -> dict | None:
-        valid = [row for row in track.observations if row.get("valid") and row.get("plate_norm")]
-        if not valid:
+    def _observation_weight(row: dict) -> float:
+        confidence = min(1.0, max(0.0, float(row.get("confidence", 0.0))))
+        quality = min(1.0, max(0.0, float(row.get("quality_score", 0.0))))
+        return confidence * max(0.25, quality)
+
+    def _consensus(self, track: _Track) -> dict | None:
+        valid = []
+        for row in track.observations:
+            normalized = normalize_plate(row.get("plate", ""))
+            if row.get("valid") and len(normalized) == 8 and plausible_plate(normalized):
+                copied = deepcopy(row)
+                copied["_plate_norm_8"] = normalized
+                valid.append(copied)
+
+        if len(valid) < self.min_votes:
             return None
-        buckets = defaultdict(list)
+
+        winner_chars = []
+        winner_counts = []
+        agreement_ratios = []
+        position_margins = []
+        position_details = []
+
+        for position in range(8):
+            buckets = defaultdict(lambda: {"count": 0, "weight": 0.0})
+            total_weight = 0.0
+            for row in valid:
+                character = row["_plate_norm_8"][position]
+                weight = self._observation_weight(row)
+                buckets[character]["count"] += 1
+                buckets[character]["weight"] += weight
+                total_weight += weight
+
+            ordered = sorted(
+                buckets.items(),
+                key=lambda item: (item[1]["count"], item[1]["weight"], item[0]),
+                reverse=True,
+            )
+            winner, metadata = ordered[0]
+            runner_weight = ordered[1][1]["weight"] if len(ordered) > 1 else 0.0
+            ratio = metadata["weight"] / max(total_weight, 1e-9)
+            margin = (metadata["weight"] - runner_weight) / max(total_weight, 1e-9)
+
+            # Every one of the eight positions must independently have at least
+            # three agreeing observations. Confidence alone cannot override a
+            # weak positional majority.
+            if (
+                metadata["count"] < self.min_votes
+                or ratio < self.min_position_ratio
+                or margin < self.min_position_margin
+            ):
+                return None
+
+            winner_chars.append(winner)
+            winner_counts.append(metadata["count"])
+            agreement_ratios.append(ratio)
+            position_margins.append(margin)
+            position_details.append({
+                "position": position,
+                "character": winner,
+                "votes": metadata["count"],
+                "ratio": round(ratio, 4),
+                "margin": round(margin, 4),
+            })
+
+        winner_norm = "".join(winner_chars)
+        if not plausible_plate(winner_norm):
+            return None
+
+        matching_scores = []
         for row in valid:
-            buckets[row["plate_norm"]].append(row)
-        winner_norm, winner_rows = max(
-            buckets.items(),
-            key=lambda item: (sum(row["confidence"] for row in item[1]), len(item[1])),
+            similarity_count = sum(
+                left == right
+                for left, right in zip(row["_plate_norm_8"], winner_norm)
+            )
+            matching_scores.append((similarity_count, row))
+
+        best_match_count = max(score for score, _ in matching_scores)
+        best = max(
+            (row for score, row in matching_scores if score == best_match_count),
+            key=lambda row: (row.get("confidence", 0.0), row.get("quality_score", 0.0)),
         )
-        best = max(winner_rows, key=lambda row: (row["confidence"], row.get("quality_score", 0.0)))
-        weighted = sum(row["confidence"] * max(0.25, row.get("quality_score", 0.0)) for row in winner_rows)
-        weight_total = sum(max(0.25, row.get("quality_score", 0.0)) for row in winner_rows)
-        average = weighted / max(weight_total, 1e-9)
-        vote_bonus = min(0.15, 0.05 * (len(winner_rows) - 1))
+
+        total_weight = sum(self._observation_weight(row) for row in valid)
+        weighted_confidence = sum(
+            float(row.get("confidence", 0.0)) * self._observation_weight(row)
+            for row in valid
+        ) / max(total_weight, 1e-9)
+        average_agreement = sum(agreement_ratios) / len(agreement_ratios)
+        minimum_margin = min(position_margins)
+
         result = deepcopy(best)
+        result.pop("_plate_norm_8", None)
         result["plate"] = format_iran_plate(winner_norm)
         result["plate_norm"] = winner_norm
-        result["confidence"] = round(min(1.0, average + vote_bonus), 4)
-        result["consensus_votes"] = len(winner_rows)
+        result["confidence"] = round(
+            min(
+                1.0,
+                0.72 * weighted_confidence
+                + 0.18 * average_agreement
+                + 0.10 * min(1.0, minimum_margin / 0.50),
+            ),
+            4,
+        )
+        result["consensus_votes"] = min(winner_counts)
+        result["consensus_observations"] = len(valid)
+        result["position_agreement"] = position_details
+        result["ambiguity_margin"] = round(minimum_margin, 4)
+
         centers = [
-            ((row["bbox"][0] + row["bbox"][2]) / 2.0, (row["bbox"][1] + row["bbox"][3]) / 2.0)
-            for row in track.observations if row.get("bbox")
+            (
+                (row["bbox"][0] + row["bbox"][2]) / 2.0,
+                (row["bbox"][1] + row["bbox"][3]) / 2.0,
+            )
+            for row in track.observations
+            if row.get("bbox")
         ]
         direction = "stationary"
         if len(centers) >= 2:
             delta_y = centers[-1][1] - centers[0][1]
-            average_height = sum(max(1.0, row["bbox"][3] - row["bbox"][1]) for row in track.observations) / len(track.observations)
+            average_height = sum(
+                max(1.0, row["bbox"][3] - row["bbox"][1])
+                for row in track.observations
+            ) / len(track.observations)
             if delta_y > max(3.0, average_height * 0.12):
                 direction = "down"
             elif delta_y < -max(3.0, average_height * 0.12):
                 direction = "up"
+
         result["track_id"] = track.track_id
         result["first_seen"] = track.first_seen
         result["last_seen"] = track.last_seen
@@ -189,6 +326,7 @@ class PlateConsensusTracker:
         timestamp = time.monotonic() if timestamp is None else float(timestamp)
         self._expire(timestamp)
         emitted = []
+
         for result in results:
             track = self._match(result, timestamp)
             if track is None:
@@ -200,26 +338,27 @@ class PlateConsensusTracker:
                 )
                 self._tracks[track.track_id] = track
                 self._next_track_id += 1
+
             track.bbox = result["bbox"]
             track.last_seen = timestamp
             track.observations.append(deepcopy(result))
             consensus = self._consensus(track)
             if consensus is None:
                 continue
-            enough_votes = consensus["consensus_votes"] >= self.min_votes
-            exceptional_single = consensus["consensus_votes"] == 1 and consensus["confidence"] >= 0.93
+
             changed = consensus["plate_norm"] != track.emitted_plate
             cooled_down = timestamp - track.emitted_at >= self.emit_cooldown
-            if (enough_votes or exceptional_single) and (changed or cooled_down):
+            if changed or cooled_down:
                 track.emitted_plate = consensus["plate_norm"]
                 track.emitted_at = timestamp
                 emitted.append(consensus)
+
         return emitted
 
     def flush(self):
         rows = []
         for track in list(self._tracks.values()):
             consensus = self._consensus(track)
-            if consensus and consensus["consensus_votes"] >= self.min_votes:
+            if consensus is not None:
                 rows.append(consensus)
         return rows

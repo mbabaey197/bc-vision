@@ -1,6 +1,7 @@
 import numpy as np
 
 from app.ai.ocr import (
+    EASYOCR_ALLOWLIST,
     _align_to_template,
     _assemble_detections,
     _variants,
@@ -15,7 +16,7 @@ def test_reassembles_real_split_output():
         {"text": "IR", "confidence": 0.4601, "x_center": 70.0},
         {"text": "ب١٢", "confidence": 0.9972, "x_center": 279.0},
         {"text": "٣٤٥", "confidence": 0.7839, "x_center": 516.0},
-        {"text": "٧ع", "confidence": 0.2839, "x_center": 776.0},
+        {"text": "٦٧", "confidence": 0.70, "x_center": 776.0},
     ]
     text, confidence = _assemble_detections(detections)
     assert text == "12-ب-345-67"
@@ -35,10 +36,24 @@ def test_ignores_noise_tokens():
     assert text == "12-ب-345-67"
 
 
-def test_position_based_confusion_repair():
-    hypotheses = _align_to_template("I2B34S67")
+def test_numeric_position_confusion_repair_remains_available():
+    hypotheses = _align_to_template("I2ب34S67")
     assert hypotheses
     assert hypotheses[0][0] == "12ب34567"
+
+
+def test_latin_lookalikes_cannot_create_persian_plate_letter():
+    assert _align_to_template("31L55674") == []
+    assert _align_to_template("31T55674") == []
+
+
+def test_easyocr_allowlist_is_strict_for_persian_plates():
+    assert "ط" in EASYOCR_ALLOWLIST
+    assert "ب" in EASYOCR_ALLOWLIST
+    assert "D" in EASYOCR_ALLOWLIST
+    assert "S" in EASYOCR_ALLOWLIST
+    for forbidden in "ABCEFGHIJKLMNOPQRTUVWXYZ":
+        assert forbidden not in EASYOCR_ALLOWLIST
 
 
 def test_invalid_noise_does_not_become_valid():
@@ -46,8 +61,8 @@ def test_invalid_noise_does_not_become_valid():
         {"text": "HELLO", "confidence": 0.99, "x_center": 10.0},
         {"text": "WORLD", "confidence": 0.99, "x_center": 100.0},
     ])
-    assert not plausible_plate(text)
-    assert confidence <= 0.45
+    assert text == ""
+    assert confidence == 0.0
 
 
 def test_preprocessing_handles_extreme_images():
