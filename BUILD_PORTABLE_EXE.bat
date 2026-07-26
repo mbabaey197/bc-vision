@@ -100,9 +100,6 @@ if errorlevel 1 goto :error
 copy /Y "requirements-ai-lock.txt" "dist\BCVision\requirements-ai-lock.txt" >nul
 if errorlevel 1 goto :error
 
-"dist\BCVision\BCVision.exe" --help >nul 2>&1
-rem A windowed launcher may ignore --help; existence is the required build gate.
-
 echo Portable AI build completed successfully.
 echo %CD%\dist\BCVision\BCVision.exe
 exit /b 0
