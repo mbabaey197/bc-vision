@@ -1,4 +1,4 @@
-name: Windows release package
+name: Windows installer and source package
 
 on:
   workflow_dispatch:
@@ -51,25 +51,24 @@ jobs:
         shell: pwsh
         run: choco install innosetup --no-progress -y
 
-      - name: Build portable application
+      - name: Build internal installer payload
         shell: cmd
         run: BUILD_PORTABLE_EXE.bat
 
-      - name: Verify portable payload
+      - name: Verify installer payload
         shell: pwsh
         run: |
           $required = @(
             "dist\BCVision\BCVision.exe",
-            "installer\BCVision.iss",
-            "installer\BCVision_Update.iss"
+            "installer\BCVision.iss"
           )
           foreach ($path in $required) {
             if (-not (Test-Path $path)) {
-              throw "Required release file missing: $path"
+              throw "Required installer file missing: $path"
             }
           }
 
-      - name: Portable startup smoke test
+      - name: Application startup smoke test
         shell: pwsh
         run: |
           $env:BCVISION_SKIP_MODEL_PREP = "1"
@@ -98,7 +97,7 @@ jobs:
             }
           }
 
-      - name: Compile full installer and updater
+      - name: Compile Windows installer
         shell: pwsh
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
@@ -107,35 +106,27 @@ jobs:
           }
           & $iscc "installer\BCVision.iss"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $iscc "installer\BCVision_Update.iss"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Verify installer outputs
+      - name: Verify installer output
         shell: pwsh
         run: |
-          $required = @(
-            "setup_output\BCVision_Setup_v2.1.0.exe",
-            "setup_output\BCVision_Update_v2.1.0.exe"
-          )
-          foreach ($path in $required) {
-            if (-not (Test-Path $path)) {
-              throw "Expected installer output missing: $path"
-            }
-            if ((Get-Item $path).Length -lt 1MB) {
-              throw "Installer output is unexpectedly small: $path"
-            }
+          $path = "setup_output\BCVision_Setup_v2.1.0.exe"
+          if (-not (Test-Path $path)) {
+            throw "Expected installer output missing: $path"
+          }
+          if ((Get-Item $path).Length -lt 1MB) {
+            throw "Installer output is unexpectedly small: $path"
           }
 
-      - name: Create complete source archive
+      - name: Create release outputs
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force release_output | Out-Null
           git archive --format=zip --output="release_output\BCVision_Source_v2.1.0.zip" HEAD
           Copy-Item "setup_output\BCVision_Setup_v2.1.0.exe" "release_output\"
-          Copy-Item "setup_output\BCVision_Update_v2.1.0.exe" "release_output\"
           Get-FileHash release_output\* -Algorithm SHA256 | Format-Table -AutoSize | Out-String | Set-Content -Encoding UTF8 release_output\SHA256SUMS.txt
 
-      - name: Upload three release outputs
+      - name: Upload installer and source outputs
         uses: actions/upload-artifact@v4
         with:
           name: BCVision-v2.1.0-windows-release
