@@ -131,6 +131,29 @@ def require_admin(request):
     u=current_user(request)
     return bool(u and (u['role']=='admin' or u['is_admin']))
 
+ROLE_PERMISSIONS = {
+    'admin': {'system.manage', 'camera.manage', 'license.manage', 'watchlist.manage', 'video.process'},
+    'system': {'system.manage', 'camera.manage', 'license.manage', 'watchlist.manage', 'video.process'},
+    'operator': {'watchlist.manage', 'video.process'},
+    'guard': set(),
+}
+
+def has_permission(request, permission):
+    u=current_user(request)
+    if not u:
+        return False
+    role='admin' if u['is_admin'] else (u['role'] or 'guard')
+    return permission in ROLE_PERMISSIONS.get(role,set())
+
+def access_denied(message='شما اجازه انجام این عملیات را ندارید.'):
+    return HTMLResponse(
+        f"<!doctype html><html lang='fa' dir='rtl'><head><meta charset='utf-8'>"
+        f"<title>عدم دسترسی | BC Vision</title>{CSS}</head><body>"
+        f"<div class='wrap'><div class='card alert'>{escape(message)}</div>"
+        "<a class='btn secondary' href='/dashboard'>بازگشت به داشبورد</a></div></body></html>",
+        status_code=403,
+    )
+
 def audit(request, action, details=''):
     username=auth(request) or 'anonymous'
     ip=request.client.host if request and request.client else ''
@@ -245,6 +268,7 @@ def cam_status(camera_id:int,request:Request):
 def cameras(request:Request,msg:str=''):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
+    if not has_permission(request,'camera.manage'):return access_denied()
     rows=camera_rows(); trs=''.join(f"<tr><td>{c['id']}</td><td>{escape(c['name'])}</td><td>{escape(c['location'])}</td><td>{'فعال' if c['enabled'] else 'غیرفعال'}</td><td>{'آزمایشی' if c['is_demo'] else 'RTSP'}</td><td><a class='btn' href='/cameras/{c['id']}/edit'>ویرایش</a> <form style='display:inline' method='post' action='/cameras/{c['id']}/delete' onsubmit=\"return confirm('حذف شود؟')\"><button class='danger'>حذف</button></form></td></tr>" for c in rows) or "<tr><td colspan='6'>دوربینی ثبت نشده است.</td></tr>"
     notice="<div class='card ok'>عملیات انجام شد.</div>" if msg else ''
     return page('دوربین‌ها',f"<div class='wrap'><div class='toolbar'><h1 style='margin-left:auto'>مدیریت دوربین‌ها</h1><a class='btn' href='/cameras/new'>افزودن دوربین</a></div>{notice}<div class='card'><div class='table-wrap'><table><tr><th>ID</th><th>نام</th><th>موقعیت</th><th>وضعیت</th><th>نوع</th><th>عملیات</th></tr>{trs}</table></div></div><div class='card'><h2>🎞️ پلاک‌خوان واقعی با ویدئو</h2><p class='muted'>پس از آپلود، ویدئو پردازش و پلاک‌ها همراه با زمان عبور در گزارش تردد ذخیره می‌شوند.</p><form action='/cameras/video-upload' method='post' enctype='multipart/form-data'><label>تنظیمات کدام دوربین استفاده شود؟</label><select name='camera_id'>{''.join(f"<option value='{c['id']}'>{escape(c['name'])}</option>" for c in rows)}</select><br><label>فایل ویدئو</label><input type='file' name='video' accept='.mp4,.avi,.mkv,.mov' required><br><br><button>آپلود ویدئو</button></form></div></div>",u,request)
@@ -257,10 +281,12 @@ def cam_form(c=None):
 def new_cam_form(request:Request):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
+    if not has_permission(request,'camera.manage'):return access_denied()
     return page('افزودن دوربین',cam_form(),u,request)
 @app.post('/cameras/new')
 def new_cam(request:Request,name:str=Form(...),rtsp_url:str=Form(''),location:str=Form(''),enabled:str|None=Form(None),is_demo:int=Form(0),sort_order:int=Form(0),lpr_enabled:str|None=Form(None),lpr_confidence:int=Form(60),frame_step:int=Form(5),duplicate_seconds:float=Form(30),roi_x:int=Form(0),roi_y:int=Form(0),roi_w:int=Form(100),roi_h:int=Form(100),line_y:int=Form(50)):
     if not auth(request):return RedirectResponse('/login',302)
+    if not has_permission(request,'camera.manage'):return access_denied()
     lic=license_status()
     with connect() as con:
         count=con.execute('SELECT COUNT(*) c FROM cameras').fetchone()['c']
@@ -273,18 +299,21 @@ def new_cam(request:Request,name:str=Form(...),rtsp_url:str=Form(''),location:st
 def edit_cam_form(camera_id:int,request:Request):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
+    if not has_permission(request,'camera.manage'):return access_denied()
     with connect() as con:c=con.execute('SELECT * FROM cameras WHERE id=?',(camera_id,)).fetchone()
     if not c:return RedirectResponse('/cameras',302)
     return page('ویرایش دوربین',cam_form(c),u,request)
 @app.post('/cameras/{camera_id}/edit')
 def edit_cam(camera_id:int,request:Request,name:str=Form(...),rtsp_url:str=Form(''),location:str=Form(''),enabled:str|None=Form(None),is_demo:int=Form(0),sort_order:int=Form(0),lpr_enabled:str|None=Form(None),lpr_confidence:int=Form(60),frame_step:int=Form(5),duplicate_seconds:float=Form(30),roi_x:int=Form(0),roi_y:int=Form(0),roi_w:int=Form(100),roi_h:int=Form(100),line_y:int=Form(50)):
     if not auth(request):return RedirectResponse('/login',302)
+    if not has_permission(request,'camera.manage'):return access_denied()
     url='demo://camera' if is_demo else rtsp_url.strip()
     with connect() as con:con.execute('UPDATE cameras SET name=?,rtsp_url=?,location=?,enabled=?,is_demo=?,sort_order=?,lpr_enabled=?,lpr_confidence=?,frame_step=?,duplicate_seconds=?,roi_x=?,roi_y=?,roi_w=?,roi_h=?,line_y=? WHERE id=?',(name.strip(),url,location.strip(),1 if enabled else 0,is_demo,sort_order,1 if lpr_enabled else 0,max(1,min(99,lpr_confidence)),max(1,min(60,frame_step)),max(0,min(3600,duplicate_seconds)),max(0,min(99,roi_x)),max(0,min(99,roi_y)),max(1,min(100-roi_x,roi_w)),max(1,min(100-roi_y,roi_h)),max(0,min(100,line_y)),camera_id))
     manager.remove(camera_id);return RedirectResponse('/cameras?msg=1',303)
 @app.post('/cameras/{camera_id}/delete')
 def delete_cam(camera_id:int,request:Request):
     if not auth(request):return RedirectResponse('/login',302)
+    if not has_permission(request,'camera.manage'):return access_denied()
     with connect() as con:con.execute('DELETE FROM cameras WHERE id=?',(camera_id,))
     manager.remove(camera_id);return RedirectResponse('/cameras?msg=1',303)
 
@@ -294,7 +323,7 @@ def media(request:Request,path:str=''):
     try:
         target=Path(path).resolve()
         allowed=[Path(get_setting('snapshot_path',str(SNAPSHOT_DIR))).resolve(),Path(get_setting('plate_path',str(PLATE_DIR))).resolve(),Path(get_setting('video_path',str(VIDEO_DIR))).resolve()]
-        if not target.is_file() or not any(str(target).startswith(str(root)) for root in allowed): return JSONResponse({'error':'not found'},404)
+        if not target.is_file() or not any(target.is_relative_to(root) for root in allowed): return JSONResponse({'error':'not found'},404)
         return FileResponse(target)
     except Exception:return JSONResponse({'error':'not found'},404)
 
@@ -326,7 +355,7 @@ def events(request:Request,q:str='',camera:str='',status:str='',vehicle_type:str
         st=r['watch_status'] or 'unknown'; cls='event-blocked' if st=='blocked' else ('event-vip' if st=='vip' else '')
         vehicle=(f"<img class='thumb' onclick=\"showImage(this.src)\" src='/media?path={quote(r['image_path'])}'>" if r['image_path'] and Path(r['image_path']).exists() else '—')
         plateimg=(f"<img class='thumb plate-thumb' onclick=\"showImage(this.src)\" src='/media?path={quote(r['plate_image_path'])}'>" if r['plate_image_path'] and Path(r['plate_image_path']).exists() else '—')
-        owner=' / '.join(x for x in [r['owner_name'],r['vehicle_model'],r['vehicle_color']] if x) or '—'
+        owner=escape(' / '.join(x for x in [r['owner_name'],r['vehicle_model'],r['vehicle_color']] if x) or '—')
         trs.append(f"<tr class='{cls}'><td>{r['id']}</td><td>{vehicle}</td><td>{plateimg}</td><td><b>{escape(r['plate_text'] or '—')}</b><br>{event_status_badge(st)}</td><td>{owner}</td><td>{escape(r['vehicle_type'] or 'نامشخص')}<br><span class='muted'>{escape(r['vehicle_color'] or 'نامشخص')}</span></td><td>{int((r['confidence'] or 0)*100)}٪</td><td>{escape(r['camera_name'] or '—')}</td><td>{jalali_datetime(r['created_at'])}</td><td><a class='btn' href='/events/{r['id']}'>جزئیات و پخش</a></td></tr>")
     trs=''.join(trs) or "<tr><td colspan='10'>رکوردی با این فیلتر پیدا نشد.</td></tr>"
     cam_opts=''.join(f"<option {'selected' if camera==c else ''}>{escape(c)}</option>" for c in cameras)
@@ -368,6 +397,7 @@ def event_detail(event_id:int, request:Request):
 def watchlist(request:Request,msg:str=''):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
+    if not has_permission(request,'watchlist.manage'):return access_denied()
     with connect() as con:rows=con.execute('SELECT * FROM plate_watchlist ORDER BY id DESC').fetchall()
     trs=''.join(f"<tr><td>{escape(r['plate_text'])}</td><td>{event_status_badge(r['status'])}</td><td>{escape(r['owner_name'] or '—')}</td><td>{escape(r['phone'] or '—')}</td><td>{escape(r['vehicle_model'] or '—')}</td><td>{escape(r['vehicle_color'] or '—')}</td><td>{jalali_datetime(r['created_at'])}</td><td><form method='post' action='/watchlist/{r['id']}/delete' onsubmit=\"return confirm('حذف شود؟')\"><button class='danger'>حذف</button></form></td></tr>" for r in rows) or "<tr><td colspan='8'>هنوز پلاکی تعریف نشده است.</td></tr>"
     notice="<div class='card ok'>پلاک ذخیره شد.</div>" if msg else ''
@@ -377,6 +407,7 @@ def watchlist(request:Request,msg:str=''):
 @app.post('/watchlist')
 def add_watchlist(request:Request,plate_text:str=Form(...),status:str=Form('allowed'),owner_name:str=Form(''),phone:str=Form(''),vehicle_model:str=Form(''),vehicle_color:str=Form(''),notes:str=Form('')):
     if not auth(request):return RedirectResponse('/login',302)
+    if not has_permission(request,'watchlist.manage'):return access_denied()
     status=status if status in ('allowed','blocked','vip') else 'allowed'
     with connect() as con:
         con.execute("INSERT INTO plate_watchlist(plate_text,plate_norm,status,owner_name,phone,vehicle_model,vehicle_color,notes) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(plate_norm) DO UPDATE SET plate_text=excluded.plate_text,status=excluded.status,owner_name=excluded.owner_name,phone=excluded.phone,vehicle_model=excluded.vehicle_model,vehicle_color=excluded.vehicle_color,notes=excluded.notes",(plate_text.strip(),normalize_plate(plate_text),status,owner_name.strip(),phone.strip(),vehicle_model.strip(),vehicle_color.strip(),notes.strip()))
@@ -385,6 +416,7 @@ def add_watchlist(request:Request,plate_text:str=Form(...),status:str=Form('allo
 @app.post('/watchlist/{item_id}/delete')
 def delete_watchlist(item_id:int,request:Request):
     if not auth(request):return RedirectResponse('/login',302)
+    if not has_permission(request,'watchlist.manage'):return access_denied()
     with connect() as con:con.execute('DELETE FROM plate_watchlist WHERE id=?',(item_id,))
     return RedirectResponse('/watchlist',303)
 
@@ -395,7 +427,8 @@ def _safe_int(value, default=0, minimum=0, maximum=100000):
 
 def _path_usage(path_value):
     try:
-        p=Path(path_value).expanduser(); p.mkdir(parents=True, exist_ok=True)
+        p=Path(path_value).expanduser()
+        if not p.is_dir(): raise ValueError('مسیر ذخیره‌سازی در دسترس نیست.')
         usage=shutil.disk_usage(p)
         return {'ok':True,'path':str(p),'total':usage.total,'used':usage.used,'free':usage.free,'percent':round(usage.used/usage.total*100,1) if usage.total else 0}
     except Exception as e:
@@ -407,10 +440,63 @@ def _fmt_bytes(n):
         if n < 1024 or unit=='TB': return f"{n:.1f} {unit}"
         n/=1024
 
-def _cleanup_old_files(folder, days):
+def _storage_paths(storage_root, snapshot_path, plate_path, video_path, backup_path):
+    raw=[storage_root,snapshot_path,plate_path,video_path,backup_path]
+    if any(not str(value).strip() for value in raw):
+        raise ValueError('همه مسیرها باید وارد شوند.')
+    paths=[Path(str(value).strip()).expanduser().resolve() for value in raw]
+    root=paths[0]
+    if root == Path(root.anchor):
+        raise ValueError('پوشه ریشه درایو یا سیستم‌عامل قابل انتخاب نیست.')
+    for child in paths[1:]:
+        if child == root or not child.is_relative_to(root):
+            raise ValueError('مسیر تصاویر، پلاک‌ها، ویدئوها و پشتیبان باید داخل مسیر اصلی باشد.')
+    if len(set(paths[1:])) != 4:
+        raise ValueError('برای هر نوع اطلاعات یک زیرپوشه جداگانه انتخاب کنید.')
+    return paths
+
+def _configured_storage_child(setting_key, default):
+    paths=_storage_paths(
+        get_setting('storage_root',str(DATA_DIR)),
+        get_setting('snapshot_path',str(SNAPSHOT_DIR)),
+        get_setting('plate_path',str(PLATE_DIR)),
+        get_setting('video_path',str(VIDEO_DIR)),
+        get_setting('backup_path',str(BACKUP_DIR)),
+    )
+    index={'snapshot_path':1,'plate_path':2,'video_path':3,'backup_path':4}[setting_key]
+    return paths[index]
+
+VIDEO_EXTENSIONS={'.mp4','.avi','.mkv','.mov','.m4v'}
+MAX_VIDEO_UPLOAD_BYTES=2*1024*1024*1024
+
+def _video_suffix(filename):
+    safe_name=Path(str(filename or '').replace('\\','/')).name
+    suffix=Path(safe_name).suffix.lower()
+    return suffix if suffix in VIDEO_EXTENSIONS else ''
+
+async def _save_video_upload(video, save_dir, suffix):
+    save_dir=Path(save_dir).resolve()
+    save_dir.mkdir(parents=True,exist_ok=True)
+    target=save_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(8)}{suffix}"
+    size=0
+    try:
+        with target.open('xb') as f:
+            while chunk:=await video.read(1024*1024):
+                size+=len(chunk)
+                if size>MAX_VIDEO_UPLOAD_BYTES:
+                    raise ValueError('حجم ویدئو بیشتر از ۲ گیگابایت است.')
+                f.write(chunk)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    return target
+
+def _cleanup_old_files(folder, days, storage_root):
     if days <= 0: return 0
     removed=0; cutoff=time.time()-days*86400
-    p=Path(folder)
+    root=Path(storage_root).resolve()
+    p=Path(folder).resolve()
+    if p == root or not p.is_relative_to(root): return 0
     if not p.exists(): return 0
     for f in p.rglob('*'):
         try:
@@ -421,9 +507,20 @@ def _cleanup_old_files(folder, days):
 
 def run_retention_cleanup():
     removed=0
-    removed += _cleanup_old_files(get_setting('snapshot_path',str(SNAPSHOT_DIR)), _safe_int(get_setting('retention_snapshots_days','90'),90))
-    removed += _cleanup_old_files(get_setting('plate_path',str(PLATE_DIR)), _safe_int(get_setting('retention_plates_days','90'),90))
-    removed += _cleanup_old_files(get_setting('video_path',str(VIDEO_DIR)), _safe_int(get_setting('retention_videos_days','7'),7))
+    root=get_setting('storage_root',str(DATA_DIR))
+    try:
+        paths=_storage_paths(
+            root,
+            get_setting('snapshot_path',str(SNAPSHOT_DIR)),
+            get_setting('plate_path',str(PLATE_DIR)),
+            get_setting('video_path',str(VIDEO_DIR)),
+            get_setting('backup_path',str(BACKUP_DIR)),
+        )
+    except ValueError:
+        return 0
+    removed += _cleanup_old_files(paths[1], _safe_int(get_setting('retention_snapshots_days','90'),90), paths[0])
+    removed += _cleanup_old_files(paths[2], _safe_int(get_setting('retention_plates_days','90'),90), paths[0])
+    removed += _cleanup_old_files(paths[3], _safe_int(get_setting('retention_videos_days','7'),7), paths[0])
     event_days=_safe_int(get_setting('retention_events_days','0'),0)
     if event_days>0:
         with connect() as con:
@@ -503,6 +600,7 @@ def audit_page(request:Request,q:str='',action:str=''):
 def settings(request:Request,saved:int=0,restart:int=0,error:str=''):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
+    if not has_permission(request,'system.manage'):return access_denied()
     msg="<div class='card ok'>تنظیمات ذخیره شد.</div>" if saved else ''
     if restart: msg += "<div class='alert' style='background:#fff8e5;color:#815b00;border-color:#ffe3a3'>مسیر اصلی ذخیره‌سازی تغییر کرد. برای استفاده کامل از دیتابیس در مسیر جدید، برنامه را یک‌بار ببندید و دوباره اجرا کنید.</div>"
     if error: msg += f"<div class='alert'>{escape(error)}</div>"
@@ -545,6 +643,7 @@ def settings(request:Request,saved:int=0,restart:int=0,error:str=''):
 def save_display_settings(request:Request,dashboard_grid:int=Form(2),live_fps:int=Form(5),stream_width:int=Form(640),jpeg_quality:int=Form(70),new_password:str=Form('')):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
+    if not has_permission(request,'system.manage'):return access_denied()
     set_setting('dashboard_grid',max(1,min(4,dashboard_grid)));set_setting('live_fps',max(1,min(15,live_fps)));set_setting('stream_width',stream_width);set_setting('jpeg_quality',max(30,min(95,jpeg_quality)))
     if new_password.strip():
         with connect() as con:con.execute('UPDATE users SET password_hash=? WHERE username=?',(hash_password(new_password.strip()),u))
@@ -554,11 +653,11 @@ def save_display_settings(request:Request,dashboard_grid:int=Form(2),live_fps:in
 @app.post('/settings/storage')
 def save_storage_settings(request:Request,storage_root:str=Form(...),snapshot_path:str=Form(...),plate_path:str=Form(...),video_path:str=Form(...),backup_path:str=Form(...),save_snapshots:str|None=Form(None),save_plate_images:str|None=Form(None),save_videos:str|None=Form(None),max_storage_gb:int=Form(0),storage_full_action:str=Form('delete_oldest'),retention_snapshots_days:int=Form(90),retention_plates_days:int=Form(90),retention_videos_days:int=Form(7),retention_events_days:int=Form(0)):
     if not auth(request):return RedirectResponse('/login',302)
+    if not has_permission(request,'system.manage'):return access_denied()
     try:
-        paths=[Path(x.strip()).expanduser() for x in [storage_root,snapshot_path,plate_path,video_path,backup_path]]
-        if any(not str(x).strip() for x in paths): raise ValueError('همه مسیرها باید وارد شوند.')
+        paths=_storage_paths(storage_root,snapshot_path,plate_path,video_path,backup_path)
         for x in paths: x.mkdir(parents=True,exist_ok=True)
-        old_root=Path(get_setting('storage_root',str(DATA_DIR))).resolve(); new_root=paths[0].resolve(); restart=old_root!=new_root
+        old_root=Path(get_setting('storage_root',str(DATA_DIR))).resolve(); new_root=paths[0]; restart=old_root!=new_root
         values={'storage_root':new_root,'snapshot_path':paths[1],'plate_path':paths[2],'video_path':paths[3],'backup_path':paths[4],'save_snapshots':'1' if save_snapshots else '0','save_plate_images':'1' if save_plate_images else '0','save_videos':'1' if save_videos else '0','max_storage_gb':max(0,max_storage_gb),'storage_full_action':storage_full_action if storage_full_action in {'delete_oldest','stop','alert'} else 'delete_oldest','retention_snapshots_days':max(0,retention_snapshots_days),'retention_plates_days':max(0,retention_plates_days),'retention_videos_days':max(0,retention_videos_days),'retention_events_days':max(0,retention_events_days)}
         for k,v in values.items(): set_setting(k,v)
         STORAGE_CONFIG_PATH.write_text(json.dumps({'storage_root':str(new_root)},ensure_ascii=False,indent=2),encoding='utf-8')
@@ -569,7 +668,7 @@ def save_storage_settings(request:Request,storage_root:str=Form(...),snapshot_pa
         run_retention_cleanup()
         return RedirectResponse('/settings?saved=1'+('&restart=1' if restart else '')+'#storage',303)
     except Exception as e:
-        return RedirectResponse('/settings?error='+str(e)+'#storage',303)
+        return RedirectResponse('/settings?error='+quote(str(e))+'#storage',303)
 
 @app.get('/api/storage/status')
 def api_storage_status(request:Request):
@@ -598,6 +697,7 @@ def health():return JSONResponse({'status':'ok','version':APP_VERSION,'opencv':C
 def license_page(request:Request,ok:int=0,error:str='',message:str=''):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
+    if not has_permission(request,'license.manage'):return access_denied()
     s=license_status(); badge="ok" if s['valid'] else "bad"
     notice=(f"<div class='card ok'>{escape(message or 'لایسنس فعال شد.')}</div>" if ok else (f"<div class='alert'>{escape(error)}</div>" if error else ""))
     labels={'trial':'آزمایشی','basic':'پایه','professional':'حرفه‌ای','enterprise':'سازمانی'}
@@ -621,18 +721,21 @@ def license_page(request:Request,ok:int=0,error:str='',message:str=''):
 @app.post('/license/offline')
 def activate_license(request:Request,license_text:str=Form(...)):
     if not auth(request):return RedirectResponse('/login',302)
+    if not has_permission(request,'license.manage'):return access_denied()
     ok,msg=install_license(license_text)
     return RedirectResponse('/license?ok=1&message='+quote(msg) if ok else '/license?error='+quote(msg),303)
 
 @app.post('/license/online')
 def activate_license_online(request:Request,server_url:str=Form(...),activation_code:str=Form(...)):
     if not auth(request):return RedirectResponse('/login',302)
+    if not has_permission(request,'license.manage'):return access_denied()
     ok,msg=activate_online(server_url,activation_code)
     return RedirectResponse('/license?ok=1&message='+quote(msg) if ok else '/license?error='+quote(msg),303)
 
 @app.post('/license/deactivate')
 def deactivate_license(request:Request):
     if not auth(request):return RedirectResponse('/login',302)
+    if not has_permission(request,'license.manage'):return access_denied()
     ok,msg=deactivate_local()
     return RedirectResponse('/license?ok=1&message='+quote(msg) if ok else '/license?error='+quote(msg),303)
 
@@ -650,6 +753,7 @@ def export_events(request:Request):
 def save_ai_settings(request:Request, ai_accelerator:str=Form('auto'), ai_quality:str=Form('balanced'), ai_confidence:int=Form(85), ai_frames:int=Form(5)):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
+    if not has_permission(request,'system.manage'):return access_denied()
     set_setting('ai_accelerator', ai_accelerator)
     set_setting('ai_quality', ai_quality)
     set_setting('ai_confidence', max(1,min(99,ai_confidence)))
@@ -659,7 +763,8 @@ def save_ai_settings(request:Request, ai_accelerator:str=Form('auto'), ai_qualit
 @app.post('/backup')
 def backup_database(request:Request):
     if not auth(request):return RedirectResponse('/login',302)
-    out=Path(get_setting('backup_path',str(BACKUP_DIR)));out.mkdir(parents=True,exist_ok=True);out=out / f"bcvision-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
+    if not has_permission(request,'system.manage'):return access_denied()
+    out=_configured_storage_child('backup_path',BACKUP_DIR);out.mkdir(parents=True,exist_ok=True);out=out / f"bcvision-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
     shutil.copy2(DB_PATH,out)
     return FileResponse(out,media_type='application/octet-stream',filename=out.name)
 
@@ -668,20 +773,14 @@ def backup_database(request:Request):
 async def cameras_video_upload(request: Request, camera_id: int = Form(...), video: UploadFile = File(...)):
     u=auth(request)
     if not u: return RedirectResponse('/login',302)
-    allowed={'.mp4','.avi','.mkv','.mov','.m4v'}
-    filename=Path(video.filename or 'video.mp4').name
-    if Path(filename).suffix.lower() not in allowed:
+    if not has_permission(request,'video.process'):return access_denied()
+    suffix=_video_suffix(video.filename)
+    if not suffix:
         return page('خطای ویدئو',"<div class='wrap'><div class='alert'>فرمت فایل پشتیبانی نمی‌شود.</div><a class='btn' href='/cameras'>بازگشت</a></div>",u,request)
-    save_dir=Path(get_setting('video_path',str(VIDEO_DIR))); save_dir.mkdir(parents=True,exist_ok=True)
-    target=save_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{filename}"
-    size=0
-    with target.open('wb') as f:
-        while chunk:=await video.read(1024*1024):
-            size+=len(chunk)
-            if size>2*1024*1024*1024:
-                f.close(); target.unlink(missing_ok=True)
-                return page('خطای ویدئو',"<div class='wrap'><div class='alert'>حجم ویدئو بیشتر از ۲ گیگابایت است.</div></div>",u,request)
-            f.write(chunk)
+    try:
+        target=await _save_video_upload(video,_configured_storage_child('video_path',VIDEO_DIR),suffix)
+    except ValueError as e:
+        return page('خطای ویدئو',f"<div class='wrap'><div class='alert'>{escape(str(e))}</div></div>",u,request)
     try:
         from app.ai.video_test import process_video
         with connect() as con:
@@ -706,9 +805,11 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(...), vid
 # ---------- Video AI Test Upload ----------
 @app.get('/ai/video-test', response_class=HTMLResponse)
 def ai_video_test_page(request: Request):
-    if not auth(request):
+    u=auth(request)
+    if not u:
         return RedirectResponse('/login',302)
-    return HTMLResponse("""
+    if not has_permission(request,'video.process'):return access_denied()
+    return page('تست ویدئو',"""
     <div style="direction:rtl;font-family:Tahoma;padding:30px">
     <h2>🧠 تست پلاک‌خوان با فایل ویدئو</h2>
     <form action="/ai/video-test/upload" method="post" enctype="multipart/form-data">
@@ -716,31 +817,35 @@ def ai_video_test_page(request: Request):
       <button type="submit">شروع تست AI</button>
     </form>
     </div>
-    """)
+    """,u,request)
 
 @app.post('/ai/video-test/upload', response_class=HTMLResponse)
 async def ai_video_test_upload(request: Request, video: UploadFile = File(...)):
-    if not auth(request):
+    u=auth(request)
+    if not u:
         return RedirectResponse('/login',302)
-    save_dir = Path(VIDEO_DIR)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    target = save_dir / video.filename
-    with target.open("wb") as f:
-        f.write(await video.read())
+    if not has_permission(request,'video.process'):return access_denied()
+    suffix=_video_suffix(video.filename)
+    if not suffix:
+        return page('خطای ویدئو',"<div class='wrap'><div class='alert'>فرمت فایل پشتیبانی نمی‌شود.</div></div>",u,request)
+    try:
+        target=await _save_video_upload(video,_configured_storage_child('video_path',VIDEO_DIR),suffix)
+    except ValueError as e:
+        return page('خطای ویدئو',f"<div class='wrap'><div class='alert'>{escape(str(e))}</div></div>",u,request)
     try:
         from app.ai.video_test import VideoTester
         tester = VideoTester(target)
         info = tester.info()
         tester.close()
-        return HTMLResponse(f"""
+        return page('نتیجه آماده‌سازی ویدئو',f"""
         <div style="direction:rtl;font-family:Tahoma;padding:30px">
         <h2>نتیجه آماده‌سازی ویدئو</h2>
-        <p>فایل: {escape(video.filename)}</p>
+        <p>فایل: {escape(video.filename or '')}</p>
         <p>فریم: {info['frames']}</p>
         <p>FPS: {info['fps']}</p>
         <p>رزولوشن: {info['width']}x{info['height']}</p>
         <p>مرحله بعد: اتصال همین ورودی به موتور تشخیص پلاک</p>
         </div>
-        """)
+        """,u,request)
     except Exception as e:
-        return HTMLResponse(f"خطا: {escape(str(e))}")
+        return page('خطای ویدئو',f"<div class='wrap'><div class='alert'>خطا: {escape(str(e))}</div></div>",u,request)

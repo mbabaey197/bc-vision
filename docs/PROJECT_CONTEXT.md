@@ -79,7 +79,29 @@ The current regression suite covers:
 - backward-compatible database migration
 - model hash verification
 
-Latest isolated full-suite result after background auto-start: `22 passed`.
+Latest isolated full-suite result on the security-hardening branch:
+`36 passed, 1 skipped`.
+
+## Security hardening status
+
+Phase 1 security hardening is implemented on
+`agent/security-hardening-phase-1` and is pending review/merge:
+
+- uploaded video names are never used as filesystem paths
+- video uploads are streamed with a 2 GiB limit and partial files are removed
+- stored watchlist fields are HTML-escaped in event reports
+- media access uses resolved path containment instead of string prefixes
+- snapshot, plate, video and backup folders must be distinct children of the
+  configured storage root
+- retention cleanup refuses any folder outside the configured storage root
+- camera, system, license, watchlist and video operations enforce server-side
+  role permissions
+- administrators and system managers can manage technical configuration
+- operators can manage watchlists and process videos
+- guards retain read-only monitoring and event access
+
+The phase 1 regression tests cover traversal filenames, upload-size cleanup,
+stored XSS, media-prefix bypass, unsafe retention paths and role boundaries.
 
 ## Operational truth
 
