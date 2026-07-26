@@ -1,5 +1,7 @@
 from __future__ import annotations
-import threading, time
+
+import threading
+import time
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -12,112 +14,256 @@ except Exception:
     np = None
     CV_OK = False
 
+
 @dataclass
 class StreamState:
     online: bool = False
     last_error: str = ""
     last_frame_at: float = 0.0
 
+
 class CameraStream:
-    def __init__(self, camera_id: int, url: str, name: str, width=640, fps=5, quality=70):
+    def __init__(
+        self,
+        camera_id: int,
+        url: str,
+        name: str,
+        width=640,
+        fps=5,
+        quality=70,
+    ):
         self.camera_id, self.url, self.name = camera_id, url, name
-        self.width, self.fps, self.quality = width, max(1, fps), quality
+        self.width, self.fps, self.quality = (
+            width,
+            max(1, fps),
+            quality,
+        )
         self.state = StreamState()
         self.latest: bytes | None = None
+        self.latest_frame = None
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.lock = threading.Lock()
 
     def start(self):
-        if self.thread and self.thread.is_alive(): return
+        if self.thread and self.thread.is_alive():
+            return
         self.stop_event.clear()
-        self.thread = threading.Thread(target=self._run, daemon=True, name=f"camera-{self.camera_id}")
+        self.thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name=f"camera-{self.camera_id}",
+        )
         self.thread.start()
 
     def stop(self):
         self.stop_event.set()
+        try:
+            from app.ai.live_worker import stop_live_camera
+            stop_live_camera(self.camera_id)
+        except Exception:
+            pass
 
     def _encode(self, frame):
+        display = frame
         if self.width and frame.shape[1] > self.width:
             scale = self.width / frame.shape[1]
-            frame = cv2.resize(frame, (self.width, int(frame.shape[0]*scale)))
-        ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality])
-        return bytes(buf) if ok else None
+            display = cv2.resize(
+                frame,
+                (self.width, int(frame.shape[0] * scale)),
+            )
+        ok, buffer = cv2.imencode(
+            ".jpg",
+            display,
+            [int(cv2.IMWRITE_JPEG_QUALITY), self.quality],
+        )
+        return bytes(buffer) if ok else None
+
+    def _publish(self, frame):
+        data = self._encode(frame)
+        if not data:
+            return
+        with self.lock:
+            self.latest = data
+            self.latest_frame = frame
+        self.state.online = True
+        self.state.last_frame_at = time.time()
+        self.state.last_error = ""
+        try:
+            from app.ai.live_worker import submit_live_frame
+            submit_live_frame(
+                self.camera_id,
+                self.name,
+                frame,
+            )
+        except Exception:
+            # ANPR failures are reported through its own status and must never
+            # interrupt or mark a healthy camera stream as offline.
+            pass
 
     def _demo_frame(self):
-        h, w = 360, 640
-        frame = np.zeros((h,w,3), dtype=np.uint8)
-        t = time.strftime('%Y-%m-%d  %H:%M:%S')
-        # Moving object proves the stream is live.
-        x = int((time.time()*90) % (w+160)) - 160
-        cv2.rectangle(frame, (x,205), (x+160,300), (70,160,225), -1)
-        cv2.circle(frame, (x+35,305), 20, (220,220,220), -1)
-        cv2.circle(frame, (x+125,305), 20, (220,220,220), -1)
-        cv2.putText(frame, 'Gilas Vision - DEMO CAMERA', (22,48), cv2.FONT_HERSHEY_SIMPLEX, .75, (255,255,255), 2)
-        cv2.putText(frame, t, (22,85), cv2.FONT_HERSHEY_SIMPLEX, .68, (210,230,255), 2)
-        cv2.putText(frame, self.name, (22,130), cv2.FONT_HERSHEY_SIMPLEX, .7, (200,255,200), 2)
+        height, width = 360, 640
+        frame = np.zeros((height, width, 3), dtype=np.uint8)
+        stamp = time.strftime("%Y-%m-%d  %H:%M:%S")
+        x = int((time.time() * 90) % (width + 160)) - 160
+        cv2.rectangle(
+            frame,
+            (x, 205),
+            (x + 160, 300),
+            (70, 160, 225),
+            -1,
+        )
+        cv2.circle(
+            frame,
+            (x + 35, 305),
+            20,
+            (220, 220, 220),
+            -1,
+        )
+        cv2.circle(
+            frame,
+            (x + 125, 305),
+            20,
+            (220, 220, 220),
+            -1,
+        )
+        cv2.putText(
+            frame,
+            "Gilas Vision - DEMO CAMERA",
+            (22, 48),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (255, 255, 255),
+            2,
+        )
+        cv2.putText(
+            frame,
+            stamp,
+            (22, 85),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.68,
+            (210, 230, 255),
+            2,
+        )
+        cv2.putText(
+            frame,
+            self.name,
+            (22, 130),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (200, 255, 200),
+            2,
+        )
         return frame
 
     def _run(self):
         if not CV_OK:
-            self.state.last_error = 'OpenCV is not available'
+            self.state.last_error = "OpenCV is not available"
             return
-        delay = 1.0/self.fps
-        if self.url.startswith('demo://'):
+        delay = 1.0 / self.fps
+        if self.url.startswith("demo://"):
             while not self.stop_event.is_set():
-                frame = self._demo_frame()
-                data = self._encode(frame)
-                if data:
-                    with self.lock: self.latest = data
-                    self.state.online = True; self.state.last_frame_at = time.time(); self.state.last_error = ''
+                self._publish(self._demo_frame())
                 time.sleep(delay)
             return
+
         while not self.stop_event.is_set():
-            cap = None
+            capture = None
             try:
-                cap = cv2.VideoCapture(self.url)
-                if not cap.isOpened(): raise RuntimeError('Cannot open RTSP stream')
+                capture = cv2.VideoCapture(
+                    self.url,
+                    cv2.CAP_FFMPEG,
+                )
+                if not capture.isOpened():
+                    capture.release()
+                    capture = cv2.VideoCapture(self.url)
+                if not capture.isOpened():
+                    raise RuntimeError("Cannot open RTSP stream")
+                capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 while not self.stop_event.is_set():
-                    ok, frame = cap.read()
-                    if not ok or frame is None: raise RuntimeError('Camera stopped sending frames')
-                    data = self._encode(frame)
-                    if data:
-                        with self.lock: self.latest = data
-                        self.state.online = True; self.state.last_frame_at = time.time(); self.state.last_error = ''
+                    ok, frame = capture.read()
+                    if not ok or frame is None:
+                        raise RuntimeError(
+                            "Camera stopped sending frames"
+                        )
+                    self._publish(frame)
                     time.sleep(delay)
-            except Exception as e:
-                self.state.online = False; self.state.last_error = str(e)
+            except Exception as exc:
+                self.state.online = False
+                self.state.last_error = str(exc)
                 time.sleep(3)
             finally:
-                if cap is not None: cap.release()
+                if capture is not None:
+                    capture.release()
 
     def frames(self) -> Iterator[bytes]:
         self.start()
         while not self.stop_event.is_set():
-            with self.lock: frame = self.latest
+            with self.lock:
+                frame = self.latest
             if frame:
-                yield b'--frame\r\nContent-Type: image/jpeg\r\nCache-Control: no-cache\r\n\r\n' + frame + b'\r\n'
-            time.sleep(1.0/self.fps)
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Cache-Control: no-cache\r\n\r\n"
+                    + frame
+                    + b"\r\n"
+                )
+            time.sleep(1.0 / self.fps)
+
 
 class StreamManager:
-    def __init__(self): self.streams = {}; self.lock = threading.Lock()
+    def __init__(self):
+        self.streams = {}
+        self.lock = threading.Lock()
+
     def get(self, camera_id, url, name, width, fps, quality):
-        key = (url,name,width,fps,quality)
+        key = (url, name, width, fps, quality)
         with self.lock:
             old = self.streams.get(camera_id)
-            if old and getattr(old,'_key',None) != key:
-                old.stop(); self.streams.pop(camera_id,None); old=None
+            if old and getattr(old, "_key", None) != key:
+                old.stop()
+                self.streams.pop(camera_id, None)
+                old = None
             if not old:
-                old = CameraStream(camera_id,url,name,width,fps,quality); old._key=key
-                self.streams[camera_id]=old; old.start()
+                old = CameraStream(
+                    camera_id,
+                    url,
+                    name,
+                    width,
+                    fps,
+                    quality,
+                )
+                old._key = key
+                self.streams[camera_id] = old
+                old.start()
             return old
+
     def remove(self, camera_id):
         with self.lock:
-            s=self.streams.pop(camera_id,None)
-            if s: s.stop()
+            stream = self.streams.pop(camera_id, None)
+            if stream:
+                stream.stop()
+
     def status(self, camera_id):
-        s=self.streams.get(camera_id)
-        if not s: return {'online':False,'error':'stream not started'}
-        return {'online':s.state.online,'error':s.state.last_error,'last_frame_at':s.state.last_frame_at}
+        stream = self.streams.get(camera_id)
+        base = {
+            "online": False,
+            "error": "stream not started",
+            "last_frame_at": 0.0,
+        }
+        if stream:
+            base = {
+                "online": stream.state.online,
+                "error": stream.state.last_error,
+                "last_frame_at": stream.state.last_frame_at,
+            }
+        try:
+            from app.ai.live_worker import live_anpr_status
+            base["anpr"] = live_anpr_status(camera_id)
+        except Exception:
+            base["anpr"] = {"active": False}
+        return base
+
 
 manager = StreamManager()
