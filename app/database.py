@@ -1,11 +1,51 @@
 import sqlite3
+
 from app.config import DB_PATH
 from app.security import hash_password
 
+
 def connect():
-    con = sqlite3.connect(DB_PATH, timeout=20, check_same_thread=False)
+    con = sqlite3.connect(
+        DB_PATH,
+        timeout=20,
+        check_same_thread=False,
+    )
     con.row_factory = sqlite3.Row
     return con
+
+
+def _add_missing_columns(con, table, migrations):
+    columns = {
+        row[1]
+        for row in con.execute(
+            f"PRAGMA table_info({table})"
+        ).fetchall()
+    }
+    for name, sql_type in migrations.items():
+        if name not in columns:
+            con.execute(
+                f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}"
+            )
+
+
+def _backfill_plate_norm(con):
+    try:
+        from app.ai.plate_rules import normalize_plate
+    except Exception:
+        return
+    rows = con.execute(
+        "SELECT id,plate_text FROM plate_events "
+        "WHERE plate_text IS NOT NULL AND plate_text<>'' "
+        "AND (plate_norm IS NULL OR plate_norm='')"
+    ).fetchall()
+    for row in rows:
+        normalized = normalize_plate(row["plate_text"])
+        if normalized:
+            con.execute(
+                "UPDATE plate_events SET plate_norm=? WHERE id=?",
+                (normalized, row["id"]),
+            )
+
 
 def init_db():
     with connect() as con:
@@ -48,6 +88,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS plate_events(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             plate_text TEXT,
+            plate_norm TEXT DEFAULT '',
             confidence REAL DEFAULT 0,
             camera_id INTEGER,
             camera_name TEXT,
@@ -67,44 +108,78 @@ def init_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         """)
-        user_columns={r[1] for r in con.execute("PRAGMA table_info(users)").fetchall()}
-        user_migrations={
-            "role":"TEXT NOT NULL DEFAULT 'admin'",
-            "is_active":"INTEGER NOT NULL DEFAULT 1",
-            "failed_attempts":"INTEGER NOT NULL DEFAULT 0",
-            "locked_until":"TEXT",
-            "last_login":"TEXT",
-            "created_at":"TEXT"
-        }
-        for name,sql_type in user_migrations.items():
-            if name not in user_columns:
-                con.execute(f"ALTER TABLE users ADD COLUMN {name} {sql_type}")
-        con.execute("UPDATE users SET role='admin' WHERE is_admin=1 AND (role IS NULL OR role='')")
-        con.execute("UPDATE users SET created_at=CURRENT_TIMESTAMP WHERE created_at IS NULL OR created_at=''")
 
-        # Backward-compatible event metadata migration.
-        event_columns={r[1] for r in con.execute("PRAGMA table_info(plate_events)").fetchall()}
-        for name,sql_type in {"plate_image_path":"TEXT","video_path":"TEXT","video_second":"REAL DEFAULT 0","detector_method":"TEXT","ocr_confidence":"REAL DEFAULT 0","vehicle_type":"TEXT DEFAULT 'نامشخص'","vehicle_color":"TEXT DEFAULT 'نامشخص'","vehicle_brand":"TEXT DEFAULT 'نامشخص'","vehicle_confidence":"REAL DEFAULT 0"}.items():
-            if name not in event_columns:
-                con.execute(f"ALTER TABLE plate_events ADD COLUMN {name} {sql_type}")
-        camera_columns={r[1] for r in con.execute("PRAGMA table_info(cameras)").fetchall()}
-        camera_migrations={
-            "lpr_enabled":"INTEGER NOT NULL DEFAULT 1",
-            "lpr_confidence":"INTEGER NOT NULL DEFAULT 60",
-            "frame_step":"INTEGER NOT NULL DEFAULT 5",
-            "duplicate_seconds":"REAL NOT NULL DEFAULT 30",
-            "roi_x":"INTEGER NOT NULL DEFAULT 0",
-            "roi_y":"INTEGER NOT NULL DEFAULT 0",
-            "roi_w":"INTEGER NOT NULL DEFAULT 100",
-            "roi_h":"INTEGER NOT NULL DEFAULT 100",
-            "line_y":"INTEGER NOT NULL DEFAULT 50"
-        }
-        for name,sql_type in camera_migrations.items():
-            if name not in camera_columns:
-                con.execute(f"ALTER TABLE cameras ADD COLUMN {name} {sql_type}")
-        if con.execute("SELECT 1 FROM users WHERE username=?", ("admin",)).fetchone() is None:
-            con.execute("INSERT INTO users(username,password_hash,display_name,is_admin) VALUES(?,?,?,1)",
-                        ("admin", hash_password("123456"), "مدیر سیستم"))
+        _add_missing_columns(con, "users", {
+            "role": "TEXT NOT NULL DEFAULT 'admin'",
+            "is_active": "INTEGER NOT NULL DEFAULT 1",
+            "failed_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "locked_until": "TEXT",
+            "last_login": "TEXT",
+            "created_at": "TEXT",
+        })
+        con.execute(
+            "UPDATE users SET role='admin' "
+            "WHERE is_admin=1 AND (role IS NULL OR role='')"
+        )
+        con.execute(
+            "UPDATE users SET created_at=CURRENT_TIMESTAMP "
+            "WHERE created_at IS NULL OR created_at=''"
+        )
+
+        _add_missing_columns(con, "plate_events", {
+            "plate_norm": "TEXT DEFAULT ''",
+            "plate_image_path": "TEXT",
+            "video_path": "TEXT",
+            "video_second": "REAL DEFAULT 0",
+            "detector_method": "TEXT",
+            "ocr_confidence": "REAL DEFAULT 0",
+            "vehicle_type": "TEXT DEFAULT 'نامشخص'",
+            "vehicle_color": "TEXT DEFAULT 'نامشخص'",
+            "vehicle_brand": "TEXT DEFAULT 'نامشخص'",
+            "vehicle_confidence": "REAL DEFAULT 0",
+            "direction": "TEXT DEFAULT 'stationary'",
+            "quality_score": "REAL DEFAULT 0",
+            "consensus_votes": "INTEGER DEFAULT 1",
+            "source": "TEXT DEFAULT 'video'",
+            "processing_ms": "REAL DEFAULT 0",
+        })
+        _backfill_plate_norm(con)
+        con.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_plate_events_created_at
+            ON plate_events(created_at);
+        CREATE INDEX IF NOT EXISTS idx_plate_events_plate_norm
+            ON plate_events(plate_norm);
+        CREATE INDEX IF NOT EXISTS idx_plate_events_camera_created
+            ON plate_events(camera_id,created_at);
+        """)
+
+        _add_missing_columns(con, "cameras", {
+            "lpr_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "lpr_confidence": "INTEGER NOT NULL DEFAULT 60",
+            "frame_step": "INTEGER NOT NULL DEFAULT 5",
+            "duplicate_seconds": "REAL NOT NULL DEFAULT 30",
+            "roi_x": "INTEGER NOT NULL DEFAULT 0",
+            "roi_y": "INTEGER NOT NULL DEFAULT 0",
+            "roi_w": "INTEGER NOT NULL DEFAULT 100",
+            "roi_h": "INTEGER NOT NULL DEFAULT 100",
+            "line_y": "INTEGER NOT NULL DEFAULT 50",
+        })
+
+        if con.execute(
+            "SELECT 1 FROM users WHERE username=?",
+            ("admin",),
+        ).fetchone() is None:
+            con.execute(
+                "INSERT INTO users(" 
+                "username,password_hash,display_name,is_admin"
+                ") VALUES(?,?,?,1)",
+                (
+                    "admin",
+                    hash_password("123456"),
+                    "مدیر سیستم",
+                ),
+            )
+
         defaults = {
             "company_name": "گیلاس آبی البرز",
             "dashboard_grid": "2",
@@ -126,17 +201,43 @@ def init_db():
             "retention_videos_days": "7",
             "retention_events_days": "0",
         }
-        for k,v in defaults.items():
-            con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k,v))
-        if con.execute("SELECT COUNT(*) c FROM cameras").fetchone()["c"] == 0:
-            con.execute("INSERT INTO cameras(name,rtsp_url,location,enabled,is_demo,sort_order) VALUES(?,?,?,?,?,?)",
-                        ("دوربین آزمایشی", "demo://camera-1", "نمایش نمونه", 1, 1, 1))
+        for key, value in defaults.items():
+            con.execute(
+                "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+                (key, value),
+            )
+
+        if con.execute(
+            "SELECT COUNT(*) c FROM cameras"
+        ).fetchone()["c"] == 0:
+            con.execute(
+                "INSERT INTO cameras(" 
+                "name,rtsp_url,location,enabled,is_demo,sort_order"
+                ") VALUES(?,?,?,?,?,?)",
+                (
+                    "دوربین آزمایشی",
+                    "demo://camera-1",
+                    "نمایش نمونه",
+                    1,
+                    1,
+                    1,
+                ),
+            )
+
 
 def get_setting(key, default=""):
     with connect() as con:
-        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        row = con.execute(
+            "SELECT value FROM settings WHERE key=?",
+            (key,),
+        ).fetchone()
         return row["value"] if row else default
+
 
 def set_setting(key, value):
     with connect() as con:
-        con.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key,str(value)))
+        con.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
