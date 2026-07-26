@@ -64,3 +64,69 @@ jobs:
         run: |
           Write-Error "ANPR tests failed. See the anpr-pytest-output artifact."
           exit 1
+
+  ai-runtime:
+    if: github.event_name == 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    env:
+      BCVISION_RUN_AI_INTEGRATION: "1"
+      BCVISION_PLATE_MODEL: ${{ runner.temp }}\bcvision-models\plate\best.pt
+      BCVISION_EASYOCR_MODEL_DIR: ${{ runner.temp }}\bcvision-models\easyocr
+      BCVISION_EASYOCR_DOWNLOAD: "0"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-ai-lock.txt
+
+      - name: Restore verified model cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\bcvision-models
+          key: bcvision-anpr-models-v1
+
+      - name: Install AI runtime
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip --quiet
+          python -m pip install -r requirements-ai-lock.txt --quiet
+          python -m pip install pytest==9.0.2 --quiet
+          python -m pip check
+
+      - name: Compile AI modules
+        shell: pwsh
+        run: |
+          python -m compileall -q app/ai
+
+      - name: Download, verify and load models
+        id: ai_test
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          python -m pytest -q tests/test_ai_runtime.py *>&1 | Tee-Object -FilePath ai-test-output.txt
+          exit $LASTEXITCODE
+
+      - name: Upload AI test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anpr-ai-test-output
+          path: ai-test-output.txt
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Enforce AI result
+        if: steps.ai_test.outcome == 'failure'
+        shell: pwsh
+        run: |
+          Write-Error "ANPR AI integration failed. See the anpr-ai-test-output artifact."
+          exit 1
