@@ -1,3 +1,6 @@
+# Complete BC Vision runtime, including ANPR AI engines.
+-r requirements-ai-lock.txt
+
 fastapi>=0.115
 uvicorn[standard]>=0.30
 python-multipart>=0.0.9
@@ -9,5 +12,4 @@ pyinstaller>=6.10
 cryptography>=43.0
 
 psutil>=6.0
-
 pytesseract>=0.3.13
