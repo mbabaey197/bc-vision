@@ -79,7 +79,22 @@ The current regression suite covers:
 - backward-compatible database migration
 - model hash verification
 
-Latest isolated full-suite result after background auto-start: `22 passed`.
+Latest isolated full-suite result on the headless-launcher branch:
+`34 passed, 1 skipped`.
+
+## Windows launcher and first-run dashboard
+
+The launcher is designed to run as a PyInstaller windowed application. Uvicorn
+now owns the main process, so no Tkinter keep-alive window is required. The
+browser opens only after the BC Vision health endpoint verifies the service
+identity. A different application listening on port 8000 is rejected instead
+of being mistaken for BC Vision.
+
+New databases no longer receive an enabled synthetic demo camera. A one-time,
+exact-match migration removes only the historical built-in sample camera from
+existing databases while preserving real cameras, user-created demo cameras,
+events, settings and license data. The empty dashboard contains instructions
+and an add-camera action without a placeholder image or animation.
 
 ## Operational truth
 

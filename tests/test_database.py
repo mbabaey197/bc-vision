@@ -104,3 +104,98 @@ def test_old_database_migrates_without_data_loss(
             )
         }
         assert "idx_plate_events_plate_norm" in indexes
+
+
+def test_new_database_has_no_automatic_demo_camera(
+    tmp_path,
+    monkeypatch,
+):
+    import app.database
+
+    db_path = tmp_path / "fresh.db"
+    monkeypatch.setattr(app.database, "DB_PATH", db_path)
+
+    app.database.init_db()
+
+    with sqlite3.connect(db_path) as con:
+        assert con.execute(
+            "SELECT COUNT(*) FROM cameras"
+        ).fetchone()[0] == 0
+        assert con.execute(
+            "SELECT value FROM settings "
+            "WHERE key='migration_remove_builtin_demo_camera_v1'"
+        ).fetchone()[0] == "1"
+
+
+def test_builtin_demo_migration_preserves_user_cameras(
+    tmp_path,
+    monkeypatch,
+):
+    import app.database
+
+    db_path = tmp_path / "existing.db"
+    monkeypatch.setattr(app.database, "DB_PATH", db_path)
+    app.database.init_db()
+
+    with sqlite3.connect(db_path) as con:
+        con.execute(
+            "DELETE FROM settings WHERE "
+            "key='migration_remove_builtin_demo_camera_v1'"
+        )
+        con.execute(
+            "INSERT INTO cameras("
+            "name,rtsp_url,location,enabled,is_demo,sort_order"
+            ") VALUES(?,?,?,?,?,?)",
+            (
+                "دوربین آزمایشی",
+                "demo://camera-1",
+                "نمایش نمونه",
+                1,
+                1,
+                1,
+            ),
+        )
+        con.execute(
+            "INSERT INTO cameras("
+            "name,rtsp_url,location,enabled,is_demo,sort_order"
+            ") VALUES(?,?,?,?,?,?)",
+            (
+                "نمونه کاربر",
+                "demo://custom",
+                "پارکینگ",
+                1,
+                1,
+                2,
+            ),
+        )
+
+    app.database.init_db()
+
+    with sqlite3.connect(db_path) as con:
+        rows = con.execute(
+            "SELECT name,rtsp_url FROM cameras ORDER BY id"
+        ).fetchall()
+        assert rows == [("نمونه کاربر", "demo://custom")]
+
+        # The marker makes the migration one-time and avoids deleting a camera
+        # that a user might deliberately create later with matching fields.
+        con.execute(
+            "INSERT INTO cameras("
+            "name,rtsp_url,location,enabled,is_demo,sort_order"
+            ") VALUES(?,?,?,?,?,?)",
+            (
+                "دوربین آزمایشی",
+                "demo://camera-1",
+                "نمایش نمونه",
+                1,
+                1,
+                3,
+            ),
+        )
+
+    app.database.init_db()
+
+    with sqlite3.connect(db_path) as con:
+        assert con.execute(
+            "SELECT COUNT(*) FROM cameras"
+        ).fetchone()[0] == 2

@@ -207,21 +207,23 @@ def init_db():
                 (key, value),
             )
 
+        migration_key = "migration_remove_builtin_demo_camera_v1"
         if con.execute(
-            "SELECT COUNT(*) c FROM cameras"
-        ).fetchone()["c"] == 0:
+            "SELECT 1 FROM settings WHERE key=?",
+            (migration_key,),
+        ).fetchone() is None:
             con.execute(
-                "INSERT INTO cameras(" 
-                "name,rtsp_url,location,enabled,is_demo,sort_order"
-                ") VALUES(?,?,?,?,?,?)",
+                "DELETE FROM cameras WHERE "
+                "name=? AND rtsp_url=? AND location=? AND is_demo=1",
                 (
                     "دوربین آزمایشی",
                     "demo://camera-1",
                     "نمایش نمونه",
-                    1,
-                    1,
-                    1,
                 ),
+            )
+            con.execute(
+                "INSERT INTO settings(key,value) VALUES(?,?)",
+                (migration_key, "1"),
             )
 
 
