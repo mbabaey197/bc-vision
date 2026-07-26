@@ -1,0 +1,76 @@
+# Trusted base-branch validation for BC Vision ANPR pull requests.
+name: ANPR PR validation
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "app/ai/**"
+      - "app/database.py"
+      - "app/streams.py"
+      - "launcher.py"
+      - "requirements-ai-lock.txt"
+      - "requirements-test.txt"
+      - "tests/**"
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-test.txt
+      - name: Install test dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip --quiet
+          python -m pip install -r requirements-test.txt --quiet
+      - name: Compile and test
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -m compileall -q app/ai app/database.py app/streams.py
+          python -m pytest -q tests
+
+  ai-runtime:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      BCVISION_RUN_AI_INTEGRATION: "1"
+      BCVISION_PLATE_MODEL: ${{ runner.temp }}\bcvision-models\plate\best.pt
+      BCVISION_EASYOCR_MODEL_DIR: ${{ runner.temp }}\bcvision-models\easyocr
+      BCVISION_EASYOCR_DOWNLOAD: "0"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-ai-lock.txt
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\bcvision-models
+          key: bcvision-anpr-models-v1
+      - name: Install AI runtime
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip --quiet
+          python -m pip install -r requirements-ai-lock.txt --quiet
+          python -m pip install pytest==9.0.2 --quiet
+          python -m pip check
+      - name: Verify real engines and models
+        shell: pwsh
+        run: |
+          python -m compileall -q app/ai
+          python -m pytest -q tests/test_ai_runtime.py
