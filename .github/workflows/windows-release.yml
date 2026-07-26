@@ -1,4 +1,4 @@
-name: Windows release package
+name: Windows source and installer package
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
       - "launcher.py"
       - "requirements*.txt"
       - "BUILD_PORTABLE_EXE.bat"
-      - "installer/**"
+      - "installer/BCVision.iss"
       - "VERSION"
       - ".github/workflows/windows-release.yml"
   pull_request:
@@ -21,7 +21,7 @@ on:
       - "launcher.py"
       - "requirements*.txt"
       - "BUILD_PORTABLE_EXE.bat"
-      - "installer/**"
+      - "installer/BCVision.iss"
       - "VERSION"
       - ".github/workflows/windows-release.yml"
 
@@ -83,8 +83,7 @@ jobs:
         run: |
           $required = @(
             "dist\BCVision\BCVision.exe",
-            "installer\BCVision.iss",
-            "installer\BCVision_Update.iss"
+            "installer\BCVision.iss"
           )
           foreach ($path in $required) {
             if (-not (Test-Path $path)) {
@@ -120,7 +119,7 @@ jobs:
             }
           }
 
-      - name: Compile Windows installer and updater
+      - name: Compile standard Windows installer
         shell: pwsh
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
@@ -129,26 +128,19 @@ jobs:
           }
           & $iscc "installer\BCVision.iss"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $iscc "installer\BCVision_Update.iss"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Verify installer outputs
+      - name: Verify installer output
         shell: pwsh
         run: |
-          $outputs = @(
-            "setup_output\BCVision_Setup_v$env:BCVISION_VERSION.exe",
-            "setup_output\BCVision_Update_v$env:BCVISION_VERSION.exe"
-          )
-          foreach ($path in $outputs) {
-            if (-not (Test-Path $path)) {
-              throw "Expected release output missing: $path"
-            }
-            if ((Get-Item $path).Length -lt 1MB) {
-              throw "Release output is unexpectedly small: $path"
-            }
+          $path = "setup_output\BCVision_Setup_v$env:BCVISION_VERSION.exe"
+          if (-not (Test-Path $path)) {
+            throw "Expected installer output missing: $path"
+          }
+          if ((Get-Item $path).Length -lt 1MB) {
+            throw "Installer output is unexpectedly small: $path"
           }
 
-      - name: Installed upgrade preservation test
+      - name: Install upgrade and data preservation test
         shell: pwsh
         run: |
           function Wait-ForLogin([System.Diagnostics.Process]$Process) {
@@ -166,15 +158,21 @@ jobs:
           }
 
           $setup = Resolve-Path "setup_output\BCVision_Setup_v$env:BCVISION_VERSION.exe"
-          $update = Resolve-Path "setup_output\BCVision_Update_v$env:BCVISION_VERSION.exe"
-          $install = Start-Process -FilePath $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-" -Wait -PassThru
-          if ($install.ExitCode -ne 0) {
-            throw "Full installer failed. ExitCode=$($install.ExitCode)"
+          $installArguments = @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-")
+
+          $firstInstall = Start-Process -FilePath $setup -ArgumentList $installArguments -Wait -PassThru
+          if ($firstInstall.ExitCode -ne 0) {
+            throw "Initial installer run failed. ExitCode=$($firstInstall.ExitCode)"
           }
 
-          $installedExe = Join-Path $env:ProgramFiles "BC Vision\BCVision.exe"
+          $installRoot = Join-Path $env:ProgramFiles "BC Vision"
+          $installedExe = Join-Path $installRoot "BCVision.exe"
+          $uninstaller = Join-Path $installRoot "unins000.exe"
           if (-not (Test-Path $installedExe)) {
             throw "Installed executable missing: $installedExe"
+          }
+          if (-not (Test-Path $uninstaller)) {
+            throw "Standard uninstaller missing: $uninstaller"
           }
 
           $firstRun = Start-Process -FilePath $installedExe -PassThru
@@ -186,23 +184,23 @@ jobs:
 
           $dataRoot = Join-Path $env:ProgramData "BCVision\data"
           $database = Join-Path $dataRoot "bcvision.db"
-          $sentinel = Join-Path $dataRoot "upgrade-preservation.txt"
+          $sentinel = Join-Path $dataRoot "installer-upgrade-preservation.txt"
           if (-not (Test-Path $database)) {
             throw "Database was not created at the persistent data path: $database"
           }
           "preserve-$env:GITHUB_SHA" | Set-Content -Encoding utf8 $sentinel
           $databaseHashBefore = (Get-FileHash $database -Algorithm SHA256).Hash
 
-          $upgrade = Start-Process -FilePath $update -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-" -Wait -PassThru
-          if ($upgrade.ExitCode -ne 0) {
-            throw "One-click updater failed. ExitCode=$($upgrade.ExitCode)"
+          $upgradeInstall = Start-Process -FilePath $setup -ArgumentList $installArguments -Wait -PassThru
+          if ($upgradeInstall.ExitCode -ne 0) {
+            throw "Installer upgrade run failed. ExitCode=$($upgradeInstall.ExitCode)"
           }
           if (-not (Test-Path $sentinel)) {
-            throw "Persistent data sentinel was removed by the updater."
+            throw "Persistent data sentinel was removed during installer upgrade."
           }
           $databaseHashAfter = (Get-FileHash $database -Algorithm SHA256).Hash
           if ($databaseHashBefore -ne $databaseHashAfter) {
-            throw "Database content changed during file-only updater installation."
+            throw "Database content changed during installer upgrade."
           }
 
           $secondRun = Start-Process -FilePath $installedExe -PassThru
@@ -216,9 +214,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force release_output | Out-Null
-          git archive --format=zip --output="release_output\BCVision_Source_v$env:BCVISION_VERSION.zip" HEAD
-          Copy-Item "setup_output\BCVision_Setup_v$env:BCVISION_VERSION.exe" "release_output\"
-          Copy-Item "setup_output\BCVision_Update_v$env:BCVISION_VERSION.exe" "release_output\"
+          git archive --format=zip --output="release_output\BC_Vision_Source_v$env:BCVISION_VERSION.zip" HEAD
+          Copy-Item "setup_output\BCVision_Setup_v$env:BCVISION_VERSION.exe" "release_output\BC_Vision_Setup_v$env:BCVISION_VERSION.exe"
 
           $releaseFiles = Get-ChildItem release_output -File | Sort-Object Name
           $checksumLines = foreach ($file in $releaseFiles) {
@@ -239,7 +236,7 @@ jobs:
             }
           }
 
-      - name: Upload installer source and updater outputs
+      - name: Upload source and installer outputs
         uses: actions/upload-artifact@v4
         with:
           name: BCVision-v${{ steps.version.outputs.version }}-windows-release
