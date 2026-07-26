@@ -1,0 +1,144 @@
+name: Windows release package
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "app/**"
+      - "launcher.py"
+      - "requirements*.txt"
+      - "BUILD_PORTABLE_EXE.bat"
+      - "installer/**"
+      - ".github/workflows/windows-release.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-smoke-test:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    env:
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      BCVISION_SKIP_MODEL_PREP: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            requirements-lock.txt
+            requirements-ai-lock.txt
+            requirements-test.txt
+
+      - name: Run regression tests
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip --quiet
+          python -m pip install -r requirements-test.txt --quiet
+          python -m pytest -q tests
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build portable application
+        shell: cmd
+        run: BUILD_PORTABLE_EXE.bat
+
+      - name: Verify portable payload
+        shell: pwsh
+        run: |
+          $required = @(
+            "dist\BCVision\BCVision.exe",
+            "installer\BCVision.iss",
+            "installer\BCVision_Update.iss"
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path $path)) {
+              throw "Required release file missing: $path"
+            }
+          }
+
+      - name: Portable startup smoke test
+        shell: pwsh
+        run: |
+          $env:BCVISION_SKIP_MODEL_PREP = "1"
+          $process = Start-Process -FilePath "dist\BCVision\BCVision.exe" -PassThru
+          try {
+            $ready = $false
+            foreach ($attempt in 1..60) {
+              Start-Sleep -Seconds 1
+              try {
+                $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:8000/login" -TimeoutSec 2
+                if ($response.StatusCode -eq 200) {
+                  $ready = $true
+                  break
+                }
+              } catch {}
+              if ($process.HasExited) {
+                throw "BCVision.exe exited before the login page became available. ExitCode=$($process.ExitCode)"
+              }
+            }
+            if (-not $ready) {
+              throw "BCVision.exe did not expose the login page during the smoke-test window."
+            }
+          } finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+          }
+
+      - name: Compile full installer and updater
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            throw "Inno Setup compiler was not found: $iscc"
+          }
+          & $iscc "installer\BCVision.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $iscc "installer\BCVision_Update.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify installer outputs
+        shell: pwsh
+        run: |
+          $required = @(
+            "setup_output\BCVision_Setup_v2.1.0.exe",
+            "setup_output\BCVision_Update_v2.1.0.exe"
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path $path)) {
+              throw "Expected installer output missing: $path"
+            }
+            if ((Get-Item $path).Length -lt 1MB) {
+              throw "Installer output is unexpectedly small: $path"
+            }
+          }
+
+      - name: Create complete source archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release_output | Out-Null
+          git archive --format=zip --output="release_output\BCVision_Source_v2.1.0.zip" HEAD
+          Copy-Item "setup_output\BCVision_Setup_v2.1.0.exe" "release_output\"
+          Copy-Item "setup_output\BCVision_Update_v2.1.0.exe" "release_output\"
+          Get-FileHash release_output\* -Algorithm SHA256 | Format-Table -AutoSize | Out-String | Set-Content -Encoding UTF8 release_output\SHA256SUMS.txt
+
+      - name: Upload three release outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: BCVision-v2.1.0-windows-release
+          path: release_output/*
+          if-no-files-found: error
+          retention-days: 14
