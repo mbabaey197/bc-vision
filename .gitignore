@@ -12,3 +12,4 @@ setup_output/
 .vscode/
 tools/keys/
 license.json
+.buildvenv/
