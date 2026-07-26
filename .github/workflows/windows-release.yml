@@ -1,7 +1,18 @@
-name: Windows installer and source package
+name: Windows release package
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "app/**"
+      - "launcher.py"
+      - "requirements*.txt"
+      - "BUILD_PORTABLE_EXE.bat"
+      - "installer/**"
+      - "VERSION"
+      - ".github/workflows/windows-release.yml"
   pull_request:
     branches:
       - main
@@ -11,6 +22,7 @@ on:
       - "requirements*.txt"
       - "BUILD_PORTABLE_EXE.bat"
       - "installer/**"
+      - "VERSION"
       - ".github/workflows/windows-release.yml"
 
 permissions:
@@ -29,6 +41,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Invalid VERSION value: $version"
+          }
+          "BCVISION_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
@@ -60,7 +83,8 @@ jobs:
         run: |
           $required = @(
             "dist\BCVision\BCVision.exe",
-            "installer\BCVision.iss"
+            "installer\BCVision.iss",
+            "installer\BCVision_Update.iss"
           )
           foreach ($path in $required) {
             if (-not (Test-Path $path)) {
@@ -71,7 +95,6 @@ jobs:
       - name: Application startup smoke test
         shell: pwsh
         run: |
-          $env:BCVISION_SKIP_MODEL_PREP = "1"
           $process = Start-Process -FilePath "dist\BCVision\BCVision.exe" -PassThru
           try {
             $ready = $false
@@ -97,7 +120,7 @@ jobs:
             }
           }
 
-      - name: Compile Windows installer
+      - name: Compile Windows installer and updater
         shell: pwsh
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
@@ -106,30 +129,120 @@ jobs:
           }
           & $iscc "installer\BCVision.iss"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $iscc "installer\BCVision_Update.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Verify installer output
+      - name: Verify installer outputs
         shell: pwsh
         run: |
-          $path = "setup_output\BCVision_Setup_v2.1.0.exe"
-          if (-not (Test-Path $path)) {
-            throw "Expected installer output missing: $path"
+          $outputs = @(
+            "setup_output\BCVision_Setup_v$env:BCVISION_VERSION.exe",
+            "setup_output\BCVision_Update_v$env:BCVISION_VERSION.exe"
+          )
+          foreach ($path in $outputs) {
+            if (-not (Test-Path $path)) {
+              throw "Expected release output missing: $path"
+            }
+            if ((Get-Item $path).Length -lt 1MB) {
+              throw "Release output is unexpectedly small: $path"
+            }
           }
-          if ((Get-Item $path).Length -lt 1MB) {
-            throw "Installer output is unexpectedly small: $path"
+
+      - name: Installed upgrade preservation test
+        shell: pwsh
+        run: |
+          function Wait-ForLogin([System.Diagnostics.Process]$Process) {
+            foreach ($attempt in 1..60) {
+              Start-Sleep -Seconds 1
+              try {
+                $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:8000/login" -TimeoutSec 2
+                if ($response.StatusCode -eq 200) { return }
+              } catch {}
+              if ($Process.HasExited) {
+                throw "Installed BCVision.exe exited before login became available. ExitCode=$($Process.ExitCode)"
+              }
+            }
+            throw "Installed BCVision.exe did not expose the login page."
+          }
+
+          $setup = Resolve-Path "setup_output\BCVision_Setup_v$env:BCVISION_VERSION.exe"
+          $update = Resolve-Path "setup_output\BCVision_Update_v$env:BCVISION_VERSION.exe"
+          $install = Start-Process -FilePath $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-" -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            throw "Full installer failed. ExitCode=$($install.ExitCode)"
+          }
+
+          $installedExe = Join-Path $env:ProgramFiles "BC Vision\BCVision.exe"
+          if (-not (Test-Path $installedExe)) {
+            throw "Installed executable missing: $installedExe"
+          }
+
+          $firstRun = Start-Process -FilePath $installedExe -PassThru
+          try {
+            Wait-ForLogin $firstRun
+          } finally {
+            if (-not $firstRun.HasExited) { Stop-Process -Id $firstRun.Id -Force }
+          }
+
+          $dataRoot = Join-Path $env:ProgramData "BCVision\data"
+          $database = Join-Path $dataRoot "bcvision.db"
+          $sentinel = Join-Path $dataRoot "upgrade-preservation.txt"
+          if (-not (Test-Path $database)) {
+            throw "Database was not created at the persistent data path: $database"
+          }
+          "preserve-$env:GITHUB_SHA" | Set-Content -Encoding utf8 $sentinel
+          $databaseHashBefore = (Get-FileHash $database -Algorithm SHA256).Hash
+
+          $upgrade = Start-Process -FilePath $update -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-" -Wait -PassThru
+          if ($upgrade.ExitCode -ne 0) {
+            throw "One-click updater failed. ExitCode=$($upgrade.ExitCode)"
+          }
+          if (-not (Test-Path $sentinel)) {
+            throw "Persistent data sentinel was removed by the updater."
+          }
+          $databaseHashAfter = (Get-FileHash $database -Algorithm SHA256).Hash
+          if ($databaseHashBefore -ne $databaseHashAfter) {
+            throw "Database content changed during file-only updater installation."
+          }
+
+          $secondRun = Start-Process -FilePath $installedExe -PassThru
+          try {
+            Wait-ForLogin $secondRun
+          } finally {
+            if (-not $secondRun.HasExited) { Stop-Process -Id $secondRun.Id -Force }
           }
 
       - name: Create release outputs
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force release_output | Out-Null
-          git archive --format=zip --output="release_output\BCVision_Source_v2.1.0.zip" HEAD
-          Copy-Item "setup_output\BCVision_Setup_v2.1.0.exe" "release_output\"
-          Get-FileHash release_output\* -Algorithm SHA256 | Format-Table -AutoSize | Out-String | Set-Content -Encoding UTF8 release_output\SHA256SUMS.txt
+          git archive --format=zip --output="release_output\BCVision_Source_v$env:BCVISION_VERSION.zip" HEAD
+          Copy-Item "setup_output\BCVision_Setup_v$env:BCVISION_VERSION.exe" "release_output\"
+          Copy-Item "setup_output\BCVision_Update_v$env:BCVISION_VERSION.exe" "release_output\"
 
-      - name: Upload installer and source outputs
+          $releaseFiles = Get-ChildItem release_output -File | Sort-Object Name
+          $checksumLines = foreach ($file in $releaseFiles) {
+            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash *$($file.Name)"
+          }
+          $checksumLines | Set-Content -Encoding ascii release_output\SHA256SUMS.txt
+
+          foreach ($line in Get-Content release_output\SHA256SUMS.txt) {
+            if ($line -notmatch '^([0-9a-f]{64}) \*(.+)$') {
+              throw "Invalid checksum line: $line"
+            }
+            $expected = $Matches[1]
+            $path = Join-Path release_output $Matches[2]
+            $actual = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $expected) {
+              throw "Checksum verification failed for $path"
+            }
+          }
+
+      - name: Upload installer source and updater outputs
         uses: actions/upload-artifact@v4
         with:
-          name: BCVision-v2.1.0-windows-release
+          name: BCVision-v${{ steps.version.outputs.version }}-windows-release
           path: release_output/*
           if-no-files-found: error
           retention-days: 14
