@@ -2,6 +2,14 @@ name: ANPR AI integration
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - codex/anpr-completion
+    paths:
+      - "app/ai/**"
+      - "requirements-ai-lock.txt"
+      - "tests/test_ai_runtime.py"
+      - ".github/workflows/anpr-ai-integration.yml"
   pull_request:
     branches:
       - main
@@ -46,9 +54,9 @@ jobs:
       - name: Install AI runtime
         shell: pwsh
         run: |
-          python -m pip install --disable-pip-version-check --upgrade pip
-          python -m pip install -r requirements-ai-lock.txt
-          python -m pip install pytest==9.0.2 cryptography==49.0.0
+          python -m pip install --disable-pip-version-check --upgrade pip --quiet
+          python -m pip install -r requirements-ai-lock.txt --quiet
+          python -m pip install pytest==9.0.2 cryptography==49.0.0 --quiet
           python -m pip check
 
       - name: Compile AI modules
@@ -57,6 +65,25 @@ jobs:
           python -m compileall -q app/ai
 
       - name: Download, verify and load models
+        id: ai_test
+        continue-on-error: true
         shell: pwsh
         run: |
-          python -m pytest -q tests/test_ai_runtime.py
+          python -m pytest -q tests/test_ai_runtime.py *>&1 | Tee-Object -FilePath ai-test-output.txt
+          exit $LASTEXITCODE
+
+      - name: Upload AI test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anpr-ai-test-output
+          path: ai-test-output.txt
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Enforce AI result
+        if: steps.ai_test.outcome == 'failure'
+        shell: pwsh
+        run: |
+          Write-Error "ANPR AI integration failed. See the anpr-ai-test-output artifact."
+          exit 1
