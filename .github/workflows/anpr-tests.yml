@@ -1,3 +1,4 @@
+# Unified Windows validation: fast ANPR regression plus real AI model smoke test.
 name: ANPR tests
 
 on:
