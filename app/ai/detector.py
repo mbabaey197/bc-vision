@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import os
+from itertools import combinations
 from pathlib import Path
 from typing import Iterable
 
 import cv2
 import numpy as np
+
+from .plate_rules import format_iran_plate, plausible_plate
 
 try:
     from ultralytics import YOLO
@@ -16,6 +19,41 @@ except Exception:
 _model = None
 _model_key = None
 _model_error = ""
+
+IRANIAN_CHARACTER_MAP = {
+    0: "0",
+    1: "1",
+    2: "2",
+    3: "3",
+    4: "4",
+    5: "5",
+    6: "6",
+    7: "7",
+    8: "8",
+    9: "9",
+    10: "الف",
+    11: "ب",
+    12: "ت",
+    13: "ث",
+    14: "ج",
+    15: "د",
+    16: "س",
+    17: "ش",
+    18: "ص",
+    19: "ط",
+    20: "ظ",
+    21: "ع",
+    22: "ق",
+    23: "ل",
+    24: "م",
+    25: "ن",
+    26: "ه",
+    27: "و",
+    28: "پ",
+    29: "ژ",
+    31: "ی",
+}
+IRANIAN_PLATE_CLASS_ID = 30
 
 
 def _model_paths() -> list[Path]:
@@ -102,6 +140,130 @@ def _nms(candidates: list[dict], threshold: float = 0.38) -> list[dict]:
         if all(_iou(candidate["bbox"], row["bbox"]) < threshold for row in kept):
             kept.append(candidate)
     return kept
+
+
+def _plate_class_ids(model) -> list[int] | None:
+    names = getattr(model, "names", {}) or {}
+    if isinstance(names, list):
+        names = dict(enumerate(names))
+    if (
+        IRANIAN_PLATE_CLASS_ID in names
+        and len(names) >= 32
+    ):
+        return [IRANIAN_PLATE_CLASS_ID]
+    matching = [
+        int(class_id)
+        for class_id, name in names.items()
+        if "plate" in str(name).lower()
+        or "license" in str(name).lower()
+    ]
+    if matching:
+        return matching
+    if len(names) == 1:
+        return [int(next(iter(names)))]
+    return None
+
+
+def _select_plate_sequence(characters: list[dict]) -> tuple[str, float]:
+    filtered = _nms(
+        [
+            row
+            for row in characters
+            if row.get("class_id") in IRANIAN_CHARACTER_MAP
+            and float(row.get("confidence", 0.0)) >= 0.15
+        ],
+        threshold=0.45,
+    )
+    ordered = sorted(filtered, key=lambda row: row["x_center"])
+    if len(ordered) < 8:
+        return "", 0.0
+
+    # The model occasionally reports symbols from the blue country strip or
+    # two competing classes for one glyph. Select the highest-confidence
+    # eight-character subsequence that exactly matches the Iranian layout.
+    best = None
+    for selected in combinations(ordered[:14], 8):
+        raw = "".join(
+            IRANIAN_CHARACTER_MAP[row["class_id"]]
+            for row in selected
+        )
+        if not plausible_plate(raw):
+            continue
+        confidence = sum(
+            float(row["confidence"])
+            for row in selected
+        ) / 8.0
+        minimum = min(
+            float(row["confidence"])
+            for row in selected
+        )
+        score = 0.78 * confidence + 0.22 * minimum
+        candidate = (score, confidence, raw)
+        if best is None or candidate > best:
+            best = candidate
+
+    if best is None:
+        return "", 0.0
+    return format_iran_plate(best[2]), round(best[1], 4)
+
+
+def _recognize_plate_crops(model, candidates: list[dict]) -> None:
+    if not candidates:
+        return
+    for candidate in candidates:
+        candidate["direct_ocr_attempted"] = True
+    try:
+        image_size = max(
+            320,
+            min(
+                640,
+                int(os.environ.get(
+                    "BCVISION_CHARACTER_IMAGE_SIZE",
+                    "416",
+                )),
+            ),
+        )
+        # Sequential crops keep peak RAM bounded. A large batch briefly
+        # duplicates the 1080p model tensors and can terminate low-memory
+        # Windows systems even though it is only marginally faster.
+        for candidate in candidates:
+            result = model.predict(
+                candidate["crop"],
+                verbose=False,
+                conf=0.15,
+                iou=0.42,
+                imgsz=image_size,
+                max_det=24,
+                classes=sorted(IRANIAN_CHARACTER_MAP),
+                augment=False,
+            )[0]
+            characters = []
+            for box in result.boxes:
+                class_id = int(box.cls[0])
+                x1, y1, x2, y2 = (
+                    float(value)
+                    for value in box.xyxy[0].tolist()
+                )
+                characters.append({
+                    "class_id": class_id,
+                    "confidence": float(box.conf[0]),
+                    "bbox": (x1, y1, x2, y2),
+                    "x_center": (x1 + x2) / 2.0,
+                })
+            text, confidence = _select_plate_sequence(characters)
+            candidate["direct_text"] = text
+            candidate["direct_ocr_confidence"] = confidence
+            if text:
+                candidate["method"] = "yolo-plate+chars"
+    except Exception as exc:
+        global _model_error
+        _model_error = (
+            "Character recognition failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        # Keep the plate detection, but do not start the much heavier generic
+        # OCR path for a crop already attempted by this dedicated model.
+        return
 
 
 def _order_points(points: np.ndarray) -> np.ndarray:
@@ -244,14 +406,38 @@ def detect_plates(frame, min_confidence: float = 0.25, max_results: int = 8):
     found = []
     if model is not None:
         try:
+            plate_class_ids = _plate_class_ids(model)
+            model_max_results = (
+                min(max_results, 4)
+                if plate_class_ids == [IRANIAN_PLATE_CLASS_ID]
+                else max_results
+            )
             results = model.predict(
                 frame, verbose=False, conf=max(0.05, float(min_confidence)),
-                iou=0.42, imgsz=960, max_det=max_results,
+                iou=0.42,
+                imgsz=max(
+                    512,
+                    min(
+                        960,
+                        int(os.environ.get(
+                            "BCVISION_DETECTOR_IMAGE_SIZE",
+                            "640",
+                        )),
+                    ),
+                ),
+                max_det=model_max_results,
+                classes=plate_class_ids,
                 augment=os.environ.get("BCVISION_YOLO_TTA", "0") == "1",
             )
             for result in results:
                 for box in result.boxes:
                     confidence = float(box.conf[0])
+                    class_id = int(box.cls[0])
+                    if (
+                        plate_class_ids is not None
+                        and class_id not in plate_class_ids
+                    ):
+                        continue
                     x1, y1, x2, y2 = _clip_box(box.xyxy[0].tolist(), width, height)
                     if x2 <= x1 or y2 <= y1:
                         continue
@@ -265,7 +451,15 @@ def detect_plates(frame, min_confidence: float = 0.25, max_results: int = 8):
                         "method": "yolo",
                     })
             if found:
-                return _nms(found)[:max_results]
+                found = _nms(found)[:model_max_results]
+                if plate_class_ids == [IRANIAN_PLATE_CLASS_ID]:
+                    _recognize_plate_crops(model, found)
+                return found
+            # A successful zero-result YOLO inference means no plate was
+            # present at this threshold. Running the broad OpenCV fallback on
+            # every such frame creates false candidates and invokes expensive
+            # OCR work. Fallback is reserved for an unavailable/failed model.
+            return []
         except Exception as exc:
             global _model_error
             _model_error = f"{type(exc).__name__}: {exc}"

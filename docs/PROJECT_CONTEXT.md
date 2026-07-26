@@ -43,6 +43,20 @@ The Iranian plate-recognition subsystem now includes:
 - persistent, SHA-256-verified AI model management
 - AI-aware PyInstaller build configuration
 
+## ANPR model execution contract
+
+The verified `best.pt` asset is a combined Iranian plate/character model, not
+a single-class plate-only detector. Full-frame inference must select class
+`30` (plate), followed by a character-only inference on the cropped plate.
+Generic EasyOCR is reserved for the OpenCV/no-model fallback. Vehicle
+attributes are calculated only after stable plate consensus, immediately
+before event persistence.
+
+The CPU-oriented defaults are 640px for plate localization, 416px for
+character recognition, no test-time augmentation, and at most four plate
+candidates per processed frame. A successful zero-result model inference does
+not trigger the expensive OpenCV fallback.
+
 ## Important commits
 
 - Iranian plate rules: `16f0a5354125ff90c9d45b253852e5dc56b239dc`

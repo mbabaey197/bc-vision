@@ -1,7 +1,14 @@
 import cv2
 import numpy as np
 
-from app.ai.detector import _iou, _nms, detect_plates, detector_status
+from app.ai.detector import (
+    _iou,
+    _nms,
+    _plate_class_ids,
+    _select_plate_sequence,
+    detect_plates,
+    detector_status,
+)
 
 
 def make_plate_scene(brightness=45, angle=0, blur=0):
@@ -66,3 +73,83 @@ def test_nms_removes_overlaps():
 def test_status_is_safe():
     status = detector_status()
     assert "model_exists" in status
+
+
+def _characters(text, confidences):
+    class_ids = {
+        **{str(value): value for value in range(10)},
+        "ب": 11,
+        "ط": 19,
+        "ق": 22,
+    }
+    return [
+        {
+            "class_id": class_ids[character],
+            "confidence": confidence,
+            "x_center": index * 20.0,
+            "bbox": (
+                index * 20.0,
+                0.0,
+                index * 20.0 + 12.0,
+                24.0,
+            ),
+        }
+        for index, (character, confidence) in enumerate(
+            zip(text, confidences)
+        )
+    ]
+
+
+def test_character_decoder_removes_low_confidence_country_strip_noise():
+    text, confidence = _select_plate_sequence(
+        _characters(
+            "027ط25374",
+            [0.17, 0.86, 0.85, 0.85, 0.85, 0.85, 0.85, 0.87, 0.86],
+        )
+    )
+    assert text == "27-ط-253-74"
+    assert confidence > 0.84
+
+
+def test_character_decoder_selects_highest_confidence_plate_template():
+    text, _ = _select_plate_sequence(
+        _characters(
+            "418ب987232",
+            [0.18, 0.82, 0.86, 0.89, 0.85, 0.86, 0.86, 0.46, 0.87, 0.86],
+        )
+    )
+    assert text == "18-ب-987-32"
+
+
+def test_verified_model_uses_only_plate_class():
+    model = type(
+        "Model",
+        (),
+        {"names": {index: str(index) for index in range(32)}},
+    )()
+    assert _plate_class_ids(model) == [30]
+
+
+def test_successful_empty_yolo_result_does_not_run_fallback(
+    monkeypatch,
+):
+    class Model:
+        names = {index: str(index) for index in range(32)}
+
+        @staticmethod
+        def predict(*_args, **_kwargs):
+            return [type("Result", (), {"boxes": []})()]
+
+    monkeypatch.setattr(
+        "app.ai.detector.load_model",
+        lambda: Model(),
+    )
+    monkeypatch.setattr(
+        "app.ai.detector._opencv_candidates",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("fallback should not run")
+        ),
+    )
+
+    frame = np.zeros((180, 320, 3), dtype=np.uint8)
+    assert detect_plates(frame) == []

@@ -75,7 +75,15 @@ def process_frame(frame, min_detection_confidence=0.25):
     for item in detect_plates(frame, min_confidence=min_detection_confidence):
         crop = item["crop"]
         quality = image_quality(crop)
-        text, ocr_confidence = read_plate(crop)
+        text = item.get("direct_text", "")
+        ocr_confidence = float(
+            item.get("direct_ocr_confidence", 0.0)
+        )
+        if (
+            not plausible_plate(text)
+            and not item.get("direct_ocr_attempted")
+        ):
+            text, ocr_confidence = read_plate(crop)
         valid = plausible_plate(text)
         combined = _combined_confidence(
             item["confidence"],
@@ -83,7 +91,6 @@ def process_frame(frame, min_detection_confidence=0.25):
             quality["score"],
             valid,
         )
-        vehicle = analyze_vehicle(frame, item["bbox"])
         results.append({
             "plate": text or "ناخوانا",
             "plate_norm": normalize_plate(text) if valid else "",
@@ -96,14 +103,27 @@ def process_frame(frame, min_detection_confidence=0.25):
             "crop": crop,
             "method": item["method"],
             "valid": valid,
-            "vehicle_type": vehicle["vehicle_type"],
-            "vehicle_color": vehicle["vehicle_color"],
-            "vehicle_brand": vehicle["vehicle_brand"],
-            "vehicle_confidence": vehicle["vehicle_confidence"],
-            "vehicle_bbox": vehicle["vehicle_bbox"],
+            "vehicle_type": "نامشخص",
+            "vehicle_color": "نامشخص",
+            "vehicle_brand": "نامشخص",
+            "vehicle_confidence": 0.0,
+            "vehicle_bbox": item["bbox"],
         })
     results.sort(key=lambda row: (row["valid"], row["confidence"]), reverse=True)
     return results
+
+
+def add_vehicle_analysis(result: dict, frame) -> dict:
+    enriched = dict(result)
+    vehicle = analyze_vehicle(frame, result["bbox"])
+    enriched.update({
+        "vehicle_type": vehicle["vehicle_type"],
+        "vehicle_color": vehicle["vehicle_color"],
+        "vehicle_brand": vehicle["vehicle_brand"],
+        "vehicle_confidence": vehicle["vehicle_confidence"],
+        "vehicle_bbox": vehicle["vehicle_bbox"],
+    })
+    return enriched
 
 
 def bbox_iou(a, b) -> float:

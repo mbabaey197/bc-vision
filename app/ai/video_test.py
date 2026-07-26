@@ -5,7 +5,11 @@ from datetime import datetime
 from pathlib import Path
 import cv2
 
-from .pipeline import PlateConsensusTracker, process_frame
+from .pipeline import (
+    PlateConsensusTracker,
+    add_vehicle_analysis,
+    process_frame,
+)
 from .plate_rules import normalize_plate
 
 
@@ -65,6 +69,7 @@ def _translate_result(result, offset_x, offset_y):
 
 
 def _save_event(result, frame, frame_no, fps, plate_dir, snapshot_dir, video_path):
+    result = add_vehicle_analysis(result, frame)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     plate_file = plate_dir / f"plate-{stamp}.jpg"
     snap_file = snapshot_dir / f"vehicle-{stamp}.jpg"

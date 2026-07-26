@@ -4,6 +4,7 @@ from app.ai.pipeline import (
     PlateConsensusTracker,
     image_quality,
     plate_similarity,
+    process_frame,
 )
 from app.ai.plate_rules import normalize_plate
 
@@ -171,3 +172,42 @@ def test_plate_similarity_handles_formatting():
         "31ط55674",
     ) == 1.0
     assert plate_similarity("", "31ط55674") == 0.0
+
+
+def test_direct_yolo_text_skips_expensive_ocr_and_vehicle_ai(
+    monkeypatch,
+):
+    crop = np.full((40, 160, 3), 180, dtype=np.uint8)
+    monkeypatch.setattr(
+        "app.ai.pipeline.detect_plates",
+        lambda *_args, **_kwargs: [{
+            "crop": crop,
+            "bbox": (10, 20, 170, 60),
+            "confidence": 0.8,
+            "method": "yolo-plate+chars",
+            "direct_text": "27-ط-253-74",
+            "direct_ocr_confidence": 0.86,
+            "direct_ocr_attempted": True,
+        }],
+    )
+    monkeypatch.setattr(
+        "app.ai.pipeline.read_plate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("EasyOCR should not run")
+        ),
+    )
+    monkeypatch.setattr(
+        "app.ai.pipeline.analyze_vehicle",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("vehicle AI should be deferred")
+        ),
+    )
+
+    rows = process_frame(
+        np.full((100, 200, 3), 100, dtype=np.uint8)
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["plate"] == "27-ط-253-74"
+    assert rows[0]["valid"] is True
+    assert rows[0]["vehicle_type"] == "نامشخص"

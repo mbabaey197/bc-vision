@@ -209,6 +209,9 @@ def _get_easyocr_reader():
         gpu=False,
         verbose=False,
         model_storage_directory=str(model_dir),
+        user_network_directory=str(
+            model_dir / "user_network"
+        ),
         download_enabled=allow_download,
     )
     _easy_reader_key = key

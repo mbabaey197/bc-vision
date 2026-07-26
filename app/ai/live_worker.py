@@ -14,7 +14,11 @@ import time
 
 import cv2
 
-from .pipeline import PlateConsensusTracker, process_frame
+from .pipeline import (
+    PlateConsensusTracker,
+    add_vehicle_analysis,
+    process_frame,
+)
 from .plate_rules import normalize_plate
 
 
@@ -133,6 +137,7 @@ class LiveANPRWorker:
         from app.database import connect
         from app.config import PLATE_DIR, SNAPSHOT_DIR
 
+        result = add_vehicle_analysis(result, frame)
         plate_dir = Path(self._setting("plate_path", str(PLATE_DIR)))
         snapshot_dir = Path(
             self._setting("snapshot_path", str(SNAPSHOT_DIR))

@@ -4,7 +4,7 @@ BC Vision stores AI model files in the persistent data directory instead of the
 application directory. Installer and one-click updates therefore do not delete
 models, settings, events, snapshots, or the database.
 
-## Iranian plate detector
+## Iranian plate and character detector
 
 - Model repository: `makhresearch/persian-license-plate-detector`
 - Source: `https://huggingface.co/makhresearch/persian-license-plate-detector`
@@ -12,6 +12,12 @@ models, settings, events, snapshots, or the database.
 - Expected size: `119237050` bytes
 - SHA-256: `258104262D3A16A6BC613938CC1DD0198DA8A7DDEAB4843197666CB9CE0DB756`
 - License declared by the model repository: MIT
+
+This is a 32-class model. Class `30` is the full plate; the remaining
+documented classes represent Persian plate characters. BC Vision must first
+filter the full-frame result to class `30`, then run character recognition on
+the resulting plate crop. Treating every class as a full plate produces false
+candidates and excessive OCR load.
 
 The application downloads this model only over HTTPS. It is moved into the
 active model path only after both the exact size and SHA-256 digest match.
@@ -42,7 +48,14 @@ BCVISION_PLATE_MODEL
 BCVISION_EASYOCR_MODEL_DIR
 BCVISION_MODEL_SOURCE_DIR
 BCVISION_EASYOCR_SOURCE_DIR
+BCVISION_DETECTOR_IMAGE_SIZE
+BCVISION_CHARACTER_IMAGE_SIZE
 ```
+
+Default inference sizes are `640` for full-frame plate localization and `416`
+for the cropped character pass. These defaults were selected from the real
+1920×1080 reference video to reduce CPU time while retaining plate detections.
+The character crops are processed sequentially to bound peak RAM.
 
 ## Operational limitation
 

@@ -216,6 +216,9 @@ def ensure_easyocr_models(download=True) -> Path:
         gpu=False,
         verbose=False,
         model_storage_directory=str(target),
+        user_network_directory=str(
+            target / "user_network"
+        ),
         download_enabled=True,
     )
     invalid = [
