@@ -1,23 +1,130 @@
+"""Canonical normalization and validation rules for Iranian license plates."""
+
 import re
 
-PERSIAN_DIGITS='۰۱۲۳۴۵۶۷۸۹'
-ARABIC_DIGITS='٠١٢٣٤٥٦٧٨٩'
-DIGIT_TRANS=str.maketrans(PERSIAN_DIGITS+ARABIC_DIGITS,'0123456789'*2)
-LETTER_MAP={'ب':'B','ج':'J','د':'D','س':'S','ص':'S','ط':'T','ق':'Q','ل':'L','م':'M','ن':'N','و':'V','ه':'H','ی':'Y','ت':'T','ع':'E','پ':'P','الف':'A'}
+
+PERSIAN_DIGITS = "\u06f0\u06f1\u06f2\u06f3\u06f4\u06f5\u06f6\u06f7\u06f8\u06f9"
+ARABIC_DIGITS = "\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669"
+
+DIGIT_TRANS = str.maketrans(
+    PERSIAN_DIGITS + ARABIC_DIGITS,
+    "0123456789" * 2,
+)
+
+CHAR_TRANS = str.maketrans({
+    "\u064a": "\u06cc",
+    "\u0649": "\u06cc",
+    "\u0643": "\u06a9",
+    "\u0629": "\u0647",
+    "\u06c0": "\u0647",
+    "\u0624": "\u0648",
+    "\u0623": "\u0627",
+    "\u0625": "\u0627",
+    "\u0622": "\u0627",
+})
+
+IRAN_WORD = "\u0627\u06cc\u0631\u0627\u0646"
+ALEF_WORD = "\u0627\u0644\u0641"
+
+# Personal and special-purpose Iranian vehicle plate letters.
+PERSIAN_PLATE_LETTERS = (
+    "\u0627"  # Alef / government
+    "\u0628"
+    "\u067e"
+    "\u062a"
+    "\u062b"
+    "\u062c"
+    "\u062f"
+    "\u0632"
+    "\u0698"
+    "\u0633"
+    "\u0634"
+    "\u0635"
+    "\u0637"
+    "\u0639"
+    "\u0641"
+    "\u0642"
+    "\u06a9"
+    "\u06af"
+    "\u0644"
+    "\u0645"
+    "\u0646"
+    "\u0648"
+    "\u0647"
+    "\u06cc"
+)
+
+# Latin letters used by diplomatic and embassy-service plates.
+# OCR aliases such as B -> ب are handled by the OCR layer, not validation.
+LATIN_PLATE_ALIASES = "DS"
+
+ALLOWED_PLATE_LETTERS = (
+    PERSIAN_PLATE_LETTERS
+    + LATIN_PLATE_ALIASES
+)
+
+IRAN_PLATE_PATTERN = re.compile(
+    rf"^(?P<prefix>\d{{2}})"
+    rf"(?P<letter>[{re.escape(ALLOWED_PLATE_LETTERS)}])"
+    rf"(?P<serial>\d{{3}})"
+    rf"(?P<region>\d{{2}})$"
+)
+
 
 def normalize_plate(text):
-    text=(text or '').translate(DIGIT_TRANS).upper()
-    for k,v in LETTER_MAP.items(): text=text.replace(k,v)
-    return re.sub(r'[^0-9A-Z]','',text)
+    """Return a stable key using ASCII digits and a normalized plate letter."""
+
+    value = str(text or "").translate(DIGIT_TRANS).translate(CHAR_TRANS).upper()
+
+    value = value.replace(ALEF_WORD, "\u0627")
+    value = value.replace(IRAN_WORD, "")
+    value = value.replace("IRAN", "")
+    value = value.replace("IRI", "")
+    value = value.replace("IR", "")
+
+    return "".join(
+        char
+        for char in value
+        if char.isdigit()
+        or "A" <= char <= "Z"
+        or "\u0600" <= char <= "\u06ff"
+    )
+
+
+def split_iran_plate(text):
+    """Return the four standard Iranian plate parts or None."""
+
+    match = IRAN_PLATE_PATTERN.fullmatch(normalize_plate(text))
+
+    if match is None:
+        return None
+
+    return {
+        "prefix": match.group("prefix"),
+        "letter": match.group("letter"),
+        "serial": match.group("serial"),
+        "region": match.group("region"),
+    }
+
 
 def plausible_plate(text):
-    t=normalize_plate(text)
-    digits=sum(ch.isdigit() for ch in t)
-    return 6 <= len(t) <= 10 and digits >= 5
+    """Validate the common 2-letter-3-2 Iranian plate layout."""
+
+    return split_iran_plate(text) is not None
+
 
 def format_iran_plate(text):
-    t=normalize_plate(text)
-    # Keep stable machine-readable text; add separators for common 2+1+3+2 layout.
-    if len(t)==8:
-        return f'{t[:2]}-{t[2]}-{t[3:6]}-{t[6:]}'
-    return t
+    """Format a valid canonical plate while preserving invalid OCR text."""
+
+    normalized = normalize_plate(text)
+    parts = split_iran_plate(normalized)
+
+    if parts is None:
+        return normalized
+
+    return (
+        f"{parts['prefix']}-"
+        f"{parts['letter']}-"
+        f"{parts['serial']}-"
+        f"{parts['region']}"
+    )
