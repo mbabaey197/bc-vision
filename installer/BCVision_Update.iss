@@ -10,11 +10,11 @@ AppVersion={#MyAppVersion}
 VersionInfoVersion=2.1.0.0
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\BC Vision
-DefaultGroupName=BC Vision
+DisableDirPage=auto
 DisableProgramGroupPage=yes
 UsePreviousAppDir=yes
 OutputDir=..\setup_output
-OutputBaseFilename=BCVision_Setup_v2.1.0
+OutputBaseFilename=BCVision_Update_v2.1.0
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -29,12 +29,14 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 [Files]
 Source: "..\dist\BCVision\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
-[Icons]
-Name: "{autoprograms}\BC Vision"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\BC Vision"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
-
-[Tasks]
-Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
-
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Run BC Vision"; Flags: nowait postinstall skipifsilent
+
+[Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  if not FileExists(ExpandConstant('{app}\BCVision.exe')) then
+    Result := 'BC Vision is not installed. Run the full installer first.'
+  else
+    Result := '';
+end;
