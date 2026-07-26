@@ -68,6 +68,7 @@ def prepare_anpr_models():
 
 
 def run_server():
+    manager = None
     try:
         if sys.stdout is None:
             sys.stdout = open(
@@ -84,6 +85,16 @@ def run_server():
 
         import uvicorn
         from app.main import app
+        from app.streams import manager as stream_manager
+
+        manager = stream_manager
+        try:
+            started = manager.start_enabled_cameras()
+            log(f"Background camera streams started: {started}")
+        except Exception:
+            # A bad camera URL must not prevent the server and other cameras
+            # from starting. Stream threads handle their own reconnection.
+            log("Background camera startup failed:\n" + traceback.format_exc())
 
         log("Starting server")
         uvicorn.run(
@@ -95,6 +106,13 @@ def run_server():
         )
     except Exception:
         log(traceback.format_exc())
+    finally:
+        if manager is not None:
+            try:
+                manager.stop_all()
+                log("Background camera streams stopped")
+            except Exception:
+                log("Background camera shutdown failed:\n" + traceback.format_exc())
 
 
 def main():

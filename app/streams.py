@@ -239,11 +239,45 @@ class StreamManager:
                 old.start()
             return old
 
+    def start_enabled_cameras(self):
+        """Start every enabled camera for continuous background ANPR."""
+        from app.database import connect, get_setting
+
+        width = int(get_setting("stream_width", "640"))
+        fps = int(get_setting("live_fps", "5"))
+        quality = int(get_setting("jpeg_quality", "70"))
+        with connect() as con:
+            rows = con.execute(
+                "SELECT id,name,rtsp_url FROM cameras "
+                "WHERE enabled=1 AND rtsp_url<>'' "
+                "ORDER BY sort_order,id"
+            ).fetchall()
+
+        started = 0
+        for row in rows:
+            self.get(
+                int(row["id"]),
+                str(row["rtsp_url"]),
+                str(row["name"]),
+                width,
+                fps,
+                quality,
+            )
+            started += 1
+        return started
+
+    def stop_all(self):
+        with self.lock:
+            streams = list(self.streams.values())
+            self.streams.clear()
+        for stream in streams:
+            stream.stop()
+
     def remove(self, camera_id):
         with self.lock:
             stream = self.streams.pop(camera_id, None)
-            if stream:
-                stream.stop()
+        if stream:
+            stream.stop()
 
     def status(self, camera_id):
         stream = self.streams.get(camera_id)
