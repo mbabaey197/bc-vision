@@ -14,6 +14,13 @@ except Exception:
     np = None
     CV_OK = False
 
+try:
+    import av
+    AV_OK = True
+except Exception:
+    av = None
+    AV_OK = False
+
 
 @dataclass
 class StreamState:
@@ -156,6 +163,28 @@ class CameraStream:
         )
         return frame
 
+    def _run_pyav_video(self, source, delay):
+        """Decode an uploaded video with bundled FFmpeg when OpenCV cannot."""
+        if not AV_OK:
+            raise RuntimeError(
+                "OpenCV could not decode the video and PyAV is unavailable"
+            )
+        while not self.stop_event.is_set():
+            published = 0
+            with av.open(str(source)) as container:
+                for video_frame in container.decode(video=0):
+                    if self.stop_event.is_set():
+                        return
+                    frame = video_frame.to_ndarray(format="bgr24")
+                    self._publish(frame)
+                    published += 1
+                    if self.stop_event.wait(delay):
+                        return
+            if not published:
+                raise RuntimeError(
+                    "FFmpeg could not decode any frame from the video"
+                )
+
     def _run(self):
         if not CV_OK:
             self.state.last_error = "OpenCV is not available"
@@ -175,6 +204,7 @@ class CameraStream:
         )
         while not self.stop_event.is_set():
             capture = None
+            published = 0
             try:
                 capture = cv2.VideoCapture(
                     capture_source,
@@ -194,14 +224,22 @@ class CameraStream:
                             ok, frame = capture.read()
                             if ok and frame is not None:
                                 self._publish(frame)
+                                published += 1
                                 time.sleep(delay)
                                 continue
                         raise RuntimeError(
                             "Camera stopped sending frames"
                         )
                     self._publish(frame)
+                    published += 1
                     time.sleep(delay)
             except Exception as exc:
+                if is_video_file and published == 0 and AV_OK:
+                    try:
+                        self._run_pyav_video(capture_source, delay)
+                        continue
+                    except Exception as fallback_exc:
+                        exc = fallback_exc
                 self.state.online = False
                 self.state.last_error = str(exc)
                 self.stop_event.wait(1 if is_video_file else 3)

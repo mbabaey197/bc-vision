@@ -5,7 +5,7 @@
 - GitHub repository: `mahdibabaey197/bc-vision`
 - Default branch: `main`
 - Product: BC Vision
-- Current application version in source: `2.2.0-rc3`
+- Current application version in source: `2.2.0-rc5`
 - Windows persistent data root: `C:\ProgramData\BCVision\data`
 
 ## Release contract
@@ -162,6 +162,14 @@ identity probes use hidden child-process flags. Windows CI parses the built
 PE header and rejects any `BCVision.exe` that is not
 `IMAGE_SUBSYSTEM_WINDOWS_GUI`.
 
+Version `2.2.0-rc5` makes uploaded-video ANPR observable and independent of
+OpenCV codec coverage. CCTV exports fall back to bundled FFmpeg/PyAV decoding,
+camera cards show processed frames, detections, events, model readiness and
+errors, and the consensus window adapts to slower CPU processing. Verified
+detector and EasyOCR models are seeded inside the Windows package, then loaded
+and exercised offline from the installed executable both before and after the
+one-click update.
+
 New databases no longer receive an enabled synthetic demo camera. A one-time,
 exact-match migration removes only the historical built-in sample camera from
 existing databases while preserving real cameras, user-created demo cameras,
@@ -187,7 +195,7 @@ Before declaring a production release, perform these validations with real custo
 
 The current performance/accuracy work remains on the draft ANPR pull request
 until direct comparison ground truth is available. Windows packaging for
-`2.2.0-rc3` includes an isolated executable self-test plus installer/updater
+`2.2.0-rc5` includes an isolated executable self-test plus installer/updater
 data-preservation verification. A production release has not yet been
 declared.
 

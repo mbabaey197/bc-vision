@@ -81,3 +81,58 @@ def test_submit_is_non_blocking_and_drops_to_latest(monkeypatch):
     assert processed[0] == 0
     assert processed[-1] == 4
     assert len(processed) <= 3
+
+
+def test_slow_cpu_keeps_three_observations_for_consensus(monkeypatch):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState()
+    state.config = {
+        "enabled": 1,
+        "lpr_enabled": 1,
+        "lpr_confidence": 50,
+        "duplicate_seconds": 0,
+        "roi_x": 0,
+        "roi_y": 0,
+        "roi_w": 100,
+        "roi_h": 100,
+    }
+    frame = np.full((90, 160, 3), 80, dtype=np.uint8)
+    result = {
+        "plate": "12-ب-345-67",
+        "plate_norm": "12ب34567",
+        "valid": True,
+        "confidence": 0.90,
+        "quality_score": 0.80,
+        "bbox": (30, 30, 130, 65),
+        "crop": frame[30:65, 30:130].copy(),
+        "method": "test",
+    }
+    monkeypatch.setattr(
+        live_worker,
+        "process_frame",
+        lambda *_args, **_kwargs: [dict(result)],
+    )
+    persisted = []
+    monkeypatch.setattr(
+        worker,
+        "_persist",
+        lambda *_args: persisted.append(_args[3]),
+    )
+    clock = iter((0.0, 3.0, 3.0, 6.0, 6.0, 9.0))
+    monkeypatch.setattr(
+        live_worker.time,
+        "perf_counter",
+        lambda: next(clock),
+    )
+
+    for timestamp in (0.0, 3.0, 6.0):
+        state.busy = True
+        worker._process(
+            state,
+            (1, "CPU camera", frame.copy(), timestamp),
+        )
+    worker.shutdown()
+
+    assert len(persisted) == 1
+    assert persisted[0]["plate_norm"] == "12ب34567"
+    assert state.tracker.max_age_seconds >= 11.0

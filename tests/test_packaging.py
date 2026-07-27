@@ -100,3 +100,25 @@ def test_pe_subsystem_reader_accepts_gui_executable(tmp_path):
     executable.write_bytes(image)
 
     assert read_subsystem(executable) == IMAGE_SUBSYSTEM_WINDOWS_GUI
+
+
+def test_packaged_self_test_can_require_offline_anpr_models():
+    root = Path(__file__).resolve().parents[1]
+    launcher = (root / "launcher.py").read_text(encoding="utf-8")
+    build = (root / "BUILD_PORTABLE_EXE.bat").read_text(encoding="utf-8")
+
+    assert '"--verify-anpr" in sys.argv' in launcher
+    assert "prepare_models(download=False)" in launcher
+    assert '--add-data ".model-seed;model-seed"' in build
+    assert "--collect-all av" in build
+
+
+def test_windows_gate_runs_detector_and_ocr_inside_installed_executable():
+    root = Path(__file__).resolve().parents[1]
+    workflow = (
+        root / ".github" / "workflows" / "windows-release-candidate.yml"
+    ).read_text(encoding="utf-8")
+
+    assert workflow.count('"--verify-anpr"') == 2
+    assert "firstJson.anpr_ready" in workflow
+    assert "updatedJson.anpr_ready" in workflow
