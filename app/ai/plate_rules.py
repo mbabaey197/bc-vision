@@ -10,6 +10,10 @@ DIGIT_TRANS = str.maketrans(
     PERSIAN_DIGITS + ARABIC_DIGITS,
     "0123456789" * 2,
 )
+PERSIAN_DIGIT_TRANS = str.maketrans(
+    "0123456789" + ARABIC_DIGITS,
+    PERSIAN_DIGITS * 2,
+)
 
 CHAR_TRANS = str.maketrans({
     "\u064a": "\u06cc",
@@ -128,3 +132,23 @@ def format_iran_plate(text):
         f"{parts['serial']}-"
         f"{parts['region']}"
     )
+
+
+def persian_digits(text):
+    """Render digits with Persian glyphs without changing the stored key."""
+
+    return str(text or "").translate(PERSIAN_DIGIT_TRANS)
+
+
+def iran_plate_parts(text):
+    """Return display-ready Persian plate parts or None for invalid input."""
+
+    parts = split_iran_plate(text)
+    if parts is None:
+        return None
+    return {
+        "prefix": persian_digits(parts["prefix"]),
+        "letter": parts["letter"],
+        "serial": persian_digits(parts["serial"]),
+        "region": persian_digits(parts["region"]),
+    }

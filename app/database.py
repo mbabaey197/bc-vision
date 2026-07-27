@@ -1,4 +1,7 @@
 import sqlite3
+from contextlib import closing
+from pathlib import Path
+from uuid import uuid4
 
 from app.config import DB_PATH
 from app.security import hash_password
@@ -11,7 +14,48 @@ def connect():
         check_same_thread=False,
     )
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA busy_timeout=20000")
+    con.execute("PRAGMA synchronous=NORMAL")
     return con
+
+
+def backup_database(destination):
+    """Create an atomic, integrity-checked snapshot of the live database."""
+    target = Path(destination).expanduser().resolve()
+    source_path = Path(DB_PATH).expanduser().resolve()
+    if target == source_path:
+        raise ValueError("Backup destination must differ from the live database.")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(
+        f".{target.name}.{uuid4().hex}.tmp"
+    )
+    try:
+        with closing(connect()) as source, closing(
+            sqlite3.connect(temporary)
+        ) as snapshot:
+            source.backup(snapshot)
+            result = snapshot.execute("PRAGMA quick_check").fetchone()
+            if not result or result[0] != "ok":
+                raise sqlite3.DatabaseError(
+                    "SQLite backup integrity check failed."
+                )
+        temporary.replace(target)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return target
+
+
+def set_settings_for_database(database_path, values):
+    """Update settings in a selected database without changing global state."""
+    path = Path(database_path).expanduser().resolve()
+    with sqlite3.connect(path, timeout=20) as con:
+        con.executemany(
+            "INSERT INTO settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ((key, str(value)) for key, value in values.items()),
+        )
 
 
 def _add_missing_columns(con, table, migrations):
@@ -49,6 +93,8 @@ def _backfill_plate_norm(con):
 
 def init_db():
     with connect() as con:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA wal_autocheckpoint=1000")
         con.executescript("""
         CREATE TABLE IF NOT EXISTS users(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,6 +153,21 @@ def init_db():
             notes TEXT DEFAULT '',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS anpr_feedback(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER NOT NULL,
+            observed_text TEXT NOT NULL,
+            observed_norm TEXT NOT NULL DEFAULT '',
+            corrected_text TEXT NOT NULL,
+            corrected_norm TEXT NOT NULL,
+            plate_image_path TEXT DEFAULT '',
+            image_path TEXT DEFAULT '',
+            submitted_by TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'confirmed',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(event_id) REFERENCES plate_events(id)
+                ON DELETE CASCADE
+        );
         """)
 
         _add_missing_columns(con, "users", {
@@ -151,6 +212,10 @@ def init_db():
             ON plate_events(plate_norm);
         CREATE INDEX IF NOT EXISTS idx_plate_events_camera_created
             ON plate_events(camera_id,created_at);
+        CREATE INDEX IF NOT EXISTS idx_anpr_feedback_observed
+            ON anpr_feedback(observed_norm,status);
+        CREATE INDEX IF NOT EXISTS idx_anpr_feedback_event
+            ON anpr_feedback(event_id);
         """)
 
         _add_missing_columns(con, "cameras", {
@@ -207,21 +272,23 @@ def init_db():
                 (key, value),
             )
 
+        migration_key = "migration_remove_builtin_demo_camera_v1"
         if con.execute(
-            "SELECT COUNT(*) c FROM cameras"
-        ).fetchone()["c"] == 0:
+            "SELECT 1 FROM settings WHERE key=?",
+            (migration_key,),
+        ).fetchone() is None:
             con.execute(
-                "INSERT INTO cameras(" 
-                "name,rtsp_url,location,enabled,is_demo,sort_order"
-                ") VALUES(?,?,?,?,?,?)",
+                "DELETE FROM cameras WHERE "
+                "name=? AND rtsp_url=? AND location=? AND is_demo=1",
                 (
                     "دوربین آزمایشی",
                     "demo://camera-1",
                     "نمایش نمونه",
-                    1,
-                    1,
-                    1,
                 ),
+            )
+            con.execute(
+                "INSERT INTO settings(key,value) VALUES(?,?)",
+                (migration_key, "1"),
             )
 
 

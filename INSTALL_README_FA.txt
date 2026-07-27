@@ -1,4 +1,4 @@
-BC Vision v2.2.0-rc1 - بسته نصب ویندوز
+BC Vision v2.2.0-rc5 - بسته نصب ویندوز
 
 نصب مستقیم:
 1) فایل INSTALL_BC_VISION.bat را راست‌کلیک کنید.
@@ -10,7 +10,7 @@ C:\ProgramData\BCVision\data
 
 ساخت Setup.exe استاندارد روی ویندوز:
 فایل BUILD_SETUP_EXE.bat را اجرا کنید. این فایل Python، PyInstaller و Inno Setup را آماده می‌کند و خروجی زیر را می‌سازد:
-setup_output\BCVision_Setup_v2.2.0-rc1.exe
+setup_output\BCVision_Setup_v2.2.0-rc5.exe
 
 ورود اولیه:
 admin / 123456

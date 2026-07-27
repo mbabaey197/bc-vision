@@ -1,9 +1,12 @@
 from pathlib import Path
+import time
 
 import cv2
 import numpy as np
 
 import app.ai.video_test as video_test
+import app.streams as streams
+from app.streams import CameraStream
 
 
 def _write_video(path: Path, frames=8):
@@ -77,3 +80,107 @@ def test_video_emits_one_consensus_event(tmp_path, monkeypatch):
     assert events[0]["consensus_votes"] >= 2
     assert Path(events[0]["plate_path"]).is_file()
     assert Path(events[0]["image_path"]).is_file()
+
+
+def test_uploaded_video_stream_loops_without_becoming_offline(tmp_path, monkeypatch):
+    video_path = tmp_path / "loop.avi"
+    _write_video(video_path, frames=3)
+    stream = CameraStream(
+        91,
+        f"video://{video_path}",
+        "Uploaded video",
+        fps=30,
+    )
+    published = []
+    monkeypatch.setattr(stream, "_publish", lambda frame: published.append(frame))
+
+    stream.start()
+    for _ in range(50):
+        if len(published) >= 5:
+            break
+        time.sleep(0.02)
+    stream.stop()
+    stream.thread.join(timeout=2)
+
+    assert len(published) >= 5
+    assert not stream.thread.is_alive()
+
+
+def test_uploaded_video_uses_ffmpeg_fallback_when_opencv_has_no_frames(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "camera-export.mp4"
+    source.write_bytes(b"codec-fixture")
+    stream = CameraStream(
+        92,
+        f"video://{source}",
+        "HEVC export",
+        fps=30,
+    )
+    published = []
+
+    class FailedCapture:
+        def __init__(self, *_args):
+            pass
+
+        def isOpened(self):
+            return False
+
+        def release(self):
+            pass
+
+    class VideoFrame:
+        def to_ndarray(self, format):
+            assert format == "bgr24"
+            return np.full((24, 32, 3), 90, dtype=np.uint8)
+
+    class Container:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def decode(self, video):
+            assert video == 0
+            yield VideoFrame()
+
+    monkeypatch.setattr(streams.cv2, "VideoCapture", FailedCapture)
+    monkeypatch.setattr(
+        streams.av,
+        "open",
+        lambda path: Container(),
+    )
+
+    def publish(frame):
+        published.append(frame)
+        stream.stop_event.set()
+
+    monkeypatch.setattr(stream, "_publish", publish)
+    stream._run()
+
+    assert len(published) == 1
+    assert published[0].shape == (24, 32, 3)
+
+
+def test_uploaded_video_stream_produces_real_jpeg(tmp_path):
+    video_path = tmp_path / "dashboard.avi"
+    _write_video(video_path, frames=3)
+    stream = CameraStream(
+        93,
+        f"video://{video_path}",
+        "Dashboard upload",
+        fps=30,
+    )
+    stream.start()
+    for _ in range(100):
+        if stream.latest:
+            break
+        time.sleep(0.01)
+    stream.stop()
+    stream.thread.join(timeout=2)
+
+    assert stream.latest
+    assert stream.latest.startswith(b"\xff\xd8")
+    assert stream.latest.endswith(b"\xff\xd9")

@@ -6,10 +6,11 @@ on:
     branches:
       - main
     paths:
-      - "app/ai/**"
-      - "app/database.py"
-      - "app/streams.py"
+      - "app/**"
+      - "installer/**"
       - "launcher.py"
+      - "VERSION"
+      - "requirements-lock.txt"
       - "requirements-ai-lock.txt"
       - "requirements-test.txt"
       - "tests/**"
@@ -17,6 +18,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: anpr-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   regression:

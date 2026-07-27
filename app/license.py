@@ -12,6 +12,27 @@ PLAN_FEATURES = {
     "enterprise": ["anpr", "events", "reports", "vehicle_ai", "watchlist", "api", "gate", "multi_site", "priority_support"],
 }
 
+def _hidden_process_kwargs() -> dict:
+    """Prevent Windows hardware-ID probes from flashing a console window."""
+    if platform.system().lower() != "windows":
+        return {}
+
+    kwargs = {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    }
+    startupinfo_type = getattr(subprocess, "STARTUPINFO", None)
+    if startupinfo_type is not None:
+        startupinfo = startupinfo_type()
+        startupinfo.dwFlags |= getattr(
+            subprocess,
+            "STARTF_USESHOWWINDOW",
+            0,
+        )
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        kwargs["startupinfo"] = startupinfo
+    return kwargs
+
+
 def machine_id() -> str:
     parts = [platform.system(), platform.machine(), platform.node(), str(uuid.getnode())]
     if platform.system().lower() == "windows":
@@ -21,7 +42,13 @@ def machine_id() -> str:
         ]
         for cmd in commands:
             try:
-                out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=5)
+                out = subprocess.check_output(
+                    cmd,
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    **_hidden_process_kwargs(),
+                )
                 vals = [x.strip() for x in out.splitlines() if x.strip() and "uuid" not in x.lower()]
                 if vals:
                     parts.append(vals[0]); break
