@@ -11,6 +11,7 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
+import sys
 import tempfile
 import urllib.request
 
@@ -62,6 +63,40 @@ def easyocr_dir() -> Path:
     if configured:
         return Path(configured).expanduser()
     return _data_dir() / "models" / "easyocr"
+
+
+def packaged_seed_dir() -> Path | None:
+    configured = os.environ.get(
+        "BCVISION_PACKAGED_MODEL_SEED",
+        "",
+    ).strip()
+    if configured:
+        return Path(configured).expanduser()
+    bundle_root = getattr(sys, "_MEIPASS", "")
+    if bundle_root:
+        candidate = Path(bundle_root) / "model-seed"
+        if candidate.is_dir():
+            return candidate
+    candidate = Path(__file__).resolve().parents[2] / "model-seed"
+    return candidate if candidate.is_dir() else None
+
+
+def _copy_verified(
+    source: Path,
+    target: Path,
+    digest: str,
+    size: int | None = None,
+) -> bool:
+    if not verify_file(source, digest, size):
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".seed")
+    shutil.copy2(source, temporary)
+    if not verify_file(temporary, digest, size):
+        temporary.unlink(missing_ok=True)
+        return False
+    os.replace(temporary, target)
+    return True
 
 
 def sha256_file(
@@ -160,14 +195,21 @@ def ensure_detector_model(download=True) -> Path:
     ).strip()
     if source_dir:
         source = Path(source_dir) / "best.pt"
-        if verify_file(
+        if _copy_verified(
             source,
+            target,
             DETECTOR_SHA256,
             DETECTOR_SIZE,
         ):
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
             return target
+    seed = packaged_seed_dir()
+    if seed and _copy_verified(
+        seed / "plate" / "best.pt",
+        target,
+        DETECTOR_SHA256,
+        DETECTOR_SIZE,
+    ):
+        return target
     if not download:
         raise FileNotFoundError(
             f"Verified detector model not found: {target}"
@@ -204,6 +246,19 @@ def ensure_easyocr_models(download=True) -> Path:
             for name, digest in EASYOCR_HASHES.items()
         ):
             return target
+    seed = packaged_seed_dir()
+    if seed:
+        for name, digest in EASYOCR_HASHES.items():
+            _copy_verified(
+                seed / "easyocr" / name,
+                target / name,
+                digest,
+            )
+        if all(
+            verify_file(target / name, digest)
+            for name, digest in EASYOCR_HASHES.items()
+        ):
+            return target
 
     if not download:
         raise FileNotFoundError(
@@ -216,6 +271,9 @@ def ensure_easyocr_models(download=True) -> Path:
         gpu=False,
         verbose=False,
         model_storage_directory=str(target),
+        user_network_directory=str(
+            target / "user_network"
+        ),
         download_enabled=True,
     )
     invalid = [
@@ -237,6 +295,31 @@ def prepare_models(download=True) -> dict:
     return {
         "detector": str(detector),
         "easyocr": str(ocr),
+    }
+
+
+def prepare_seed(seed_dir: Path, download=True) -> dict:
+    detector = ensure_detector_model(download=download)
+    ocr = ensure_easyocr_models(download=download)
+    seed = Path(seed_dir)
+    detector_target = seed / "plate" / "best.pt"
+    if not _copy_verified(
+        detector,
+        detector_target,
+        DETECTOR_SHA256,
+        DETECTOR_SIZE,
+    ):
+        raise ValueError("Detector seed verification failed")
+    for name, digest in EASYOCR_HASHES.items():
+        if not _copy_verified(
+            ocr / name,
+            seed / "easyocr" / name,
+            digest,
+        ):
+            raise ValueError(f"EasyOCR seed verification failed: {name}")
+    return {
+        "detector": str(detector_target),
+        "easyocr": str(seed / "easyocr"),
     }
 
 
@@ -272,8 +355,18 @@ def main(argv=None):
         action="store_true",
         help="Never access the network",
     )
+    parser.add_argument(
+        "--seed-dir",
+        type=Path,
+        help="Create a verified offline model seed for packaging",
+    )
     args = parser.parse_args(argv)
-    if not args.check:
+    if args.seed_dir:
+        prepare_seed(
+            args.seed_dir,
+            download=not args.no_download,
+        )
+    elif not args.check:
         prepare_models(download=not args.no_download)
     status = model_status()
     for key, value in status.items():

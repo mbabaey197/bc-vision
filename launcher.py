@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import socket
 import sys
 import threading
@@ -8,8 +9,8 @@ import time
 import traceback
 import webbrowser
 from pathlib import Path
-import tkinter as tk
-from tkinter import messagebox
+from urllib.error import URLError
+from urllib.request import urlopen
 
 
 def app_dir() -> Path:
@@ -25,6 +26,8 @@ from app.config import LOG_PATH
 
 LOG = LOG_PATH
 LOG.parent.mkdir(parents=True, exist_ok=True)
+PANEL_URL = "http://127.0.0.1:8000/login"
+HEALTH_URL = "http://127.0.0.1:8000/api/health"
 
 
 def log(message):
@@ -36,6 +39,27 @@ def log(message):
         )
 
 
+def hide_service_console() -> bool:
+    """Hide an accidentally attached Windows console for packaged runs."""
+    if sys.platform != "win32":
+        return False
+    if not (
+        getattr(sys, "frozen", False)
+        or os.environ.get("BCVISION_HIDE_CONSOLE", "0") == "1"
+    ):
+        return False
+    try:
+        import ctypes
+
+        console = ctypes.windll.kernel32.GetConsoleWindow()
+        if not console:
+            return False
+        ctypes.windll.user32.ShowWindow(console, 0)
+        return True
+    except Exception:
+        return False
+
+
 def port_open():
     try:
         with socket.create_connection(
@@ -45,6 +69,41 @@ def port_open():
             return True
     except OSError:
         return False
+
+
+def service_ready():
+    try:
+        with urlopen(HEALTH_URL, timeout=0.75) as response:
+            if response.status != 200:
+                return False
+            payload = json.loads(response.read().decode("utf-8"))
+            return (
+                payload.get("service") == "bc-vision"
+                and payload.get("status") == "ok"
+            )
+    except (OSError, URLError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def show_startup_error(message):
+    text = (
+        f"برنامه اجرا نشد:\n{message}\n\n"
+        f"فایل گزارش:\n{LOG}"
+    )
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                text,
+                "خطای اجرای BC Vision",
+                0x10,
+            )
+            return
+        except Exception:
+            pass
+    print(text, file=sys.stderr)
 
 
 def prepare_anpr_models():
@@ -115,83 +174,155 @@ def run_server():
                 log("Background camera shutdown failed:\n" + traceback.format_exc())
 
 
+def _argument_value(name: str) -> str:
+    try:
+        index = sys.argv.index(name)
+    except ValueError:
+        return ""
+    if index + 1 >= len(sys.argv):
+        return ""
+    return sys.argv[index + 1]
+
+
+def run_self_test() -> int:
+    """Exercise the packaged runtime without opening the GUI or a browser."""
+    result = {
+        "ok": False,
+        "version": "",
+        "data_dir": "",
+        "database_path": "",
+        "database_ready": False,
+        "public_key_ready": False,
+        "web_app_ready": False,
+        "anpr_ready": False,
+    }
+    try:
+        from app.config import (
+            APP_VERSION,
+            DATA_DIR,
+            DB_PATH,
+            PUBLIC_KEY_PATH,
+        )
+        from app.database import connect, init_db
+
+        init_db()
+        with connect() as con:
+            user_count = int(
+                con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            )
+            table_count = int(
+                con.execute(
+                    "SELECT COUNT(*) FROM sqlite_master "
+                    "WHERE type='table'"
+                ).fetchone()[0]
+            )
+        from app.main import app
+
+        verify_anpr = "--verify-anpr" in sys.argv
+        anpr_ready = not verify_anpr
+        if verify_anpr:
+            import numpy as np
+            import easyocr
+            from ultralytics import YOLO
+            from app.ai.model_manager import prepare_models
+
+            models = prepare_models(download=False)
+            detector = YOLO(models["detector"])
+            detector.predict(
+                source=np.zeros((96, 160, 3), dtype=np.uint8),
+                imgsz=160,
+                device="cpu",
+                verbose=False,
+            )
+            easyocr.Reader(
+                ["fa", "en"],
+                gpu=False,
+                verbose=False,
+                model_storage_directory=models["easyocr"],
+                user_network_directory=str(
+                    Path(models["easyocr"]) / "user_network"
+                ),
+                download_enabled=False,
+            )
+            anpr_ready = True
+
+        result.update({
+            "ok": (
+                DB_PATH.is_file()
+                and PUBLIC_KEY_PATH.is_file()
+                and table_count >= 6
+                and user_count >= 1
+                and app is not None
+                and anpr_ready
+            ),
+            "version": APP_VERSION,
+            "data_dir": str(DATA_DIR),
+            "database_path": str(DB_PATH),
+            "database_ready": DB_PATH.is_file() and table_count >= 6,
+            "public_key_ready": PUBLIC_KEY_PATH.is_file(),
+            "web_app_ready": app is not None,
+            "anpr_ready": anpr_ready,
+            "user_count": user_count,
+            "table_count": table_count,
+        })
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        log("Self-test failed:\n" + traceback.format_exc())
+
+    payload = json.dumps(result, ensure_ascii=False, indent=2)
+    output_path = _argument_value("--self-test-output")
+    if output_path:
+        destination = Path(output_path).expanduser()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(payload, encoding="utf-8")
+    elif sys.stdout is not None:
+        print(payload)
+    return 0 if result["ok"] else 1
+
+
+def open_panel_when_ready():
+    for _ in range(80):
+        if service_ready():
+            webbrowser.open(PANEL_URL)
+            return
+        time.sleep(0.25)
+    log("Web panel did not become ready within 20 seconds")
+
+
 def main():
     try:
+        hide_service_console()
+
         threading.Thread(
             target=prepare_anpr_models,
             daemon=True,
             name="anpr-model-preparation",
         ).start()
 
-        if not port_open():
-            threading.Thread(
-                target=run_server,
-                daemon=True,
-                name="bcvision-server",
-            ).start()
+        if service_ready():
+            webbrowser.open(PANEL_URL)
+            return
 
-        for _ in range(40):
-            if port_open():
-                break
-            time.sleep(0.25)
-
-        if not port_open():
+        if port_open():
             raise RuntimeError(
-                "Server did not start. See data/BCVision.log"
+                "پورت 8000 در اختیار برنامه دیگری است."
             )
 
-        webbrowser.open("http://127.0.0.1:8000/login")
+        threading.Thread(
+            target=open_panel_when_ready,
+            daemon=True,
+            name="bcvision-browser",
+        ).start()
 
-        root = tk.Tk()
-        root.title("BC Vision | گیلاس آبی البرز")
-        root.geometry("560x300")
-        root.resizable(False, False)
-        tk.Label(
-            root,
-            text="سامانه پلاک‌خوان در حال اجراست",
-            font=("Tahoma", 16, "bold"),
-        ).pack(pady=(28, 10))
-        tk.Label(
-            root,
-            text="آدرس پنل: http://127.0.0.1:8000/login",
-            font=("Tahoma", 10),
-        ).pack(pady=5)
-        tk.Label(
-            root,
-            text="نام کاربری اولیه: admin     رمز اولیه: 123456",
-            font=("Tahoma", 10),
-        ).pack(pady=5)
-        tk.Label(
-            root,
-            text=(
-                "در اولین اجرا، مدل‌های هوش مصنوعی در پس‌زمینه "
-                "آماده می‌شوند."
-            ),
-            font=("Tahoma", 9),
-            fg="#555",
-        ).pack(pady=4)
-        tk.Button(
-            root,
-            text="باز کردن پنل",
-            width=24,
-            height=2,
-            command=lambda: webbrowser.open(
-                "http://127.0.0.1:8000/login"
-            ),
-        ).pack(pady=14)
-        tk.Label(
-            root,
-            text="برای توقف سرویس این پنجره را ببندید.",
-            fg="#666",
-        ).pack()
-        root.mainloop()
+        # Uvicorn runs in the main process, so the service stays alive without
+        # a Tkinter keep-alive window and shuts camera workers down cleanly.
+        run_server()
     except Exception as exc:
         log(traceback.format_exc())
-        messagebox.showerror(
-            "خطای اجرا",
-            f"برنامه اجرا نشد:\n{exc}\n\nفایل گزارش:\n{LOG}",
-        )
+        show_startup_error(str(exc))
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        raise SystemExit(run_self_test())
     main()

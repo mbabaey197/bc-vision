@@ -2,11 +2,20 @@
 from __future__ import annotations
 
 import os
+from itertools import combinations
 from pathlib import Path
+import threading
 from typing import Iterable
 
 import cv2
 import numpy as np
+
+from .plate_recovery import recover_mild_blur, should_attempt_recovery
+from .plate_rules import (
+    format_iran_plate,
+    normalize_plate,
+    plausible_plate,
+)
 
 try:
     from ultralytics import YOLO
@@ -16,6 +25,72 @@ except Exception:
 _model = None
 _model_key = None
 _model_error = ""
+_model_lock = threading.RLock()
+_inference_lock = threading.RLock()
+
+IRANIAN_CHARACTER_MAP = {
+    0: "0",
+    1: "1",
+    2: "2",
+    3: "3",
+    4: "4",
+    5: "5",
+    6: "6",
+    7: "7",
+    8: "8",
+    9: "9",
+    10: "الف",
+    11: "ب",
+    12: "ت",
+    13: "ث",
+    14: "ج",
+    15: "د",
+    16: "س",
+    17: "ش",
+    18: "ص",
+    19: "ط",
+    20: "ظ",
+    21: "ع",
+    22: "ق",
+    23: "ل",
+    24: "م",
+    25: "ن",
+    26: "ه",
+    27: "و",
+    28: "پ",
+    29: "ژ",
+    31: "ی",
+}
+IRANIAN_PLATE_CLASS_ID = 30
+
+
+def _cpu_thread_limit() -> int:
+    default = min(6, max(1, (os.cpu_count() or 1) - 1))
+    try:
+        configured = int(
+            os.environ.get(
+                "BCVISION_CPU_THREADS",
+                str(default),
+            )
+        )
+    except (TypeError, ValueError):
+        configured = default
+    return max(1, min(8, configured))
+
+
+def _configure_cpu_threads() -> int:
+    limit = _cpu_thread_limit()
+    try:
+        cv2.setNumThreads(limit)
+    except Exception:
+        pass
+    try:
+        import torch
+
+        torch.set_num_threads(limit)
+    except Exception:
+        pass
+    return limit
 
 
 def _model_paths() -> list[Path]:
@@ -61,21 +136,29 @@ def detector_status() -> dict:
 
 def load_model():
     global _model, _model_key, _model_error
-    model_path = next((path for path in _model_paths() if path.is_file()), None)
-    key = str(model_path.resolve()) if model_path else ""
-    if _model is not None and _model_key == key:
+    with _model_lock:
+        _configure_cpu_threads()
+        model_path = next(
+            (path for path in _model_paths() if path.is_file()),
+            None,
+        )
+        key = str(model_path.resolve()) if model_path else ""
+        if _model is not None and _model_key == key:
+            return _model
+        if YOLO is None or model_path is None:
+            return None
+        try:
+            _model = YOLO(str(model_path))
+            # Ultralytics may reset Torch's global thread pool while importing
+            # or constructing the model. Reapply the CPU budget afterwards.
+            _configure_cpu_threads()
+            _model_key = key
+            _model_error = ""
+        except Exception as exc:
+            _model = None
+            _model_key = None
+            _model_error = f"{type(exc).__name__}: {exc}"
         return _model
-    if YOLO is None or model_path is None:
-        return None
-    try:
-        _model = YOLO(str(model_path))
-        _model_key = key
-        _model_error = ""
-    except Exception as exc:
-        _model = None
-        _model_key = None
-        _model_error = f"{type(exc).__name__}: {exc}"
-    return _model
 
 
 def _clip_box(box, width: int, height: int):
@@ -102,6 +185,230 @@ def _nms(candidates: list[dict], threshold: float = 0.38) -> list[dict]:
         if all(_iou(candidate["bbox"], row["bbox"]) < threshold for row in kept):
             kept.append(candidate)
     return kept
+
+
+def _plate_class_ids(model) -> list[int] | None:
+    names = getattr(model, "names", {}) or {}
+    if isinstance(names, list):
+        names = dict(enumerate(names))
+    if (
+        IRANIAN_PLATE_CLASS_ID in names
+        and len(names) >= 32
+    ):
+        return [IRANIAN_PLATE_CLASS_ID]
+    matching = [
+        int(class_id)
+        for class_id, name in names.items()
+        if "plate" in str(name).lower()
+        or "license" in str(name).lower()
+    ]
+    if matching:
+        return matching
+    if len(names) == 1:
+        return [int(next(iter(names)))]
+    return None
+
+
+def _select_plate_sequence(characters: list[dict]) -> tuple[str, float]:
+    filtered = _nms(
+        [
+            row
+            for row in characters
+            if row.get("class_id") in IRANIAN_CHARACTER_MAP
+            and float(row.get("confidence", 0.0)) >= 0.15
+        ],
+        threshold=0.45,
+    )
+    ordered = sorted(filtered, key=lambda row: row["x_center"])
+    if len(ordered) < 8:
+        return "", 0.0
+
+    # The model occasionally reports symbols from the blue country strip or
+    # two competing classes for one glyph. Select the highest-confidence
+    # eight-character subsequence that exactly matches the Iranian layout.
+    best = None
+    for selected in combinations(ordered[:14], 8):
+        raw = "".join(
+            IRANIAN_CHARACTER_MAP[row["class_id"]]
+            for row in selected
+        )
+        if not plausible_plate(raw):
+            continue
+        confidence = sum(
+            float(row["confidence"])
+            for row in selected
+        ) / 8.0
+        minimum = min(
+            float(row["confidence"])
+            for row in selected
+        )
+        score = 0.78 * confidence + 0.22 * minimum
+        candidate = (score, confidence, raw)
+        if best is None or candidate > best:
+            best = candidate
+
+    if best is None:
+        return "", 0.0
+    return format_iran_plate(best[2]), round(best[1], 4)
+
+
+def _recognize_plate_crop(
+    model,
+    crop: np.ndarray,
+    image_size: int,
+) -> tuple[str, float]:
+    result = model.predict(
+        crop,
+        verbose=False,
+        conf=0.15,
+        iou=0.42,
+        imgsz=image_size,
+        max_det=24,
+        classes=sorted(IRANIAN_CHARACTER_MAP),
+        augment=False,
+    )[0]
+    characters = []
+    for box in result.boxes:
+        class_id = int(box.cls[0])
+        x1, y1, x2, y2 = (
+            float(value)
+            for value in box.xyxy[0].tolist()
+        )
+        characters.append({
+            "class_id": class_id,
+            "confidence": float(box.conf[0]),
+            "bbox": (x1, y1, x2, y2),
+            "x_center": (x1 + x2) / 2.0,
+        })
+    return _select_plate_sequence(characters)
+
+
+def _choose_recovery_result(
+    original: tuple[str, float],
+    recovered: tuple[str, float],
+) -> tuple[str, float, str]:
+    original_text, original_confidence = original
+    recovered_text, recovered_confidence = recovered
+    original_valid = plausible_plate(original_text)
+    recovered_valid = plausible_plate(recovered_text)
+    if not recovered_valid:
+        return original_text, original_confidence, "original"
+    if not original_valid:
+        if recovered_confidence >= 0.72:
+            return recovered_text, recovered_confidence, "recovered"
+        return "", 0.0, "ambiguous"
+    if normalize_plate(original_text) == normalize_plate(recovered_text):
+        return (
+            original_text,
+            max(original_confidence, recovered_confidence),
+            "agreement",
+        )
+    if (
+        recovered_confidence >= 0.78
+        and recovered_confidence >= original_confidence + 0.035
+    ):
+        return recovered_text, recovered_confidence, "recovered"
+    if original_confidence >= recovered_confidence + 0.08:
+        return original_text, original_confidence, "original"
+    # Two plausible but conflicting reads without a decisive confidence gap
+    # are evidence of ambiguity, not permission to guess a digit.
+    return "", 0.0, "ambiguous"
+
+
+def _recognize_plate_crops(model, candidates: list[dict]) -> None:
+    if not candidates:
+        return
+    for candidate in candidates:
+        candidate["direct_ocr_attempted"] = True
+    try:
+        image_size = max(
+            320,
+            min(
+                640,
+                int(os.environ.get(
+                    "BCVISION_CHARACTER_IMAGE_SIZE",
+                    "416",
+                )),
+            ),
+        )
+        # Sequential crops keep peak RAM bounded. A large batch briefly
+        # duplicates the 1080p model tensors and can terminate low-memory
+        # Windows systems even though it is only marginally faster.
+        for candidate in candidates:
+            original = _recognize_plate_crop(
+                model,
+                candidate["crop"],
+                image_size,
+            )
+            text, confidence = original
+            candidate["recovery_attempted"] = False
+            candidate["recovery_selected"] = False
+            try:
+                recovery_enabled = (
+                    os.environ.get("BCVISION_BLUR_RECOVERY", "1") != "0"
+                )
+                recovery_needed = (
+                    recovery_enabled
+                    and should_attempt_recovery(
+                        candidate["crop"],
+                        text,
+                        confidence,
+                    )
+                )
+                if recovery_needed:
+                    restored, metadata = recover_mild_blur(
+                        candidate["crop"],
+                    )
+                    recovered = _recognize_plate_crop(
+                        model,
+                        restored,
+                        image_size,
+                    )
+                    text, confidence, decision = _choose_recovery_result(
+                        original,
+                        recovered,
+                    )
+                    candidate.update({
+                        "recovery_attempted": True,
+                        "recovery_method": metadata.get("method", ""),
+                        "recovery_decision": decision,
+                        "recovery_original_text": original[0],
+                        "recovery_original_confidence": original[1],
+                        "recovery_text": recovered[0],
+                        "recovery_confidence": recovered[1],
+                    })
+                    use_restored_crop = (
+                        decision == "recovered"
+                        or (
+                            decision == "agreement"
+                            and recovered[1] > original[1]
+                        )
+                    )
+                    if use_restored_crop:
+                        candidate["crop"] = restored
+                        candidate["recovery_selected"] = True
+            except Exception as recovery_error:
+                candidate["recovery_error"] = (
+                    f"{type(recovery_error).__name__}: {recovery_error}"
+                )
+                text, confidence = original
+            candidate["direct_text"] = text
+            candidate["direct_ocr_confidence"] = confidence
+            if text:
+                candidate["method"] = (
+                    "yolo-plate+chars+recovery"
+                    if candidate["recovery_selected"]
+                    else "yolo-plate+chars"
+                )
+    except Exception as exc:
+        global _model_error
+        _model_error = (
+            "Character recognition failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        # Keep the plate detection, but do not start the much heavier generic
+        # OCR path for a crop already attempted by this dedicated model.
+        return
 
 
 def _order_points(points: np.ndarray) -> np.ndarray:
@@ -243,32 +550,84 @@ def detect_plates(frame, min_confidence: float = 0.25, max_results: int = 8):
     model = load_model()
     found = []
     if model is not None:
-        try:
-            results = model.predict(
-                frame, verbose=False, conf=max(0.05, float(min_confidence)),
-                iou=0.42, imgsz=960, max_det=max_results,
-                augment=os.environ.get("BCVISION_YOLO_TTA", "0") == "1",
-            )
-            for result in results:
-                for box in result.boxes:
-                    confidence = float(box.conf[0])
-                    x1, y1, x2, y2 = _clip_box(box.xyxy[0].tolist(), width, height)
-                    if x2 <= x1 or y2 <= y1:
-                        continue
-                    pad_x = max(2, int((x2 - x1) * 0.035))
-                    pad_y = max(2, int((y2 - y1) * 0.10))
-                    x1, y1, x2, y2 = _clip_box((x1 - pad_x, y1 - pad_y, x2 + pad_x, y2 + pad_y), width, height)
-                    found.append({
-                        "crop": frame[y1:y2, x1:x2].copy(),
-                        "bbox": (x1, y1, x2, y2),
-                        "confidence": confidence,
-                        "method": "yolo",
-                    })
-            if found:
-                return _nms(found)[:max_results]
-        except Exception as exc:
-            global _model_error
-            _model_error = f"{type(exc).__name__}: {exc}"
+        # Ultralytics mutates predictor state during predict().  A shared model
+        # used concurrently by live-camera workers can silently return empty
+        # detections.  Serialize the full detector+character transaction.
+        with _inference_lock:
+            try:
+                plate_class_ids = _plate_class_ids(model)
+                model_max_results = (
+                    min(max_results, 4)
+                    if plate_class_ids == [IRANIAN_PLATE_CLASS_ID]
+                    else max_results
+                )
+                results = model.predict(
+                    frame,
+                    verbose=False,
+                    conf=max(0.05, float(min_confidence)),
+                    iou=0.42,
+                    imgsz=max(
+                        512,
+                        min(
+                            960,
+                            int(os.environ.get(
+                                "BCVISION_DETECTOR_IMAGE_SIZE",
+                                "640",
+                            )),
+                        ),
+                    ),
+                    max_det=model_max_results,
+                    classes=plate_class_ids,
+                    augment=(
+                        os.environ.get("BCVISION_YOLO_TTA", "0") == "1"
+                    ),
+                )
+                for result in results:
+                    for box in result.boxes:
+                        confidence = float(box.conf[0])
+                        class_id = int(box.cls[0])
+                        if (
+                            plate_class_ids is not None
+                            and class_id not in plate_class_ids
+                        ):
+                            continue
+                        x1, y1, x2, y2 = _clip_box(
+                            box.xyxy[0].tolist(),
+                            width,
+                            height,
+                        )
+                        if x2 <= x1 or y2 <= y1:
+                            continue
+                        pad_x = max(2, int((x2 - x1) * 0.035))
+                        pad_y = max(2, int((y2 - y1) * 0.10))
+                        x1, y1, x2, y2 = _clip_box(
+                            (
+                                x1 - pad_x,
+                                y1 - pad_y,
+                                x2 + pad_x,
+                                y2 + pad_y,
+                            ),
+                            width,
+                            height,
+                        )
+                        found.append({
+                            "crop": frame[y1:y2, x1:x2].copy(),
+                            "bbox": (x1, y1, x2, y2),
+                            "confidence": confidence,
+                            "method": "yolo",
+                        })
+                if found:
+                    found = _nms(found)[:model_max_results]
+                    if plate_class_ids == [IRANIAN_PLATE_CLASS_ID]:
+                        _recognize_plate_crops(model, found)
+                    return found
+                # A successful zero-result YOLO inference means no plate was
+                # present at this threshold. Fallback is reserved for a
+                # genuinely unavailable or failed model.
+                return []
+            except Exception as exc:
+                global _model_error
+                _model_error = f"{type(exc).__name__}: {exc}"
     fallback = _opencv_candidates(frame, max_results=max_results)
     return [row for row in fallback if row["confidence"] >= min(0.45, max(0.08, float(min_confidence) * 0.65))][:max_results]
 

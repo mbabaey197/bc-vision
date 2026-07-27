@@ -13,3 +13,4 @@ setup_output/
 tools/keys/
 license.json
 .buildvenv/
+.coverage

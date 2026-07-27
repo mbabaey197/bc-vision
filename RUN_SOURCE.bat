@@ -9,14 +9,16 @@ if not defined PY (
  pause
  exit /b 1
 )
-if not exist .venv (
- %PY% -m venv .venv || goto :error
+if not exist ".venv\Scripts\python.exe" (
+ %PY% -m venv ".venv" || goto :error
 )
-call .venv\Scripts\activate.bat
-python -m pip install --upgrade pip
-pip install -r requirements.txt || goto :error
-python launcher.py
-exit /b
+".venv\Scripts\python.exe" -m pip install --upgrade pip
+if errorlevel 1 goto :error
+".venv\Scripts\python.exe" -m pip install -r requirements.txt
+if errorlevel 1 goto :error
+if not exist ".venv\Scripts\pythonw.exe" goto :error
+start "" /B "%CD%\.venv\Scripts\pythonw.exe" "%CD%\launcher.py"
+exit /b 0
 :error
 echo.
 echo Installation or execution failed.

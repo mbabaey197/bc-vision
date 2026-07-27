@@ -17,7 +17,11 @@ def test_verified_models_and_real_engines_load():
     import torchvision
     import ultralytics
 
-    from app.ai.detector import detector_status, load_model
+    from app.ai.detector import (
+        _plate_class_ids,
+        detector_status,
+        load_model,
+    )
     from app.ai.model_manager import model_status, prepare_models
     from app.ai.ocr import _get_easyocr_reader
 
@@ -38,6 +42,7 @@ def test_verified_models_and_real_engines_load():
     model = load_model()
     assert model is not None
     assert detector_status()["model_loaded"]
+    assert _plate_class_ids(model) == [30]
 
     blank = np.full((320, 640, 3), 255, dtype=np.uint8)
     model.predict(

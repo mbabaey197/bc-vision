@@ -11,7 +11,7 @@ if not "%errorlevel%"=="0" (
 )
 
 set "APPDIR=%ProgramFiles%\BC Vision"
-set "DATADIR=%ProgramData%\BC Vision"
+set "DATADIR=%ProgramData%\BCVision"
 set "LOGFILE=%TEMP%\BCVision_Install.log"
 echo BC Vision installer started > "%LOGFILE%"
 
@@ -76,7 +76,7 @@ start "BC Vision" "%APPDIR%\.venv\Scripts\pythonw.exe" "%APPDIR%\launcher.py"
 
 echo.
 echo ==============================================
-echo BC Vision v2.1.0 با موفقیت نصب شد.
+echo BC Vision v2.2.0-rc5 با موفقیت نصب شد.
 echo نام کاربری: admin
 echo رمز اولیه: 123456
 echo اطلاعات برنامه در این مسیر حفظ می‌شود:

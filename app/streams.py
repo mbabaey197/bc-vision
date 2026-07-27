@@ -14,6 +14,13 @@ except Exception:
     np = None
     CV_OK = False
 
+try:
+    import av
+    AV_OK = True
+except Exception:
+    av = None
+    AV_OK = False
+
 
 @dataclass
 class StreamState:
@@ -65,7 +72,35 @@ class CameraStream:
             pass
 
     def _encode(self, frame):
-        display = frame
+        display = frame.copy()
+        try:
+            from app.ai.live_worker import live_anpr_detections
+            for result in live_anpr_detections(self.camera_id):
+                x1, y1, x2, y2 = result["bbox"]
+                color = (36, 220, 96) if result.get("valid") else (0, 190, 255)
+                cv2.rectangle(display, (x1, y1), (x2, y2), color, 3)
+                confidence = int(float(result.get("confidence", 0)) * 100)
+                label = f"PLATE {confidence}%"
+                top = max(24, y1)
+                cv2.rectangle(
+                    display,
+                    (x1, top - 24),
+                    (min(display.shape[1] - 1, x1 + 145), top),
+                    color,
+                    -1,
+                )
+                cv2.putText(
+                    display,
+                    label,
+                    (x1 + 5, top - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48,
+                    (8, 16, 24),
+                    1,
+                    cv2.LINE_AA,
+                )
+        except Exception:
+            pass
         if self.width and frame.shape[1] > self.width:
             scale = self.width / frame.shape[1]
             display = cv2.resize(
@@ -156,6 +191,28 @@ class CameraStream:
         )
         return frame
 
+    def _run_pyav_video(self, source, delay):
+        """Decode an uploaded video with bundled FFmpeg when OpenCV cannot."""
+        if not AV_OK:
+            raise RuntimeError(
+                "OpenCV could not decode the video and PyAV is unavailable"
+            )
+        while not self.stop_event.is_set():
+            published = 0
+            with av.open(str(source)) as container:
+                for video_frame in container.decode(video=0):
+                    if self.stop_event.is_set():
+                        return
+                    frame = video_frame.to_ndarray(format="bgr24")
+                    self._publish(frame)
+                    published += 1
+                    if self.stop_event.wait(delay):
+                        return
+            if not published:
+                raise RuntimeError(
+                    "FFmpeg could not decode any frame from the video"
+                )
+
     def _run(self):
         if not CV_OK:
             self.state.last_error = "OpenCV is not available"
@@ -167,31 +224,53 @@ class CameraStream:
                 time.sleep(delay)
             return
 
+        is_video_file = self.url.startswith("video://")
+        capture_source = (
+            self.url[len("video://"):]
+            if is_video_file
+            else self.url
+        )
         while not self.stop_event.is_set():
             capture = None
+            published = 0
             try:
                 capture = cv2.VideoCapture(
-                    self.url,
+                    capture_source,
                     cv2.CAP_FFMPEG,
                 )
                 if not capture.isOpened():
                     capture.release()
-                    capture = cv2.VideoCapture(self.url)
+                    capture = cv2.VideoCapture(capture_source)
                 if not capture.isOpened():
-                    raise RuntimeError("Cannot open RTSP stream")
+                    raise RuntimeError("Cannot open camera or video stream")
                 capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 while not self.stop_event.is_set():
                     ok, frame = capture.read()
                     if not ok or frame is None:
+                        if is_video_file:
+                            capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            ok, frame = capture.read()
+                            if ok and frame is not None:
+                                self._publish(frame)
+                                published += 1
+                                time.sleep(delay)
+                                continue
                         raise RuntimeError(
                             "Camera stopped sending frames"
                         )
                     self._publish(frame)
+                    published += 1
                     time.sleep(delay)
             except Exception as exc:
+                if is_video_file and published == 0 and AV_OK:
+                    try:
+                        self._run_pyav_video(capture_source, delay)
+                        continue
+                    except Exception as fallback_exc:
+                        exc = fallback_exc
                 self.state.online = False
                 self.state.last_error = str(exc)
-                time.sleep(3)
+                self.stop_event.wait(1 if is_video_file else 3)
             finally:
                 if capture is not None:
                     capture.release()
