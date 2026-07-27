@@ -125,3 +125,35 @@ def test_live_overlay_survives_stream_resize(monkeypatch):
     assert display.shape[:2] == (100, 160)
     # The green rectangle drawn before resize must still be visible.
     assert int(display[:, :, 1].max()) > 150
+
+
+def test_live_overlay_tracks_plate_motion_between_inference_frames():
+    rng = np.random.default_rng(20260727)
+    previous = np.zeros((140, 240, 3), dtype=np.uint8)
+    texture = rng.integers(
+        25,
+        235,
+        (50, 80, 3),
+        dtype=np.uint8,
+    )
+    previous[40:90, 60:140] = texture
+    current = np.zeros_like(previous)
+    current[46:96, 73:153] = texture
+
+    tracked = CameraStream._track_overlay_rows(
+        previous,
+        current,
+        [{
+            "bbox": (60, 40, 140, 90),
+            "plate": "12-ب-345-67",
+            "confidence": 0.9,
+            "valid": True,
+        }],
+    )
+
+    assert len(tracked) == 1
+    x1, y1, x2, y2 = tracked[0]["bbox"]
+    assert abs(x1 - 73) <= 2
+    assert abs(y1 - 46) <= 2
+    assert abs(x2 - 153) <= 2
+    assert abs(y2 - 96) <= 2
