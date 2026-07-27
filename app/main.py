@@ -299,8 +299,20 @@ def dashboard(request:Request):
     js=f"""<script>
 const ids=[{ids}];
 async function cameraStatus(){{for(const id of ids){{try{{let r=await fetch('/api/cameras/'+id+'/status');let s=await r.json();let e=document.getElementById('st-'+id),a=document.getElementById('anpr-'+id),n=v=>Number(v||0).toLocaleString('fa-IR');e.textContent=s.online?'آنلاین':'آفلاین';e.className='badge '+(s.online?'online':'');const p=s.anpr||{{}},m=p.models||{{}};if(!m.ready){{a.textContent='پلاک‌خوان آماده نیست: مدل تشخیص یا OCR نصب نشده است';a.className='anpr-status bad'}}else if(p.last_error){{a.textContent='خطای پلاک‌خوان: '+p.last_error;a.className='anpr-status bad'}}else{{a.textContent='پردازش: '+n(p.processed_frames)+' فریم | تشخیص: '+n(p.detected_candidates)+' | ثبت: '+n(p.emitted_events);a.className='anpr-status'}}}}catch(e){{}}}}}}
+let latestEventId={recent[0]['id'] if recent else 0};
+async function refreshRecentEvents(){{
+ try{{
+  const r=await fetch('/api/dashboard/recent-events?after='+latestEventId,{{cache:'no-store'}});
+  if(!r.ok)return;
+  const data=await r.json();
+  if(data.latest_id>latestEventId){{
+   document.getElementById('recentEventsBody').innerHTML=data.rows_html;
+   latestEventId=data.latest_id;
+  }}
+ }}catch(e){{}}
+}}
 function setGrid(n){{document.getElementById('liveGrid').style.setProperty('--cols',n);document.querySelectorAll('.grid-switch button').forEach(b=>b.classList.toggle('active',Number(b.dataset.n)===n));localStorage.setItem('bc-grid',n)}}
-const savedGrid=Number(localStorage.getItem('bc-grid')||{cols});setGrid(savedGrid);cameraStatus();setInterval(cameraStatus,4000);
+const savedGrid=Number(localStorage.getItem('bc-grid')||{cols});setGrid(savedGrid);cameraStatus();setInterval(cameraStatus,4000);setInterval(refreshRecentEvents,750);
 </script>"""
     valid_class='ok' if lic['valid'] else 'bad'
     body=f"""<div class='wrap'><div class='toolbar'><div style='margin-left:auto'><h1 class='page-title'>داشبورد</h1><p class='page-sub'>نمای کلی وضعیت سامانه و تصاویر زنده</p></div><a class='btn' href='/cameras/new'>＋ افزودن دوربین</a></div>
@@ -311,8 +323,34 @@ const savedGrid=Number(localStorage.getItem('bc-grid')||{cols});setGrid(savedGri
       <div class='card stat-card'><div class='stat-head'><span class='muted'>وضعیت لایسنس</span><span class='stat-icon'>◆</span></div><div class='{valid_class}' style='font-size:20px;font-weight:900;margin-top:10px'>{escape(lic['plan'])}</div><div class='trend'>{escape(lic['message'])}</div></div>
     </div>
     <div class='card'><div class='toolbar'><div style='margin-left:auto'><h3 style='margin:0'>نمایش زنده</h3><span class='muted'>تصاویر دوربین‌های فعال</span></div><div class='grid-switch'><button data-n='1' onclick='setGrid(1)'>۱</button><button data-n='2' onclick='setGrid(2)'>۴</button><button data-n='3' onclick='setGrid(3)'>۹</button><button data-n='4' onclick='setGrid(4)'>۱۶</button></div><button class='secondary' onclick='document.documentElement.requestFullscreen?.()'>تمام‌صفحه</button></div><div class='live-grid' id='liveGrid' style='--cols:{cols}'>{tiles}</div></div>
-    <div class='card'><h3>آخرین پلاک‌های خوانده‌شده</h3><p class='feedback-note'>در نسخه آزمایشی، پلاک صحیح را کنار هر نتیجه وارد کنید. اصلاح ثبت‌شده همان رویداد را تصحیح می‌کند، خوانش مشابه را به حافظه محلی می‌سپارد و تصویر آن را برای بازآموزی کنترل‌شده نگه می‌دارد.</p><div class='table-wrap'><table><tr><th>پلاک ایران</th><th>دوربین</th><th>اطمینان</th><th>زمان</th><th>اصلاح و آموزش</th></tr>{recent_rows}</table></div><div style='margin-top:12px'><a class='btn secondary' href='/events'>مشاهده همه گزارش‌ها</a> <a class='btn secondary' href='/settings'>وضعیت فنی سامانه</a></div></div>{js}</div>"""
+    <div class='card'><h3>آخرین پلاک‌های خوانده‌شده</h3><p class='feedback-note'>در نسخه آزمایشی، پلاک صحیح را کنار هر نتیجه وارد کنید. اصلاح ثبت‌شده همان رویداد را تصحیح می‌کند، خوانش مشابه را به حافظه محلی می‌سپارد و تصویر آن را برای بازآموزی کنترل‌شده نگه می‌دارد.</p><div class='table-wrap'><table><thead><tr><th>پلاک ایران</th><th>دوربین</th><th>اطمینان</th><th>زمان</th><th>اصلاح و آموزش</th></tr></thead><tbody id='recentEventsBody'>{recent_rows}</tbody></table></div><div style='margin-top:12px'><a class='btn secondary' href='/events'>مشاهده همه گزارش‌ها</a> <a class='btn secondary' href='/settings'>وضعیت فنی سامانه</a></div></div>{js}</div>"""
     return page('داشبورد',body,u,request)
+
+@app.get('/api/dashboard/recent-events')
+def dashboard_recent_events(request:Request,after:int=0):
+    if not auth(request):
+        return JSONResponse({'error':'unauthorized'},401)
+    with connect() as con:
+        recent=con.execute(
+            "SELECT id,plate_text,camera_name,confidence,created_at "
+            "FROM plate_events ORDER BY id DESC LIMIT 6"
+        ).fetchall()
+    latest_id=int(recent[0]['id']) if recent else 0
+    if latest_id <= max(0,int(after)):
+        return JSONResponse({'latest_id':latest_id,'rows_html':''})
+    rows=''.join(
+        f"<tr><td>{iran_plate_html(r['plate_text'],True)}</td>"
+        f"<td>{escape(r['camera_name'] or '—')}</td>"
+        f"<td>{persian_digits(int((r['confidence'] or 0)*100))}٪</td>"
+        f"<td>{persian_digits(jalali_datetime(r['created_at'],False))}</td>"
+        f"<td><form class='correction-form' method='post' "
+        f"action='/events/{r['id']}/correct'>"
+        f"<input name='corrected_plate' required maxlength='20' "
+        f"placeholder='مثال: ۱۲ ب ۳۴۵ ایران ۶۷'>"
+        f"<button>ثبت اصلاح</button></form></td></tr>"
+        for r in recent
+    ) or "<tr><td colspan='5'>هنوز پلاکی ثبت نشده است.</td></tr>"
+    return JSONResponse({'latest_id':latest_id,'rows_html':rows})
 
 @app.get('/live/{camera_id}')
 def live(camera_id:int,request:Request):
