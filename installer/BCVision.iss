@@ -1,5 +1,5 @@
 #define MyAppName "BC Vision"
-#define MyAppVersion "2.2.0-rc7"
+#define MyAppVersion "2.2.0-rc8"
 #define MyAppPublisher "Gilas Abi Alborz"
 #define MyAppExeName "BCVision.exe"
 
@@ -14,7 +14,7 @@ DefaultGroupName=BC Vision
 DisableProgramGroupPage=yes
 UsePreviousAppDir=yes
 OutputDir=..\setup_output
-OutputBaseFilename=BCVision_Setup_v2.2.0-rc7
+OutputBaseFilename=BCVision_Setup_v2.2.0-rc8
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
