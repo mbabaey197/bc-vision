@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from uuid import uuid4
 
@@ -30,7 +31,9 @@ def backup_database(destination):
         f".{target.name}.{uuid4().hex}.tmp"
     )
     try:
-        with connect() as source, sqlite3.connect(temporary) as snapshot:
+        with closing(connect()) as source, closing(
+            sqlite3.connect(temporary)
+        ) as snapshot:
             source.backup(snapshot)
             result = snapshot.execute("PRAGMA quick_check").fetchone()
             if not result or result[0] != "ok":
