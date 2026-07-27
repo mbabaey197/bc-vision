@@ -5,7 +5,7 @@
 - GitHub repository: `mahdibabaey197/bc-vision`
 - Default branch: `main`
 - Product: BC Vision
-- Current application version in source: `2.1.0`
+- Current application version in source: `2.2.0-rc1`
 - Windows persistent data root: `C:\ProgramData\BCVision\data`
 
 ## Release contract
@@ -42,6 +42,8 @@ The Iranian plate-recognition subsystem now includes:
 - backward-compatible SQLite migrations and canonical `plate_norm`
 - persistent, SHA-256-verified AI model management
 - AI-aware PyInstaller build configuration
+- serialized shared-model inference for multi-camera correctness
+- conditional mild-motion deblurring with dedicated-AI reread
 
 ## ANPR model execution contract
 
@@ -62,6 +64,19 @@ model construction, because Ultralytics can otherwise reset Torch to use
 nearly all logical processors. At least one logical processor is left
 available on smaller systems. Deployments can override this with
 `BCVISION_CPU_THREADS=1..8`.
+
+Ultralytics predictor state is not shared safely across simultaneous
+`predict()` calls. Live-camera workers therefore serialize the complete
+plate-localization and character-read transaction on the shared model while
+continuing to replace stale queued frames. This prevents silent empty
+detections and avoids concurrent CPU oversubscription.
+
+Mild-blur recovery is conditional and defaults on. The original crop is read
+first; only a soft or uncertain crop is restored and read once more by the
+dedicated character model. A recovered digit is accepted only with agreement
+or a decisive confidence improvement. Conflicting plausible reads become
+unreadable and are left to multi-frame consensus. Operators can disable this
+pass with `BCVISION_BLUR_RECOVERY=0`.
 
 ## Important commits
 
@@ -98,8 +113,11 @@ The current regression suite covers:
 - background camera auto-start and clean shutdown
 - backward-compatible database migration
 - model hash verification
+- shared-model concurrent-call serialization
+- conservative blur-recovery gating and result selection
 
-Latest isolated full-suite result after background auto-start: `22 passed`.
+The latest full-suite result is recorded in
+`agent-results/latest/ANPR_VIDEO_PERFORMANCE_FIX.md`.
 
 ## Operational truth
 
@@ -118,4 +136,8 @@ Before declaring a production release, perform these validations with real custo
 - Windows portable build, installer and one-click updater
 - upgrade from the previous installed version while preserving the database and models
 
-The ANPR source is merged into `main`; a new installer/release has not yet been produced from these commits.
+The current performance/accuracy work remains on the draft ANPR pull request
+until direct comparison ground truth is available. Windows packaging for
+`2.2.0-rc1` includes an isolated executable self-test plus installer/updater
+data-preservation verification. A production release has not yet been
+declared.

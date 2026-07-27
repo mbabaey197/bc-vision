@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import socket
 import sys
 import threading
@@ -115,6 +116,81 @@ def run_server():
                 log("Background camera shutdown failed:\n" + traceback.format_exc())
 
 
+def _argument_value(name: str) -> str:
+    try:
+        index = sys.argv.index(name)
+    except ValueError:
+        return ""
+    if index + 1 >= len(sys.argv):
+        return ""
+    return sys.argv[index + 1]
+
+
+def run_self_test() -> int:
+    """Exercise the packaged runtime without opening the GUI or a browser."""
+    result = {
+        "ok": False,
+        "version": "",
+        "data_dir": "",
+        "database_path": "",
+        "database_ready": False,
+        "public_key_ready": False,
+        "web_app_ready": False,
+    }
+    try:
+        from app.config import (
+            APP_VERSION,
+            DATA_DIR,
+            DB_PATH,
+            PUBLIC_KEY_PATH,
+        )
+        from app.database import connect, init_db
+
+        init_db()
+        with connect() as con:
+            user_count = int(
+                con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            )
+            table_count = int(
+                con.execute(
+                    "SELECT COUNT(*) FROM sqlite_master "
+                    "WHERE type='table'"
+                ).fetchone()[0]
+            )
+        from app.main import app
+
+        result.update({
+            "ok": (
+                DB_PATH.is_file()
+                and PUBLIC_KEY_PATH.is_file()
+                and table_count >= 6
+                and user_count >= 1
+                and app is not None
+            ),
+            "version": APP_VERSION,
+            "data_dir": str(DATA_DIR),
+            "database_path": str(DB_PATH),
+            "database_ready": DB_PATH.is_file() and table_count >= 6,
+            "public_key_ready": PUBLIC_KEY_PATH.is_file(),
+            "web_app_ready": app is not None,
+            "user_count": user_count,
+            "table_count": table_count,
+        })
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        log("Self-test failed:\n" + traceback.format_exc())
+
+    payload = json.dumps(result, ensure_ascii=False, indent=2)
+    output_path = _argument_value("--self-test-output")
+    if output_path:
+        destination = Path(output_path).expanduser()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(payload, encoding="utf-8")
+    elif sys.stdout is not None:
+        print(payload)
+    return 0 if result["ok"] else 1
+
+
 def main():
     try:
         threading.Thread(
@@ -194,4 +270,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        raise SystemExit(run_self_test())
     main()

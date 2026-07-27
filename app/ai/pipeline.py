@@ -102,6 +102,19 @@ def process_frame(frame, min_detection_confidence=0.25):
             "bbox": item["bbox"],
             "crop": crop,
             "method": item["method"],
+            "recovery_attempted": bool(
+                item.get("recovery_attempted")
+            ),
+            "recovery_selected": bool(
+                item.get("recovery_selected")
+            ),
+            "recovery_decision": item.get(
+                "recovery_decision",
+                "",
+            ),
+            "recovery_confidence": float(
+                item.get("recovery_confidence", 0.0)
+            ),
             "valid": valid,
             "vehicle_type": "نامشخص",
             "vehicle_color": "نامشخص",

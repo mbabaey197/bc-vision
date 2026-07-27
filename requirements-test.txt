@@ -3,4 +3,5 @@ cryptography==49.0.0
 fastapi==0.140.0
 numpy==2.5.1
 opencv-python-headless==5.0.0.93
+python-multipart==0.0.32
 pytest==9.0.2

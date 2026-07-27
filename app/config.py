@@ -3,7 +3,7 @@ import json, os, sys
 
 COMPANY_NAME = "گیلاس آبی البرز"
 APP_NAME = "BC Vision"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0-rc1"
 HOST = "127.0.0.1"
 PORT = 8000
 
@@ -15,6 +15,9 @@ def install_dir() -> Path:
 
 
 def default_data_dir() -> Path:
+    override = os.environ.get("BCVISION_DATA_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
     if os.name == "nt":
         base = Path(os.environ.get("PROGRAMDATA", Path.home() / "AppData" / "Local"))
         return base / "BCVision" / "data"

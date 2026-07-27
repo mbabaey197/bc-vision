@@ -65,6 +65,7 @@ rmdir /s /q dist 2>nul
     --hidden-import app.ai.detector ^
     --hidden-import app.ai.ocr ^
     --hidden-import app.ai.pipeline ^
+    --hidden-import app.ai.plate_recovery ^
     --hidden-import app.ai.plate_rules ^
     --hidden-import app.ai.vehicle_intelligence ^
     --hidden-import app.ai.video_test ^

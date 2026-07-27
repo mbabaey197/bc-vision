@@ -1,6 +1,6 @@
 # ANPR Video Accuracy and Performance Fix
 
-Date: 2026-07-26
+Date: 2026-07-27
 Status: implementation in progress on `agent/anpr-fast-accurate-video`
 
 ## Confirmed root causes
@@ -28,14 +28,42 @@ Status: implementation in progress on `agent/anpr-fast-accurate-video`
 - Use OpenCV fallback only when YOLO is unavailable or fails, not on a valid
   zero-result frame.
 - Defer vehicle color/type analysis until a stable event is actually saved.
+- Serialize full-frame and character inference on the shared Ultralytics
+  instance. Concurrent live workers previously could return an empty result
+  for one of two simultaneous calls because predictor state is mutable.
+- Add conditional mild-motion deblurring followed by one dedicated-AI reread.
+- Keep the original read unless the restored read agrees or improves by a
+  decisive confidence margin; conflicting plausible reads become unreadable.
 
 ## Current verification
 
 - Three real reference crops: dedicated character inference completed in
   0.328 seconds total at 416px before template selection.
-- Targeted detector/pipeline/video/live tests: 20 passed.
-- Full source regression suite: 33 passed, 1 skipped.
+- Targeted detector/recovery/pipeline/video/live tests: 28 passed.
+- Full source regression suite: 40 passed, 1 skipped.
 - Compile-all and whitespace validation: passed.
+
+## Multi-camera and mild-blur verification
+
+- Two real video frames that produce one and two plate candidates were read
+  both sequentially and through two simultaneous worker threads.
+- Sequential and concurrent signatures matched exactly after serialization:
+  candidate counts `[1, 2]` in both modes, including bounding boxes and text.
+- Three real plate crops were given controlled mild horizontal motion blur.
+  The raw model became empty or changed one digit; the recovery+reread path
+  returned the same stable model text seen before blur in all three samples.
+  This is a robustness check, not a ground-truth accuracy claim.
+- A corrupted/recompressed local copy of the reference video was usable only
+  through frame 225 and does not match the trusted fixture SHA-256. On that
+  prefix, tuned recovery attempted nine rereads and produced the same 14
+  stable event signatures as the recovery-disabled control.
+- Prefix control: 28.410 seconds, 163.966 CPU seconds, 5.77 average cores,
+  1,254.2 MB peak RSS.
+- Prefix with recovery: 29.098 seconds, 168.607 CPU seconds, 5.80 average
+  cores, 1,245.8 MB peak RSS. The measured wall-time overhead was about 2.4
+  percent.
+
+The prefix benchmark cannot replace the clean full-fixture result below.
 
 ## Clean full-video verification
 

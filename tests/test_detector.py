@@ -1,7 +1,12 @@
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
+
 import cv2
 import numpy as np
 
 from app.ai.detector import (
+    _choose_recovery_result,
     _configure_cpu_threads,
     _cpu_thread_limit,
     _iou,
@@ -146,6 +151,54 @@ def test_character_decoder_selects_highest_confidence_plate_template():
         )
     )
     assert text == "18-ب-987-32"
+
+
+def test_recovery_result_requires_evidence_before_changing_digit():
+    original = ("18-ب-987-33", 0.80)
+    assert _choose_recovery_result(
+        original,
+        ("18-ب-987-32", 0.84),
+    ) == ("18-ب-987-32", 0.84, "recovered")
+    assert _choose_recovery_result(
+        original,
+        ("18-ب-987-32", 0.82),
+    ) == ("", 0.0, "ambiguous")
+    assert _choose_recovery_result(
+        original,
+        ("18-ب-987-33", 0.86),
+    ) == ("18-ب-987-33", 0.86, "agreement")
+
+
+def test_parallel_detector_calls_are_serialized(monkeypatch):
+    active = 0
+    maximum_active = 0
+    state_lock = threading.Lock()
+
+    class Model:
+        names = {index: str(index) for index in range(32)}
+
+        @staticmethod
+        def predict(*_args, **_kwargs):
+            nonlocal active, maximum_active
+            with state_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            time.sleep(0.03)
+            with state_lock:
+                active -= 1
+            return [type("Result", (), {"boxes": []})()]
+
+    model = Model()
+    monkeypatch.setattr(
+        "app.ai.detector.load_model",
+        lambda: model,
+    )
+    frame = np.zeros((180, 320, 3), dtype=np.uint8)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        rows = list(executor.map(detect_plates, [frame, frame]))
+
+    assert rows == [[], []]
+    assert maximum_active == 1
 
 
 def test_verified_model_uses_only_plate_class():
