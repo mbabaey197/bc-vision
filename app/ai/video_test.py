@@ -68,22 +68,48 @@ def _translate_result(result, offset_x, offset_y):
     return translated
 
 
-def _save_event(result, frame, frame_no, fps, plate_dir, snapshot_dir, video_path):
+def _save_event(
+    result,
+    frame,
+    frame_no,
+    fps,
+    plate_dir,
+    snapshot_dir,
+    video_path,
+    existing=None,
+):
     result = add_vehicle_analysis(result, frame)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    plate_file = plate_dir / f"plate-{stamp}.jpg"
-    snap_file = snapshot_dir / f"vehicle-{stamp}.jpg"
+    plate_file = Path(
+        existing.get("plate_path")
+        if existing
+        else plate_dir / f"plate-{stamp}.jpg"
+    )
+    snap_file = Path(
+        existing.get("image_path")
+        if existing
+        else snapshot_dir / f"vehicle-{stamp}.jpg"
+    )
     crop = result.get("crop")
     if crop is not None and getattr(crop, "size", 0):
         cv2.imwrite(str(plate_file), crop, [cv2.IMWRITE_JPEG_QUALITY, 94])
-    annotated = frame.copy()
+    vehicle = result.get("vehicle_crop")
+    using_vehicle_crop = bool(
+        vehicle is not None and getattr(vehicle, "size", 0)
+    )
+    annotated = vehicle.copy() if using_vehicle_crop else frame.copy()
     x1, y1, x2, y2 = result["bbox"]
+    if using_vehicle_crop and result.get("vehicle_bbox"):
+        vx1, vy1, _, _ = result["vehicle_bbox"]
+        x1, x2 = x1 - vx1, x2 - vx1
+        y1, y2 = y1 - vy1, y2 - vy1
     cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-    vehicle_box = result.get("vehicle_bbox") or result["bbox"]
-    vx1, vy1, vx2, vy2 = vehicle_box
-    cv2.rectangle(annotated, (vx1, vy1), (vx2, vy2), (255, 180, 0), 2)
     cv2.imwrite(str(snap_file), annotated, [cv2.IMWRITE_JPEG_QUALITY, 90])
-    event = {key: value for key, value in result.items() if key != "crop"}
+    event = {
+        key: value
+        for key, value in result.items()
+        if key not in {"crop", "vehicle_crop", "capture_frame"}
+    }
     event.update({
         "plate_path": str(plate_file),
         "image_path": str(snap_file),
@@ -115,28 +141,67 @@ def process_video(
         min_votes=2,
         max_age_seconds=max(1.2, float(frame_step) * 4.0 / fps),
         emit_cooldown=max(0.0, float(duplicate_seconds)),
+        emit_unreadable=True,
     )
     events = []
+    events_by_track: dict[int, int] = {}
     seen: dict[str, float] = {}
-    saved_track_ids = set()
     frame_no = 0
     last_frame = None
 
     def accept(rows, frame):
         for result in rows:
-            if result["confidence"] < float(min_confidence):
+            capture_only = bool(result.get("capture_only"))
+            if (
+                not capture_only
+                and result["confidence"] < float(min_confidence)
+            ):
                 continue
             key = result.get("plate_norm") or normalize_plate(result.get("plate"))
             now_sec = frame_no / fps
-            if key and key in seen and now_sec - seen[key] < max(0.0, float(duplicate_seconds)):
-                continue
-            if result.get("track_id") in saved_track_ids:
+            track_id = int(result.get("track_id") or 0)
+            event_index = events_by_track.get(track_id)
+            if (
+                event_index is None
+                and key
+                and key in seen
+                and now_sec - seen[key]
+                < max(0.0, float(duplicate_seconds))
+            ):
                 continue
             if key:
                 seen[key] = now_sec
-            saved_track_ids.add(result.get("track_id"))
-            events.append(_save_event(result, frame, frame_no, fps, plate_dir, snapshot_dir, video_path))
-            if len(events) >= int(max_events):
+            capture_frame = result.pop("capture_frame", None)
+            persistence_frame = (
+                capture_frame
+                if capture_frame is not None
+                and getattr(capture_frame, "size", 0)
+                else frame
+            )
+            existing = (
+                events[event_index]
+                if event_index is not None
+                else None
+            )
+            saved = _save_event(
+                result,
+                persistence_frame,
+                frame_no,
+                fps,
+                plate_dir,
+                snapshot_dir,
+                video_path,
+                existing=existing,
+            )
+            if event_index is None:
+                events_by_track[track_id] = len(events)
+                events.append(saved)
+            else:
+                events[event_index] = saved
+            if (
+                len(events) >= int(max_events)
+                and not capture_only
+            ):
                 return True
         return False
 
@@ -151,7 +216,11 @@ def process_video(
                 _translate_result(result, offset_x, offset_y)
                 for result in process_frame(source, min_confidence)
             ]
-            stable = tracker.update(results, timestamp=frame_no / fps)
+            stable = tracker.update(
+                results,
+                timestamp=frame_no / fps,
+                frame=frame,
+            )
             if accept(stable, frame):
                 return info, events
         if last_frame is not None:

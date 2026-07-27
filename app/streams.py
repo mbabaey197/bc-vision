@@ -51,6 +51,11 @@ class CameraStream:
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.lock = threading.Lock()
+        self._overlay_rows: list[dict] = []
+        self._overlay_gray = None
+        self._overlay_revision = 0
+        self._overlay_updated_at = 0.0
+        self._overlay_max_age = 4.0
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -71,11 +76,148 @@ class CameraStream:
         except Exception:
             pass
 
+    @staticmethod
+    def _gray(frame):
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    @staticmethod
+    def _track_overlay_rows(previous_frame, current_frame, rows):
+        if (
+            previous_frame is None
+            or current_frame is None
+            or previous_frame.shape[:2] != current_frame.shape[:2]
+        ):
+            return [dict(row) for row in rows]
+        previous_gray = (
+            previous_frame
+            if previous_frame.ndim == 2
+            else CameraStream._gray(previous_frame)
+        )
+        current_gray = (
+            current_frame
+            if current_frame.ndim == 2
+            else CameraStream._gray(current_frame)
+        )
+        height, width = current_gray.shape[:2]
+        tracked = []
+        for source in rows:
+            x1, y1, x2, y2 = (
+                max(0, int(value)) for value in source["bbox"]
+            )
+            x2, y2 = min(width, x2), min(height, y2)
+            if x2 - x1 < 4 or y2 - y1 < 4:
+                continue
+            mask = np.zeros_like(previous_gray)
+            mask[y1:y2, x1:x2] = 255
+            points = cv2.goodFeaturesToTrack(
+                previous_gray,
+                mask=mask,
+                maxCorners=36,
+                qualityLevel=0.01,
+                minDistance=3,
+                blockSize=5,
+            )
+            if points is None or len(points) < 3:
+                continue
+            moved, status, _ = cv2.calcOpticalFlowPyrLK(
+                previous_gray,
+                current_gray,
+                points,
+                None,
+                winSize=(21, 21),
+                maxLevel=3,
+                criteria=(
+                    cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                    20,
+                    0.03,
+                ),
+            )
+            if moved is None or status is None:
+                continue
+            valid = status.reshape(-1) == 1
+            if int(valid.sum()) < 3:
+                continue
+            delta = moved.reshape(-1, 2)[valid] - points.reshape(-1, 2)[valid]
+            dx, dy = np.median(delta, axis=0)
+            if not np.isfinite(dx) or not np.isfinite(dy):
+                continue
+            row = dict(source)
+            moved_box = (
+                max(0, min(width - 1, int(round(x1 + dx)))),
+                max(0, min(height - 1, int(round(y1 + dy)))),
+                max(1, min(width, int(round(x2 + dx)))),
+                max(1, min(height, int(round(y2 + dy)))),
+            )
+            if (
+                moved_box[2] <= moved_box[0]
+                or moved_box[3] <= moved_box[1]
+            ):
+                continue
+            row["bbox"] = moved_box
+            tracked.append(row)
+        return tracked
+
+    def _live_overlays(self, frame):
+        now = time.time()
+        received_new_snapshot = False
+        try:
+            from app.ai.live_worker import live_anpr_detection_snapshot
+            snapshot = live_anpr_detection_snapshot(
+                self.camera_id,
+                self._overlay_revision,
+            )
+            revision = int(snapshot.get("revision", 0))
+            reference = snapshot.get("frame")
+            detections = snapshot.get("detections") or []
+            if revision > self._overlay_revision and reference is not None:
+                compensated = self._track_overlay_rows(
+                    reference,
+                    frame,
+                    detections,
+                )
+                self._overlay_rows = compensated or [
+                    dict(row) for row in detections
+                ]
+                self._overlay_revision = revision
+                self._overlay_updated_at = now
+                self._overlay_max_age = float(
+                    snapshot.get("max_age", 4.0)
+                )
+                self._overlay_gray = self._gray(frame)
+                received_new_snapshot = True
+        except Exception:
+            pass
+
+        if not self._overlay_rows and self._overlay_revision == 0:
+            try:
+                from app.ai.live_worker import live_anpr_detections
+                rows = live_anpr_detections(self.camera_id)
+                if rows:
+                    self._overlay_rows = [dict(row) for row in rows]
+                    self._overlay_updated_at = now
+                    self._overlay_gray = self._gray(frame)
+                    received_new_snapshot = True
+            except Exception:
+                pass
+
+        if now - self._overlay_updated_at > self._overlay_max_age:
+            self._overlay_rows = []
+            self._overlay_gray = self._gray(frame)
+            return []
+        if not received_new_snapshot and self._overlay_rows:
+            current_gray = self._gray(frame)
+            self._overlay_rows = self._track_overlay_rows(
+                self._overlay_gray,
+                current_gray,
+                self._overlay_rows,
+            )
+            self._overlay_gray = current_gray
+        return [dict(row) for row in self._overlay_rows]
+
     def _encode(self, frame):
         display = frame.copy()
         try:
-            from app.ai.live_worker import live_anpr_detections
-            for result in live_anpr_detections(self.camera_id):
+            for result in self._live_overlays(frame):
                 x1, y1, x2, y2 = result["bbox"]
                 color = (36, 220, 96) if result.get("valid") else (0, 190, 255)
                 cv2.rectangle(display, (x1, y1), (x2, y2), color, 3)

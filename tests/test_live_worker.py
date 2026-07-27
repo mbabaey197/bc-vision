@@ -1,8 +1,105 @@
 import time
+import sqlite3
 
 import numpy as np
 
 import app.ai.live_worker as live_worker
+
+
+def test_unreadable_vehicle_event_is_upgraded_without_duplicate(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "events.db"
+    with sqlite3.connect(db_path) as con:
+        con.executescript("""
+        CREATE TABLE plate_events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plate_text TEXT,
+            plate_norm TEXT,
+            confidence REAL,
+            camera_id INTEGER,
+            camera_name TEXT,
+            image_path TEXT,
+            plate_image_path TEXT,
+            detector_method TEXT,
+            ocr_confidence REAL,
+            vehicle_type TEXT,
+            vehicle_color TEXT,
+            vehicle_brand TEXT,
+            vehicle_confidence REAL,
+            direction TEXT,
+            quality_score REAL,
+            consensus_votes INTEGER,
+            source TEXT,
+            processing_ms REAL
+        );
+        """)
+
+    import app.database
+
+    def connect():
+        con = sqlite3.connect(db_path)
+        con.row_factory = sqlite3.Row
+        return con
+
+    monkeypatch.setattr(app.database, "connect", connect)
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    settings = {
+        "plate_path": str(tmp_path / "plates"),
+        "snapshot_path": str(tmp_path / "vehicles"),
+        "save_plate_images": "1",
+        "save_snapshots": "1",
+    }
+    monkeypatch.setattr(
+        worker,
+        "_setting",
+        lambda key, default="": settings.get(key, default),
+    )
+    frame = np.full((160, 260, 3), 175, dtype=np.uint8)
+    base = {
+        "plate": "ناخوانا",
+        "plate_norm": "",
+        "valid": False,
+        "confidence": 0.41,
+        "detector_confidence": 0.82,
+        "ocr_confidence": 0.0,
+        "quality_score": 0.76,
+        "bbox": (80, 95, 180, 125),
+        "crop": frame[95:125, 80:180].copy(),
+        "method": "test",
+        "consensus_votes": 0,
+    }
+    event_id = worker._persist(3, "Gate", frame, base, 25.0)
+    recognized = dict(base)
+    recognized.update({
+        "plate": "31-ط-556-74",
+        "plate_norm": "31ط55674",
+        "valid": True,
+        "confidence": 0.91,
+        "ocr_confidence": 0.90,
+        "consensus_votes": 3,
+    })
+    updated_id = worker._persist(
+        3,
+        "Gate",
+        frame,
+        recognized,
+        28.0,
+        event_id,
+    )
+    worker.shutdown()
+
+    with connect() as con:
+        rows = con.execute(
+            "SELECT * FROM plate_events ORDER BY id"
+        ).fetchall()
+    assert updated_id == event_id
+    assert len(rows) == 1
+    assert rows[0]["plate_norm"] == "31ط55674"
+    assert rows[0]["consensus_votes"] == 3
+    assert (tmp_path / "plates").is_dir()
+    assert (tmp_path / "vehicles").is_dir()
 
 
 def test_roi_and_translation():
@@ -113,11 +210,19 @@ def test_slow_cpu_keeps_three_observations_for_consensus(monkeypatch):
         lambda *_args, **_kwargs: [dict(result)],
     )
     persisted = []
-    monkeypatch.setattr(
-        worker,
-        "_persist",
-        lambda *_args: persisted.append(_args[3]),
-    )
+
+    def fake_persist(
+        _camera_id,
+        _camera_name,
+        _frame,
+        saved_result,
+        _processing_ms,
+        event_id=None,
+    ):
+        persisted.append((saved_result, event_id))
+        return event_id or 41
+
+    monkeypatch.setattr(worker, "_persist", fake_persist)
     clock = iter((0.0, 3.0, 3.0, 6.0, 6.0, 9.0))
     monkeypatch.setattr(
         live_worker.time,
@@ -133,8 +238,14 @@ def test_slow_cpu_keeps_three_observations_for_consensus(monkeypatch):
         )
     worker.shutdown()
 
-    assert len(persisted) == 1
-    assert persisted[0]["plate_norm"] == "12ب34567"
+    assert persisted[0][0]["capture_only"] is True
+    recognized = [
+        row for row, _event_id in persisted
+        if not row.get("capture_only")
+    ]
+    assert len(recognized) == 1
+    assert recognized[0]["plate_norm"] == "12ب34567"
+    assert persisted[-1][1] == 41
     assert state.tracker.max_age_seconds >= 11.0
 
 
@@ -172,6 +283,7 @@ def test_latest_detection_is_available_for_live_overlay(monkeypatch):
         "apply_learned_correction",
         lambda result: result,
     )
+    monkeypatch.setattr(worker, "_persist", lambda *_args: 1)
     state.busy = True
     worker._process(state, (4, "cam", frame, time.monotonic()))
     detections = worker.detections(4)
@@ -223,4 +335,49 @@ def test_submit_adaptively_spaces_slow_cpu_inference(monkeypatch):
     # EMA=2s yields a 0.9s minimum interval. Frames inside that interval are
     # skipped, then the newest eligible frame is submitted.
     assert len(submitted) == 2
+
+
+def test_every_received_frame_can_improve_pending_ocr_selection(
+    monkeypatch,
+):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState(
+        busy=True,
+        config={
+            "id": 12,
+            "enabled": 1,
+            "lpr_enabled": 1,
+            "frame_step": 999,
+        },
+        config_loaded_at=200.0,
+    )
+    worker._states[12] = state
+    monkeypatch.setattr(
+        worker,
+        "_config",
+        lambda _camera_id, current, _now: current.config,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_selection_score",
+        lambda frame, _config: float(frame[0, 0, 0]),
+    )
+    times = iter((200.0, 200.1, 200.2))
+    monkeypatch.setattr(
+        live_worker.time,
+        "monotonic",
+        lambda: next(times),
+    )
+
+    for value in (20, 200, 80):
+        worker.submit(
+            12,
+            "quality camera",
+            np.full((20, 40, 3), value, dtype=np.uint8),
+        )
+    selected = int(state.pending[2][0, 0, 0])
+    worker.shutdown()
+
+    assert state.frame_counter == 3
+    assert selected == 200
 # RC7 regression coverage for adaptive live-frame processing.

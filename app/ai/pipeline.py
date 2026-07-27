@@ -135,6 +135,7 @@ def add_vehicle_analysis(result: dict, frame) -> dict:
         "vehicle_brand": vehicle["vehicle_brand"],
         "vehicle_confidence": vehicle["vehicle_confidence"],
         "vehicle_bbox": vehicle["vehicle_bbox"],
+        "vehicle_crop": vehicle.get("vehicle_crop"),
     })
     return enriched
 
@@ -168,6 +169,11 @@ class _Track:
     observations: deque = field(default_factory=lambda: deque(maxlen=20))
     emitted_plate: str = ""
     emitted_at: float = 0.0
+    capture_event_emitted: bool = False
+    capture_event_score: float = -1.0
+    best_capture_score: float = -1.0
+    best_capture_result: dict | None = None
+    best_frame: object | None = None
 
 
 class PlateConsensusTracker:
@@ -180,6 +186,7 @@ class PlateConsensusTracker:
         emit_cooldown=4.0,
         min_position_ratio=0.60,
         min_position_margin=0.18,
+        emit_unreadable=False,
     ):
         # One or two frames are never enough for a definitive CCTV read.
         self.min_votes = max(3, int(min_votes))
@@ -187,8 +194,56 @@ class PlateConsensusTracker:
         self.emit_cooldown = max(0.0, float(emit_cooldown))
         self.min_position_ratio = min(0.95, max(0.50, float(min_position_ratio)))
         self.min_position_margin = min(0.90, max(0.05, float(min_position_margin)))
+        self.emit_unreadable = bool(emit_unreadable)
         self._tracks: dict[int, _Track] = {}
         self._next_track_id = 1
+
+    @staticmethod
+    def _capture_score(result: dict, frame) -> float:
+        quality = min(
+            1.0,
+            max(0.0, float(result.get("quality_score", 0.0))),
+        )
+        detector = min(
+            1.0,
+            max(0.0, float(result.get("detector_confidence", 0.0))),
+        )
+        x1, y1, x2, y2 = result["bbox"]
+        frame_area = max(1, int(frame.shape[0]) * int(frame.shape[1]))
+        plate_area = max(1, (x2 - x1) * (y2 - y1))
+        size_score = min(1.0, plate_area / max(1.0, frame_area * 0.018))
+        return round(0.60 * quality + 0.25 * detector + 0.15 * size_score, 5)
+
+    def _consider_capture(self, track: _Track, result: dict, frame) -> bool:
+        if frame is None or getattr(frame, "size", 0) == 0:
+            return False
+        score = self._capture_score(result, frame)
+        if score <= track.best_capture_score + 0.015:
+            return False
+        track.best_capture_score = score
+        track.best_capture_result = deepcopy(result)
+        track.best_frame = frame.copy()
+        return True
+
+    @staticmethod
+    def _capture_result(track: _Track, refresh=False) -> dict | None:
+        if track.best_capture_result is None or track.best_frame is None:
+            return None
+        result = deepcopy(track.best_capture_result)
+        result.update({
+            "plate": "ناخوانا",
+            "plate_norm": "",
+            "valid": False,
+            "ocr_confidence": 0.0,
+            "track_id": track.track_id,
+            "first_seen": track.first_seen,
+            "last_seen": track.last_seen,
+            "capture_only": True,
+            "capture_refresh": bool(refresh),
+            "capture_frame": track.best_frame.copy(),
+            "consensus_votes": 0,
+        })
+        return result
 
     def _match(self, result: dict, timestamp: float) -> _Track | None:
         best = None
@@ -353,9 +408,13 @@ class PlateConsensusTracker:
         result["first_seen"] = track.first_seen
         result["last_seen"] = track.last_seen
         result["direction"] = direction
+        if track.best_frame is not None:
+            result["capture_frame"] = track.best_frame.copy()
+        if track.best_capture_result is not None:
+            result["bbox"] = tuple(track.best_capture_result["bbox"])
         return result
 
-    def update(self, results, timestamp=None):
+    def update(self, results, timestamp=None, frame=None):
         timestamp = time.monotonic() if timestamp is None else float(timestamp)
         self._expire(timestamp)
         emitted = []
@@ -375,8 +434,25 @@ class PlateConsensusTracker:
             track.bbox = result["bbox"]
             track.last_seen = timestamp
             track.observations.append(deepcopy(result))
+            capture_improved = self._consider_capture(track, result, frame)
             consensus = self._consensus(track)
             if consensus is None:
+                if self.emit_unreadable and not track.capture_event_emitted:
+                    capture = self._capture_result(track)
+                    if capture is not None:
+                        track.capture_event_emitted = True
+                        track.capture_event_score = track.best_capture_score
+                        emitted.append(capture)
+                elif (
+                    self.emit_unreadable
+                    and capture_improved
+                    and track.best_capture_score
+                    > track.capture_event_score + 0.04
+                ):
+                    capture = self._capture_result(track, refresh=True)
+                    if capture is not None:
+                        track.capture_event_score = track.best_capture_score
+                        emitted.append(capture)
                 continue
 
             changed = consensus["plate_norm"] != track.emitted_plate
@@ -387,6 +463,9 @@ class PlateConsensusTracker:
                 emitted.append(consensus)
 
         return emitted
+
+    def active_track_ids(self) -> set[int]:
+        return set(self._tracks)
 
     def flush(self):
         rows = []
