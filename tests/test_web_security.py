@@ -262,6 +262,118 @@ def test_camera_video_upload_registers_live_source_without_batch_processing(
     assert calls["get"][0][1].startswith("video://")
 
 
+def test_uploaded_video_flows_through_worker_to_sqlite_and_dashboard(
+    tmp_path,
+    monkeypatch,
+):
+    import app.ai.live_worker as live_worker
+
+    _as_role(monkeypatch, "operator")
+    db_path = tmp_path / "end-to-end.db"
+    video_dir = tmp_path / "videos"
+    source_path = tmp_path / "traffic.avi"
+    writer = cv2.VideoWriter(
+        str(source_path),
+        cv2.VideoWriter_fourcc(*"MJPG"),
+        10.0,
+        (160, 90),
+    )
+    assert writer.isOpened()
+    for value in (30, 60, 90, 120):
+        writer.write(np.full((90, 160, 3), value, dtype=np.uint8))
+    writer.release()
+
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    database.init_db()
+    with database.connect() as con:
+        con.execute(
+            "UPDATE settings SET value=? WHERE key='plate_path'",
+            (str(tmp_path / "plates"),),
+        )
+        con.execute(
+            "UPDATE settings SET value=? WHERE key='snapshot_path'",
+            (str(tmp_path / "snapshots"),),
+        )
+        source_camera_id = con.execute(
+            "INSERT INTO cameras("
+            "name,rtsp_url,location,enabled,is_demo,lpr_enabled,"
+            "lpr_confidence,frame_step,duplicate_seconds"
+            ") VALUES(?,?,?,?,?,?,?,?,?)",
+            ("Gate", "rtsp://gate", "Gate", 1, 0, 1, 50, 1, 0),
+        ).lastrowid
+
+    monkeypatch.setattr(
+        main,
+        "_configured_storage_child",
+        lambda setting_key, default: video_dir,
+    )
+    frame_result = {
+        "plate": "12-ب-345-67",
+        "plate_norm": "12ب34567",
+        "valid": True,
+        "confidence": 0.90,
+        "detector_confidence": 0.90,
+        "ocr_confidence": 0.90,
+        "quality_score": 0.85,
+        "bbox": (30, 30, 130, 65),
+        "method": "end-to-end-test",
+    }
+
+    def detect(frame, *_args, **_kwargs):
+        result = dict(frame_result)
+        result["crop"] = frame[30:65, 30:130].copy()
+        return [result]
+
+    monkeypatch.setattr(live_worker, "process_frame", detect)
+    monkeypatch.setattr(
+        live_worker.worker,
+        "_models",
+        lambda: {
+            "ready": True,
+            "detector_ready": True,
+            "easyocr_ready": True,
+        },
+    )
+
+    virtual_id = None
+    try:
+        with TestClient(main.app) as client, source_path.open("rb") as source:
+            response = client.post(
+                "/cameras/video-upload",
+                data={"camera_id": str(source_camera_id)},
+                files={"video": ("traffic.avi", source, "video/x-msvideo")},
+                headers={"X-Requested-With": "XMLHttpRequest"},
+            )
+            assert response.status_code == 200
+            virtual_id = int(response.json()["camera_id"])
+
+            for _ in range(250):
+                with database.connect() as con:
+                    event = con.execute(
+                        "SELECT * FROM plate_events "
+                        "WHERE camera_id=? ORDER BY id DESC LIMIT 1",
+                        (virtual_id,),
+                    ).fetchone()
+                stream = main.manager.streams.get(virtual_id)
+                if event and stream and stream.latest:
+                    break
+                time.sleep(0.02)
+
+            dashboard = client.get("/dashboard")
+
+        assert event is not None
+        assert event["plate_norm"] == "12ب34567"
+        assert dashboard.status_code == 200
+        assert f"id='anpr-{virtual_id}'" in dashboard.text
+        assert "ویدئو: traffic" in dashboard.text
+        assert main.manager.streams[virtual_id].latest.startswith(b"\xff\xd8")
+    finally:
+        if virtual_id is not None:
+            main.manager.remove(virtual_id)
+            live_worker.stop_live_camera(virtual_id)
+
+
 def test_events_escape_stored_watchlist_html(tmp_path, monkeypatch):
     db_path = tmp_path / "security.db"
     monkeypatch.setattr(database, "DB_PATH", db_path)

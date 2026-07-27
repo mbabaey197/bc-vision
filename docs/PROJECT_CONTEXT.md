@@ -5,7 +5,7 @@
 - GitHub repository: `mahdibabaey197/bc-vision`
 - Default branch: `main`
 - Product: BC Vision
-- Current application version in source: `2.2.0-rc3`
+- Current application version in source: `2.2.0-rc6`
 - Windows persistent data root: `C:\ProgramData\BCVision\data`
 
 ## Release contract
@@ -162,6 +162,14 @@ identity probes use hidden child-process flags. Windows CI parses the built
 PE header and rejects any `BCVision.exe` that is not
 `IMAGE_SUBSYSTEM_WINDOWS_GUI`.
 
+Version `2.2.0-rc5` makes uploaded-video ANPR observable and independent of
+OpenCV codec coverage. CCTV exports fall back to bundled FFmpeg/PyAV decoding,
+camera cards show processed frames, detections, events, model readiness and
+errors, and the consensus window adapts to slower CPU processing. Verified
+detector and EasyOCR models are seeded inside the Windows package, then loaded
+and exercised offline from the installed executable both before and after the
+one-click update.
+
 New databases no longer receive an enabled synthetic demo camera. A one-time,
 exact-match migration removes only the historical built-in sample camera from
 existing databases while preserving real cameras, user-created demo cameras,
@@ -187,9 +195,27 @@ Before declaring a production release, perform these validations with real custo
 
 The current performance/accuracy work remains on the draft ANPR pull request
 until direct comparison ground truth is available. Windows packaging for
-`2.2.0-rc3` includes an isolated executable self-test plus installer/updater
+`2.2.0-rc5` includes an isolated executable self-test plus installer/updater
 data-preservation verification. A production release has not yet been
 declared.
+
+## Trial operator-feedback loop
+
+Version `2.2.0-rc6` adds an operator-confirmed correction loop without
+silently weakening plate validation. The dashboard renders canonical Iranian
+plates with Persian digits and a physical-plate layout, and allows an
+authorized operator to submit the correct full plate next to each recent
+event. The original observation, corrected canonical value, event, operator,
+vehicle snapshot and plate crop are retained in `anpr_feedback`. The displayed
+event is corrected immediately and an exact repeated OCR observation can reuse
+the confirmed mapping locally. Broader OCR/model changes require a reviewed
+offline training and validation run; feedback does not mutate model weights
+inside the live process.
+
+Live streams now draw a green box around valid plate candidates and an amber
+box around unreadable candidates. Dashboard video cards are capped at a
+smaller width, and the old system-status card beside recent plate events was
+removed; technical status remains available from Settings.
 
 ## Uploaded video live-source fix
 

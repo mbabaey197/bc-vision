@@ -20,6 +20,7 @@ from .pipeline import (
     process_frame,
 )
 from .plate_rules import normalize_plate
+from .feedback import apply_learned_correction
 
 
 @dataclass
@@ -40,7 +41,13 @@ class _CameraState:
     last_error: str = ""
     last_event_at: float = 0.0
     processed_frames: int = 0
+    detected_candidates: int = 0
     emitted_events: int = 0
+    last_processed_at: float = 0.0
+    last_processing_ms: float = 0.0
+    processing_seconds_ema: float = 0.0
+    latest_detections: list = field(default_factory=list)
+    latest_detections_at: float = 0.0
 
 
 class LiveANPRWorker:
@@ -52,6 +59,28 @@ class LiveANPRWorker:
         )
         self._lock = threading.RLock()
         self._stopped = False
+        self._model_state = {}
+        self._model_state_at = 0.0
+
+    def _models(self) -> dict:
+        now = time.monotonic()
+        if now - self._model_state_at >= 30.0:
+            try:
+                from .model_manager import model_status
+                self._model_state = model_status()
+            except Exception as exc:
+                self._model_state = {
+                    "detector_ready": False,
+                    "easyocr_ready": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            self._model_state_at = now
+        status = dict(self._model_state)
+        status["ready"] = bool(
+            status.get("detector_ready")
+            and status.get("easyocr_ready")
+        )
+        return status
 
     @staticmethod
     def _load_config(camera_id: int) -> dict | None:
@@ -293,21 +322,46 @@ class LiveANPRWorker:
                 ),
             )
             rows = [
-                self._translate(row, offset_x, offset_y)
+                apply_learned_correction(
+                    self._translate(row, offset_x, offset_y)
+                )
                 for row in process_frame(
                     source,
                     min_confidence * 0.45,
                 )
             ]
+            processing_seconds = time.perf_counter() - started
+            if state.processing_seconds_ema:
+                state.processing_seconds_ema = (
+                    state.processing_seconds_ema * 0.70
+                    + processing_seconds * 0.30
+                )
+            else:
+                state.processing_seconds_ema = processing_seconds
+            state.tracker.max_age_seconds = max(
+                2.4,
+                min(45.0, state.processing_seconds_ema * 3.5 + 1.0),
+            )
             state.processed_frames += 1
+            state.detected_candidates += len(rows)
+            state.latest_detections = [
+                {
+                    "bbox": tuple(row["bbox"]),
+                    "plate": row.get("plate", "ناخوانا"),
+                    "confidence": float(row.get("confidence", 0.0)),
+                    "valid": bool(row.get("valid")),
+                }
+                for row in rows
+            ]
+            state.latest_detections_at = time.time()
+            state.last_processed_at = time.time()
+            state.last_processing_ms = processing_seconds * 1000.0
             stable = state.tracker.update(rows, timestamp=timestamp)
             duplicate_seconds = max(
                 0.0,
                 float(config.get("duplicate_seconds", 30)),
             )
-            processing_ms = (
-                time.perf_counter() - started
-            ) * 1000.0
+            processing_ms = processing_seconds * 1000.0
             for result in stable:
                 if result["confidence"] < min_confidence:
                     continue
@@ -351,17 +405,43 @@ class LiveANPRWorker:
             if not state:
                 return {
                     "active": False,
+                    "received_frames": 0,
                     "processed_frames": 0,
+                    "detected_candidates": 0,
                     "emitted_events": 0,
                     "last_error": "",
+                    "models": self._models(),
                 }
             return {
                 "active": bool(state.busy or state.config),
+                "received_frames": state.frame_counter,
                 "processed_frames": state.processed_frames,
+                "detected_candidates": state.detected_candidates,
                 "emitted_events": state.emitted_events,
                 "last_event_at": state.last_event_at,
+                "last_processed_at": state.last_processed_at,
+                "last_processing_ms": round(
+                    state.last_processing_ms,
+                    1,
+                ),
+                "consensus_window_seconds": round(
+                    state.tracker.max_age_seconds,
+                    2,
+                ),
                 "last_error": state.last_error,
+                "models": self._models(),
             }
+
+    def detections(self, camera_id: int, max_age=2.5) -> list:
+        with self._lock:
+            state = self._states.get(int(camera_id))
+            if (
+                not state
+                or time.time() - state.latest_detections_at
+                > float(max_age)
+            ):
+                return []
+            return [dict(row) for row in state.latest_detections]
 
     def remove(self, camera_id: int):
         with self._lock:
@@ -384,6 +464,10 @@ def submit_live_frame(camera_id, camera_name, frame):
 
 def live_anpr_status(camera_id):
     return worker.status(camera_id)
+
+
+def live_anpr_detections(camera_id):
+    return worker.detections(camera_id)
 
 
 def stop_live_camera(camera_id):

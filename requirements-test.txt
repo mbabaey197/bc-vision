@@ -1,4 +1,5 @@
 # Minimal deterministic ANPR test environment (Python 3.13)
+av==18.0.0
 cryptography==49.0.0
 fastapi==0.140.0
 httpx==0.28.1
