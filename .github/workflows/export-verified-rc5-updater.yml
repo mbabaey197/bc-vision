@@ -1,0 +1,104 @@
+name: Export verified rc5 updater
+
+on:
+  push:
+    branches:
+      - "agent/anpr-video-processing-visible-rc5"
+    paths:
+      - ".github/workflows/export-verified-rc5-updater.yml"
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  export-updater:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download verified Windows candidate
+        run: |
+          gh run download 30276736514 \
+            --repo mahdibabaey197/bc-vision \
+            --name BCVision-2.2.0-rc5-windows \
+            --dir release
+
+      - name: Verify release and split updater
+        run: |
+          cd release
+          sha256sum --check SHA256SUMS.txt
+          python - <<'PY'
+          from hashlib import sha256
+          from pathlib import Path
+
+          source = next(Path('.').glob('BCVision_Update_v2.2.0-rc5.exe'))
+          chunk_size = 256 * 1024 * 1024
+          digest = sha256()
+          parts = []
+          with source.open('rb') as handle:
+              index = 1
+              while True:
+                  payload = handle.read(chunk_size)
+                  if not payload:
+                      break
+                  digest.update(payload)
+                  part = Path(f'updater.part{index:02d}')
+                  part.write_bytes(payload)
+                  parts.append((part.name, len(payload), sha256(payload).hexdigest()))
+                  index += 1
+          manifest = [
+              f'file={source.name}',
+              f'size={source.stat().st_size}',
+              f'sha256={digest.hexdigest()}',
+          ]
+          manifest.extend(f'part={name},{size},{part_hash}' for name, size, part_hash in parts)
+          Path('updater.manifest').write_text('\n'.join(manifest) + '\n', encoding='ascii')
+          print('\n'.join(manifest))
+          PY
+
+      - name: Upload manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: rc5-updater-manifest
+          path: release/updater.manifest
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload updater part 1
+        uses: actions/upload-artifact@v4
+        with:
+          name: rc5-updater-part01
+          path: release/updater.part01
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload updater part 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: rc5-updater-part02
+          path: release/updater.part02
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload updater part 3
+        uses: actions/upload-artifact@v4
+        with:
+          name: rc5-updater-part03
+          path: release/updater.part03
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload updater part 4
+        uses: actions/upload-artifact@v4
+        with:
+          name: rc5-updater-part04
+          path: release/updater.part04
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 7
