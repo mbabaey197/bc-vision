@@ -63,6 +63,12 @@ jobs:
         shell: cmd
         run: BUILD_PORTABLE_EXE.bat
 
+      - name: Verify windowless Windows service host
+        shell: pwsh
+        run: |
+          python scripts\verify_windows_gui_subsystem.py `
+            dist\BCVision\BCVision.exe
+
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --no-progress -y

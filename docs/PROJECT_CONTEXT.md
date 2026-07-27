@@ -5,7 +5,7 @@
 - GitHub repository: `mahdibabaey197/bc-vision`
 - Default branch: `main`
 - Product: BC Vision
-- Current application version in source: `2.2.0-rc2`
+- Current application version in source: `2.2.0-rc3`
 - Windows persistent data root: `C:\ProgramData\BCVision\data`
 
 ## Release contract
@@ -155,6 +155,13 @@ browser opens only after the BC Vision health endpoint verifies the service
 identity. A different application listening on port 8000 is rejected instead
 of being mistaken for BC Vision.
 
+Version `2.2.0-rc3` hardens every Windows launch path against service-console
+windows. Packaged runs hide any accidentally attached console as a runtime
+safeguard, source runs hand off to `pythonw.exe`, and PowerShell/WMIC hardware
+identity probes use hidden child-process flags. Windows CI parses the built
+PE header and rejects any `BCVision.exe` that is not
+`IMAGE_SUBSYSTEM_WINDOWS_GUI`.
+
 New databases no longer receive an enabled synthetic demo camera. A one-time,
 exact-match migration removes only the historical built-in sample camera from
 existing databases while preserving real cameras, user-created demo cameras,
@@ -180,7 +187,7 @@ Before declaring a production release, perform these validations with real custo
 
 The current performance/accuracy work remains on the draft ANPR pull request
 until direct comparison ground truth is available. Windows packaging for
-`2.2.0-rc2` includes an isolated executable self-test plus installer/updater
+`2.2.0-rc3` includes an isolated executable self-test plus installer/updater
 data-preservation verification. A production release has not yet been
 declared.
 

@@ -39,6 +39,27 @@ def log(message):
         )
 
 
+def hide_service_console() -> bool:
+    """Hide an accidentally attached Windows console for packaged runs."""
+    if sys.platform != "win32":
+        return False
+    if not (
+        getattr(sys, "frozen", False)
+        or os.environ.get("BCVISION_HIDE_CONSOLE", "0") == "1"
+    ):
+        return False
+    try:
+        import ctypes
+
+        console = ctypes.windll.kernel32.GetConsoleWindow()
+        if not console:
+            return False
+        ctypes.windll.user32.ShowWindow(console, 0)
+        return True
+    except Exception:
+        return False
+
+
 def port_open():
     try:
         with socket.create_connection(
@@ -239,6 +260,8 @@ def open_panel_when_ready():
 
 def main():
     try:
+        hide_service_console()
+
         threading.Thread(
             target=prepare_anpr_models,
             daemon=True,

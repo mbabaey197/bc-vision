@@ -4,6 +4,11 @@ from pathlib import Path
 import subprocess
 import sys
 
+from scripts.verify_windows_gui_subsystem import (
+    IMAGE_SUBSYSTEM_WINDOWS_GUI,
+    read_subsystem,
+)
+
 
 def test_launcher_self_test_uses_isolated_data_directory(tmp_path):
     output_path = tmp_path / "self-test.json"
@@ -61,3 +66,37 @@ def test_release_version_metadata_stays_consistent():
         ).read_text(encoding="utf-8")
         assert f'#define MyAppVersion "{version}"' in source
         assert f"OutputBaseFilename={prefix}{version}" in source
+
+
+def test_windows_build_and_source_launch_are_windowless():
+    root = Path(__file__).resolve().parents[1]
+    build = (root / "BUILD_PORTABLE_EXE.bat").read_text(
+        encoding="utf-8",
+    )
+    source_launcher = (root / "RUN_SOURCE.bat").read_text(
+        encoding="utf-8",
+    )
+
+    assert "--windowed" in build
+    assert "pythonw.exe" in source_launcher
+    assert 'start "" /B' in source_launcher
+    assert "python launcher.py" not in source_launcher
+
+
+def test_pe_subsystem_reader_accepts_gui_executable(tmp_path):
+    executable = tmp_path / "BCVision.exe"
+    image = bytearray(512)
+    image[:2] = b"MZ"
+    image[0x3C:0x40] = (0x80).to_bytes(4, "little")
+    image[0x80:0x84] = b"PE\0\0"
+    optional_header = 0x80 + 4 + 20
+    image[optional_header:optional_header + 2] = (0x20B).to_bytes(
+        2,
+        "little",
+    )
+    image[
+        optional_header + 68:optional_header + 70
+    ] = IMAGE_SUBSYSTEM_WINDOWS_GUI.to_bytes(2, "little")
+    executable.write_bytes(image)
+
+    assert read_subsystem(executable) == IMAGE_SUBSYSTEM_WINDOWS_GUI
