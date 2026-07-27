@@ -223,3 +223,4 @@ def test_submit_adaptively_spaces_slow_cpu_inference(monkeypatch):
     # EMA=2s yields a 0.9s minimum interval. Frames inside that interval are
     # skipped, then the newest eligible frame is submitted.
     assert len(submitted) == 2
+# RC7 regression coverage for adaptive live-frame processing.
