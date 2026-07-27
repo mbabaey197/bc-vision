@@ -88,6 +88,19 @@ def test_old_database_migrates_without_data_loss(
             "consensus_votes",
             "source",
         } <= columns
+        feedback_columns = {
+            row[1]
+            for row in con.execute(
+                "PRAGMA table_info(anpr_feedback)"
+            )
+        }
+        assert {
+            "event_id",
+            "observed_norm",
+            "corrected_norm",
+            "submitted_by",
+            "status",
+        } <= feedback_columns
         row = con.execute(
             "SELECT * FROM plate_events WHERE id=1"
         ).fetchone()

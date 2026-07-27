@@ -1,5 +1,7 @@
 name: Windows release candidate
 
+# Candidate builds run on each relevant agent-branch update.
+
 on:
   workflow_dispatch:
   push:

@@ -153,6 +153,21 @@ def init_db():
             notes TEXT DEFAULT '',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS anpr_feedback(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER NOT NULL,
+            observed_text TEXT NOT NULL,
+            observed_norm TEXT NOT NULL DEFAULT '',
+            corrected_text TEXT NOT NULL,
+            corrected_norm TEXT NOT NULL,
+            plate_image_path TEXT DEFAULT '',
+            image_path TEXT DEFAULT '',
+            submitted_by TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'confirmed',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(event_id) REFERENCES plate_events(id)
+                ON DELETE CASCADE
+        );
         """)
 
         _add_missing_columns(con, "users", {
@@ -197,6 +212,10 @@ def init_db():
             ON plate_events(plate_norm);
         CREATE INDEX IF NOT EXISTS idx_plate_events_camera_created
             ON plate_events(camera_id,created_at);
+        CREATE INDEX IF NOT EXISTS idx_anpr_feedback_observed
+            ON anpr_feedback(observed_norm,status);
+        CREATE INDEX IF NOT EXISTS idx_anpr_feedback_event
+            ON anpr_feedback(event_id);
         """)
 
         _add_missing_columns(con, "cameras", {

@@ -5,7 +5,7 @@
 - GitHub repository: `mahdibabaey197/bc-vision`
 - Default branch: `main`
 - Product: BC Vision
-- Current application version in source: `2.2.0-rc5`
+- Current application version in source: `2.2.0-rc6`
 - Windows persistent data root: `C:\ProgramData\BCVision\data`
 
 ## Release contract
@@ -198,6 +198,24 @@ until direct comparison ground truth is available. Windows packaging for
 `2.2.0-rc5` includes an isolated executable self-test plus installer/updater
 data-preservation verification. A production release has not yet been
 declared.
+
+## Trial operator-feedback loop
+
+Version `2.2.0-rc6` adds an operator-confirmed correction loop without
+silently weakening plate validation. The dashboard renders canonical Iranian
+plates with Persian digits and a physical-plate layout, and allows an
+authorized operator to submit the correct full plate next to each recent
+event. The original observation, corrected canonical value, event, operator,
+vehicle snapshot and plate crop are retained in `anpr_feedback`. The displayed
+event is corrected immediately and an exact repeated OCR observation can reuse
+the confirmed mapping locally. Broader OCR/model changes require a reviewed
+offline training and validation run; feedback does not mutate model weights
+inside the live process.
+
+Live streams now draw a green box around valid plate candidates and an amber
+box around unreadable candidates. Dashboard video cards are capped at a
+smaller width, and the old system-status card beside recent plate events was
+removed; technical status remains available from Settings.
 
 ## Uploaded video live-source fix
 
