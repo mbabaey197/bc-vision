@@ -210,7 +210,7 @@ def test_verified_model_uses_only_plate_class():
     assert _plate_class_ids(model) == [30]
 
 
-def test_successful_empty_yolo_result_does_not_run_fallback(
+def test_successful_empty_yolo_result_uses_geometry_fallback(
     monkeypatch,
 ):
     class Model:
@@ -224,12 +224,16 @@ def test_successful_empty_yolo_result_does_not_run_fallback(
         "app.ai.detector.load_model",
         lambda: Model(),
     )
+    candidate = {
+        "crop": np.zeros((20, 80, 3), dtype=np.uint8),
+        "bbox": (10, 10, 90, 30),
+        "confidence": 0.6,
+        "method": "opencv",
+    }
     monkeypatch.setattr(
         "app.ai.detector._opencv_candidates",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("fallback should not run")
-        ),
+        lambda *_args, **_kwargs: [candidate],
     )
 
     frame = np.zeros((180, 320, 3), dtype=np.uint8)
-    assert detect_plates(frame) == []
+    assert detect_plates(frame) == [candidate]
