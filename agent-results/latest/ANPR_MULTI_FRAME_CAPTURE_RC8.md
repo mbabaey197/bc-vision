@@ -17,6 +17,9 @@ Version: `2.2.0-rc8`
 - Added vehicle and plate thumbnails beside the recognized value in the
   dashboard's live recent-events report.
 - Applied the same one-event upgrade behavior to offline video processing.
+- Repaired the two pre-existing ANPR validation workflows by moving
+  `runner.temp` model paths from unsupported job-level expressions to the AI
+  test steps where the runner context is available.
 
 ## Safety and compatibility
 
