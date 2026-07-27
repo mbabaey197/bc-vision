@@ -5,7 +5,7 @@
 - GitHub repository: `mahdibabaey197/bc-vision`
 - Default branch: `main`
 - Product: BC Vision
-- Current application version in source: `2.2.0-rc7`
+- Current application version in source: `2.2.0-rc8`
 - Windows persistent data root: `C:\ProgramData\BCVision\data`
 
 ## Release contract
@@ -227,6 +227,28 @@ the recent-event report within about one second of a committed event, and
 adaptively spaces expensive inference on slower CPUs while retaining the
 newest selected frame. Plate consensus and unreadable-result safeguards remain
 unchanged.
+
+## RC8 multi-frame capture and overlay tracking
+
+Version `2.2.0-rc8` uses every received display frame for lightweight optical
+tracking and clear-frame selection while retaining RC7's adaptive limit on
+expensive detector/OCR inference. A new detector result is motion-compensated
+from its source frame to the current live frame, then the plate box advances
+with optical flow on every displayed frame. When tracking evidence is lost,
+the box is removed instead of being left behind at a stale position.
+
+Every detector observation can replace the pending inference frame when it is
+clearer, even when a camera's historical `frame_step` is greater than one.
+The expensive shared detector remains serialized and rate-limited, so this
+improves multi-frame evidence without restoring continuous high CPU usage.
+
+A physical plate detection now creates one event with a cropped plate image
+and a clear cropped vehicle image even when OCR is unreadable. The event keeps
+an empty canonical `plate_norm` and the visible value `ناخوانا`; it is never
+guessed. If later observations produce valid per-character consensus, the
+same database row and image paths are upgraded rather than inserting a
+duplicate event. The dashboard recent-events table shows the vehicle image
+and plate crop directly beside the recognized plate value.
 
 ## Uploaded video live-source fix
 
