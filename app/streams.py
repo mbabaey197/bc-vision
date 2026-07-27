@@ -102,10 +102,10 @@ class CameraStream:
         except Exception:
             pass
         if self.width and frame.shape[1] > self.width:
-            scale = self.width / frame.shape[1]
+            scale = self.width / display.shape[1]
             display = cv2.resize(
-                frame,
-                (self.width, int(frame.shape[0] * scale)),
+                display,
+                (self.width, int(display.shape[0] * scale)),
             )
         ok, buffer = cv2.imencode(
             ".jpg",
