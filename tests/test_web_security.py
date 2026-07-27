@@ -356,14 +356,26 @@ def test_uploaded_video_flows_through_worker_to_sqlite_and_dashboard(
                         (virtual_id,),
                     ).fetchone()
                 stream = main.manager.streams.get(virtual_id)
-                if event and stream and stream.latest:
+                if (
+                    event
+                    and event["plate_norm"] == "12ب34567"
+                    and stream
+                    and stream.latest
+                ):
                     break
                 time.sleep(0.02)
 
             dashboard = client.get("/dashboard")
 
-        assert event is not None
-        assert event["plate_norm"] == "12ب34567"
+            assert event is not None
+            assert event["plate_norm"] == "12ب34567"
+            with database.connect() as con:
+                count = con.execute(
+                    "SELECT COUNT(*) FROM plate_events WHERE camera_id=?",
+                    (virtual_id,),
+                ).fetchone()[0]
+            assert count == 1
+            assert "تصویر پلاک / پلاک خوانده‌شده" in dashboard.text
         assert dashboard.status_code == 200
         assert f"id='anpr-{virtual_id}'" in dashboard.text
         assert "ویدئو: traffic" in dashboard.text
