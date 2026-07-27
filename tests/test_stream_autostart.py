@@ -1,5 +1,11 @@
 import sqlite3
 
+import cv2
+import numpy as np
+
+import app.ai.live_worker
+import app.streams
+from app.streams import CameraStream
 from app.streams import StreamManager
 
 
@@ -84,3 +90,38 @@ def test_stop_all_stops_every_stream():
     assert first.stopped
     assert second.stopped
     assert manager.streams == {}
+
+
+def test_live_overlay_survives_stream_resize(monkeypatch):
+    stream = CameraStream(
+        camera_id=7,
+        url="demo://camera",
+        name="Gate",
+        width=160,
+        fps=5,
+        quality=70,
+    )
+    monkeypatch.setattr(
+        app.ai.live_worker,
+        "live_anpr_detections",
+        lambda _camera_id: [{
+            "bbox": (80, 60, 240, 140),
+            "plate": "12-ب-345-67",
+            "confidence": 0.92,
+            "valid": True,
+        }],
+    )
+    encoded = {}
+
+    def fake_imencode(_suffix, image, _params):
+        encoded["image"] = image.copy()
+        return True, np.array([1, 2, 3], dtype=np.uint8)
+
+    monkeypatch.setattr(app.streams.cv2, "imencode", fake_imencode)
+    frame = np.zeros((200, 320, 3), dtype=np.uint8)
+
+    assert stream._encode(frame) == b"\x01\x02\x03"
+    display = encoded["image"]
+    assert display.shape[:2] == (100, 160)
+    # The green rectangle drawn before resize must still be visible.
+    assert int(display[:, :, 1].max()) > 150

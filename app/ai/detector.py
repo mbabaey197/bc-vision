@@ -621,10 +621,23 @@ def detect_plates(frame, min_confidence: float = 0.25, max_results: int = 8):
                     if plate_class_ids == [IRANIAN_PLATE_CLASS_ID]:
                         _recognize_plate_crops(model, found)
                     return found
-                # A successful zero-result YOLO inference means no plate was
-                # present at this threshold. Fallback is reserved for a
-                # genuinely unavailable or failed model.
-                return []
+                # A detector miss is not proof that no plate exists. Iranian
+                # CCTV plates that are small, oblique or overexposed can be
+                # recovered by the geometry fallback. The live worker applies
+                # an adaptive rate limit so this second pass cannot saturate
+                # a slow CPU continuously.
+                fallback = _opencv_candidates(
+                    frame,
+                    max_results=min(max_results, 3),
+                )
+                return [
+                    row
+                    for row in fallback
+                    if row["confidence"] >= min(
+                        0.45,
+                        max(0.08, float(min_confidence) * 0.65),
+                    )
+                ][:max_results]
             except Exception as exc:
                 global _model_error
                 _model_error = f"{type(exc).__name__}: {exc}"
