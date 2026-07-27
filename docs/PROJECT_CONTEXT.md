@@ -5,7 +5,7 @@
 - GitHub repository: `mahdibabaey197/bc-vision`
 - Default branch: `main`
 - Product: BC Vision
-- Current application version in source: `2.2.0-rc6`
+- Current application version in source: `2.2.0-rc7`
 - Windows persistent data root: `C:\ProgramData\BCVision\data`
 
 ## Release contract
@@ -56,8 +56,10 @@ before event persistence.
 
 The CPU-oriented defaults are 640px for plate localization, 416px for
 character recognition, no test-time augmentation, and at most four plate
-candidates per processed frame. A successful zero-result model inference does
-not trigger the expensive OpenCV fallback.
+candidates per processed frame. A successful zero-result model inference
+triggers the geometry fallback for difficult small, oblique or overexposed
+plates. The live worker rate-limits this second pass adaptively from measured
+processing latency so it does not run continuously on a slow CPU.
 
 The model loader reapplies a six-thread maximum CPU budget after Ultralytics
 model construction, because Ultralytics can otherwise reset Torch to use
@@ -216,6 +218,15 @@ Live streams now draw a green box around valid plate candidates and an amber
 box around unreadable candidates. Dashboard video cards are capped at a
 smaller width, and the old system-status card beside recent plate events was
 removed; technical status remains available from Settings.
+
+## RC7 live reliability
+
+Version `2.2.0-rc7` preserves live overlays when the dashboard stream is
+resized, tries the geometry detector after a zero-result YOLO pass, refreshes
+the recent-event report within about one second of a committed event, and
+adaptively spaces expensive inference on slower CPUs while retaining the
+newest selected frame. Plate consensus and unreadable-result safeguards remain
+unchanged.
 
 ## Uploaded video live-source fix
 
