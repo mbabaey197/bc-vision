@@ -2,6 +2,8 @@ import cv2
 import numpy as np
 
 from app.ai.detector import (
+    _configure_cpu_threads,
+    _cpu_thread_limit,
     _iou,
     _nms,
     _plate_class_ids,
@@ -73,6 +75,31 @@ def test_nms_removes_overlaps():
 def test_status_is_safe():
     status = detector_status()
     assert "model_exists" in status
+
+
+def test_cpu_thread_limit_is_clamped(monkeypatch):
+    monkeypatch.setenv("BCVISION_CPU_THREADS", "0")
+    assert _cpu_thread_limit() == 1
+    monkeypatch.setenv("BCVISION_CPU_THREADS", "99")
+    assert _cpu_thread_limit() == 8
+
+
+def test_cpu_thread_limit_is_applied(monkeypatch):
+    applied = []
+    monkeypatch.setenv("BCVISION_CPU_THREADS", "3")
+    monkeypatch.setattr(
+        "app.ai.detector.cv2.setNumThreads",
+        lambda value: applied.append(("opencv", value)),
+    )
+
+    class Torch:
+        @staticmethod
+        def set_num_threads(value):
+            applied.append(("torch", value))
+
+    monkeypatch.setitem(__import__("sys").modules, "torch", Torch())
+    assert _configure_cpu_threads() == 3
+    assert applied == [("opencv", 3), ("torch", 3)]
 
 
 def _characters(text, confidences):

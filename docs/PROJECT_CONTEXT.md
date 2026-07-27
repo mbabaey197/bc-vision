@@ -57,6 +57,12 @@ character recognition, no test-time augmentation, and at most four plate
 candidates per processed frame. A successful zero-result model inference does
 not trigger the expensive OpenCV fallback.
 
+The model loader reapplies a six-thread maximum CPU budget after Ultralytics
+model construction, because Ultralytics can otherwise reset Torch to use
+nearly all logical processors. At least one logical processor is left
+available on smaller systems. Deployments can override this with
+`BCVISION_CPU_THREADS=1..8`.
+
 ## Important commits
 
 - Iranian plate rules: `16f0a5354125ff90c9d45b253852e5dc56b239dc`

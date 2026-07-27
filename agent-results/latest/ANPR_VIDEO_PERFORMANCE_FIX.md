@@ -37,9 +37,31 @@ Status: implementation in progress on `agent/anpr-fast-accurate-video`
 - Full source regression suite: 33 passed, 1 skipped.
 - Compile-all and whitespace validation: passed.
 
+## Clean full-video verification
+
+The complete 546-frame, 68.25-second, 1920x1080 four-camera reference video
+was processed from a clean runtime with the verified 119,237,050-byte model
+(`SHA-256 258104262D3A16A6BC613938CC1DD0198DA8A7DDEAB4843197666CB9CE0DB756`).
+
+- 109 frames were selected with `frame_step=5`.
+- The unbounded runtime completed in 63.614 seconds while using about 7.76 CPU
+  cores and emitted 29 stable plate events.
+- A four-thread limit preserved all 29 events and reduced CPU use to about
+  4.01 cores, but required 89.814 seconds.
+- A six-thread limit preserved all 29 events, completed in 69.638 seconds,
+  used about 5.92 CPU cores, and peaked at about 1.32 GB RSS.
+- The six-thread result is the selected default because it reduces CPU use by
+  about 24 percent while remaining within about 1.4 seconds of the video
+  duration on this CPU-only test host.
+- Ultralytics resets its Torch thread pool during model construction, so the
+  loader now reapplies the CPU budget after construction.
+
+The video is a four-camera mosaic with many vehicles, so the three previously
+listed plate strings are not a complete ground-truth set. Exact character
+accuracy remains pending a direct export from the comparison ANPR product;
+BC Vision does not replace or guess disputed characters.
+
 ## Pending before merge
 
-- Clean full-video run after unrelated stale benchmark processes leave the
-  constrained test sandbox.
-- Exact comparison with the plate strings reported by the other ANPR product.
+- Exact comparison with a direct plate export from the other ANPR product.
 - Windows AI runner result for the final commit.

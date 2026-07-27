@@ -56,6 +56,35 @@ IRANIAN_CHARACTER_MAP = {
 IRANIAN_PLATE_CLASS_ID = 30
 
 
+def _cpu_thread_limit() -> int:
+    default = min(6, max(1, (os.cpu_count() or 1) - 1))
+    try:
+        configured = int(
+            os.environ.get(
+                "BCVISION_CPU_THREADS",
+                str(default),
+            )
+        )
+    except (TypeError, ValueError):
+        configured = default
+    return max(1, min(8, configured))
+
+
+def _configure_cpu_threads() -> int:
+    limit = _cpu_thread_limit()
+    try:
+        cv2.setNumThreads(limit)
+    except Exception:
+        pass
+    try:
+        import torch
+
+        torch.set_num_threads(limit)
+    except Exception:
+        pass
+    return limit
+
+
 def _model_paths() -> list[Path]:
     paths: list[Path] = []
     configured = os.environ.get("BCVISION_PLATE_MODEL", "").strip()
@@ -99,6 +128,7 @@ def detector_status() -> dict:
 
 def load_model():
     global _model, _model_key, _model_error
+    _configure_cpu_threads()
     model_path = next((path for path in _model_paths() if path.is_file()), None)
     key = str(model_path.resolve()) if model_path else ""
     if _model is not None and _model_key == key:
@@ -107,6 +137,10 @@ def load_model():
         return None
     try:
         _model = YOLO(str(model_path))
+        # Ultralytics may reset Torch's global thread pool while importing or
+        # constructing the model. Apply the operator-selected CPU budget again
+        # after construction so the limit is effective during inference.
+        _configure_cpu_threads()
         _model_key = key
         _model_error = ""
     except Exception as exc:

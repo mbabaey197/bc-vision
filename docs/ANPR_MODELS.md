@@ -50,12 +50,17 @@ BCVISION_MODEL_SOURCE_DIR
 BCVISION_EASYOCR_SOURCE_DIR
 BCVISION_DETECTOR_IMAGE_SIZE
 BCVISION_CHARACTER_IMAGE_SIZE
+BCVISION_CPU_THREADS
 ```
 
 Default inference sizes are `640` for full-frame plate localization and `416`
 for the cropped character pass. These defaults were selected from the real
 1920×1080 reference video to reduce CPU time while retaining plate detections.
 The character crops are processed sequentially to bound peak RAM.
+CPU inference uses at most six worker threads by default and leaves at least
+one logical processor available to the application and operating system. Set
+`BCVISION_CPU_THREADS` from `1` through `8` to tune the budget for the
+deployment machine.
 
 ## Operational limitation
 
