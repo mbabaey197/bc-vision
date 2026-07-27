@@ -3,7 +3,7 @@
 Date: 2026-07-27
 Branch: `agent/anpr-video-processing-visible-rc5`
 Version: `2.2.0-rc5`
-Status: implemented and locally validated; Windows candidate build pending
+Status: published in draft PR #11; Windows candidate build pending
 
 ## Root causes corrected
 
