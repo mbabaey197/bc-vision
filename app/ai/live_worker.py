@@ -35,9 +35,11 @@ class _CameraState:
             min_votes=2,
             max_age_seconds=2.2,
             emit_cooldown=5.0,
+            emit_unreadable=True,
         )
     )
     seen: dict[str, float] = field(default_factory=dict)
+    track_event_ids: dict[int, int] = field(default_factory=dict)
     last_error: str = ""
     last_event_at: float = 0.0
     processed_frames: int = 0
@@ -48,6 +50,8 @@ class _CameraState:
     processing_seconds_ema: float = 0.0
     latest_detections: list = field(default_factory=list)
     latest_detections_at: float = 0.0
+    latest_detection_frame: object | None = None
+    detection_revision: int = 0
     last_submitted_at: float = 0.0
 
 
@@ -163,6 +167,7 @@ class LiveANPRWorker:
         frame,
         result: dict,
         processing_ms: float,
+        event_id: int | None = None,
     ):
         from app.database import connect
         from app.config import PLATE_DIR, SNAPSHOT_DIR
@@ -178,6 +183,19 @@ class LiveANPRWorker:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         plate_path = ""
         image_path = ""
+        with connect() as con:
+            existing = (
+                con.execute(
+                    "SELECT image_path,plate_image_path "
+                    "FROM plate_events WHERE id=?",
+                    (int(event_id),),
+                ).fetchone()
+                if event_id
+                else None
+            )
+        if existing:
+            plate_path = existing["plate_image_path"] or ""
+            image_path = existing["image_path"] or ""
         crop = result.get("crop")
 
         if (
@@ -185,7 +203,11 @@ class LiveANPRWorker:
             and crop is not None
             and getattr(crop, "size", 0)
         ):
-            target = plate_dir / f"plate-live-{stamp}.jpg"
+            target = (
+                Path(plate_path)
+                if plate_path
+                else plate_dir / f"plate-live-{stamp}.jpg"
+            )
             if cv2.imwrite(
                 str(target),
                 crop,
@@ -194,8 +216,20 @@ class LiveANPRWorker:
                 plate_path = str(target)
 
         if self._setting("save_snapshots", "1") == "1":
-            annotated = frame.copy()
+            vehicle = result.get("vehicle_crop")
+            using_vehicle_crop = bool(
+                vehicle is not None and getattr(vehicle, "size", 0)
+            )
+            annotated = (
+                vehicle.copy()
+                if using_vehicle_crop
+                else frame.copy()
+            )
             x1, y1, x2, y2 = result["bbox"]
+            if result.get("vehicle_bbox") and using_vehicle_crop:
+                vx1, vy1, _, _ = result["vehicle_bbox"]
+                x1, x2 = x1 - vx1, x2 - vx1
+                y1, y2 = y1 - vy1, y2 - vy1
             cv2.rectangle(
                 annotated,
                 (x1, y1),
@@ -203,7 +237,11 @@ class LiveANPRWorker:
                 (0, 255, 0),
                 2,
             )
-            target = snapshot_dir / f"vehicle-live-{stamp}.jpg"
+            target = (
+                Path(image_path)
+                if image_path
+                else snapshot_dir / f"vehicle-live-{stamp}.jpg"
+            )
             if cv2.imwrite(
                 str(target),
                 annotated,
@@ -212,9 +250,13 @@ class LiveANPRWorker:
                 image_path = str(target)
 
         values = {
-            "plate_text": result["plate"],
-            "plate_norm": result.get("plate_norm")
-            or normalize_plate(result["plate"]),
+            "plate_text": result.get("plate") or "ناخوانا",
+            "plate_norm": (
+                result.get("plate_norm")
+                or normalize_plate(result.get("plate"))
+                if result.get("valid")
+                else ""
+            ),
             "confidence": float(result["confidence"]),
             "camera_id": camera_id,
             "camera_name": camera_name,
@@ -259,12 +301,40 @@ class LiveANPRWorker:
                 ).fetchall()
             }
             selected = [key for key in values if key in columns]
+            if existing and event_id:
+                assignments = ",".join(f"{key}=?" for key in selected)
+                con.execute(
+                    f"UPDATE plate_events SET {assignments} WHERE id=?",
+                    tuple(values[key] for key in selected) + (int(event_id),),
+                )
+                return int(event_id)
             placeholders = ",".join("?" for _ in selected)
-            con.execute(
+            cursor = con.execute(
                 f"INSERT INTO plate_events({','.join(selected)}) "
                 f"VALUES({placeholders})",
                 tuple(values[key] for key in selected),
             )
+            return int(cursor.lastrowid)
+
+    @staticmethod
+    def _selection_score(frame, config) -> float:
+        source, _, _ = LiveANPRWorker._roi_frame(frame, config)
+        height, width = source.shape[:2]
+        if width > 320:
+            scale = 320.0 / width
+            source = cv2.resize(
+                source,
+                (320, max(1, int(height * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
+        brightness = float(gray.mean())
+        exposure = max(0.0, 1.0 - abs(brightness - 135.0) / 135.0)
+        sharpness = min(
+            1.0,
+            float(cv2.Laplacian(gray, cv2.CV_64F).var()) / 420.0,
+        )
+        return round(0.72 * sharpness + 0.28 * exposure, 5)
 
     def submit(self, camera_id: int, camera_name: str, frame):
         if (
@@ -291,8 +361,31 @@ class LiveANPRWorker:
                 or not int(config.get("lpr_enabled", 0))
             ):
                 return
-            frame_step = max(1, int(config.get("frame_step", 5)))
-            if state.frame_counter % frame_step:
+            selection_score = self._selection_score(frame, config)
+            payload = (
+                int(camera_id),
+                str(camera_name),
+                frame.copy(),
+                now,
+                selection_score,
+            )
+            if state.busy:
+                pending_score = (
+                    float(state.pending[4])
+                    if state.pending is not None and len(state.pending) > 4
+                    else -1.0
+                )
+                pending_at = (
+                    float(state.pending[3])
+                    if state.pending is not None
+                    else -1e12
+                )
+                if (
+                    state.pending is None
+                    or selection_score >= pending_score
+                    or now - pending_at >= 0.35
+                ):
+                    state.pending = payload
                 return
             # Do not let a slow CPU run ANPR continuously with no breathing
             # room. Keep the newest frame and cap inference frequency
@@ -308,20 +401,11 @@ class LiveANPRWorker:
             if now - state.last_submitted_at < minimum_interval:
                 return
             state.last_submitted_at = now
-            payload = (
-                int(camera_id),
-                str(camera_name),
-                frame.copy(),
-                now,
-            )
-            if state.busy:
-                state.pending = payload
-                return
             state.busy = True
         self._executor.submit(self._process, state, payload)
 
     def _process(self, state: _CameraState, payload):
-        camera_id, camera_name, frame, timestamp = payload
+        camera_id, camera_name, frame, timestamp = payload[:4]
         started = time.perf_counter()
         try:
             config = state.config or {}
@@ -359,25 +443,55 @@ class LiveANPRWorker:
             )
             state.processed_frames += 1
             state.detected_candidates += len(rows)
-            state.latest_detections = [
-                {
-                    "bbox": tuple(row["bbox"]),
-                    "plate": row.get("plate", "ناخوانا"),
-                    "confidence": float(row.get("confidence", 0.0)),
-                    "valid": bool(row.get("valid")),
-                }
-                for row in rows
-            ]
-            state.latest_detections_at = time.time()
+            if rows:
+                state.latest_detections = [
+                    {
+                        "bbox": tuple(row["bbox"]),
+                        "plate": row.get("plate", "ناخوانا"),
+                        "confidence": float(row.get("confidence", 0.0)),
+                        "valid": bool(row.get("valid")),
+                    }
+                    for row in rows
+                ]
+                state.latest_detection_frame = frame.copy()
+                state.latest_detections_at = time.time()
+                state.detection_revision += 1
             state.last_processed_at = time.time()
             state.last_processing_ms = processing_seconds * 1000.0
-            stable = state.tracker.update(rows, timestamp=timestamp)
+            stable = state.tracker.update(
+                rows,
+                timestamp=timestamp,
+                frame=frame,
+            )
             duplicate_seconds = max(
                 0.0,
                 float(config.get("duplicate_seconds", 30)),
             )
             processing_ms = processing_seconds * 1000.0
             for result in stable:
+                track_id = int(result.get("track_id") or 0)
+                event_id = state.track_event_ids.get(track_id)
+                capture_frame = result.pop("capture_frame", None)
+                persistence_frame = (
+                    capture_frame
+                    if capture_frame is not None
+                    and getattr(capture_frame, "size", 0)
+                    else frame
+                )
+                if result.get("capture_only"):
+                    saved_id = self._persist(
+                        camera_id,
+                        camera_name,
+                        persistence_frame,
+                        result,
+                        processing_ms,
+                        event_id,
+                    )
+                    state.track_event_ids[track_id] = saved_id
+                    if event_id is None:
+                        state.emitted_events += 1
+                        state.last_event_at = time.time()
+                    continue
                 if result["confidence"] < min_confidence:
                     continue
                 key = result.get("plate_norm") or normalize_plate(
@@ -386,18 +500,30 @@ class LiveANPRWorker:
                 if not key:
                     continue
                 previous = state.seen.get(key, -1e12)
-                if timestamp - previous < duplicate_seconds:
+                if (
+                    event_id is None
+                    and timestamp - previous < duplicate_seconds
+                ):
                     continue
                 state.seen[key] = timestamp
-                self._persist(
+                saved_id = self._persist(
                     camera_id,
                     camera_name,
-                    frame,
+                    persistence_frame,
                     result,
                     processing_ms,
+                    event_id,
                 )
-                state.emitted_events += 1
+                state.track_event_ids[track_id] = saved_id
+                if event_id is None:
+                    state.emitted_events += 1
                 state.last_event_at = time.time()
+            active_tracks = state.tracker.active_track_ids()
+            state.track_event_ids = {
+                track_id: event_id
+                for track_id, event_id in state.track_event_ids.items()
+                if track_id in active_tracks
+            }
             state.last_error = ""
         except Exception as exc:
             state.last_error = f"{type(exc).__name__}: {exc}"
@@ -458,6 +584,41 @@ class LiveANPRWorker:
                 return []
             return [dict(row) for row in state.latest_detections]
 
+    def detection_snapshot(
+        self,
+        camera_id: int,
+        after_revision=0,
+        max_age=8.0,
+    ) -> dict:
+        with self._lock:
+            state = self._states.get(int(camera_id))
+            if not state:
+                return {"revision": 0, "detections": [], "frame": None}
+            if (
+                state.detection_revision <= int(after_revision)
+                or time.time() - state.latest_detections_at > float(max_age)
+            ):
+                return {
+                    "revision": state.detection_revision,
+                    "detections": [],
+                    "frame": None,
+                }
+            return {
+                "revision": state.detection_revision,
+                "detections": [
+                    dict(row) for row in state.latest_detections
+                ],
+                "frame": (
+                    state.latest_detection_frame.copy()
+                    if state.latest_detection_frame is not None
+                    else None
+                ),
+                "max_age": max(
+                    3.0,
+                    min(10.0, state.processing_seconds_ema * 2.2 + 2.0),
+                ),
+            }
+
     def remove(self, camera_id: int):
         with self._lock:
             self._states.pop(int(camera_id), None)
@@ -483,6 +644,10 @@ def live_anpr_status(camera_id):
 
 def live_anpr_detections(camera_id):
     return worker.detections(camera_id)
+
+
+def live_anpr_detection_snapshot(camera_id, after_revision=0):
+    return worker.detection_snapshot(camera_id, after_revision)
 
 
 def stop_live_camera(camera_id):
