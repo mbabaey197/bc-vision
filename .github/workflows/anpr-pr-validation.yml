@@ -52,8 +52,6 @@ jobs:
     timeout-minutes: 45
     env:
       BCVISION_RUN_AI_INTEGRATION: "1"
-      BCVISION_PLATE_MODEL: ${{ runner.temp }}\bcvision-models\plate\best.pt
-      BCVISION_EASYOCR_MODEL_DIR: ${{ runner.temp }}\bcvision-models\easyocr
       BCVISION_EASYOCR_DOWNLOAD: "0"
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
@@ -76,6 +74,9 @@ jobs:
           python -m pip check
       - name: Verify real engines and models
         shell: pwsh
+        env:
+          BCVISION_PLATE_MODEL: ${{ runner.temp }}\bcvision-models\plate\best.pt
+          BCVISION_EASYOCR_MODEL_DIR: ${{ runner.temp }}\bcvision-models\easyocr
         run: |
           python -m compileall -q app/ai
           python -m pytest -q tests/test_ai_runtime.py
