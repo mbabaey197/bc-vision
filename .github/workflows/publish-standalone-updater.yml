@@ -1,0 +1,57 @@
+name: Publish standalone updater
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful Windows release-candidate run ID
+        required: true
+        type: string
+      version:
+        description: BC Vision version, for example 2.2.0-rc7
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  extract-updater:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Download verified release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: BCVision-${{ inputs.version }}-windows
+          path: bundle
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Select updater and write checksum
+        id: updater
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="BCVision_Update_v${RELEASE_VERSION}.exe"
+          source_file="$(find bundle -type f -name "$expected" -print -quit)"
+          if [[ -z "$source_file" ]]; then
+            echo "Verified updater was not found: $expected" >&2
+            exit 1
+          fi
+          mkdir -p standalone-updater
+          cp "$source_file" "standalone-updater/$expected"
+          (cd standalone-updater && sha256sum "$expected" > "$expected.sha256")
+
+      - name: Upload standalone verified updater
+        uses: actions/upload-artifact@v4
+        with:
+          name: BCVision-${{ inputs.version }}-updater
+          path: standalone-updater/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
