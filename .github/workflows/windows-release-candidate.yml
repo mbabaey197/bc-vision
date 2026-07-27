@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - agent/anpr-fast-accurate-video
+      - "agent/**"
     paths:
       - "app/**"
       - "installer/**"
@@ -14,10 +14,15 @@ on:
       - "BUILD_PORTABLE_EXE.bat"
       - "requirements-lock.txt"
       - "requirements-ai-lock.txt"
+      - "requirements-test.txt"
       - ".github/workflows/windows-release-candidate.yml"
 
 permissions:
   contents: read
+
+concurrency:
+  group: windows-rc-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-and-verify:
@@ -30,6 +35,13 @@ jobs:
     steps:
       - name: Checkout exact candidate commit
         uses: actions/checkout@v4
+
+      - name: Read candidate version
+        id: version
+        shell: pwsh
+        run: |
+          $value = (Get-Content VERSION -Raw).Trim()
+          "value=$value" >> $env:GITHUB_OUTPUT
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
@@ -183,7 +195,7 @@ jobs:
       - name: Upload verified candidate
         uses: actions/upload-artifact@v4
         with:
-          name: BCVision-2.2.0-rc1-windows
+          name: BCVision-${{ steps.version.outputs.value }}-windows
           path: release/*
           if-no-files-found: error
           retention-days: 30

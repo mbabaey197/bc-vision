@@ -76,7 +76,7 @@ start "BC Vision" "%APPDIR%\.venv\Scripts\pythonw.exe" "%APPDIR%\launcher.py"
 
 echo.
 echo ==============================================
-echo BC Vision v2.2.0-rc1 با موفقیت نصب شد.
+echo BC Vision v2.2.0-rc2 با موفقیت نصب شد.
 echo نام کاربری: admin
 echo رمز اولیه: 123456
 echo اطلاعات برنامه در این مسیر حفظ می‌شود:

@@ -1,5 +1,5 @@
 #define MyAppName "BC Vision"
-#define MyAppVersion "2.2.0-rc1"
+#define MyAppVersion "2.2.0-rc2"
 #define MyAppPublisher "Gilas Abi Alborz"
 #define MyAppExeName "BCVision.exe"
 
@@ -14,7 +14,7 @@ DisableDirPage=auto
 DisableProgramGroupPage=yes
 UsePreviousAppDir=yes
 OutputDir=..\setup_output
-OutputBaseFilename=BCVision_Update_v2.2.0-rc1
+OutputBaseFilename=BCVision_Update_v2.2.0-rc2
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

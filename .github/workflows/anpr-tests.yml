@@ -5,13 +5,13 @@ on:
   push:
     branches:
       - main
-      - codex/anpr-completion
-  pull_request:
-    branches:
-      - main
 
 permissions:
   contents: read
+
+concurrency:
+  group: anpr-main-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -67,7 +67,6 @@ jobs:
           exit 1
 
   ai-runtime:
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: windows-latest
     timeout-minutes: 45
 

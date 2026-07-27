@@ -4,7 +4,7 @@ setlocal
 cd /d "%~dp0"
 echo.
 echo ==========================================
-echo   BC Vision 2.2.0-rc1 - One Click Update
+echo   BC Vision 2.2.0-rc2 - One Click Update
 echo ==========================================
 echo.
 set "TARGET=%ProgramFiles%\BC Vision"

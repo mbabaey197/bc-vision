@@ -1,9 +1,11 @@
 from pathlib import Path
+import time
 
 import cv2
 import numpy as np
 
 import app.ai.video_test as video_test
+from app.streams import CameraStream
 
 
 def _write_video(path: Path, frames=8):
@@ -77,3 +79,27 @@ def test_video_emits_one_consensus_event(tmp_path, monkeypatch):
     assert events[0]["consensus_votes"] >= 2
     assert Path(events[0]["plate_path"]).is_file()
     assert Path(events[0]["image_path"]).is_file()
+
+
+def test_uploaded_video_stream_loops_without_becoming_offline(tmp_path, monkeypatch):
+    video_path = tmp_path / "loop.avi"
+    _write_video(video_path, frames=3)
+    stream = CameraStream(
+        91,
+        f"video://{video_path}",
+        "Uploaded video",
+        fps=30,
+    )
+    published = []
+    monkeypatch.setattr(stream, "_publish", lambda frame: published.append(frame))
+
+    stream.start()
+    for _ in range(50):
+        if len(published) >= 5:
+            break
+        time.sleep(0.02)
+    stream.stop()
+    stream.thread.join(timeout=2)
+
+    assert len(published) >= 5
+    assert not stream.thread.is_alive()

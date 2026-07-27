@@ -5,7 +5,7 @@
 - GitHub repository: `mahdibabaey197/bc-vision`
 - Default branch: `main`
 - Product: BC Vision
-- Current application version in source: `2.2.0-rc1`
+- Current application version in source: `2.2.0-rc2`
 - Windows persistent data root: `C:\ProgramData\BCVision\data`
 
 ## Release contract
@@ -116,8 +116,50 @@ The current regression suite covers:
 - shared-model concurrent-call serialization
 - conservative blur-recovery gating and result selection
 
-The latest full-suite result is recorded in
-`agent-results/latest/ANPR_VIDEO_PERFORMANCE_FIX.md`.
+The latest full-suite and system optimization result is recorded in
+`agent-results/latest/PROJECT_OPTIMIZATION_PHASE_1.md`: `64 passed, 1 skipped`,
+plus a successful headless runtime smoke and a 1,000-write SQLite concurrency
+and integrity check.
+
+## Security hardening status
+
+Phase 1 security hardening is included in the current optimization branch:
+
+- uploaded video names are never used as filesystem paths
+- video uploads are streamed with a 2 GiB limit and partial files are removed
+- stored watchlist fields are HTML-escaped in event reports
+- media access uses resolved path containment instead of string prefixes
+- snapshot, plate, video and backup folders must be distinct children of the
+  configured storage root
+- retention cleanup refuses any folder outside the configured storage root
+- camera, system, license, watchlist and video operations enforce server-side
+  role permissions
+- administrators and system managers can manage technical configuration
+- operators can manage watchlists and process videos
+- guards retain read-only monitoring and event access
+
+The phase 1 regression tests cover traversal filenames, upload-size cleanup,
+stored XSS, media-prefix bypass, unsafe retention paths and role boundaries.
+
+SQLite now uses WAL mode, foreign-key enforcement, a bounded busy timeout and
+NORMAL synchronous mode. Database backups use SQLite's online backup API,
+verify integrity and publish atomically. Storage-root changes prepare and
+update the destination database before atomically switching bootstrap
+configuration, while leaving the old database available for rollback.
+
+## Windows launcher and first-run dashboard
+
+The launcher is designed to run as a PyInstaller windowed application. Uvicorn
+now owns the main process, so no Tkinter keep-alive window is required. The
+browser opens only after the BC Vision health endpoint verifies the service
+identity. A different application listening on port 8000 is rejected instead
+of being mistaken for BC Vision.
+
+New databases no longer receive an enabled synthetic demo camera. A one-time,
+exact-match migration removes only the historical built-in sample camera from
+existing databases while preserving real cameras, user-created demo cameras,
+events, settings and license data. The empty dashboard contains instructions
+and an add-camera action without a placeholder image or animation.
 
 ## Operational truth
 
@@ -138,6 +180,28 @@ Before declaring a production release, perform these validations with real custo
 
 The current performance/accuracy work remains on the draft ANPR pull request
 until direct comparison ground truth is available. Windows packaging for
-`2.2.0-rc1` includes an isolated executable self-test plus installer/updater
+`2.2.0-rc2` includes an isolated executable self-test plus installer/updater
 data-preservation verification. A production release has not yet been
 declared.
+
+## Uploaded video live-source fix
+
+The `agent/video-upload-live-source` branch fixes the blocking camera-video
+upload flow. The upload request no longer runs full-video ANPR synchronously.
+After validation and storage, the file is registered as the single active
+`video://` virtual camera, starts through the normal stream manager and appears
+in the dashboard live grid. Live ANPR remains asynchronous through the existing
+latest-frame worker. Reaching the end of the file seeks back to frame zero
+without taking the stream offline. The browser form reports upload progress and
+redirects to the live dashboard when registration succeeds.
+
+The verified regression result for this combined branch is
+`66 passed, 1 skipped`; focused upload, looping-stream and web-security tests
+reported `16 passed`. Compile and whitespace checks also passed. Windows
+packaging and installed-build acceptance are still required before release.
+
+## Repository security observation
+
+GitHub reported the repository visibility as public on 2026-07-27, while the
+recorded project requirement is private. This external setting must be
+corrected separately with explicit visibility-change authority.

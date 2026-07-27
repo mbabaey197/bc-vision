@@ -167,22 +167,35 @@ class CameraStream:
                 time.sleep(delay)
             return
 
+        is_video_file = self.url.startswith("video://")
+        capture_source = (
+            self.url[len("video://"):]
+            if is_video_file
+            else self.url
+        )
         while not self.stop_event.is_set():
             capture = None
             try:
                 capture = cv2.VideoCapture(
-                    self.url,
+                    capture_source,
                     cv2.CAP_FFMPEG,
                 )
                 if not capture.isOpened():
                     capture.release()
-                    capture = cv2.VideoCapture(self.url)
+                    capture = cv2.VideoCapture(capture_source)
                 if not capture.isOpened():
-                    raise RuntimeError("Cannot open RTSP stream")
+                    raise RuntimeError("Cannot open camera or video stream")
                 capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 while not self.stop_event.is_set():
                     ok, frame = capture.read()
                     if not ok or frame is None:
+                        if is_video_file:
+                            capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            ok, frame = capture.read()
+                            if ok and frame is not None:
+                                self._publish(frame)
+                                time.sleep(delay)
+                                continue
                         raise RuntimeError(
                             "Camera stopped sending frames"
                         )
@@ -191,7 +204,7 @@ class CameraStream:
             except Exception as exc:
                 self.state.online = False
                 self.state.last_error = str(exc)
-                time.sleep(3)
+                self.stop_event.wait(1 if is_video_file else 3)
             finally:
                 if capture is not None:
                     capture.release()
