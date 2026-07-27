@@ -139,6 +139,51 @@ def test_single_exceptional_read_is_never_emitted():
     assert tracker.flush() == []
 
 
+def test_unreadable_capture_upgrades_on_same_track_with_clearest_frame():
+    tracker = PlateConsensusTracker(
+        emit_unreadable=True,
+        emit_cooldown=30,
+    )
+    dark = np.full((100, 200, 3), 25, dtype=np.uint8)
+    clear = np.full((100, 200, 3), 210, dtype=np.uint8)
+    unreadable = result(
+        "ناخوانا",
+        0.31,
+        bbox=(20, 30, 150, 65),
+        quality=0.20,
+    )
+    unreadable.update({
+        "valid": False,
+        "plate_norm": "",
+        "detector_confidence": 0.78,
+    })
+
+    first = tracker.update([unreadable], timestamp=0.0, frame=dark)
+    assert len(first) == 1
+    assert first[0]["capture_only"] is True
+    assert first[0]["plate"] == "ناخوانا"
+    track_id = first[0]["track_id"]
+
+    recognized = result(
+        "31-ط-556-74",
+        0.92,
+        bbox=(23, 30, 153, 65),
+        quality=0.95,
+    )
+    recognized["detector_confidence"] = 0.94
+    tracker.update([recognized], timestamp=0.2, frame=clear)
+    tracker.update([recognized], timestamp=0.4, frame=clear)
+    final = tracker.update([recognized], timestamp=0.6, frame=clear)
+
+    recognized_rows = [
+        row for row in final if not row.get("capture_only")
+    ]
+    assert len(recognized_rows) == 1
+    assert recognized_rows[0]["track_id"] == track_id
+    assert recognized_rows[0]["plate_norm"] == "31ط55674"
+    assert int(recognized_rows[0]["capture_frame"].mean()) == 210
+
+
 def test_no_duplicate_emission_during_cooldown():
     tracker = PlateConsensusTracker(emit_cooldown=5)
     tracker.update([result("31-ط-556-74", 0.8)], timestamp=0.0)
