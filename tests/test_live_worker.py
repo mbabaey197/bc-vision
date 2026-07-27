@@ -136,3 +136,46 @@ def test_slow_cpu_keeps_three_observations_for_consensus(monkeypatch):
     assert len(persisted) == 1
     assert persisted[0]["plate_norm"] == "12ب34567"
     assert state.tracker.max_age_seconds >= 11.0
+
+
+def test_latest_detection_is_available_for_live_overlay(monkeypatch):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState()
+    state.config = {
+        "enabled": 1,
+        "lpr_enabled": 1,
+        "lpr_confidence": 50,
+        "duplicate_seconds": 0,
+        "roi_x": 0,
+        "roi_y": 0,
+        "roi_w": 100,
+        "roi_h": 100,
+    }
+    worker._states[4] = state
+    frame = np.zeros((80, 160, 3), dtype=np.uint8)
+    monkeypatch.setattr(
+        live_worker,
+        "process_frame",
+        lambda *_args, **_kwargs: [{
+            "plate": "12-ب-345-67",
+            "plate_norm": "12ب34567",
+            "valid": True,
+            "confidence": 0.91,
+            "quality_score": 0.8,
+            "bbox": (20, 25, 130, 60),
+            "crop": frame[25:60, 20:130],
+            "method": "test",
+        }],
+    )
+    monkeypatch.setattr(
+        live_worker,
+        "apply_learned_correction",
+        lambda result: result,
+    )
+    state.busy = True
+    worker._process(state, (4, "cam", frame, time.monotonic()))
+    detections = worker.detections(4)
+    worker.shutdown()
+
+    assert detections[0]["bbox"] == (20, 25, 130, 60)
+    assert detections[0]["plate"] == "12-ب-345-67"

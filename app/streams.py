@@ -72,7 +72,35 @@ class CameraStream:
             pass
 
     def _encode(self, frame):
-        display = frame
+        display = frame.copy()
+        try:
+            from app.ai.live_worker import live_anpr_detections
+            for result in live_anpr_detections(self.camera_id):
+                x1, y1, x2, y2 = result["bbox"]
+                color = (36, 220, 96) if result.get("valid") else (0, 190, 255)
+                cv2.rectangle(display, (x1, y1), (x2, y2), color, 3)
+                confidence = int(float(result.get("confidence", 0)) * 100)
+                label = f"PLATE {confidence}%"
+                top = max(24, y1)
+                cv2.rectangle(
+                    display,
+                    (x1, top - 24),
+                    (min(display.shape[1] - 1, x1 + 145), top),
+                    color,
+                    -1,
+                )
+                cv2.putText(
+                    display,
+                    label,
+                    (x1 + 5, top - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48,
+                    (8, 16, 24),
+                    1,
+                    cv2.LINE_AA,
+                )
+        except Exception:
+            pass
         if self.width and frame.shape[1] > self.width:
             scale = self.width / frame.shape[1]
             display = cv2.resize(

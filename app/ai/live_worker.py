@@ -20,6 +20,7 @@ from .pipeline import (
     process_frame,
 )
 from .plate_rules import normalize_plate
+from .feedback import apply_learned_correction
 
 
 @dataclass
@@ -45,6 +46,8 @@ class _CameraState:
     last_processed_at: float = 0.0
     last_processing_ms: float = 0.0
     processing_seconds_ema: float = 0.0
+    latest_detections: list = field(default_factory=list)
+    latest_detections_at: float = 0.0
 
 
 class LiveANPRWorker:
@@ -319,7 +322,9 @@ class LiveANPRWorker:
                 ),
             )
             rows = [
-                self._translate(row, offset_x, offset_y)
+                apply_learned_correction(
+                    self._translate(row, offset_x, offset_y)
+                )
                 for row in process_frame(
                     source,
                     min_confidence * 0.45,
@@ -339,6 +344,16 @@ class LiveANPRWorker:
             )
             state.processed_frames += 1
             state.detected_candidates += len(rows)
+            state.latest_detections = [
+                {
+                    "bbox": tuple(row["bbox"]),
+                    "plate": row.get("plate", "ناخوانا"),
+                    "confidence": float(row.get("confidence", 0.0)),
+                    "valid": bool(row.get("valid")),
+                }
+                for row in rows
+            ]
+            state.latest_detections_at = time.time()
             state.last_processed_at = time.time()
             state.last_processing_ms = processing_seconds * 1000.0
             stable = state.tracker.update(rows, timestamp=timestamp)
@@ -417,6 +432,17 @@ class LiveANPRWorker:
                 "models": self._models(),
             }
 
+    def detections(self, camera_id: int, max_age=2.5) -> list:
+        with self._lock:
+            state = self._states.get(int(camera_id))
+            if (
+                not state
+                or time.time() - state.latest_detections_at
+                > float(max_age)
+            ):
+                return []
+            return [dict(row) for row in state.latest_detections]
+
     def remove(self, camera_id: int):
         with self._lock:
             self._states.pop(int(camera_id), None)
@@ -438,6 +464,10 @@ def submit_live_frame(camera_id, camera_name, frame):
 
 def live_anpr_status(camera_id):
     return worker.status(camera_id)
+
+
+def live_anpr_detections(camera_id):
+    return worker.detections(camera_id)
 
 
 def stop_live_camera(camera_id):
