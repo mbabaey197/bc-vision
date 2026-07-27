@@ -48,6 +48,7 @@ class _CameraState:
     processing_seconds_ema: float = 0.0
     latest_detections: list = field(default_factory=list)
     latest_detections_at: float = 0.0
+    last_submitted_at: float = 0.0
 
 
 class LiveANPRWorker:
@@ -293,6 +294,20 @@ class LiveANPRWorker:
             frame_step = max(1, int(config.get("frame_step", 5)))
             if state.frame_counter % frame_step:
                 return
+            # Do not let a slow CPU run ANPR continuously with no breathing
+            # room. Keep the newest frame and cap inference frequency
+            # adaptively; this reduces load without lowering image quality.
+            minimum_interval = (
+                max(
+                    0.20,
+                    min(1.25, state.processing_seconds_ema * 0.45),
+                )
+                if state.processing_seconds_ema
+                else 0.0
+            )
+            if now - state.last_submitted_at < minimum_interval:
+                return
+            state.last_submitted_at = now
             payload = (
                 int(camera_id),
                 str(camera_name),
