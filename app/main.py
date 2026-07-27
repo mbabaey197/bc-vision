@@ -117,6 +117,38 @@ def iran_plate_html(text, compact=False):
         f"</span>"
     )
 
+
+def dashboard_event_row(row):
+    image_path = row["image_path"] or ""
+    plate_path = row["plate_image_path"] or ""
+    vehicle = (
+        f"<a href='/events/{row['id']}'><img class='recent-vehicle-thumb' "
+        f"src='/media?path={quote(image_path)}' alt='تصویر خودرو'></a>"
+        if image_path and Path(image_path).is_file()
+        else "<span class='recent-media-missing'>بدون تصویر خودرو</span>"
+    )
+    plate_image = (
+        f"<a href='/events/{row['id']}'><img class='thumb plate-thumb' "
+        f"src='/media?path={quote(plate_path)}' alt='تصویر پلاک'></a>"
+        if plate_path and Path(plate_path).is_file()
+        else "<span class='recent-media-missing' "
+        "style='width:130px;height:48px'>بدون تصویر پلاک</span>"
+    )
+    return (
+        f"<tr><td>{vehicle}</td>"
+        f"<td><div class='recent-plate-result'>{plate_image}"
+        f"{iran_plate_html(row['plate_text'], True)}</div></td>"
+        f"<td>{escape(row['camera_name'] or '—')}</td>"
+        f"<td>{persian_digits(int((row['confidence'] or 0) * 100))}٪</td>"
+        f"<td>{persian_digits(jalali_datetime(row['created_at'], False))}</td>"
+        f"<td><form class='correction-form' method='post' "
+        f"action='/events/{row['id']}/correct'>"
+        f"<input name='corrected_plate' required maxlength='20' "
+        f"placeholder='مثال: ۱۲ ب ۳۴۵ ایران ۶۷'>"
+        f"<button>ثبت اصلاح</button></form></td></tr>"
+    )
+
+
 CSS = """<style>
 :root{--bc-navy:#071b3f;--bc-navy2:#0b2e63;--bc-blue:#087cf0;--bc-cyan:#11a8f7;--bc-bg:#f3f6fb;--bc-surface:#fff;--bc-surface2:#f7f9fc;--bc-border:#e1e8f0;--bc-text:#172033;--bc-muted:#69778d;--bc-radius:16px;--bc-shadow:0 10px 30px rgba(10,38,78,.08);--sidebar:258px}
 [data-theme=dark]{--bc-bg:#0b1220;--bc-surface:#111b2d;--bc-surface2:#162238;--bc-border:#25344d;--bc-text:#e8eef8;--bc-muted:#9aabc3;--bc-shadow:0 12px 34px rgba(0,0,0,.25)}
@@ -130,7 +162,7 @@ label{display:block;font-weight:700;color:var(--bc-text);margin-bottom:3px}input
 @media(max-width:900px){.resource-chip span.label{display:none}.resource-chip{min-width:auto}}
 @media(max-width:760px){.sidebar{transform:translateX(110%);width:258px}.sidebar.mobile-open{transform:translateX(0)}.sidebar-toggle{display:none}.main,.main.collapsed{margin-right:0}.mobile-menu{display:grid}.topbar{padding:0 12px}.user-chip span:last-child{display:none}.wrap{padding:17px 12px}.stats-grid{grid-template-columns:1fr 1fr;gap:10px}.card{padding:15px}.live-grid{grid-template-columns:1fr!important}.two-col,.storage-grid{grid-template-columns:1fr}.toolbar h1{width:100%;font-size:23px}.login{margin:4vh 12px}}
 @media(max-width:440px){.stats-grid{grid-template-columns:1fr}.top-title{font-size:15px}}
-.thumb{width:110px;height:62px;object-fit:cover;border-radius:9px;border:1px solid var(--bc-border);background:#eef2f7;cursor:pointer}.plate-thumb{width:130px;height:48px}.status-pill{display:inline-block;padding:3px 9px;border-radius:999px;font-size:12px;font-weight:900}.status-pill.ok{background:#e5f7ef;color:#147a50}.status-pill.bad{background:#ffe8e8;color:#b42318}.status-pill.vip{background:#fff3cd;color:#8a6100}.event-blocked{background:rgba(214,69,69,.07)}.event-vip{background:rgba(229,161,26,.08)}.filter-grid{display:grid;grid-template-columns:repeat(5,minmax(140px,1fr));gap:10px;align-items:end}.modal-img{position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:5000;display:none;place-items:center;padding:30px}.modal-img.open{display:grid}.modal-img img{max-width:95vw;max-height:90vh;border-radius:14px}.modal-img button{position:absolute;top:20px;left:20px}@media(max-width:900px){.filter-grid{grid-template-columns:1fr 1fr}}
+.thumb{width:110px;height:62px;object-fit:cover;border-radius:9px;border:1px solid var(--bc-border);background:#eef2f7;cursor:pointer}.plate-thumb{width:130px;height:48px}.recent-plate-result{display:flex;align-items:center;gap:10px;min-width:275px}.recent-plate-result .plate-thumb{flex:0 0 auto}.recent-vehicle-thumb{width:126px;height:72px;object-fit:cover;border-radius:10px;border:1px solid var(--bc-border);background:#eef2f7}.recent-media-missing{display:inline-flex;width:126px;height:72px;align-items:center;justify-content:center;border:1px dashed var(--bc-border);border-radius:10px;color:var(--bc-muted);font-size:12px}.status-pill{display:inline-block;padding:3px 9px;border-radius:999px;font-size:12px;font-weight:900}.status-pill.ok{background:#e5f7ef;color:#147a50}.status-pill.bad{background:#ffe8e8;color:#b42318}.status-pill.vip{background:#fff3cd;color:#8a6100}.event-blocked{background:rgba(214,69,69,.07)}.event-vip{background:rgba(229,161,26,.08)}.filter-grid{display:grid;grid-template-columns:repeat(5,minmax(140px,1fr));gap:10px;align-items:end}.modal-img{position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:5000;display:none;place-items:center;padding:30px}.modal-img.open{display:grid}.modal-img img{max-width:95vw;max-height:90vh;border-radius:14px}.modal-img button{position:absolute;top:20px;left:20px}@media(max-width:900px){.filter-grid{grid-template-columns:1fr 1fr}}
 .login-page{min-height:100vh;display:grid;grid-template-columns:minmax(320px,520px) 1fr;background:linear-gradient(135deg,#071b3f 0%,#0b2e63 52%,#087cf0 100%);direction:ltr;overflow:hidden}.login-panel{direction:rtl;background:var(--bc-surface);padding:clamp(26px,5vw,68px);display:flex;align-items:center;justify-content:center;box-shadow:20px 0 60px rgba(0,0,0,.18);z-index:2}.login-box{width:100%;max-width:410px}.login-logo{display:flex;align-items:center;gap:13px;margin-bottom:34px}.login-logo .brand-mark{width:58px;height:58px;min-width:58px;font-size:22px}.login-logo h1{margin:0;font-size:28px}.login-logo p{margin:0;color:var(--bc-muted)}.login-title{font-size:25px;font-weight:900;margin:0 0 5px}.login-subtitle{color:var(--bc-muted);margin:0 0 26px}.password-wrap{position:relative}.password-wrap input{padding-left:48px}.password-toggle{position:absolute;left:7px;top:10px;width:36px;height:36px;background:transparent!important;color:var(--bc-muted)!important;box-shadow:none;padding:0}.password-toggle:hover{transform:none;background:var(--bc-surface2)!important}.login-submit{width:100%;height:46px;font-size:15px;margin-top:5px}.login-help{display:flex;justify-content:space-between;gap:12px;margin-top:17px;font-size:12px;color:var(--bc-muted)}.login-visual{direction:rtl;color:#fff;display:flex;align-items:center;justify-content:center;padding:60px;position:relative}.login-visual:before,.login-visual:after{content:'';position:absolute;border-radius:50%;background:rgba(255,255,255,.08)}.login-visual:before{width:420px;height:420px;left:-130px;top:-170px}.login-visual:after{width:300px;height:300px;right:8%;bottom:-140px}.login-hero{max-width:670px;position:relative;z-index:1}.login-hero h2{font-size:clamp(32px,4vw,54px);font-weight:900;line-height:1.35;margin:0 0 16px}.login-hero p{font-size:17px;opacity:.82;max-width:570px}.login-features{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:34px}.login-feature{padding:17px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.08);backdrop-filter:blur(10px);border-radius:15px}.login-feature b{display:block;font-size:15px;margin-bottom:3px}.login-feature span{font-size:12px;opacity:.75}.login-version{position:absolute;bottom:24px;left:30px;opacity:.62;font-size:12px}@media(max-width:900px){.login-page{grid-template-columns:1fr}.login-visual{display:none}.login-panel{min-height:100vh;padding:24px}.login-help{flex-direction:column}}
 .anpr-status{display:block;padding:7px 12px;color:#c8d5df;background:#0c141a;font-size:11px;line-height:1.7;border-top:1px solid #263945}.anpr-status.bad{color:#ffb4ab;background:#301716}
 .iran-plate{display:inline-flex;direction:ltr;align-items:stretch;height:54px;min-width:250px;border:2px solid #15191f;border-radius:7px;overflow:hidden;background:#fff;color:#111;font-family:Tahoma,"Segoe UI",sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.14)}.iran-plate.compact{height:42px;min-width:205px}.plate-blue{width:32px;background:#0868b7;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:12px;line-height:1}.plate-blue small{font-size:7px;margin-top:3px}.plate-main{display:flex;align-items:center;justify-content:space-evenly;gap:8px;flex:1;padding:0 9px;font-size:21px}.compact .plate-main{font-size:17px;gap:6px;padding:0 7px}.plate-iran{width:54px;border-left:2px solid #15191f;display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1}.plate-iran small{font-size:9px}.plate-iran b{font-size:17px;margin-top:4px}.compact .plate-iran{width:46px}.compact .plate-iran b{font-size:14px}.plate-unreadable{display:inline-block;padding:6px 10px;border-radius:7px;background:#fff1c7;color:#714f00;font-weight:800}.correction-form{display:flex;gap:7px;align-items:center;min-width:265px}.correction-form input:not([type=checkbox]){margin:0;min-width:170px;padding:7px 9px}.correction-form button{padding:7px 10px;white-space:nowrap}.feedback-note{font-size:12px;color:var(--bc-muted);margin-top:8px}
@@ -277,7 +309,8 @@ def dashboard(request:Request):
         today=con.execute("SELECT COUNT(*) c FROM plate_events WHERE date(created_at)=date('now','localtime')").fetchone()['c']
         alerts=con.execute("SELECT COUNT(*) c FROM plate_events WHERE confidence < 0.70 AND date(created_at)=date('now','localtime')").fetchone()['c']
         recent=con.execute(
-            "SELECT id,plate_text,camera_name,confidence,created_at "
+            "SELECT id,plate_text,camera_name,confidence,created_at,"
+            "image_path,plate_image_path "
             "FROM plate_events ORDER BY id DESC LIMIT 6"
         ).fetchall()
     lic=license_status()
@@ -285,17 +318,8 @@ def dashboard(request:Request):
     if not tiles: tiles="<div class='card empty-state'><h3>هنوز دوربینی فعال نیست</h3><p class='muted'>برای شروع، دوربین واقعی خود را اضافه کنید.</p><a class='btn' href='/cameras/new'>افزودن اولین دوربین</a></div>"
     ids=','.join(str(c['id']) for c in cams)
     recent_rows=''.join(
-        f"<tr><td>{iran_plate_html(r['plate_text'],True)}</td>"
-        f"<td>{escape(r['camera_name'] or '—')}</td>"
-        f"<td>{persian_digits(int((r['confidence'] or 0)*100))}٪</td>"
-        f"<td>{persian_digits(jalali_datetime(r['created_at'],False))}</td>"
-        f"<td><form class='correction-form' method='post' "
-        f"action='/events/{r['id']}/correct'>"
-        f"<input name='corrected_plate' required maxlength='20' "
-        f"placeholder='مثال: ۱۲ ب ۳۴۵ ایران ۶۷'>"
-        f"<button>ثبت اصلاح</button></form></td></tr>"
-        for r in recent
-    ) or "<tr><td colspan='5'>هنوز پلاکی ثبت نشده است.</td></tr>"
+        dashboard_event_row(r) for r in recent
+    ) or "<tr><td colspan='6'>هنوز پلاکی ثبت نشده است.</td></tr>"
     js=f"""<script>
 const ids=[{ids}];
 async function cameraStatus(){{for(const id of ids){{try{{let r=await fetch('/api/cameras/'+id+'/status');let s=await r.json();let e=document.getElementById('st-'+id),a=document.getElementById('anpr-'+id),n=v=>Number(v||0).toLocaleString('fa-IR');e.textContent=s.online?'آنلاین':'آفلاین';e.className='badge '+(s.online?'online':'');const p=s.anpr||{{}},m=p.models||{{}};if(!m.ready){{a.textContent='پلاک‌خوان آماده نیست: مدل تشخیص یا OCR نصب نشده است';a.className='anpr-status bad'}}else if(p.last_error){{a.textContent='خطای پلاک‌خوان: '+p.last_error;a.className='anpr-status bad'}}else{{a.textContent='پردازش: '+n(p.processed_frames)+' فریم | تشخیص: '+n(p.detected_candidates)+' | ثبت: '+n(p.emitted_events);a.className='anpr-status'}}}}catch(e){{}}}}}}
@@ -323,7 +347,7 @@ const savedGrid=Number(localStorage.getItem('bc-grid')||{cols});setGrid(savedGri
       <div class='card stat-card'><div class='stat-head'><span class='muted'>وضعیت لایسنس</span><span class='stat-icon'>◆</span></div><div class='{valid_class}' style='font-size:20px;font-weight:900;margin-top:10px'>{escape(lic['plan'])}</div><div class='trend'>{escape(lic['message'])}</div></div>
     </div>
     <div class='card'><div class='toolbar'><div style='margin-left:auto'><h3 style='margin:0'>نمایش زنده</h3><span class='muted'>تصاویر دوربین‌های فعال</span></div><div class='grid-switch'><button data-n='1' onclick='setGrid(1)'>۱</button><button data-n='2' onclick='setGrid(2)'>۴</button><button data-n='3' onclick='setGrid(3)'>۹</button><button data-n='4' onclick='setGrid(4)'>۱۶</button></div><button class='secondary' onclick='document.documentElement.requestFullscreen?.()'>تمام‌صفحه</button></div><div class='live-grid' id='liveGrid' style='--cols:{cols}'>{tiles}</div></div>
-    <div class='card'><h3>آخرین پلاک‌های خوانده‌شده</h3><p class='feedback-note'>در نسخه آزمایشی، پلاک صحیح را کنار هر نتیجه وارد کنید. اصلاح ثبت‌شده همان رویداد را تصحیح می‌کند، خوانش مشابه را به حافظه محلی می‌سپارد و تصویر آن را برای بازآموزی کنترل‌شده نگه می‌دارد.</p><div class='table-wrap'><table><thead><tr><th>پلاک ایران</th><th>دوربین</th><th>اطمینان</th><th>زمان</th><th>اصلاح و آموزش</th></tr></thead><tbody id='recentEventsBody'>{recent_rows}</tbody></table></div><div style='margin-top:12px'><a class='btn secondary' href='/events'>مشاهده همه گزارش‌ها</a> <a class='btn secondary' href='/settings'>وضعیت فنی سامانه</a></div></div>{js}</div>"""
+    <div class='card'><h3>آخرین تشخیص‌های پلاک و خودرو</h3><p class='feedback-note'>در نسخه آزمایشی، پلاک صحیح را کنار هر نتیجه وارد کنید. اصلاح ثبت‌شده همان رویداد را تصحیح می‌کند، خوانش مشابه را به حافظه محلی می‌سپارد و تصویر آن را برای بازآموزی کنترل‌شده نگه می‌دارد.</p><div class='table-wrap'><table><thead><tr><th>تصویر خودرو</th><th>تصویر پلاک / پلاک خوانده‌شده</th><th>دوربین</th><th>اطمینان</th><th>زمان</th><th>اصلاح و آموزش</th></tr></thead><tbody id='recentEventsBody'>{recent_rows}</tbody></table></div><div style='margin-top:12px'><a class='btn secondary' href='/events'>مشاهده همه گزارش‌ها</a> <a class='btn secondary' href='/settings'>وضعیت فنی سامانه</a></div></div>{js}</div>"""
     return page('داشبورد',body,u,request)
 
 @app.get('/api/dashboard/recent-events')
@@ -332,24 +356,16 @@ def dashboard_recent_events(request:Request,after:int=0):
         return JSONResponse({'error':'unauthorized'},401)
     with connect() as con:
         recent=con.execute(
-            "SELECT id,plate_text,camera_name,confidence,created_at "
+            "SELECT id,plate_text,camera_name,confidence,created_at,"
+            "image_path,plate_image_path "
             "FROM plate_events ORDER BY id DESC LIMIT 6"
         ).fetchall()
     latest_id=int(recent[0]['id']) if recent else 0
     if latest_id <= max(0,int(after)):
         return JSONResponse({'latest_id':latest_id,'rows_html':''})
     rows=''.join(
-        f"<tr><td>{iran_plate_html(r['plate_text'],True)}</td>"
-        f"<td>{escape(r['camera_name'] or '—')}</td>"
-        f"<td>{persian_digits(int((r['confidence'] or 0)*100))}٪</td>"
-        f"<td>{persian_digits(jalali_datetime(r['created_at'],False))}</td>"
-        f"<td><form class='correction-form' method='post' "
-        f"action='/events/{r['id']}/correct'>"
-        f"<input name='corrected_plate' required maxlength='20' "
-        f"placeholder='مثال: ۱۲ ب ۳۴۵ ایران ۶۷'>"
-        f"<button>ثبت اصلاح</button></form></td></tr>"
-        for r in recent
-    ) or "<tr><td colspan='5'>هنوز پلاکی ثبت نشده است.</td></tr>"
+        dashboard_event_row(r) for r in recent
+    ) or "<tr><td colspan='6'>هنوز پلاکی ثبت نشده است.</td></tr>"
     return JSONResponse({'latest_id':latest_id,'rows_html':rows})
 
 @app.get('/live/{camera_id}')
