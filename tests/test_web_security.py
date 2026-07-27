@@ -403,6 +403,39 @@ def test_events_escape_stored_watchlist_html(tmp_path, monkeypatch):
     assert "&lt;img src=x onerror=alert(1)&gt;" in response.text
 
 
+def test_dashboard_recent_events_returns_only_after_new_commit(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "dashboard-events.db"
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    database.init_db()
+    _as_role(monkeypatch, "operator")
+    with database.connect() as con:
+        event_id = con.execute(
+            "INSERT INTO plate_events("
+            "plate_text,plate_norm,confidence,camera_name"
+            ") VALUES(?,?,?,?)",
+            ("12-ب-345-67", "12ب34567", 0.91, "Gate"),
+        ).lastrowid
+
+    with TestClient(main.app) as client:
+        fresh = client.get("/api/dashboard/recent-events?after=0")
+        unchanged = client.get(
+            f"/api/dashboard/recent-events?after={event_id}"
+        )
+
+    assert fresh.status_code == 200
+    assert fresh.json()["latest_id"] == event_id
+    assert "Gate" in fresh.json()["rows_html"]
+    assert "۱۲" in fresh.json()["rows_html"]
+    assert unchanged.json() == {
+        "latest_id": event_id,
+        "rows_html": "",
+    }
+
+
 def test_public_health_does_not_expose_license_or_customer_data():
     with TestClient(main.app) as client:
         response = client.get("/health")
