@@ -1,5 +1,7 @@
 name: Windows release candidate
 
+# Candidate builds run on each relevant agent-branch update.
+
 on:
   workflow_dispatch:
   push:
@@ -63,6 +65,12 @@ jobs:
         shell: cmd
         run: BUILD_PORTABLE_EXE.bat
 
+      - name: Verify windowless Windows service host
+        shell: pwsh
+        run: |
+          python scripts\verify_windows_gui_subsystem.py `
+            dist\BCVision\BCVision.exe
+
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --no-progress -y
@@ -105,6 +113,7 @@ jobs:
           $env:BCVISION_SKIP_MODEL_PREP = "1"
           $first = Start-Process -FilePath "$installDir\BCVision.exe" -ArgumentList @(
             "--self-test",
+            "--verify-anpr",
             "--self-test-output",
             $firstResult
           ) -Wait -PassThru
@@ -134,6 +143,7 @@ jobs:
 
           $updated = Start-Process -FilePath "$installDir\BCVision.exe" -ArgumentList @(
             "--self-test",
+            "--verify-anpr",
             "--self-test-output",
             $updatedResult
           ) -Wait -PassThru
@@ -143,6 +153,9 @@ jobs:
           $updatedJson = Get-Content $updatedResult -Raw | ConvertFrom-Json
           if (-not $updatedJson.ok -or $updatedJson.version -ne $version) {
             throw "Updated executable self-test failed"
+          }
+          if (-not $firstJson.anpr_ready -or -not $updatedJson.anpr_ready) {
+            throw "Packaged ANPR models failed offline inference validation"
           }
 
           python -c "import os,sqlite3,sys; p=os.path.join(os.environ['BCVISION_DATA_DIR'],'bcvision.db'); c=sqlite3.connect(p); r=c.execute('SELECT value FROM settings WHERE key=?',('release_test_marker',)).fetchone(); c.close(); sys.exit(0 if r and r[0]==os.environ['BCVISION_TEST_MARKER'] else 1)"

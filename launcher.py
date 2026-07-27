@@ -39,6 +39,27 @@ def log(message):
         )
 
 
+def hide_service_console() -> bool:
+    """Hide an accidentally attached Windows console for packaged runs."""
+    if sys.platform != "win32":
+        return False
+    if not (
+        getattr(sys, "frozen", False)
+        or os.environ.get("BCVISION_HIDE_CONSOLE", "0") == "1"
+    ):
+        return False
+    try:
+        import ctypes
+
+        console = ctypes.windll.kernel32.GetConsoleWindow()
+        if not console:
+            return False
+        ctypes.windll.user32.ShowWindow(console, 0)
+        return True
+    except Exception:
+        return False
+
+
 def port_open():
     try:
         with socket.create_connection(
@@ -173,6 +194,7 @@ def run_self_test() -> int:
         "database_ready": False,
         "public_key_ready": False,
         "web_app_ready": False,
+        "anpr_ready": False,
     }
     try:
         from app.config import (
@@ -196,6 +218,34 @@ def run_self_test() -> int:
             )
         from app.main import app
 
+        verify_anpr = "--verify-anpr" in sys.argv
+        anpr_ready = not verify_anpr
+        if verify_anpr:
+            import numpy as np
+            import easyocr
+            from ultralytics import YOLO
+            from app.ai.model_manager import prepare_models
+
+            models = prepare_models(download=False)
+            detector = YOLO(models["detector"])
+            detector.predict(
+                source=np.zeros((96, 160, 3), dtype=np.uint8),
+                imgsz=160,
+                device="cpu",
+                verbose=False,
+            )
+            easyocr.Reader(
+                ["fa", "en"],
+                gpu=False,
+                verbose=False,
+                model_storage_directory=models["easyocr"],
+                user_network_directory=str(
+                    Path(models["easyocr"]) / "user_network"
+                ),
+                download_enabled=False,
+            )
+            anpr_ready = True
+
         result.update({
             "ok": (
                 DB_PATH.is_file()
@@ -203,6 +253,7 @@ def run_self_test() -> int:
                 and table_count >= 6
                 and user_count >= 1
                 and app is not None
+                and anpr_ready
             ),
             "version": APP_VERSION,
             "data_dir": str(DATA_DIR),
@@ -210,6 +261,7 @@ def run_self_test() -> int:
             "database_ready": DB_PATH.is_file() and table_count >= 6,
             "public_key_ready": PUBLIC_KEY_PATH.is_file(),
             "web_app_ready": app is not None,
+            "anpr_ready": anpr_ready,
             "user_count": user_count,
             "table_count": table_count,
         })
@@ -239,6 +291,8 @@ def open_panel_when_ready():
 
 def main():
     try:
+        hide_service_console()
+
         threading.Thread(
             target=prepare_anpr_models,
             daemon=True,

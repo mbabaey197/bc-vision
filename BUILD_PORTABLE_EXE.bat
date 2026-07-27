@@ -47,6 +47,10 @@ if errorlevel 1 goto :error
 "%BUILD_PY%" -m pip check
 if errorlevel 1 goto :error
 
+rmdir /s /q .model-seed 2>nul
+"%BUILD_PY%" -m app.ai.model_manager --seed-dir ".model-seed"
+if errorlevel 1 goto :error
+
 rmdir /s /q build 2>nul
 rmdir /s /q dist 2>nul
 
@@ -71,6 +75,8 @@ rmdir /s /q dist 2>nul
     --hidden-import app.ai.video_test ^
     --hidden-import app.ai.live_worker ^
     --hidden-import app.ai.model_manager ^
+    --add-data ".model-seed;model-seed" ^
+    --collect-all av ^
     --collect-all fastapi ^
     --collect-all starlette ^
     --collect-all uvicorn ^

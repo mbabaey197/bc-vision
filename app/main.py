@@ -18,6 +18,8 @@ import time, csv, shutil, os, json, secrets
 from datetime import datetime, timedelta
 from urllib.parse import quote
 from pathlib import Path
+from app.ai.plate_rules import iran_plate_parts, persian_digits
+from app.ai.feedback import validate_correction
 
 try:
     import psutil
@@ -97,6 +99,24 @@ def event_status_badge(status):
     st=status if status in labels else 'unknown'
     return f"<span class='status-pill {classes[st]}'>{labels[st]}</span>"
 
+
+def iran_plate_html(text, compact=False):
+    parts = iran_plate_parts(text)
+    if parts is None:
+        value = persian_digits(text) if text else "ناخوانا"
+        return f"<span class='plate-unreadable'>{escape(value)}</span>"
+    size = " compact" if compact else ""
+    return (
+        f"<span class='iran-plate{size}' dir='ltr'>"
+        f"<span class='plate-blue'>🇮🇷<small>I.R.</small></span>"
+        f"<span class='plate-main'><b>{escape(parts['prefix'])}</b>"
+        f"<b>{escape(parts['letter'])}</b>"
+        f"<b>{escape(parts['serial'])}</b></span>"
+        f"<span class='plate-iran'><small>ایران</small>"
+        f"<b>{escape(parts['region'])}</b></span>"
+        f"</span>"
+    )
+
 CSS = """<style>
 :root{--bc-navy:#071b3f;--bc-navy2:#0b2e63;--bc-blue:#087cf0;--bc-cyan:#11a8f7;--bc-bg:#f3f6fb;--bc-surface:#fff;--bc-surface2:#f7f9fc;--bc-border:#e1e8f0;--bc-text:#172033;--bc-muted:#69778d;--bc-radius:16px;--bc-shadow:0 10px 30px rgba(10,38,78,.08);--sidebar:258px}
 [data-theme=dark]{--bc-bg:#0b1220;--bc-surface:#111b2d;--bc-surface2:#162238;--bc-border:#25344d;--bc-text:#e8eef8;--bc-muted:#9aabc3;--bc-shadow:0 12px 34px rgba(0,0,0,.25)}
@@ -105,13 +125,15 @@ CSS = """<style>
 .main{margin-right:var(--sidebar);min-height:100vh;transition:margin-right .22s}.main.collapsed{margin-right:84px}.topbar{height:70px;background:color-mix(in srgb,var(--bc-surface) 92%,transparent);backdrop-filter:blur(12px);border-bottom:1px solid var(--bc-border);display:flex;align-items:center;gap:12px;padding:0 24px;position:sticky;top:0;z-index:900}.top-title{font-size:18px;font-weight:900;color:var(--bc-navy);margin-left:auto}.resource-strip{display:flex;align-items:center;gap:7px;direction:ltr}.resource-chip{display:flex;align-items:center;gap:5px;min-width:66px;padding:5px 8px;border:1px solid var(--bc-border);background:var(--bc-surface);border-radius:10px;font-size:12px;font-weight:800}.resource-dot{width:8px;height:8px;border-radius:50%;background:#22a06b;box-shadow:0 0 0 3px rgba(34,160,107,.12)}.resource-chip.warn .resource-dot{background:#e5a11a}.resource-chip.danger .resource-dot{background:#d64545}.storage-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.drive-card{border:1px solid var(--bc-border);background:var(--bc-surface2);border-radius:13px;padding:14px}.storage-progress{height:10px;background:var(--bc-border);border-radius:8px;overflow:hidden;margin:9px 0}.storage-progress span{display:block;height:100%;background:linear-gradient(90deg,var(--bc-blue),var(--bc-cyan));border-radius:8px}[data-theme=dark] .top-title{color:#eaf2ff}.top-action{width:40px;height:40px;border-radius:11px;border:1px solid var(--bc-border);background:var(--bc-surface);color:var(--bc-text);display:grid;place-items:center;cursor:pointer;box-shadow:none;padding:0}.user-chip{display:flex;align-items:center;gap:9px;border:1px solid var(--bc-border);background:var(--bc-surface);padding:6px 10px;border-radius:12px}.avatar{width:29px;height:29px;border-radius:9px;background:linear-gradient(135deg,var(--bc-blue),var(--bc-cyan));color:#fff;display:grid;place-items:center;font-weight:900}.wrap{max-width:1550px;margin:auto;padding:25px}.page-title{font-weight:900;font-size:28px;margin:0;color:var(--bc-navy)}[data-theme=dark] .page-title,[data-theme=dark] h1{color:#edf4ff}h1{font-size:27px;font-weight:900;color:var(--bc-navy)}h3{font-size:18px;font-weight:800}.page-sub{color:var(--bc-muted);margin:2px 0 0}
 .card{background:var(--bc-surface);border:1px solid var(--bc-border);border-radius:var(--bc-radius);padding:20px;box-shadow:var(--bc-shadow);margin-bottom:17px}.login{max-width:430px;margin:7vh auto;padding:30px}.login .brand{text-align:center;font-size:28px;margin-bottom:3px}.login .muted{text-align:center}.brand{font-size:25px;font-weight:900;color:var(--bc-navy)}.muted{color:var(--bc-muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}.stats-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:15px;margin-bottom:17px}.stat-card{position:relative;overflow:hidden}.stat-card:after{content:"";position:absolute;width:90px;height:90px;border-radius:50%;left:-25px;top:-28px;background:rgba(8,124,240,.07)}.stat-head{display:flex;align-items:center;justify-content:space-between}.stat-icon{width:43px;height:43px;border-radius:13px;background:rgba(8,124,240,.1);color:var(--bc-blue);display:grid;place-items:center;font-size:21px}.stat{font-size:31px;font-weight:900;color:var(--bc-text);margin-top:5px;line-height:1.2}.trend{font-size:12px;color:var(--bc-muted)}
 label{display:block;font-weight:700;color:var(--bc-text);margin-bottom:3px}input,select,textarea,button{font-family:inherit;font-size:14px}input:not([type=checkbox]),select,textarea{width:100%;padding:10px 12px;border:1px solid var(--bc-border);border-radius:10px;margin:5px 0 13px;background:var(--bc-surface);color:var(--bc-text);outline:0;transition:.18s}input:focus,select:focus,textarea:focus{border-color:var(--bc-blue);box-shadow:0 0 0 3px rgba(8,124,240,.13)}button,.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:0;background:linear-gradient(135deg,var(--bc-blue),#075dc5);color:#fff!important;padding:9px 16px;border-radius:9px;text-decoration:none;cursor:pointer;font-weight:700;box-shadow:0 4px 12px rgba(8,124,240,.18);transition:.18s}button:hover,.btn:hover{transform:translateY(-1px);filter:brightness(1.04)}.secondary{background:#65738a!important;box-shadow:none}.danger{background:#c63838!important;box-shadow:none}.ok{color:#168458}.bad{color:#d34747}.replay-layout{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(300px,.8fr);gap:18px}.video-panel video{width:100%;max-height:70vh;background:#05080d;border-radius:14px}.replay-controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:12px}.replay-controls button{padding:8px 12px}.event-meta{display:grid;grid-template-columns:1fr 1fr;gap:10px}.meta-item{padding:10px;border:1px solid var(--bc-border);border-radius:10px;background:var(--bc-surface2)}.meta-item small{display:block;color:var(--bc-muted)}.detail-images{display:grid;grid-template-columns:1fr 1fr;gap:10px}.detail-images img{width:100%;height:165px;object-fit:contain;background:#0b1220;border-radius:11px}.time-badge{font-size:20px;font-weight:900;color:var(--bc-blue)}@media(max-width:900px){.replay-layout{grid-template-columns:1fr}.event-meta{grid-template-columns:1fr}}.alert{padding:12px 15px;border-radius:10px;background:#fff1f2;color:#9b1c2d;border:1px solid #ffd5da;margin-bottom:14px}.toast-box{position:fixed;left:22px;bottom:22px;z-index:2000;min-width:270px;background:var(--bc-surface);border:1px solid var(--bc-border);border-right:4px solid #168458;border-radius:12px;padding:12px 15px;box-shadow:var(--bc-shadow);animation:toastin .3s ease}.toast-box.hide{opacity:0;transform:translateY(12px);transition:.35s}@keyframes toastin{from{opacity:0;transform:translateY(15px)}}
-.table-wrap{overflow:auto}table{width:100%;border-collapse:separate;border-spacing:0;min-width:700px}th,td{padding:12px 11px;border-bottom:1px solid var(--bc-border);text-align:right;vertical-align:middle}th{font-size:13px;color:var(--bc-muted);background:var(--bc-surface2);font-weight:800}tr:last-child td{border-bottom:0}tbody tr:hover td{background:var(--bc-surface2)}.code{direction:ltr;text-align:left;font-family:Consolas,"Courier New",monospace}.live-grid{display:grid;grid-template-columns:repeat(var(--cols),minmax(0,1fr));gap:14px}.camera-tile{background:#101820;border-radius:14px;overflow:hidden;position:relative;min-height:180px;box-shadow:var(--bc-shadow)}.camera-tile img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;background:#101820}.camera-head{display:flex;justify-content:space-between;align-items:center;color:#fff;padding:9px 12px;background:#162631}.badge{font-size:11px;padding:4px 9px;border-radius:20px;background:#657180}.badge.online{background:#168458}.toolbar{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:17px}.toolbar h1{margin-left:auto;margin-bottom:0}.toolbar select{width:auto;margin:0}.two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px}.system-bars{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.meter-label{display:flex;justify-content:space-between;margin-bottom:7px}.meter{height:8px;border-radius:8px;background:var(--bc-border);overflow:hidden}.meter span{display:block;height:100%;background:linear-gradient(90deg,var(--bc-blue),var(--bc-cyan));border-radius:8px;transition:width .4s}.empty-state{text-align:center;padding:38px 20px}.grid-switch{display:flex;background:var(--bc-surface);border:1px solid var(--bc-border);border-radius:10px;padding:3px;gap:3px}.grid-switch button{box-shadow:none;background:transparent;color:var(--bc-muted)!important;padding:6px 10px}.grid-switch button.active{background:var(--bc-blue);color:#fff!important}.mobile-menu{display:none}
+.table-wrap{overflow:auto}table{width:100%;border-collapse:separate;border-spacing:0;min-width:700px}th,td{padding:12px 11px;border-bottom:1px solid var(--bc-border);text-align:right;vertical-align:middle}th{font-size:13px;color:var(--bc-muted);background:var(--bc-surface2);font-weight:800}tr:last-child td{border-bottom:0}tbody tr:hover td{background:var(--bc-surface2)}.code{direction:ltr;text-align:left;font-family:Consolas,"Courier New",monospace}.live-grid{display:grid;grid-template-columns:repeat(var(--cols),minmax(0,520px));gap:14px;justify-content:start}.camera-tile{background:#101820;border-radius:14px;overflow:hidden;position:relative;min-height:160px;box-shadow:var(--bc-shadow)}.camera-tile img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;background:#101820}.camera-head{display:flex;justify-content:space-between;align-items:center;color:#fff;padding:8px 11px;background:#162631}.badge{font-size:11px;padding:4px 9px;border-radius:20px;background:#657180}.badge.online{background:#168458}.toolbar{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:17px}.toolbar h1{margin-left:auto;margin-bottom:0}.toolbar select{width:auto;margin:0}.two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px}.system-bars{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.meter-label{display:flex;justify-content:space-between;margin-bottom:7px}.meter{height:8px;border-radius:8px;background:var(--bc-border);overflow:hidden}.meter span{display:block;height:100%;background:linear-gradient(90deg,var(--bc-blue),var(--bc-cyan));border-radius:8px;transition:width .4s}.empty-state{text-align:center;padding:38px 20px}.grid-switch{display:flex;background:var(--bc-surface);border:1px solid var(--bc-border);border-radius:10px;padding:3px;gap:3px}.grid-switch button{box-shadow:none;background:transparent;color:var(--bc-muted)!important;padding:6px 10px}.grid-switch button.active{background:var(--bc-blue);color:#fff!important}.mobile-menu{display:none}
 @media(max-width:1150px){.stats-grid{grid-template-columns:repeat(2,1fr)}.system-bars{grid-template-columns:1fr}}
 @media(max-width:900px){.resource-chip span.label{display:none}.resource-chip{min-width:auto}}
 @media(max-width:760px){.sidebar{transform:translateX(110%);width:258px}.sidebar.mobile-open{transform:translateX(0)}.sidebar-toggle{display:none}.main,.main.collapsed{margin-right:0}.mobile-menu{display:grid}.topbar{padding:0 12px}.user-chip span:last-child{display:none}.wrap{padding:17px 12px}.stats-grid{grid-template-columns:1fr 1fr;gap:10px}.card{padding:15px}.live-grid{grid-template-columns:1fr!important}.two-col,.storage-grid{grid-template-columns:1fr}.toolbar h1{width:100%;font-size:23px}.login{margin:4vh 12px}}
 @media(max-width:440px){.stats-grid{grid-template-columns:1fr}.top-title{font-size:15px}}
 .thumb{width:110px;height:62px;object-fit:cover;border-radius:9px;border:1px solid var(--bc-border);background:#eef2f7;cursor:pointer}.plate-thumb{width:130px;height:48px}.status-pill{display:inline-block;padding:3px 9px;border-radius:999px;font-size:12px;font-weight:900}.status-pill.ok{background:#e5f7ef;color:#147a50}.status-pill.bad{background:#ffe8e8;color:#b42318}.status-pill.vip{background:#fff3cd;color:#8a6100}.event-blocked{background:rgba(214,69,69,.07)}.event-vip{background:rgba(229,161,26,.08)}.filter-grid{display:grid;grid-template-columns:repeat(5,minmax(140px,1fr));gap:10px;align-items:end}.modal-img{position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:5000;display:none;place-items:center;padding:30px}.modal-img.open{display:grid}.modal-img img{max-width:95vw;max-height:90vh;border-radius:14px}.modal-img button{position:absolute;top:20px;left:20px}@media(max-width:900px){.filter-grid{grid-template-columns:1fr 1fr}}
 .login-page{min-height:100vh;display:grid;grid-template-columns:minmax(320px,520px) 1fr;background:linear-gradient(135deg,#071b3f 0%,#0b2e63 52%,#087cf0 100%);direction:ltr;overflow:hidden}.login-panel{direction:rtl;background:var(--bc-surface);padding:clamp(26px,5vw,68px);display:flex;align-items:center;justify-content:center;box-shadow:20px 0 60px rgba(0,0,0,.18);z-index:2}.login-box{width:100%;max-width:410px}.login-logo{display:flex;align-items:center;gap:13px;margin-bottom:34px}.login-logo .brand-mark{width:58px;height:58px;min-width:58px;font-size:22px}.login-logo h1{margin:0;font-size:28px}.login-logo p{margin:0;color:var(--bc-muted)}.login-title{font-size:25px;font-weight:900;margin:0 0 5px}.login-subtitle{color:var(--bc-muted);margin:0 0 26px}.password-wrap{position:relative}.password-wrap input{padding-left:48px}.password-toggle{position:absolute;left:7px;top:10px;width:36px;height:36px;background:transparent!important;color:var(--bc-muted)!important;box-shadow:none;padding:0}.password-toggle:hover{transform:none;background:var(--bc-surface2)!important}.login-submit{width:100%;height:46px;font-size:15px;margin-top:5px}.login-help{display:flex;justify-content:space-between;gap:12px;margin-top:17px;font-size:12px;color:var(--bc-muted)}.login-visual{direction:rtl;color:#fff;display:flex;align-items:center;justify-content:center;padding:60px;position:relative}.login-visual:before,.login-visual:after{content:'';position:absolute;border-radius:50%;background:rgba(255,255,255,.08)}.login-visual:before{width:420px;height:420px;left:-130px;top:-170px}.login-visual:after{width:300px;height:300px;right:8%;bottom:-140px}.login-hero{max-width:670px;position:relative;z-index:1}.login-hero h2{font-size:clamp(32px,4vw,54px);font-weight:900;line-height:1.35;margin:0 0 16px}.login-hero p{font-size:17px;opacity:.82;max-width:570px}.login-features{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:34px}.login-feature{padding:17px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.08);backdrop-filter:blur(10px);border-radius:15px}.login-feature b{display:block;font-size:15px;margin-bottom:3px}.login-feature span{font-size:12px;opacity:.75}.login-version{position:absolute;bottom:24px;left:30px;opacity:.62;font-size:12px}@media(max-width:900px){.login-page{grid-template-columns:1fr}.login-visual{display:none}.login-panel{min-height:100vh;padding:24px}.login-help{flex-direction:column}}
+.anpr-status{display:block;padding:7px 12px;color:#c8d5df;background:#0c141a;font-size:11px;line-height:1.7;border-top:1px solid #263945}.anpr-status.bad{color:#ffb4ab;background:#301716}
+.iran-plate{display:inline-flex;direction:ltr;align-items:stretch;height:54px;min-width:250px;border:2px solid #15191f;border-radius:7px;overflow:hidden;background:#fff;color:#111;font-family:Tahoma,"Segoe UI",sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.14)}.iran-plate.compact{height:42px;min-width:205px}.plate-blue{width:32px;background:#0868b7;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:12px;line-height:1}.plate-blue small{font-size:7px;margin-top:3px}.plate-main{display:flex;align-items:center;justify-content:space-evenly;gap:8px;flex:1;padding:0 9px;font-size:21px}.compact .plate-main{font-size:17px;gap:6px;padding:0 7px}.plate-iran{width:54px;border-left:2px solid #15191f;display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1}.plate-iran small{font-size:9px}.plate-iran b{font-size:17px;margin-top:4px}.compact .plate-iran{width:46px}.compact .plate-iran b{font-size:14px}.plate-unreadable{display:inline-block;padding:6px 10px;border-radius:7px;background:#fff1c7;color:#714f00;font-weight:800}.correction-form{display:flex;gap:7px;align-items:center;min-width:265px}.correction-form input:not([type=checkbox]){margin:0;min-width:170px;padding:7px 9px}.correction-form button{padding:7px 10px;white-space:nowrap}.feedback-note{font-size:12px;color:var(--bc-muted);margin-top:8px}
 </style>"""
 
 BOOTSTRAP = "<link href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.rtl.min.css' rel='stylesheet'>"
@@ -252,18 +274,31 @@ def dashboard(request:Request):
     if not u:return RedirectResponse('/login',302)
     cams=camera_rows(True); cols=max(1,min(4,int(get_setting('dashboard_grid','2'))))
     with connect() as con:
-        total=con.execute('SELECT COUNT(*) c FROM plate_events').fetchone()['c']
         today=con.execute("SELECT COUNT(*) c FROM plate_events WHERE date(created_at)=date('now','localtime')").fetchone()['c']
         alerts=con.execute("SELECT COUNT(*) c FROM plate_events WHERE confidence < 0.70 AND date(created_at)=date('now','localtime')").fetchone()['c']
-        recent=con.execute("SELECT plate_text,camera_name,confidence,created_at FROM plate_events ORDER BY id DESC LIMIT 6").fetchall()
+        recent=con.execute(
+            "SELECT id,plate_text,camera_name,confidence,created_at "
+            "FROM plate_events ORDER BY id DESC LIMIT 6"
+        ).fetchall()
     lic=license_status()
-    tiles=''.join(f"<div class='camera-tile'><div class='camera-head'><span>{escape(c['name'])}</span><span class='badge' id='st-{c['id']}'>در حال اتصال</span></div><img loading='lazy' src='/live/{c['id']}?t={int(time.time())}' alt='{escape(c['name'])}'><div class='camera-head'><small>{escape(c['location'] or 'بدون موقعیت')}</small><a style='color:#bdefff' href='/cameras/{c['id']}/snapshot'>گرفتن عکس</a></div></div>" for c in cams)
+    tiles=''.join(f"<div class='camera-tile'><div class='camera-head'><span>{escape(c['name'])}</span><span class='badge' id='st-{c['id']}'>در حال اتصال</span></div><img loading='lazy' src='/live/{c['id']}?t={int(time.time())}' alt='{escape(c['name'])}'><span class='anpr-status' id='anpr-{c['id']}'>پلاک‌خوان: در انتظار اولین فریم</span><div class='camera-head'><small>{escape(c['location'] or 'بدون موقعیت')}</small><a style='color:#bdefff' href='/cameras/{c['id']}/snapshot'>گرفتن عکس</a></div></div>" for c in cams)
     if not tiles: tiles="<div class='card empty-state'><h3>هنوز دوربینی فعال نیست</h3><p class='muted'>برای شروع، دوربین واقعی خود را اضافه کنید.</p><a class='btn' href='/cameras/new'>افزودن اولین دوربین</a></div>"
     ids=','.join(str(c['id']) for c in cams)
-    recent_rows=''.join(f"<tr><td><b>{escape(r['plate_text'] or '—')}</b></td><td>{escape(r['camera_name'] or '—')}</td><td>{int((r['confidence'] or 0)*100)}٪</td><td>{jalali_datetime(r['created_at'],False)}</td></tr>" for r in recent) or "<tr><td colspan='4'>هنوز پلاکی ثبت نشده است.</td></tr>"
+    recent_rows=''.join(
+        f"<tr><td>{iran_plate_html(r['plate_text'],True)}</td>"
+        f"<td>{escape(r['camera_name'] or '—')}</td>"
+        f"<td>{persian_digits(int((r['confidence'] or 0)*100))}٪</td>"
+        f"<td>{persian_digits(jalali_datetime(r['created_at'],False))}</td>"
+        f"<td><form class='correction-form' method='post' "
+        f"action='/events/{r['id']}/correct'>"
+        f"<input name='corrected_plate' required maxlength='20' "
+        f"placeholder='مثال: ۱۲ ب ۳۴۵ ایران ۶۷'>"
+        f"<button>ثبت اصلاح</button></form></td></tr>"
+        for r in recent
+    ) or "<tr><td colspan='5'>هنوز پلاکی ثبت نشده است.</td></tr>"
     js=f"""<script>
 const ids=[{ids}];
-async function cameraStatus(){{for(const id of ids){{try{{let r=await fetch('/api/cameras/'+id+'/status');let s=await r.json();let e=document.getElementById('st-'+id);e.textContent=s.online?'آنلاین':'آفلاین';e.className='badge '+(s.online?'online':'');}}catch(e){{}}}}}}
+async function cameraStatus(){{for(const id of ids){{try{{let r=await fetch('/api/cameras/'+id+'/status');let s=await r.json();let e=document.getElementById('st-'+id),a=document.getElementById('anpr-'+id),n=v=>Number(v||0).toLocaleString('fa-IR');e.textContent=s.online?'آنلاین':'آفلاین';e.className='badge '+(s.online?'online':'');const p=s.anpr||{{}},m=p.models||{{}};if(!m.ready){{a.textContent='پلاک‌خوان آماده نیست: مدل تشخیص یا OCR نصب نشده است';a.className='anpr-status bad'}}else if(p.last_error){{a.textContent='خطای پلاک‌خوان: '+p.last_error;a.className='anpr-status bad'}}else{{a.textContent='پردازش: '+n(p.processed_frames)+' فریم | تشخیص: '+n(p.detected_candidates)+' | ثبت: '+n(p.emitted_events);a.className='anpr-status'}}}}catch(e){{}}}}}}
 function setGrid(n){{document.getElementById('liveGrid').style.setProperty('--cols',n);document.querySelectorAll('.grid-switch button').forEach(b=>b.classList.toggle('active',Number(b.dataset.n)===n));localStorage.setItem('bc-grid',n)}}
 const savedGrid=Number(localStorage.getItem('bc-grid')||{cols});setGrid(savedGrid);cameraStatus();setInterval(cameraStatus,4000);
 </script>"""
@@ -276,8 +311,7 @@ const savedGrid=Number(localStorage.getItem('bc-grid')||{cols});setGrid(savedGri
       <div class='card stat-card'><div class='stat-head'><span class='muted'>وضعیت لایسنس</span><span class='stat-icon'>◆</span></div><div class='{valid_class}' style='font-size:20px;font-weight:900;margin-top:10px'>{escape(lic['plan'])}</div><div class='trend'>{escape(lic['message'])}</div></div>
     </div>
     <div class='card'><div class='toolbar'><div style='margin-left:auto'><h3 style='margin:0'>نمایش زنده</h3><span class='muted'>تصاویر دوربین‌های فعال</span></div><div class='grid-switch'><button data-n='1' onclick='setGrid(1)'>۱</button><button data-n='2' onclick='setGrid(2)'>۴</button><button data-n='3' onclick='setGrid(3)'>۹</button><button data-n='4' onclick='setGrid(4)'>۱۶</button></div><button class='secondary' onclick='document.documentElement.requestFullscreen?.()'>تمام‌صفحه</button></div><div class='live-grid' id='liveGrid' style='--cols:{cols}'>{tiles}</div></div>
-    <div class='two-col'><div class='card'><h3>آخرین ترددها</h3><div class='table-wrap'><table><tr><th>پلاک</th><th>دوربین</th><th>اطمینان</th><th>زمان</th></tr>{recent_rows}</table></div><div style='margin-top:12px'><a class='btn secondary' href='/events'>مشاهده همه گزارش‌ها</a></div></div>
-    <div class='card'><h3>وضعیت سامانه</h3><p class='muted'>موتور تصویر: <b class='{'ok' if CV_OK else 'bad'}'>{'آماده' if CV_OK else 'غیرفعال'}</b></p><p class='muted'>کل ترددهای ثبت‌شده: <b>{total}</b></p><p class='muted'>مسیر ذخیره‌سازی: <b class='code'>{escape(str(DATA_DIR))}</b></p><a class='btn secondary' href='/settings#storage'>مدیریت ذخیره‌سازی</a></div></div>{js}</div>"""
+    <div class='card'><h3>آخرین پلاک‌های خوانده‌شده</h3><p class='feedback-note'>در نسخه آزمایشی، پلاک صحیح را کنار هر نتیجه وارد کنید. اصلاح ثبت‌شده همان رویداد را تصحیح می‌کند، خوانش مشابه را به حافظه محلی می‌سپارد و تصویر آن را برای بازآموزی کنترل‌شده نگه می‌دارد.</p><div class='table-wrap'><table><tr><th>پلاک ایران</th><th>دوربین</th><th>اطمینان</th><th>زمان</th><th>اصلاح و آموزش</th></tr>{recent_rows}</table></div><div style='margin-top:12px'><a class='btn secondary' href='/events'>مشاهده همه گزارش‌ها</a> <a class='btn secondary' href='/settings'>وضعیت فنی سامانه</a></div></div>{js}</div>"""
     return page('داشبورد',body,u,request)
 
 @app.get('/live/{camera_id}')
@@ -398,7 +432,7 @@ def events(request:Request,q:str='',camera:str='',status:str='',vehicle_type:str
         vehicle=(f"<img class='thumb' onclick=\"showImage(this.src)\" src='/media?path={quote(r['image_path'])}'>" if r['image_path'] and Path(r['image_path']).exists() else '—')
         plateimg=(f"<img class='thumb plate-thumb' onclick=\"showImage(this.src)\" src='/media?path={quote(r['plate_image_path'])}'>" if r['plate_image_path'] and Path(r['plate_image_path']).exists() else '—')
         owner=escape(' / '.join(x for x in [r['owner_name'],r['vehicle_model'],r['vehicle_color']] if x) or '—')
-        trs.append(f"<tr class='{cls}'><td>{r['id']}</td><td>{vehicle}</td><td>{plateimg}</td><td><b>{escape(r['plate_text'] or '—')}</b><br>{event_status_badge(st)}</td><td>{owner}</td><td>{escape(r['vehicle_type'] or 'نامشخص')}<br><span class='muted'>{escape(r['vehicle_color'] or 'نامشخص')}</span></td><td>{int((r['confidence'] or 0)*100)}٪</td><td>{escape(r['camera_name'] or '—')}</td><td>{jalali_datetime(r['created_at'])}</td><td><a class='btn' href='/events/{r['id']}'>جزئیات و پخش</a></td></tr>")
+        trs.append(f"<tr class='{cls}'><td>{persian_digits(r['id'])}</td><td>{vehicle}</td><td>{plateimg}</td><td>{iran_plate_html(r['plate_text'],True)}<br>{event_status_badge(st)}</td><td>{owner}</td><td>{escape(r['vehicle_type'] or 'نامشخص')}<br><span class='muted'>{escape(r['vehicle_color'] or 'نامشخص')}</span></td><td>{persian_digits(int((r['confidence'] or 0)*100))}٪</td><td>{escape(r['camera_name'] or '—')}</td><td>{persian_digits(jalali_datetime(r['created_at']))}</td><td><a class='btn' href='/events/{r['id']}'>جزئیات و پخش</a></td></tr>")
     trs=''.join(trs) or "<tr><td colspan='10'>رکوردی با این فیلتر پیدا نشد.</td></tr>"
     cam_opts=''.join(f"<option {'selected' if camera==c else ''}>{escape(c)}</option>" for c in cameras)
     type_opts=''.join(f"<option {'selected' if vehicle_type==v else ''}>{escape(v)}</option>" for v in vehicle_types)
@@ -409,6 +443,68 @@ def events(request:Request,q:str='',camera:str='',status:str='',vehicle_type:str
     <div class='card'><div class='table-wrap'><table><tr><th>ردیف</th><th>تصویر خودرو</th><th>تصویر پلاک</th><th>پلاک/وضعیت</th><th>مالک/خودرو</th><th>تشخیص خودرو</th><th>اطمینان</th><th>دوربین</th><th>تاریخ و ساعت شمسی</th><th>عملیات</th></tr>{trs}</table></div></div></div>
     <div id='imgModal' class='modal-img' onclick='this.classList.remove("open")'><button>بستن</button><img id='modalImage'></div><script>function showImage(src){{document.getElementById('modalImage').src=src;document.getElementById('imgModal').classList.add('open')}}</script>"""
     return page('ترددها',body,u,request)
+
+
+@app.post('/events/{event_id:int}/correct')
+def correct_event_plate(
+    event_id: int,
+    request: Request,
+    corrected_plate: str = Form(...),
+):
+    username = auth(request)
+    if not username:
+        return RedirectResponse('/login', 302)
+    if not has_permission(request, 'video.process'):
+        return access_denied()
+    try:
+        corrected_text, corrected_norm = validate_correction(
+            corrected_plate
+        )
+    except ValueError:
+        return page(
+            'پلاک نامعتبر',
+            "<div class='wrap'><div class='card alert'>"
+            "پلاک را با قالب کامل ایران وارد کنید؛ نمونه: "
+            "۱۲ ب ۳۴۵ ایران ۶۷</div>"
+            f"<a class='btn' href='/dashboard'>بازگشت</a></div>",
+            username,
+            request,
+        )
+    with connect() as con:
+        row = con.execute(
+            "SELECT * FROM plate_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+        if not row:
+            return JSONResponse({'error': 'event not found'}, 404)
+        observed_text = row['plate_text'] or ''
+        con.execute(
+            "INSERT INTO anpr_feedback("
+            "event_id,observed_text,observed_norm,corrected_text,"
+            "corrected_norm,plate_image_path,image_path,submitted_by"
+            ") VALUES(?,?,?,?,?,?,?,?)",
+            (
+                event_id,
+                observed_text,
+                normalize_plate(observed_text),
+                corrected_text,
+                corrected_norm,
+                row['plate_image_path'] or '',
+                row['image_path'] or '',
+                username,
+            ),
+        )
+        con.execute(
+            "UPDATE plate_events SET plate_text=?,plate_norm=? WHERE id=?",
+            (corrected_text, corrected_norm, event_id),
+        )
+    audit(
+        request,
+        'anpr_feedback',
+        f"event={event_id}; corrected={corrected_norm}",
+    )
+    return RedirectResponse('/dashboard?corrected=1', 303)
+
 
 @app.get('/events/{event_id:int}')
 def event_detail(event_id:int, request:Request):
@@ -429,7 +525,7 @@ def event_detail(event_id:int, request:Request):
     owner=' / '.join(x for x in [r['owner_name'],r['vehicle_model'],r['vehicle_color']] if x) or 'ثبت نشده'
     body=f"""<div class='wrap'><div class='toolbar'><h1 style='margin-left:auto'>جزئیات تردد شماره {r['id']}</h1><a class='btn secondary' href='/events'>بازگشت به ترددها</a></div>
     <div class='replay-layout'><div class='card video-panel'><h3>پخش ویدئو از لحظه عبور</h3><div class='time-badge'>زمان ثبت در ویدئو: {second:.2f} ثانیه</div>{video}</div>
-    <div><div class='card'><h3>اطلاعات تردد</h3><div class='event-meta'><div class='meta-item'><small>پلاک</small><b>{escape(r['plate_text'] or '—')}</b></div><div class='meta-item'><small>وضعیت</small>{event_status_badge(st)}</div><div class='meta-item'><small>دوربین</small>{escape(r['camera_name'] or '—')}</div><div class='meta-item'><small>اطمینان</small>{(r['confidence'] or 0)*100:.1f}٪</div><div class='meta-item'><small>تاریخ و ساعت شمسی</small>{jalali_datetime(r['created_at'])}</div><div class='meta-item'><small>روش تشخیص</small>{escape(r['detector_method'] or '—')}</div><div class='meta-item'><small>نوع خودرو</small>{escape(r['vehicle_type'] or 'نامشخص')}</div><div class='meta-item'><small>رنگ خودرو</small>{escape(r['vehicle_color'] or 'نامشخص')}</div><div class='meta-item'><small>اطمینان تشخیص خودرو</small>{(r['vehicle_confidence'] or 0)*100:.1f}٪</div><div class='meta-item'><small>مالک / خودرو</small>{escape(owner)}</div><div class='meta-item'><small>شماره تماس</small>{escape(r['phone'] or '—')}</div></div></div>
+    <div><div class='card'><h3>اطلاعات تردد</h3><div class='event-meta'><div class='meta-item' style='grid-column:1/-1'><small>پلاک</small>{iran_plate_html(r['plate_text'])}</div><div class='meta-item'><small>وضعیت</small>{event_status_badge(st)}</div><div class='meta-item'><small>دوربین</small>{escape(r['camera_name'] or '—')}</div><div class='meta-item'><small>اطمینان</small>{persian_digits(f"{(r['confidence'] or 0)*100:.1f}")}٪</div><div class='meta-item'><small>تاریخ و ساعت شمسی</small>{persian_digits(jalali_datetime(r['created_at']))}</div><div class='meta-item'><small>روش تشخیص</small>{escape(r['detector_method'] or '—')}</div><div class='meta-item'><small>نوع خودرو</small>{escape(r['vehicle_type'] or 'نامشخص')}</div><div class='meta-item'><small>رنگ خودرو</small>{escape(r['vehicle_color'] or 'نامشخص')}</div><div class='meta-item'><small>اطمینان تشخیص خودرو</small>{persian_digits(f"{(r['vehicle_confidence'] or 0)*100:.1f}")}٪</div><div class='meta-item'><small>مالک / خودرو</small>{escape(owner)}</div><div class='meta-item'><small>شماره تماس</small>{persian_digits(r['phone'] or '—')}</div></div></div>
     <div class='card'><h3>تصاویر ثبت‌شده</h3><div class='detail-images'><div>{vehicle}<small>تصویر خودرو</small></div><div>{plate}<small>تصویر پلاک</small></div></div></div></div></div></div>
     <div id='imgModal' class='modal-img' onclick='this.classList.remove("open")'><button>بستن</button><img id='modalImage'></div>
     <script>const eventSecond={second:.3f};const v=document.getElementById('eventVideo');function jumpToEvent(){{if(!v)return;v.currentTime=Math.max(0,eventSecond-.5);v.play().catch(()=>{{}})}}function stepFrame(dir){{if(!v)return;v.pause();v.currentTime=Math.max(0,v.currentTime+dir/25)}}function setSpeed(rate){{if(!v)return;v.playbackRate=rate;document.getElementById('speedLabel').textContent='سرعت: '+rate+'×'}}function showImage(src){{document.getElementById('modalImage').src=src;document.getElementById('imgModal').classList.add('open')}}if(v){{v.addEventListener('loadedmetadata',jumpToEvent,{{once:true}})}}</script>"""

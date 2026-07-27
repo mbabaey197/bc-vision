@@ -57,6 +57,33 @@ def test_service_ready_requires_bcvision_health_identity(monkeypatch):
     assert launcher.service_ready() is False
 
 
+def test_hide_service_console_only_for_packaged_windows(monkeypatch):
+    calls = []
+
+    class _Kernel32:
+        @staticmethod
+        def GetConsoleWindow():
+            return 123
+
+    class _User32:
+        @staticmethod
+        def ShowWindow(window, command):
+            calls.append((window, command))
+
+    class _Windll:
+        kernel32 = _Kernel32()
+        user32 = _User32()
+
+    import ctypes
+
+    monkeypatch.setattr(launcher.sys, "platform", "win32")
+    monkeypatch.setattr(launcher.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(ctypes, "windll", _Windll(), raising=False)
+
+    assert launcher.hide_service_console() is True
+    assert calls == [(123, 0)]
+
+
 def test_main_runs_server_in_foreground_without_keepalive_window(
     monkeypatch,
 ):
