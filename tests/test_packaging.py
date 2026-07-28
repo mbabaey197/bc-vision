@@ -109,8 +109,11 @@ def test_packaged_self_test_can_require_offline_anpr_models():
 
     assert '"--verify-anpr" in sys.argv' in launcher
     assert "prepare_models(download=False)" in launcher
+    assert "read_plate_crnn(" in launcher
     assert '--add-data ".model-seed;model-seed"' in build
     assert "--collect-all av" in build
+    assert "--collect-all onnxruntime" in build
+    assert 'copy /Y "THIRD_PARTY_NOTICES.md"' in build
 
 
 def test_windows_gate_runs_detector_and_ocr_inside_installed_executable():

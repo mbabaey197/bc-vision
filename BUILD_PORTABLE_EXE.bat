@@ -68,6 +68,7 @@ rmdir /s /q dist 2>nul
     --hidden-import app.license ^
     --hidden-import app.ai.detector ^
     --hidden-import app.ai.ocr ^
+    --hidden-import app.ai.onnx_crnn ^
     --hidden-import app.ai.pipeline ^
     --hidden-import app.ai.plate_recovery ^
     --hidden-import app.ai.plate_rules ^
@@ -82,6 +83,7 @@ rmdir /s /q dist 2>nul
     --collect-all uvicorn ^
     --collect-all cv2 ^
     --collect-all easyocr ^
+    --collect-all onnxruntime ^
     --collect-all ultralytics ^
     --collect-all torch ^
     --collect-all torchvision ^
@@ -105,6 +107,9 @@ copy /Y "README_FA.txt" "dist\BCVision\README_FA.txt" >nul
 if errorlevel 1 goto :error
 
 copy /Y "requirements-ai-lock.txt" "dist\BCVision\requirements-ai-lock.txt" >nul
+if errorlevel 1 goto :error
+
+copy /Y "THIRD_PARTY_NOTICES.md" "dist\BCVision\THIRD_PARTY_NOTICES.md" >nul
 if errorlevel 1 goto :error
 
 echo Portable AI build completed successfully.

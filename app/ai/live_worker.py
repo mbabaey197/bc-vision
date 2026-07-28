@@ -14,6 +14,8 @@ import time
 
 import cv2
 
+from app.cpu_budget import parallel_camera_limit, threads_per_camera
+
 from .pipeline import (
     PlateConsensusTracker,
     add_vehicle_analysis,
@@ -45,6 +47,11 @@ class _CameraState:
     processed_frames: int = 0
     detected_candidates: int = 0
     emitted_events: int = 0
+    whole_plate_ocr_attempts: int = 0
+    ocr_agreements: int = 0
+    ocr_disagreements: int = 0
+    crnn_selected: int = 0
+    character_reader_selected: int = 0
     last_processed_at: float = 0.0
     last_processing_ms: float = 0.0
     processing_seconds_ema: float = 0.0
@@ -58,10 +65,16 @@ class _CameraState:
 
 
 class LiveANPRWorker:
-    def __init__(self, max_workers=2):
+    def __init__(self, max_workers=None):
         self._states: dict[int, _CameraState] = {}
+        automatic_capacity = parallel_camera_limit()
+        self._worker_capacity = (
+            automatic_capacity
+            if max_workers is None
+            else max(1, min(automatic_capacity, int(max_workers)))
+        )
         self._executor = ThreadPoolExecutor(
-            max_workers=max(1, int(max_workers)),
+            max_workers=self._worker_capacity,
             thread_name_prefix="bc-anpr",
         )
         self._lock = threading.RLock()
@@ -78,14 +91,19 @@ class LiveANPRWorker:
             except Exception as exc:
                 self._model_state = {
                     "detector_ready": False,
+                    "crnn_ready": False,
                     "easyocr_ready": False,
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             self._model_state_at = now
         status = dict(self._model_state)
+        status["ocr_ready"] = bool(
+            status.get("crnn_ready")
+            or status.get("easyocr_ready")
+        )
         status["ready"] = bool(
             status.get("detector_ready")
-            and status.get("easyocr_ready")
+            and status["ocr_ready"]
         )
         return status
 
@@ -270,6 +288,14 @@ class LiveANPRWorker:
             "ocr_confidence": float(
                 result.get("ocr_confidence", 0.0)
             ),
+            "ocr_engine": result.get("ocr_engine", ""),
+            "ocr_alternative": result.get(
+                "ocr_alternative",
+                "",
+            ),
+            "ocr_disagreement": int(
+                bool(result.get("ocr_disagreement"))
+            ),
             "vehicle_type": result.get(
                 "vehicle_type",
                 "نامشخص",
@@ -294,6 +320,15 @@ class LiveANPRWorker:
             ),
             "source": "live",
             "processing_ms": float(processing_ms),
+            "review_status": (
+                "unreadable"
+                if result.get("unreadable_final")
+                else (
+                    "suggested"
+                    if result.get("needs_review")
+                    else "confirmed-ai"
+                )
+            ),
         }
         with connect() as con:
             columns = {
@@ -474,6 +509,7 @@ class LiveANPRWorker:
                 for row in process_frame(
                     source,
                     min_confidence * 0.45,
+                    engine_key=camera_id,
                 )
             ]
             processing_seconds = time.perf_counter() - started
@@ -490,6 +526,25 @@ class LiveANPRWorker:
             )
             state.processed_frames += 1
             state.detected_candidates += len(rows)
+            for row in rows:
+                state.whole_plate_ocr_attempts += int(
+                    bool(row.get("whole_plate_ocr_attempted"))
+                )
+                state.ocr_agreements += int(
+                    str(row.get("ocr_engine", "")).startswith(
+                        "multi-engine-agreement"
+                    )
+                )
+                state.ocr_disagreements += int(
+                    bool(row.get("ocr_disagreement"))
+                )
+                state.crnn_selected += int(
+                    row.get("ocr_engine") == "crnn-onnx"
+                )
+                state.character_reader_selected += int(
+                    row.get("ocr_engine")
+                    == "dedicated-character-detector"
+                )
             if rows:
                 state.no_plate_streak = 0
             else:
@@ -503,6 +558,23 @@ class LiveANPRWorker:
                         "plate": row.get("plate", "ناخوانا"),
                         "confidence": float(row.get("confidence", 0.0)),
                         "valid": bool(row.get("valid")),
+                        "best_effort": bool(
+                            row.get("best_effort")
+                        ),
+                        "needs_review": bool(
+                            row.get("needs_review")
+                        ),
+                        "ocr_engine": row.get(
+                            "ocr_engine",
+                            "",
+                        ),
+                        "ocr_alternative": row.get(
+                            "ocr_alternative",
+                            "",
+                        ),
+                        "ocr_disagreement": bool(
+                            row.get("ocr_disagreement")
+                        ),
                     }
                     for row in rows
                 ]
@@ -548,7 +620,14 @@ class LiveANPRWorker:
                         state.emitted_events += 1
                         state.last_event_at = time.time()
                     continue
-                if result["confidence"] < min_confidence:
+                # A low-confidence read is still valuable as an explicitly
+                # reviewable suggestion.  Camera confidence remains the gate
+                # for automatic/confirmed reads, not for operator training
+                # samples requested by the user.
+                if (
+                    result["confidence"] < min_confidence
+                    and not result.get("needs_review")
+                ):
                     continue
                 key = result.get("plate_norm") or normalize_plate(
                     result.get("plate")
@@ -609,6 +688,15 @@ class LiveANPRWorker:
                     "emitted_events": 0,
                     "last_error": "",
                     "models": self._models(),
+                    "ocr_ab": {
+                        "whole_plate_attempts": 0,
+                        "agreements": 0,
+                        "disagreements": 0,
+                        "crnn_selected": 0,
+                        "character_reader_selected": 0,
+                    },
+                    "threads_per_camera": threads_per_camera(),
+                    "parallel_camera_limit": self._worker_capacity,
                 }
             return {
                 "active": bool(state.busy or state.config),
@@ -634,6 +722,19 @@ class LiveANPRWorker:
                 ),
                 "last_error": state.last_error,
                 "models": self._models(),
+                "ocr_ab": {
+                    "whole_plate_attempts": (
+                        state.whole_plate_ocr_attempts
+                    ),
+                    "agreements": state.ocr_agreements,
+                    "disagreements": state.ocr_disagreements,
+                    "crnn_selected": state.crnn_selected,
+                    "character_reader_selected": (
+                        state.character_reader_selected
+                    ),
+                },
+                "threads_per_camera": threads_per_camera(),
+                "parallel_camera_limit": self._worker_capacity,
             }
 
     def detections(self, camera_id: int, max_age=2.5) -> list:

@@ -2,10 +2,17 @@
 from __future__ import annotations
 
 import os
-from itertools import combinations
 from pathlib import Path
 import threading
 from typing import Iterable
+
+from app.cpu_budget import (
+    configure_process_cpu_budget,
+    parallel_camera_limit,
+    threads_per_camera,
+)
+
+configure_process_cpu_budget()
 
 import cv2
 import numpy as np
@@ -22,11 +29,11 @@ try:
 except Exception:
     YOLO = None
 
-_model = None
-_model_key = None
+_models: dict[int, object] = {}
+_model_keys: dict[int, str] = {}
 _model_error = ""
 _model_lock = threading.RLock()
-_inference_lock = threading.RLock()
+_inference_locks: dict[int, threading.RLock] = {}
 
 IRANIAN_CHARACTER_MAP = {
     0: "0",
@@ -65,24 +72,11 @@ IRANIAN_PLATE_CLASS_ID = 30
 
 
 def _cpu_thread_limit() -> int:
-    # Leave two logical processors for decoding, the dashboard and Windows.
-    # Four inference threads are enough to keep the compact model responsive
-    # without letting Torch/OpenCV occupy nearly the whole machine.
-    default = min(4, max(1, (os.cpu_count() or 1) - 2))
-    try:
-        configured = int(
-            os.environ.get(
-                "BCVISION_CPU_THREADS",
-                str(default),
-            )
-        )
-    except (TypeError, ValueError):
-        configured = default
-    return max(1, min(8, configured))
+    return threads_per_camera()
 
 
 def _configure_cpu_threads() -> int:
-    limit = _cpu_thread_limit()
+    limit = configure_process_cpu_budget()
     try:
         cv2.setNumThreads(limit)
     except Exception:
@@ -91,6 +85,11 @@ def _configure_cpu_threads() -> int:
         import torch
 
         torch.set_num_threads(limit)
+        try:
+            torch.set_num_interop_threads(limit)
+        except (AttributeError, RuntimeError):
+            # Torch accepts this only before its first parallel operation.
+            pass
     except Exception:
         pass
     return limit
@@ -132,13 +131,27 @@ def detector_status() -> dict:
         "yolo_available": YOLO is not None,
         "model_path": str(path) if path else "",
         "model_exists": bool(path),
-        "model_loaded": _model is not None,
+        "model_loaded": bool(_models),
+        "model_instances": len(_models),
+        "parallel_camera_limit": parallel_camera_limit(),
+        "threads_per_camera": threads_per_camera(),
         "model_error": _model_error,
     }
 
 
-def load_model():
-    global _model, _model_key, _model_error
+def _runtime_slot(engine_key=None) -> int:
+    if engine_key is None:
+        return 0
+    try:
+        numeric = int(engine_key)
+    except (TypeError, ValueError):
+        numeric = sum(ord(character) for character in str(engine_key))
+    return abs(numeric) % parallel_camera_limit()
+
+
+def load_model(engine_key=None):
+    global _model_error
+    slot = _runtime_slot(engine_key)
     with _model_lock:
         _configure_cpu_threads()
         model_path = next(
@@ -146,22 +159,24 @@ def load_model():
             None,
         )
         key = str(model_path.resolve()) if model_path else ""
-        if _model is not None and _model_key == key:
-            return _model
+        if slot in _models and _model_keys.get(slot) == key:
+            return _models[slot]
         if YOLO is None or model_path is None:
             return None
         try:
-            _model = YOLO(str(model_path))
+            model = YOLO(str(model_path))
             # Ultralytics may reset Torch's global thread pool while importing
             # or constructing the model. Reapply the CPU budget afterwards.
             _configure_cpu_threads()
-            _model_key = key
+            _models[slot] = model
+            _model_keys[slot] = key
+            _inference_locks.setdefault(slot, threading.RLock())
             _model_error = ""
         except Exception as exc:
-            _model = None
-            _model_key = None
+            _models.pop(slot, None)
+            _model_keys.pop(slot, None)
             _model_error = f"{type(exc).__name__}: {exc}"
-        return _model
+        return _models.get(slot)
 
 
 def _clip_box(box, width: int, height: int):
@@ -212,54 +227,249 @@ def _plate_class_ids(model) -> list[int] | None:
     return None
 
 
-def _select_plate_sequence(characters: list[dict]) -> tuple[str, float]:
-    filtered = _nms(
-        [
-            row
-            for row in characters
-            if row.get("class_id") in IRANIAN_CHARACTER_MAP
-            and float(row.get("confidence", 0.0)) >= 0.15
-        ],
-        threshold=0.45,
-    )
-    ordered = sorted(filtered, key=lambda row: row["x_center"])
-    if len(ordered) < 8:
-        return "", 0.0
+def _character_groups(characters: list[dict]) -> list[list[dict]]:
+    """Keep competing classes for one glyph instead of discarding them."""
+    filtered = [
+        dict(row)
+        for row in characters
+        if row.get("class_id") in IRANIAN_CHARACTER_MAP
+        and float(row.get("confidence", 0.0)) >= 0.12
+    ]
+    groups: list[list[dict]] = []
+    for row in sorted(filtered, key=lambda item: item["x_center"]):
+        target = None
+        for group in groups:
+            if max(
+                _iou(row["bbox"], member["bbox"])
+                for member in group
+            ) >= 0.42:
+                target = group
+                break
+        if target is None:
+            target = []
+            groups.append(target)
+        target.append(row)
 
-    # The model occasionally reports symbols from the blue country strip or
-    # two competing classes for one glyph. Select the highest-confidence
-    # eight-character subsequence that exactly matches the Iranian layout.
-    best = None
-    for selected in combinations(ordered[:14], 8):
-        raw = "".join(
-            IRANIAN_CHARACTER_MAP[row["class_id"]]
-            for row in selected
+    compact = []
+    for group in groups:
+        by_character = {}
+        for row in group:
+            character = IRANIAN_CHARACTER_MAP[row["class_id"]]
+            previous = by_character.get(character)
+            if (
+                previous is None
+                or float(row["confidence"])
+                > float(previous["confidence"])
+            ):
+                by_character[character] = row
+        compact.append(
+            sorted(
+                by_character.values(),
+                key=lambda item: float(item["confidence"]),
+                reverse=True,
+            )[:3]
         )
-        if not plausible_plate(raw):
+    return compact[:16]
+
+
+def _character_matches_position(character: str, position: int) -> bool:
+    if position == 2:
+        return not character.isdigit()
+    return character.isdigit()
+
+
+def _select_plate_hypotheses(
+    characters: list[dict],
+    limit: int = 5,
+) -> list[dict]:
+    """Decode several semantically valid alternatives with a small beam."""
+    groups = _character_groups(characters)
+    if len(groups) < 8:
+        return []
+
+    # State: normalized text, selected confidences and selected group indexes.
+    states = [("", tuple(), tuple())]
+    for group_index, group in enumerate(groups):
+        next_states = list(states)
+        for text, confidences, selected_groups in states:
+            position = len(text)
+            if position >= 8:
+                continue
+            for row in group:
+                character = IRANIAN_CHARACTER_MAP[row["class_id"]]
+                if not _character_matches_position(character, position):
+                    continue
+                next_states.append((
+                    text + character,
+                    confidences + (float(row["confidence"]),),
+                    selected_groups + (group_index,),
+                ))
+
+        # Keep alternatives per decoded length. This preserves a lower
+        # confidence but layout-compatible class that the previous NMS lost.
+        buckets: dict[int, list[tuple]] = {}
+        for state in next_states:
+            buckets.setdefault(len(state[0]), []).append(state)
+        states = []
+        for length, rows in buckets.items():
+            rows.sort(
+                key=lambda state: (
+                    sum(state[1]) / max(1, len(state[1])),
+                    min(state[1]) if state[1] else 0.0,
+                    state[0],
+                ),
+                reverse=True,
+            )
+            states.extend(rows[:48 if length == 8 else 24])
+
+    decoded = {}
+    for text, confidences, selected_groups in states:
+        if len(text) != 8 or not plausible_plate(text):
             continue
-        confidence = sum(
-            float(row["confidence"])
-            for row in selected
-        ) / 8.0
-        minimum = min(
-            float(row["confidence"])
-            for row in selected
-        )
-        score = 0.78 * confidence + 0.22 * minimum
-        candidate = (score, confidence, raw)
-        if best is None or candidate > best:
-            best = candidate
+        average = sum(confidences) / 8.0
+        minimum = min(confidences)
+        score = 0.78 * average + 0.22 * minimum
+        row = {
+            "plate": format_iran_plate(text),
+            "plate_norm": text,
+            "confidence": round(average, 4),
+            "minimum_confidence": round(minimum, 4),
+            "score": round(score, 5),
+            "groups": selected_groups,
+        }
+        previous = decoded.get(text)
+        if previous is None or row["score"] > previous["score"]:
+            decoded[text] = row
 
-    if best is None:
+    return sorted(
+        decoded.values(),
+        key=lambda row: (
+            row["score"],
+            row["confidence"],
+            row["plate_norm"],
+        ),
+        reverse=True,
+    )[:max(1, int(limit))]
+
+
+_EXPECTED_CHARACTER_CENTERS = (
+    0.08,
+    0.18,
+    0.30,
+    0.41,
+    0.51,
+    0.61,
+    0.82,
+    0.91,
+)
+
+
+def _select_partial_position_hypotheses(
+    characters: list[dict],
+    crop_width: int,
+    limit: int = 5,
+) -> list[dict]:
+    """Align incomplete character reads to known Iranian plate positions."""
+    groups = _character_groups(characters)
+    if len(groups) < 5 or crop_width <= 0:
+        return []
+
+    # State: position map, last plate position, confidence list, error list.
+    states = [({}, -1, tuple(), tuple())]
+    for group in groups:
+        next_states = list(states)
+        for positions, last_position, confidences, errors in states:
+            for position in range(last_position + 1, 8):
+                expected = _EXPECTED_CHARACTER_CENTERS[position]
+                for row in group:
+                    character = IRANIAN_CHARACTER_MAP[row["class_id"]]
+                    if not _character_matches_position(character, position):
+                        continue
+                    location = float(row["x_center"]) / float(crop_width)
+                    error = abs(location - expected)
+                    if error > 0.16:
+                        continue
+                    updated = dict(positions)
+                    updated[position] = {
+                        "character": character,
+                        "confidence": round(
+                            float(row["confidence"]),
+                            4,
+                        ),
+                    }
+                    next_states.append((
+                        updated,
+                        position,
+                        confidences + (float(row["confidence"]),),
+                        errors + (error,),
+                    ))
+
+        # Retain a compact beam for every coverage level.
+        buckets: dict[int, list[tuple]] = {}
+        for state in next_states:
+            buckets.setdefault(len(state[0]), []).append(state)
+        states = []
+        for coverage, rows in buckets.items():
+            rows.sort(
+                key=lambda state: (
+                    sum(state[2]) / max(1, len(state[2])),
+                    -sum(state[3]) / max(1, len(state[3])),
+                ),
+                reverse=True,
+            )
+            states.extend(rows[:32 if coverage >= 5 else 12])
+
+    decoded = {}
+    for positions, _last_position, confidences, errors in states:
+        coverage = len(positions)
+        if coverage < 5 or coverage >= 8 or 2 not in positions:
+            continue
+        average_confidence = sum(confidences) / coverage
+        average_error = sum(errors) / coverage
+        geometry = max(0.0, 1.0 - average_error / 0.16)
+        score = (
+            0.72 * average_confidence
+            + 0.28 * geometry
+        ) * (0.80 + 0.025 * coverage)
+        signature = tuple(
+            (position, row["character"])
+            for position, row in sorted(positions.items())
+        )
+        candidate = {
+            "positions": positions,
+            "coverage": coverage,
+            "confidence": round(average_confidence, 4),
+            "geometry": round(geometry, 4),
+            "score": round(score, 5),
+        }
+        previous = decoded.get(signature)
+        if previous is None or candidate["score"] > previous["score"]:
+            decoded[signature] = candidate
+
+    return sorted(
+        decoded.values(),
+        key=lambda row: (
+            row["coverage"],
+            row["score"],
+            row["confidence"],
+        ),
+        reverse=True,
+    )[:max(1, int(limit))]
+
+
+def _select_plate_sequence(characters: list[dict]) -> tuple[str, float]:
+    hypotheses = _select_plate_hypotheses(characters, limit=1)
+    if not hypotheses:
         return "", 0.0
-    return format_iran_plate(best[2]), round(best[1], 4)
+    best = hypotheses[0]
+    return best["plate"], best["confidence"]
 
 
 def _recognize_plate_crop(
     model,
     crop: np.ndarray,
     image_size: int,
-) -> tuple[str, float]:
+) -> tuple[str, float, list[dict], list[dict]]:
     result = model.predict(
         crop,
         verbose=False,
@@ -283,7 +493,81 @@ def _recognize_plate_crop(
             "bbox": (x1, y1, x2, y2),
             "x_center": (x1 + x2) / 2.0,
         })
-    return _select_plate_sequence(characters)
+    hypotheses = _select_plate_hypotheses(characters)
+    position_hypotheses = _select_partial_position_hypotheses(
+        characters,
+        crop.shape[1],
+    )
+    if not hypotheses:
+        return "", 0.0, [], position_hypotheses
+    return (
+        hypotheses[0]["plate"],
+        hypotheses[0]["confidence"],
+        hypotheses,
+        position_hypotheses,
+    )
+
+
+def _merge_plate_hypotheses(*collections) -> list[dict]:
+    merged = {}
+    for rows in collections:
+        for row in rows or []:
+            normalized = normalize_plate(row.get("plate_norm") or row.get("plate"))
+            if not plausible_plate(normalized):
+                continue
+            candidate = dict(row)
+            candidate["plate_norm"] = normalized
+            candidate["plate"] = format_iran_plate(normalized)
+            previous = merged.get(normalized)
+            if (
+                previous is None
+                or float(candidate.get("score", candidate.get("confidence", 0.0)))
+                > float(previous.get("score", previous.get("confidence", 0.0)))
+            ):
+                merged[normalized] = candidate
+    return sorted(
+        merged.values(),
+        key=lambda row: (
+            float(row.get("score", row.get("confidence", 0.0))),
+            float(row.get("confidence", 0.0)),
+            row["plate_norm"],
+        ),
+        reverse=True,
+    )[:5]
+
+
+def _merge_position_hypotheses(*collections) -> list[dict]:
+    merged = {}
+    for rows in collections:
+        for row in rows or []:
+            positions = {
+                int(position): dict(value)
+                for position, value in row.get("positions", {}).items()
+                if 0 <= int(position) < 8
+            }
+            signature = tuple(
+                (position, value.get("character", ""))
+                for position, value in sorted(positions.items())
+            )
+            if len(signature) < 5:
+                continue
+            candidate = dict(row)
+            candidate["positions"] = positions
+            previous = merged.get(signature)
+            if (
+                previous is None
+                or float(candidate.get("score", 0.0))
+                > float(previous.get("score", 0.0))
+            ):
+                merged[signature] = candidate
+    return sorted(
+        merged.values(),
+        key=lambda row: (
+            int(row.get("coverage", 0)),
+            float(row.get("score", 0.0)),
+        ),
+        reverse=True,
+    )[:5]
 
 
 def _choose_recovery_result(
@@ -343,7 +627,9 @@ def _recognize_plate_crops(model, candidates: list[dict]) -> None:
                 candidate["crop"],
                 image_size,
             )
-            text, confidence = original
+            text, confidence = original[:2]
+            hypotheses = list(original[2])
+            position_hypotheses = list(original[3])
             candidate["recovery_attempted"] = False
             candidate["recovery_selected"] = False
             try:
@@ -368,8 +654,16 @@ def _recognize_plate_crops(model, candidates: list[dict]) -> None:
                         image_size,
                     )
                     text, confidence, decision = _choose_recovery_result(
-                        original,
-                        recovered,
+                        original[:2],
+                        recovered[:2],
+                    )
+                    hypotheses = _merge_plate_hypotheses(
+                        original[2],
+                        recovered[2],
+                    )
+                    position_hypotheses = _merge_position_hypotheses(
+                        original[3],
+                        recovered[3],
                     )
                     candidate.update({
                         "recovery_attempted": True,
@@ -397,6 +691,8 @@ def _recognize_plate_crops(model, candidates: list[dict]) -> None:
                 text, confidence = original
             candidate["direct_text"] = text
             candidate["direct_ocr_confidence"] = confidence
+            candidate["plate_hypotheses"] = hypotheses
+            candidate["position_hypotheses"] = position_hypotheses
             if text:
                 candidate["method"] = (
                     "yolo-plate+chars+recovery"
@@ -546,17 +842,27 @@ def _opencv_candidates(frame: np.ndarray, max_results: int) -> list[dict]:
     return _nms(candidates)[:max_results]
 
 
-def detect_plates(frame, min_confidence: float = 0.25, max_results: int = 8):
+def detect_plates(
+    frame,
+    min_confidence: float = 0.25,
+    max_results: int = 8,
+    engine_key=None,
+):
     if frame is None or getattr(frame, "size", 0) == 0:
         return []
     height, width = frame.shape[:2]
-    model = load_model()
+    model = load_model() if engine_key is None else load_model(engine_key)
     found = []
     if model is not None:
         # Ultralytics mutates predictor state during predict().  A shared model
         # used concurrently by live-camera workers can silently return empty
         # detections.  Serialize the full detector+character transaction.
-        with _inference_lock:
+        slot = _runtime_slot(engine_key)
+        inference_lock = _inference_locks.setdefault(
+            slot,
+            threading.RLock(),
+        )
+        with inference_lock:
             try:
                 plate_class_ids = _plate_class_ids(model)
                 model_max_results = (

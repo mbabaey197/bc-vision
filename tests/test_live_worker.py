@@ -1,5 +1,6 @@
 import time
 import sqlite3
+import threading
 
 import numpy as np
 
@@ -24,6 +25,9 @@ def test_unreadable_vehicle_event_is_upgraded_without_duplicate(
             plate_image_path TEXT,
             detector_method TEXT,
             ocr_confidence REAL,
+            ocr_engine TEXT,
+            ocr_alternative TEXT,
+            ocr_disagreement INTEGER,
             vehicle_type TEXT,
             vehicle_color TEXT,
             vehicle_brand TEXT,
@@ -64,6 +68,9 @@ def test_unreadable_vehicle_event_is_upgraded_without_duplicate(
         "confidence": 0.41,
         "detector_confidence": 0.82,
         "ocr_confidence": 0.0,
+        "ocr_engine": "none",
+        "ocr_alternative": "",
+        "ocr_disagreement": False,
         "quality_score": 0.76,
         "bbox": (80, 95, 180, 125),
         "crop": frame[95:125, 80:180].copy(),
@@ -78,6 +85,9 @@ def test_unreadable_vehicle_event_is_upgraded_without_duplicate(
         "valid": True,
         "confidence": 0.91,
         "ocr_confidence": 0.90,
+        "ocr_engine": "crnn-onnx",
+        "ocr_alternative": "31-ط-558-74",
+        "ocr_disagreement": True,
         "consensus_votes": 3,
     })
     updated_id = worker._persist(
@@ -98,6 +108,9 @@ def test_unreadable_vehicle_event_is_upgraded_without_duplicate(
     assert len(rows) == 1
     assert rows[0]["plate_norm"] == "31ط55674"
     assert rows[0]["consensus_votes"] == 3
+    assert rows[0]["ocr_engine"] == "crnn-onnx"
+    assert rows[0]["ocr_alternative"] == "31-ط-558-74"
+    assert rows[0]["ocr_disagreement"] == 1
     assert (tmp_path / "plates").is_dir()
     assert (tmp_path / "vehicles").is_dir()
 
@@ -411,6 +424,10 @@ def test_empty_inference_enters_backoff_and_clears_overlay(
         "bbox": (20, 25, 130, 60),
         "crop": frame[25:60, 20:130],
         "method": "test",
+        "whole_plate_ocr_attempted": True,
+        "ocr_engine": "crnn-onnx",
+        "ocr_alternative": "31-ط-556-74",
+        "ocr_disagreement": True,
     }
     outputs = iter(([detected], [], [], []))
     monkeypatch.setattr(
@@ -445,6 +462,13 @@ def test_empty_inference_enters_backoff_and_clears_overlay(
     assert status["idle_mode"] is True
     assert status["no_plate_streak"] == 3
     assert status["next_inference_seconds"] >= 1.0
+    assert status["ocr_ab"] == {
+        "whole_plate_attempts": 1,
+        "agreements": 0,
+        "disagreements": 1,
+        "crnn_selected": 1,
+        "character_reader_selected": 0,
+    }
 
 
 def test_no_plate_backoff_grows_but_recognition_stays_responsive():
@@ -456,3 +480,58 @@ def test_no_plate_backoff_grows_but_recognition_stays_responsive():
     assert delay(0.25, 3) == 1.60
     assert delay(0.25, 4) == 3.20
     assert delay(0.25, 10) == 3.20
+
+
+def test_two_cameras_receive_independent_worker_slots(monkeypatch):
+    monkeypatch.setattr(
+        live_worker,
+        "parallel_camera_limit",
+        lambda: 2,
+    )
+    worker = live_worker.LiveANPRWorker()
+    monkeypatch.setattr(
+        worker,
+        "_load_config",
+        lambda camera_id: {
+            "id": camera_id,
+            "enabled": 1,
+            "lpr_enabled": 1,
+            "lpr_confidence": 50,
+            "duplicate_seconds": 0,
+            "roi_x": 0,
+            "roi_y": 0,
+            "roi_w": 100,
+            "roi_h": 100,
+        },
+    )
+    active = 0
+    maximum_active = 0
+    engine_keys = []
+    active_lock = threading.Lock()
+
+    def process(_frame, _confidence, engine_key=None):
+        nonlocal active, maximum_active
+        with active_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+            engine_keys.append(engine_key)
+        time.sleep(0.05)
+        with active_lock:
+            active -= 1
+        return []
+
+    monkeypatch.setattr(live_worker, "process_frame", process)
+    frame = np.zeros((80, 160, 3), dtype=np.uint8)
+
+    worker.submit(1, "gate one", frame)
+    worker.submit(2, "gate two", frame)
+    time.sleep(0.14)
+    first = worker.status(1)
+    second = worker.status(2)
+    worker.shutdown()
+
+    assert maximum_active == 2
+    assert sorted(engine_keys) == [1, 2]
+    assert first["threads_per_camera"] == 2
+    assert first["parallel_camera_limit"] == 2
+    assert second["processed_frames"] == 1

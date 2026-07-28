@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from itertools import product
 import os
 from pathlib import Path
+import threading
 from typing import Iterable, Sequence
 
 import cv2
@@ -24,11 +25,14 @@ from .plate_rules import (
     normalize_plate,
     plausible_plate,
 )
+from .onnx_crnn import get_crnn_status, read_plate_crnn
 
 _easy_reader = None
 _easy_reader_key = None
+_easy_reader_lock = threading.RLock()
 _last_status = {
     "engine": "none",
+    "crnn_error": "",
     "easyocr_error": "",
     "tesseract_error": "",
     "candidate_count": 0,
@@ -76,7 +80,18 @@ class OCRToken:
 
 
 def get_ocr_status():
-    return dict(_last_status)
+    status = dict(_last_status)
+    crnn = get_crnn_status()
+    status.update({
+        "crnn_attempted": bool(crnn.get("attempted")),
+        "crnn_model_loaded": bool(crnn.get("model_loaded")),
+        "crnn_model_path": crnn.get("model_path", ""),
+        "crnn_raw_text": crnn.get("raw_text", ""),
+        "crnn_confidence": float(crnn.get("confidence", 0.0)),
+        "crnn_error": crnn.get("error", ""),
+        "crnn_threads": int(crnn.get("threads", 0)),
+    })
+    return status
 
 
 def _safe_confidence(value) -> float:
@@ -553,42 +568,46 @@ def _easyocr(image) -> tuple[str, float]:
         best = ("", 0.0)
         total_candidates = 0
 
-        for variant in variants:
-            raw = reader.readtext(
-                variant,
-                detail=1,
-                paragraph=False,
-                allowlist=EASYOCR_ALLOWLIST,
-                decoder="beamsearch",
-                beamWidth=5,
-                text_threshold=0.45,
-                low_text=0.25,
-                link_threshold=0.25,
-                mag_ratio=1.0,
-            )
-            detections = []
+        # EasyOCR's Reader owns mutable Torch modules.  The generic fallback
+        # is rare and remains shared to avoid duplicating its large model for
+        # every camera, so protect its read transaction.
+        with _easy_reader_lock:
+            for variant in variants:
+                raw = reader.readtext(
+                    variant,
+                    detail=1,
+                    paragraph=False,
+                    allowlist=EASYOCR_ALLOWLIST,
+                    decoder="beamsearch",
+                    beamWidth=5,
+                    text_threshold=0.45,
+                    low_text=0.25,
+                    link_threshold=0.25,
+                    mag_ratio=1.0,
+                )
+                detections = []
 
-            for box, text, confidence in raw:
-                xs = [
-                    float(point[0])
-                    for point in box
-                ]
-                ys = [
-                    float(point[1])
-                    for point in box
-                ]
-                detections.append({
-                    "text": text,
-                    "confidence": confidence,
-                    "x_center": sum(xs) / len(xs),
-                    "y_center": sum(ys) / len(ys),
-                })
+                for box, text, confidence in raw:
+                    xs = [
+                        float(point[0])
+                        for point in box
+                    ]
+                    ys = [
+                        float(point[1])
+                        for point in box
+                    ]
+                    detections.append({
+                        "text": text,
+                        "confidence": confidence,
+                        "x_center": sum(xs) / len(xs),
+                        "y_center": sum(ys) / len(ys),
+                    })
 
-            total_candidates += len(detections)
-            candidate = _assemble_detections(detections)
+                total_candidates += len(detections)
+                candidate = _assemble_detections(detections)
 
-            if candidate[1] > best[1]:
-                best = candidate
+                if candidate[1] > best[1]:
+                    best = candidate
 
         _last_status.update(
             engine="easyocr",
@@ -681,15 +700,51 @@ def _tesseract(image) -> tuple[str, float]:
         return "", 0.0
 
 
-def read_plate(image) -> tuple[str, float]:
+def read_plate_candidate(
+    image,
+    engine_key=None,
+    allow_legacy=True,
+) -> tuple[str, float, str]:
     if image is None or getattr(image, "size", 0) == 0:
-        return "", 0.0
+        return "", 0.0, "none"
+
+    mode = os.environ.get(
+        "BCVISION_OCR_ENGINE",
+        "hybrid",
+    ).strip().lower()
+    if mode not in {"hybrid", "crnn", "legacy"}:
+        mode = "hybrid"
+
+    if mode != "legacy":
+        crnn_text, crnn_confidence = read_plate_crnn(
+            image,
+            engine_key=engine_key,
+        )
+        if plausible_plate(crnn_text):
+            _last_status.update(
+                engine="crnn-onnx",
+                crnn_error="",
+            )
+            return (
+                format_iran_plate(crnn_text),
+                float(crnn_confidence),
+                "crnn-onnx",
+            )
+        crnn_status = get_crnn_status()
+        _last_status["crnn_error"] = crnn_status.get(
+            "error",
+            "",
+        )
+
+    if mode == "crnn" or not allow_legacy:
+        return "", 0.0, "crnn-onnx"
 
     easy_text, easy_confidence = _easyocr(image)
     if plausible_plate(easy_text):
         return (
             format_iran_plate(easy_text),
             float(easy_confidence),
+            "easyocr",
         )
 
     tess_text, tess_confidence = _tesseract(image)
@@ -703,6 +758,20 @@ def read_plate(image) -> tuple[str, float]:
         return (
             format_iran_plate(tess_text),
             min(0.60, float(tess_confidence)),
+            "tesseract",
         )
 
-    return "", 0.0
+    return "", 0.0, "none"
+
+
+def read_plate(
+    image,
+    engine_key=None,
+    allow_legacy=True,
+) -> tuple[str, float]:
+    text, confidence, _engine = read_plate_candidate(
+        image,
+        engine_key=engine_key,
+        allow_legacy=allow_legacy,
+    )
+    return text, confidence

@@ -5,7 +5,7 @@
 - GitHub repository: `mahdibabaey197/bc-vision`
 - Default branch: `main`
 - Product: BC Vision
-- Current application version in source: `2.2.0-rc9`
+- Current application version in source: `2.2.0-rc11`
 - Windows persistent data root: `C:\ProgramData\BCVision\data`
 
 ## Release contract
@@ -44,13 +44,18 @@ The Iranian plate-recognition subsystem now includes:
 - AI-aware PyInstaller build configuration
 - serialized shared-model inference for multi-camera correctness
 - conditional mild-motion deblurring with dedicated-AI reread
+- whole-plate Iranian CRNN+CTC OCR through ONNX Runtime
+- per-camera ONNX sessions with a hard two-thread ceiling
+- A/B evidence fusion between whole-plate and character-level readers
 
 ## ANPR model execution contract
 
 The verified `best.pt` asset is a combined Iranian plate/character model, not
 a single-class plate-only detector. Full-frame inference must select class
-`30` (plate), followed by a character-only inference on the cropped plate.
-Generic EasyOCR is reserved for the OpenCV/no-model fallback. Vehicle
+`30` (plate), followed by two independent crop readers: the character branch
+of `best.pt`, and a segmentation-free Iranian CRNN+CTC model executed through
+ONNX Runtime. Their alternatives are retained for multi-frame voting.
+EasyOCR/Tesseract are reserved for the final crop-level fallback. Vehicle
 attributes are calculated only after stable plate consensus, immediately
 before event persistence.
 
@@ -61,17 +66,22 @@ triggers the geometry fallback for difficult small, oblique or overexposed
 plates. The live worker rate-limits this second pass adaptively from measured
 processing latency so it does not run continuously on a slow CPU.
 
-The model loader reapplies a four-thread maximum CPU budget after Ultralytics
-model construction, because Ultralytics can otherwise reset Torch to use
-nearly all logical processors. Two logical processors are reserved when the
-host has enough cores. Deployments can override this with
-`BCVISION_CPU_THREADS=1..8`.
+Each camera inference is hard-capped to two native compute threads across
+OpenMP, BLAS, OpenCV and Torch. Deployments may reduce the per-camera budget
+to one with `BCVISION_CPU_THREADS=1`; larger values are clamped to two.
+Concurrent camera capacity is calculated from logical CPU count while
+reserving two logical processors for decoding, the dashboard and Windows.
+Each of the default three camera keys keeps a distinct bounded ONNX Runtime
+session even when a small host permits only one simultaneous inference.
+Every session uses `intra_op_num_threads <= 2`,
+`inter_op_num_threads = 1`, sequential graph execution and disabled worker
+spinning.
 
 Ultralytics predictor state is not shared safely across simultaneous
-`predict()` calls. Live-camera workers therefore serialize the complete
-plate-localization and character-read transaction on the shared model while
-continuing to replace stale queued frames. This prevents silent empty
-detections and avoids concurrent CPU oversubscription.
+`predict()` calls. The detector therefore owns one model instance and lock per
+bounded runtime slot. A camera always maps to the same slot; cameras in
+different slots can infer concurrently, while additional cameras queue safely
+and continue replacing stale frames.
 
 Mild-blur recovery is conditional and defaults on. The original crop is read
 first; only a soft or uncertain crop is restored and read once more by the
@@ -97,6 +107,9 @@ The target Windows Python 3.13 environment successfully imported and executed:
 - Ultralytics `8.4.106`
 
 Persian EasyOCR reader creation and inference were verified with the persistent Arabic recognition and CRAFT detector models.
+ONNX Runtime `1.28.0` and the verified CRNN model are RC11 Windows acceptance
+dependencies; packaged inference remains a release gate until the candidate
+workflow completes.
 
 ## Automated validation
 
@@ -214,10 +227,11 @@ the confirmed mapping locally. Broader OCR/model changes require a reviewed
 offline training and validation run; feedback does not mutate model weights
 inside the live process.
 
-Live streams now draw a green box around valid plate candidates and an amber
-box around unreadable candidates. Dashboard video cards are capped at a
-smaller width, and the old system-status card beside recent plate events was
-removed; technical status remains available from Settings.
+Live streams draw a green box around every physical plate candidate. OCR
+confidence and review state are carried by result metadata instead of changing
+the box colour. Dashboard video cards are capped at a smaller width, and the
+old system-status card beside recent plate events was removed; technical
+status remains available from Settings.
 
 ## RC7 live reliability
 
@@ -286,6 +300,92 @@ ground-truth set would make accuracy and installer compatibility unverified.
 OpenVINO export is the preferred next CPU benchmark, while PP-OCRv5 should be
 evaluated only as a crop-level fallback against the current dedicated Iranian
 character model.
+
+## RC10 per-camera CPU and multi-hypothesis OCR
+
+Version `2.2.0-rc10` hard-caps every camera at two native compute threads.
+The live scheduler separately limits simultaneous cameras from logical CPU
+count and reserves two logical processors for Windows, decoding and the web
+panel. On an eight-logical-processor host the default is three simultaneous
+camera slots. Each slot owns a separate Ultralytics model instance and
+inference lock, removing RC9's process-wide model bottleneck without sharing
+unsafe predictor state.
+
+The character decoder now groups overlapping class predictions instead of
+discarding every lower-confidence alternative through global NMS. It keeps up
+to five valid Iranian-plate hypotheses and the temporal tracker aggregates
+their probability independently at all eight positions. A character that is
+the consistent second model choice across frames can therefore defeat
+different one-frame errors, while equal alternatives still fail the ambiguity
+margin for automatic confirmation. After the review window expires, the
+strongest fully observed alternative is retained as an explicitly reviewable
+best-effort read rather than being discarded.
+
+Incomplete dedicated-model reads are also retained. Five-to-seven detected
+characters are aligned to the physical Iranian plate positions using crop
+geometry. Different incomplete frames may supply the missing positions, but
+every final position still requires at least three credible observations plus
+the existing ratio and margin checks. No missing character is invented.
+
+EasyOCR remains a crop-only fallback and is protected by one shared lock to
+avoid duplicating its large model for every camera. Failure or first-run
+migration of the operator-feedback table no longer interrupts ANPR.
+
+RC10 preserves imperfect reads for operator correction. A complete
+low-confidence hypothesis is stored as `suggested`; five-to-seven observed
+positions are shown with `؟` only in missing positions. `ناخوانا` is reserved
+for a physical plate crop with no usable character evidence. Corrections remain
+durable labelled samples. Exact complete mistakes are reused immediately, and
+character-level generalization requires at least two consistent confirmed
+corrections and may only re-rank alternatives already emitted by OCR.
+
+The live overlay is always green for a physical plate candidate and advances
+on every displayed frame. Tracking uses forward/backward optical flow, affine
+translation/scale estimation and a template-matching fallback. Synthetic
+translation-plus-scale verification tracked `18/18` frames with zero misses
+and mean/minimum IoU `1.000`. Full local regression is
+`114 passed, 1 skipped`; real uploaded-video and Windows acceptance remain
+release gates.
+
+## RC11 whole-plate CRNN in ONNX Runtime
+
+Version `2.2.0-rc11` adds a segmentation-free Iranian CRNN+CTC reader that
+reads the complete `DD L DDD DD` plate crop in one inference. ONNX Runtime is
+the execution backend for that CRNN model; it is not an alternative model
+architecture. The verified 10,452,525-byte model is stored under the
+persistent data directory and accepted only when its fixed SHA-256 matches.
+The model and its MIT notice are included in the offline Windows model seed.
+
+RC11 keeps the RC10 character detector as an independent reader. Agreement
+boosts the selected OCR confidence. On disagreement both valid hypotheses are
+retained for position-wise multi-frame voting; a CRNN result replaces the
+primary one only when its confidence exceeds the character read by at least
+0.08, and the event remains explicitly reviewable. EasyOCR/Tesseract run only
+when both dedicated readers fail on a credible plate crop.
+
+The selected OCR engine, alternative complete read and disagreement flag are
+stored in additive `plate_events` columns. Per-camera runtime status also
+reports whole-plate attempts, agreements, disagreements and selection counts,
+so the A/B result can be measured without replacing or deleting old events.
+
+Each of the default three camera keys retains a distinct bounded ONNX session.
+Session options enforce at most two intra-operation threads, one
+inter-operation thread, sequential execution and disabled thread spinning.
+Concurrent inference remains separately limited by available CPU capacity;
+the bounded LRU cache prevents modulo collisions between camera IDs on
+small-core Windows hosts.
+
+Local verification after RC11 implementation is `121 passed, 1 skipped`.
+Unit tests use deterministic CTC logits and a controlled ONNX session double;
+an additional real ONNX Runtime `1.28.0` smoke executed a generated ONNX graph
+through preprocessing, inference and CTC formatting with the two-thread cap.
+Windows PR run `30348185238` loaded and executed the verified YOLO, EasyOCR,
+ONNX Runtime and production CRNN assets successfully. Windows candidate run
+`30348180982` built the portable executable, installer and updater, verified
+the GUI subsystem, exercised clean install and in-place update, ran offline
+ANPR self-tests before and after update, preserved SQLite and model markers,
+and uploaded the release bundle. Accuracy comparison on labelled frames from
+`01.mp4` and real multi-camera performance measurement remain release gates.
 
 ## Uploaded video live-source fix
 
