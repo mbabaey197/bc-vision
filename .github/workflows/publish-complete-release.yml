@@ -58,6 +58,30 @@ jobs:
             exit 1
           fi
 
+          run_conclusion="$(
+            gh api \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
+              --jq '.conclusion'
+          )"
+          candidate_sha="$(
+            gh api \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
+              --jq '.head_sha'
+          )"
+          if [[ "$run_conclusion" != "success" ]]; then
+            echo "Candidate run $run_id did not complete successfully" >&2
+            exit 1
+          fi
+          compare_status="$(
+            gh api \
+              "repos/$GITHUB_REPOSITORY/compare/${candidate_sha}...${GITHUB_SHA}" \
+              --jq '.status'
+          )"
+          if [[ "$compare_status" != "ahead" && "$compare_status" != "identical" ]]; then
+            echo "Candidate commit $candidate_sha is not contained in main" >&2
+            exit 1
+          fi
+
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
