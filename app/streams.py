@@ -25,6 +25,7 @@ except Exception:
 @dataclass
 class StreamState:
     online: bool = False
+    paused: bool = False
     last_error: str = ""
     last_frame_at: float = 0.0
 
@@ -49,6 +50,7 @@ class CameraStream:
         self.latest: bytes | None = None
         self.latest_frame = None
         self.stop_event = threading.Event()
+        self.pause_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.lock = threading.Lock()
         self._overlay_rows: list[dict] = []
@@ -75,6 +77,30 @@ class CameraStream:
             stop_live_camera(self.camera_id)
         except Exception:
             pass
+
+    def pause(self):
+        if self.url.startswith("video://"):
+            self.pause_event.set()
+            self.state.paused = True
+            return True
+        return False
+
+    def resume(self):
+        if self.url.startswith("video://"):
+            self.pause_event.clear()
+            self.state.paused = False
+            return True
+        return False
+
+    def _wait_while_paused(self):
+        while (
+            self.pause_event.is_set()
+            and not self.stop_event.is_set()
+        ):
+            self.state.paused = True
+            self.stop_event.wait(0.10)
+        if not self.stop_event.is_set():
+            self.state.paused = False
 
     @staticmethod
     def _gray(frame):
@@ -170,14 +196,18 @@ class CameraStream:
             reference = snapshot.get("frame")
             detections = snapshot.get("detections") or []
             if revision > self._overlay_revision and reference is not None:
-                compensated = self._track_overlay_rows(
-                    reference,
-                    frame,
-                    detections,
-                )
-                self._overlay_rows = compensated or [
-                    dict(row) for row in detections
-                ]
+                if detections:
+                    compensated = self._track_overlay_rows(
+                        reference,
+                        frame,
+                        detections,
+                    )
+                    # A failed motion match means the detector coordinates no
+                    # longer have visual support on this newer display frame.
+                    # Never redraw the old coordinates as a fallback.
+                    self._overlay_rows = compensated
+                else:
+                    self._overlay_rows = []
                 self._overlay_revision = revision
                 self._overlay_updated_at = now
                 self._overlay_max_age = float(
@@ -345,6 +375,9 @@ class CameraStream:
                 for video_frame in container.decode(video=0):
                     if self.stop_event.is_set():
                         return
+                    self._wait_while_paused()
+                    if self.stop_event.is_set():
+                        return
                     frame = video_frame.to_ndarray(format="bgr24")
                     self._publish(frame)
                     published += 1
@@ -387,6 +420,9 @@ class CameraStream:
                     raise RuntimeError("Cannot open camera or video stream")
                 capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 while not self.stop_event.is_set():
+                    self._wait_while_paused()
+                    if self.stop_event.is_set():
+                        break
                     ok, frame = capture.read()
                     if not ok or frame is None:
                         if is_video_file:
@@ -504,12 +540,14 @@ class StreamManager:
         stream = self.streams.get(camera_id)
         base = {
             "online": False,
+            "paused": False,
             "error": "stream not started",
             "last_frame_at": 0.0,
         }
         if stream:
             base = {
                 "online": stream.state.online,
+                "paused": stream.state.paused,
                 "error": stream.state.last_error,
                 "last_frame_at": stream.state.last_frame_at,
             }
@@ -519,6 +557,17 @@ class StreamManager:
         except Exception:
             base["anpr"] = {"active": False}
         return base
+
+    def set_playback(self, camera_id, action):
+        with self.lock:
+            stream = self.streams.get(int(camera_id))
+        if not stream or not stream.url.startswith("video://"):
+            return False
+        if action == "pause":
+            return stream.pause()
+        if action == "play":
+            return stream.resume()
+        return False
 
 
 manager = StreamManager()
