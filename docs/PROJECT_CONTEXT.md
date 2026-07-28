@@ -420,10 +420,17 @@ Persian, including license expiration, event time, replay timing and the demo
 overlay. Database timestamps, filenames, API contracts and JavaScript numeric
 control values remain machine-stable ASCII.
 
-The initial local RC12 regression is `131 passed, 1 skipped`; the skip is the
+The final local RC12 regression is `130 passed, 1 skipped`; the skip is the
 real-model integration test, which is enabled in the Windows AI acceptance
-job. Windows installer/updater acceptance and release identifiers must be
-added here after the GitHub gates complete.
+job. PR validation run `30359483088`, main run `30359720847` and Windows
+release-candidate run `30359478238` passed. The candidate built the windowless
+application, Setup and one-click Update, then verified clean install, offline
+ANPR, in-place update, database/model preservation and standard uninstall.
+PRs `#21` and `#22` were merged. Tag `v2.2.0-rc12` points to application merge
+commit `273ebf43b7f12b20fd46e68f30ebcfab3784c113`; complete-release run
+`30361052399` published the verified Setup, Update, exact Source ZIP and
+SHA-256 manifest. Accuracy comparison on the customer's real `01.mp4` remains
+a field validation gate and is not inferred from the model smoke tests.
 
 ## Uploaded video live-source fix
 
