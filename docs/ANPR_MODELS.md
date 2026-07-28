@@ -109,6 +109,22 @@ No trained YOLO26-OBB or fine-tuned Hezar weights are committed in RC13. Those
 weights must be produced from licensed data, signed, and pass the fixed real
 camera Golden Dataset in shadow mode before `next` can be activated.
 
+### Hezar v2 export and isolated benchmark
+
+`tools/export_hezar_onnx.py` exports the official Hezar v2 Persian
+license-plate CRNN to the exact ONNX contract used by RC13. It also writes the
+label map and preprocessing metadata beside the ONNX file and rejects an
+export whose ONNX Runtime output differs materially from PyTorch.
+
+`tools/benchmark_hezar_video.py` pairs an exported OCR with the current
+detector for an isolated OCR comparison before an OBB weight exists. Truth
+plates must be supplied explicitly; other outputs remain unverified.
+
+The local `01.mp4` benchmark on 2026-07-28 processed all 546 frames. Baseline
+and ready-made Hezar v2 each matched only 1 of the 3 known plates, while Hezar
+was 37.3% slower. The checkpoint was therefore not promoted. See
+`agent-results/latest/ANPR_HEZAR_VIDEO_BENCHMARK_RC13.md`.
+
 ## Operator training and promotion
 
 Confirmed corrections copy the corresponding plate crop into an immutable

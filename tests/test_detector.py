@@ -52,7 +52,14 @@ def make_plate_scene(brightness=45, angle=0, blur=0):
 
 
 def test_fallback_detects_clear_plate(monkeypatch):
-    monkeypatch.setattr("app.ai.detector.load_model", lambda: None)
+    monkeypatch.setattr(
+        "app.ai.detector.detect_plates_onnx",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        "app.ai.detector.onnx_detector_status",
+        lambda: {"model_loaded": False},
+    )
     rows = detect_plates(make_plate_scene(), min_confidence=0.1)
     assert rows
     assert rows[0]["crop"].size > 0
@@ -60,7 +67,14 @@ def test_fallback_detects_clear_plate(monkeypatch):
 
 
 def test_fallback_handles_dark_rotated_blurred(monkeypatch):
-    monkeypatch.setattr("app.ai.detector.load_model", lambda: None)
+    monkeypatch.setattr(
+        "app.ai.detector.detect_plates_onnx",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        "app.ai.detector.onnx_detector_status",
+        lambda: {"model_loaded": False},
+    )
     for scene in [
         make_plate_scene(brightness=8),
         make_plate_scene(angle=8),

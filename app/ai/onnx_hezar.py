@@ -61,6 +61,8 @@ def clear_hezar_sessions() -> None:
 
 def _softmax(logits: np.ndarray) -> np.ndarray:
     values = np.asarray(logits, dtype=np.float64)
+    if values.ndim != 2:
+        raise ValueError("CTC logits must have shape (time, classes)")
     values -= values.max(axis=1, keepdims=True)
     exponent = np.exp(values)
     return exponent / np.maximum(
@@ -85,9 +87,34 @@ def ctc_beam_hypotheses(
     """Return plate-layout-constrained CTC prefixes with relative scores."""
 
     probabilities = _softmax(np.asarray(logits))
+    class_count = probabilities.shape[1]
     blank = len(labels) if blank_index is None else int(blank_index)
-    if probabilities.ndim != 2 or not 0 <= blank < probabilities.shape[1]:
+    if not 0 <= blank < class_count:
         raise ValueError("Invalid CTC output or blank index")
+    # BC Vision's native CRNN stores the blank after all labels.  Hezar v2
+    # stores it at class 0 and includes the empty blank label in id2label.
+    # Accept either representation so manifest labels map to their real logit
+    # indices instead of silently shifting every Persian character.
+    if len(labels) == class_count:
+        label_items = [
+            (index, str(character))
+            for index, character in enumerate(labels)
+            if index != blank and str(character)
+        ]
+    elif len(labels) == class_count - 1:
+        label_items = list(zip(
+            (
+                index
+                for index in range(class_count)
+                if index != blank
+            ),
+            (str(character) for character in labels),
+        ))
+    else:
+        raise ValueError(
+            "CTC label count does not match output classes: "
+            f"{len(labels)} labels for {class_count} classes"
+        )
     beams = {"": (1.0, 0.0)}
     width = max(2, int(beam_width))
 
@@ -96,7 +123,7 @@ def ctc_beam_hypotheses(
         for prefix, (blank_prob, nonblank_prob) in beams.items():
             total = blank_prob + nonblank_prob
             candidates[prefix][0] += total * float(timestep[blank])
-            for index, character in enumerate(labels):
+            for index, character in label_items:
                 probability = float(timestep[index])
                 if probability <= 1e-9:
                     continue
@@ -170,8 +197,13 @@ def hypothesis_position_margins(hypotheses: list[dict]) -> list[dict]:
                 "margin": 0.0,
             })
             continue
-        first = ordered[0]
-        second = ordered[1][1] if len(ordered) > 1 else 0.0
+        total = sum(value for _, value in ordered)
+        first = (ordered[0][0], ordered[0][1] / max(total, 1e-12))
+        second = (
+            ordered[1][1] / max(total, 1e-12)
+            if len(ordered) > 1
+            else 0.0
+        )
         details.append({
             "position": position,
             "character": first[0],
@@ -227,7 +259,17 @@ def prepare_hezar_input(image, spec: dict) -> np.ndarray | None:
             if image.ndim == 3
             else image
         )
-        resized = cv2.resize(source, (width, height))
+        if bool(spec.get("mirror", False)):
+            source = cv2.flip(source, 1)
+        resized = cv2.resize(
+            source,
+            (width, height),
+            interpolation=(
+                cv2.INTER_AREA
+                if source.shape[1] > width
+                else cv2.INTER_LINEAR
+            ),
+        )
         tensor = resized.astype(np.float32)[None, None] / 255.0
     else:
         source = (
@@ -235,14 +277,30 @@ def prepare_hezar_input(image, spec: dict) -> np.ndarray | None:
             if image.ndim == 2
             else cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         )
-        resized = cv2.resize(source, (width, height))
+        if bool(spec.get("mirror", False)):
+            source = cv2.flip(source, 1)
+        resized = cv2.resize(
+            source,
+            (width, height),
+            interpolation=(
+                cv2.INTER_AREA
+                if source.shape[1] > width
+                else cv2.INTER_LINEAR
+            ),
+        )
         tensor = (
             np.transpose(resized, (2, 0, 1))
             .astype(np.float32)[None]
             / 255.0
         )
-    mean = float(spec.get("mean", 0.5))
-    std = max(1e-6, float(spec.get("std", 0.5)))
+    raw_mean = spec.get("mean", 0.5)
+    raw_std = spec.get("std", 0.5)
+    if isinstance(raw_mean, (list, tuple)):
+        raw_mean = raw_mean[0] if raw_mean else 0.5
+    if isinstance(raw_std, (list, tuple)):
+        raw_std = raw_std[0] if raw_std else 0.5
+    mean = float(raw_mean)
+    std = max(1e-6, float(raw_std))
     return (tensor - mean) / std
 
 
@@ -303,6 +361,12 @@ def read_plate_hezar(image, engine_key=None) -> dict:
         logits = np.asarray(output)
         if logits.ndim == 3:
             logits = logits[0]
+        if bool(spec.get("reverse_output_digits", False)):
+            # Hezar mirrors the input image and reverses the decoded digit
+            # sequence in post-processing.  Reversing the time axis before
+            # constrained CTC decoding applies the Iranian layout constraints
+            # in the final, human-readable direction.
+            logits = logits[::-1]
         labels = list(spec.get("labels") or CRNN_LABELS)
         blank_index = int(spec.get("blank_index", len(labels)))
         hypotheses = ctc_beam_hypotheses(

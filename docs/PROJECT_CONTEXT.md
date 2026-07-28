@@ -491,6 +491,17 @@ ONNX integration test that requires the Windows model bundle. Windows
 installer/update validation and real-video accuracy remain pending release
 gates and are not claimed by this local test.
 
+The real Hezar v2 preprocessing/decoder contract was subsequently completed:
+blank index zero, full id-to-label mapping, mirrored `32x384` input,
+reverse-time constrained decoding and normalized character margins. The
+official checkpoint was exported locally to ONNX with maximum PyTorch parity
+error `0.0000057220458984375` and tested on all 546 frames of `01.mp4`.
+Baseline and the Hezar hybrid each matched 1 of 3 known truth plates; candidate
+elapsed time was 92.751 seconds versus 67.542 seconds. The candidate therefore
+failed promotion and RC12 remains the active customer engine. No model weight
+was committed. RC13 regression after the decoder/export additions is
+`145 passed, 1 skipped`.
+
 ## Repository visibility authorization
 
 The repository is public. On 2026-07-28 the owner explicitly authorized

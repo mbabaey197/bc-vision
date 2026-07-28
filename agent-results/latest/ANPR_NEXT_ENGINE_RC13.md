@@ -17,6 +17,9 @@ Version: `2.2.0-rc13`
 - Ed25519-signed model manifest and per-file SHA-256 verification
 - Golden Dataset metrics and promotion gate
 - group-aware train/validation splitting
+- Hezar v2 blank-at-zero label mapping and mirrored `32x384` preprocessing
+- reproducible Hezar-to-ONNX export with numerical parity verification
+- isolated baseline-detector/Hezar real-video benchmark command
 
 ## Intentionally not claimed
 
@@ -25,10 +28,17 @@ Placeholder weights were not created. Activation remains impossible until a
 real signed bundle is installed. Accuracy on customer cameras is not inferred
 from synthetic unit tests.
 
+The ready-made official Hezar v2 checkpoint was exported and tested locally
+without committing its weights. On all 546 frames of the fixed `01.mp4`, both
+the RC12 baseline and the Hezar hybrid matched 1 of the 3 known truth plates.
+The candidate took 92.751 seconds versus 67.542 seconds for baseline and was
+not promoted. Full evidence is recorded in
+`agent-results/latest/ANPR_HEZAR_VIDEO_BENCHMARK_RC13.md`.
+
 ## Verification
 
 ```text
-143 passed, 1 skipped
+145 passed, 1 skipped
 ```
 
 The skipped test is the existing real-model integration check. It needs the
