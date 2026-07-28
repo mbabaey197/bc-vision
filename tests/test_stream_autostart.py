@@ -157,3 +157,60 @@ def test_live_overlay_tracks_plate_motion_between_inference_frames():
     assert abs(y1 - 46) <= 2
     assert abs(x2 - 153) <= 2
     assert abs(y2 - 96) <= 2
+
+
+def test_empty_detection_revision_clears_old_overlay(monkeypatch):
+    stream = CameraStream(
+        camera_id=8,
+        url="demo://camera",
+        name="Gate",
+    )
+    stream._overlay_rows = [{
+        "bbox": (20, 20, 100, 50),
+        "plate": "12-ب-345-67",
+        "valid": True,
+    }]
+    stream._overlay_revision = 3
+    stream._overlay_updated_at = 1.0
+    frame = np.zeros((100, 180, 3), dtype=np.uint8)
+    monkeypatch.setattr(
+        app.ai.live_worker,
+        "live_anpr_detection_snapshot",
+        lambda *_args, **_kwargs: {
+            "revision": 4,
+            "detections": [],
+            "frame": frame.copy(),
+            "max_age": 4.0,
+        },
+    )
+
+    assert stream._live_overlays(frame) == []
+    assert stream._overlay_revision == 4
+
+
+def test_failed_optical_match_never_redraws_stale_coordinates(
+    monkeypatch,
+):
+    stream = CameraStream(
+        camera_id=9,
+        url="demo://camera",
+        name="Gate",
+    )
+    reference = np.zeros((100, 180, 3), dtype=np.uint8)
+    current = np.zeros_like(reference)
+    monkeypatch.setattr(
+        app.ai.live_worker,
+        "live_anpr_detection_snapshot",
+        lambda *_args, **_kwargs: {
+            "revision": 1,
+            "detections": [{
+                "bbox": (20, 20, 100, 50),
+                "plate": "12-ب-345-67",
+                "valid": True,
+            }],
+            "frame": reference,
+            "max_age": 4.0,
+        },
+    )
+
+    assert stream._live_overlays(current) == []
