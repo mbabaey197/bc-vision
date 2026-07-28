@@ -109,11 +109,9 @@ def process_frame(
         )
         whole_plate_ocr_attempted = False
         generic_ocr_attempted = False
-        # The dedicated Iranian character detector is the preferred reader,
-        # but an incomplete eight-character sequence must not end the read.
-        # Use the already bundled generic OCR only for a credible, usable
-        # plate crop. This recovers difficult glyphs without running generic
-        # OCR on frames where no physical plate was localized.
+        # CRNN is the preferred whole-plate reader.  The lightweight Iranian
+        # character CNN is attempted only for a credible crop when CRNN has
+        # no valid full-plate result.
         generic_fallback_eligible = bool(
             not direct_valid
             and (
@@ -148,7 +146,7 @@ def process_frame(
             )
             generic_ocr_attempted = bool(
                 generic_fallback_eligible
-                and fallback_engine in {"easyocr", "tesseract", "none"}
+                and fallback_engine in {"cnn-onnx", "none"}
             )
         plate_hypotheses = []
         for hypothesis in item.get("plate_hypotheses", []):
@@ -468,6 +466,90 @@ def plate_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, left, right).ratio()
 
 
+class _BoxKalman:
+    """Small constant-velocity Kalman filter for one plate rectangle."""
+
+    def __init__(self, bbox):
+        x1, y1, x2, y2 = (float(value) for value in bbox)
+        width = max(2.0, x2 - x1)
+        height = max(2.0, y2 - y1)
+        self.state = np.array(
+            [
+                (x1 + x2) / 2.0,
+                (y1 + y2) / 2.0,
+                width,
+                height,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            dtype=np.float64,
+        )
+        self.covariance = np.diag(
+            [16.0, 16.0, 9.0, 9.0, 100.0, 100.0, 36.0, 36.0]
+        )
+
+    @staticmethod
+    def _bbox(values) -> tuple[float, float, float, float]:
+        cx, cy, width, height = (
+            float(value) for value in values[:4]
+        )
+        width = max(2.0, width)
+        height = max(2.0, height)
+        return (
+            cx - width / 2.0,
+            cy - height / 2.0,
+            cx + width / 2.0,
+            cy + height / 2.0,
+        )
+
+    def predict(self, elapsed: float) -> tuple:
+        elapsed = min(1.5, max(0.01, float(elapsed)))
+        transition = np.eye(8, dtype=np.float64)
+        transition[0, 4] = elapsed
+        transition[1, 5] = elapsed
+        transition[2, 6] = elapsed
+        transition[3, 7] = elapsed
+        process = np.diag(
+            [2.0, 2.0, 1.0, 1.0, 12.0, 12.0, 5.0, 5.0]
+        ) * elapsed
+        self.state = transition @ self.state
+        self.covariance = (
+            transition @ self.covariance @ transition.T + process
+        )
+        return self._bbox(self.state)
+
+    def update(self, bbox) -> tuple:
+        x1, y1, x2, y2 = (float(value) for value in bbox)
+        measurement = np.array(
+            [
+                (x1 + x2) / 2.0,
+                (y1 + y2) / 2.0,
+                max(2.0, x2 - x1),
+                max(2.0, y2 - y1),
+            ],
+            dtype=np.float64,
+        )
+        observation = np.zeros((4, 8), dtype=np.float64)
+        observation[:4, :4] = np.eye(4, dtype=np.float64)
+        noise = np.diag([7.0, 7.0, 5.0, 5.0])
+        innovation = measurement - observation @ self.state
+        innovation_covariance = (
+            observation @ self.covariance @ observation.T + noise
+        )
+        gain = (
+            self.covariance
+            @ observation.T
+            @ np.linalg.inv(innovation_covariance)
+        )
+        self.state = self.state + gain @ innovation
+        self.covariance = (
+            np.eye(8, dtype=np.float64) - gain @ observation
+        ) @ self.covariance
+        return self._bbox(self.state)
+
+
 @dataclass
 class _Track:
     track_id: int
@@ -483,6 +565,11 @@ class _Track:
     best_capture_score: float = -1.0
     best_capture_result: dict | None = None
     best_frame: object | None = None
+    kalman: _BoxKalman | None = None
+    predicted_bbox: tuple | None = None
+    last_prediction: float = 0.0
+    hits: int = 1
+    misses: int = 0
 
 
 class PlateConsensusTracker:
@@ -616,7 +703,10 @@ class PlateConsensusTracker:
         for track in self._tracks.values():
             if timestamp - track.last_seen > self.max_age_seconds:
                 continue
-            overlap = bbox_iou(track.bbox, result["bbox"])
+            overlap = bbox_iou(
+                track.predicted_bbox or track.bbox,
+                result["bbox"],
+            )
             text_score = 0.0
             if result.get("valid"):
                 for observation in track.observations:
@@ -629,6 +719,142 @@ class PlateConsensusTracker:
             if score > best_score and (overlap >= 0.18 or text_score >= 0.74):
                 best, best_score = track, score
         return best
+
+    @staticmethod
+    def _tracking_confidence(result: dict) -> float:
+        return min(
+            1.0,
+            max(
+                0.0,
+                float(
+                    result.get(
+                        "detector_confidence",
+                        result.get("confidence", 0.0),
+                    )
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _association_score(track: _Track, result: dict) -> tuple:
+        overlap = bbox_iou(
+            track.predicted_bbox or track.bbox,
+            result["bbox"],
+        )
+        text_score = 0.0
+        if result.get("valid"):
+            for observation in track.observations:
+                if observation.get("valid"):
+                    text_score = max(
+                        text_score,
+                        plate_similarity(
+                            result.get("plate", ""),
+                            observation.get("plate", ""),
+                        ),
+                    )
+        score = max(overlap, text_score * 0.88)
+        return score, overlap, text_score
+
+    def _associate(self, results, timestamp: float) -> dict[int, _Track]:
+        """ByteTrack-style two-pass association over high/low detections."""
+
+        active = [
+            track
+            for track in self._tracks.values()
+            if timestamp - track.last_seen <= self.max_age_seconds
+        ]
+        for track in active:
+            if track.kalman is None:
+                track.kalman = _BoxKalman(track.bbox)
+            elapsed = timestamp - (
+                track.last_prediction or track.last_seen
+            )
+            track.predicted_bbox = track.kalman.predict(elapsed)
+            track.last_prediction = timestamp
+
+        high = [
+            index
+            for index, result in enumerate(results)
+            if self._tracking_confidence(result) >= 0.45
+        ]
+        low = [
+            index
+            for index, result in enumerate(results)
+            if index not in high
+        ]
+        assigned: dict[int, _Track] = {}
+        available = {track.track_id: track for track in active}
+
+        def match(indices, second_pass=False):
+            pairs = []
+            for index in indices:
+                for track in available.values():
+                    score, overlap, text_score = (
+                        self._association_score(track, results[index])
+                    )
+                    accepted = (
+                        overlap >= (0.08 if second_pass else 0.12)
+                        or (
+                            not second_pass
+                            and text_score >= 0.74
+                        )
+                    )
+                    if accepted:
+                        pairs.append(
+                            (
+                                score,
+                                overlap,
+                                text_score,
+                                -track.misses,
+                                index,
+                                track.track_id,
+                            )
+                        )
+            used_detections = set()
+            used_tracks = set()
+            for *_rank, index, track_id in sorted(
+                pairs,
+                reverse=True,
+            ):
+                if (
+                    index in used_detections
+                    or track_id in used_tracks
+                    or track_id not in available
+                ):
+                    continue
+                assigned[index] = available[track_id]
+                used_detections.add(index)
+                used_tracks.add(track_id)
+            for track_id in used_tracks:
+                available.pop(track_id, None)
+            return used_detections
+
+        matched_high = match(high, second_pass=False)
+        unmatched_low = [
+            index for index in low if index not in matched_high
+        ]
+        match(unmatched_low, second_pass=True)
+
+        for track in available.values():
+            track.misses += 1
+            if track.predicted_bbox is not None:
+                track.bbox = track.predicted_bbox
+
+        for index, result in enumerate(results):
+            if index in assigned:
+                continue
+            track = _Track(
+                track_id=self._next_track_id,
+                bbox=tuple(result["bbox"]),
+                first_seen=timestamp,
+                last_seen=timestamp,
+                kalman=_BoxKalman(result["bbox"]),
+                last_prediction=timestamp,
+            )
+            self._tracks[track.track_id] = track
+            self._next_track_id += 1
+            assigned[index] = track
+        return assigned
 
     def _expire(self, timestamp: float):
         stale = [
@@ -911,6 +1137,7 @@ class PlateConsensusTracker:
         )
         character_supported = any(
             "dedicated-character-detector" in name
+            or "cnn-onnx" in name
             or "multi-engine-agreement" in name
             for name in engine_names
         )
@@ -1084,22 +1311,30 @@ class PlateConsensusTracker:
         timestamp = time.monotonic() if timestamp is None else float(timestamp)
         self._expire(timestamp)
         emitted = []
+        results = list(results)
+        assigned = self._associate(results, timestamp)
 
-        for result in results:
-            track = self._match(result, timestamp)
-            if track is None:
-                track = _Track(
-                    track_id=self._next_track_id,
-                    bbox=result["bbox"],
-                    first_seen=timestamp,
-                    last_seen=timestamp,
-                )
-                self._tracks[track.track_id] = track
-                self._next_track_id += 1
-
-            track.bbox = result["bbox"]
+        for index, result in enumerate(results):
+            track = assigned[index]
+            if track.kalman is None:
+                track.kalman = _BoxKalman(result["bbox"])
+            filtered_bbox = track.kalman.update(result["bbox"])
+            track.predicted_bbox = filtered_bbox
+            track.bbox = filtered_bbox
             track.last_seen = timestamp
-            track.observations.append(deepcopy(result))
+            track.last_prediction = timestamp
+            track.hits += 1
+            track.misses = 0
+            result["track_id"] = track.track_id
+            result["tracking_engine"] = (
+                "bytetrack-kalman+optical-flow"
+            )
+            result["tracking_bbox"] = tuple(
+                round(float(value), 3)
+                for value in filtered_bbox
+            )
+            observation = deepcopy(result)
+            track.observations.append(observation)
             capture_improved = self._consider_capture(track, result, frame)
             consensus = self._consensus(track)
             if consensus is None:

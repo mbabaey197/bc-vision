@@ -488,7 +488,9 @@ class CameraStream:
     def _demo_frame(self):
         height, width = 360, 640
         frame = np.zeros((height, width, 3), dtype=np.uint8)
-        stamp = time.strftime("%Y-%m-%d  %H:%M:%S")
+        stamp = time.strftime("%Y-%m-%d  %H:%M:%S").translate(
+            str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+        )
         x = int((time.time() * 90) % (width + 160)) - 160
         cv2.rectangle(
             frame,

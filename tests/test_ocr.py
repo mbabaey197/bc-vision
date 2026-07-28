@@ -1,7 +1,6 @@
 import numpy as np
 
 from app.ai.ocr import (
-    EASYOCR_ALLOWLIST,
     _align_to_template,
     _assemble_detections,
     _variants,
@@ -45,15 +44,6 @@ def test_numeric_position_confusion_repair_remains_available():
 def test_latin_lookalikes_cannot_create_persian_plate_letter():
     assert _align_to_template("31L55674") == []
     assert _align_to_template("31T55674") == []
-
-
-def test_easyocr_allowlist_is_strict_for_persian_plates():
-    assert "ط" in EASYOCR_ALLOWLIST
-    assert "ب" in EASYOCR_ALLOWLIST
-    assert "D" in EASYOCR_ALLOWLIST
-    assert "S" in EASYOCR_ALLOWLIST
-    for forbidden in "ABCEFGHIJKLMNOPQRTUVWXYZ":
-        assert forbidden not in EASYOCR_ALLOWLIST
 
 
 def test_invalid_noise_does_not_become_valid():

@@ -11,8 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import product
 import os
-from pathlib import Path
-import threading
 from typing import Iterable, Sequence
 
 import cv2
@@ -20,21 +18,17 @@ import numpy as np
 
 from .plate_rules import (
     ALLOWED_PLATE_LETTERS,
-    PERSIAN_PLATE_LETTERS,
     format_iran_plate,
     normalize_plate,
     plausible_plate,
 )
 from .onnx_crnn import get_crnn_status, read_plate_crnn
+from .onnx_cnn import get_cnn_status, read_plate_cnn
 
-_easy_reader = None
-_easy_reader_key = None
-_easy_reader_lock = threading.RLock()
 _last_status = {
     "engine": "none",
     "crnn_error": "",
-    "easyocr_error": "",
-    "tesseract_error": "",
+    "cnn_error": "",
     "candidate_count": 0,
 }
 
@@ -59,18 +53,6 @@ DIGIT_CONFUSIONS = {
     "و": "9",
 }
 
-# EasyOCR is limited to real Iranian plate characters. D and S are retained
-# only for diplomatic/service plates. Removing the rest of the Latin alphabet
-# prevents systematic conversions such as L -> ل or T -> ط.
-EASYOCR_ALLOWLIST = (
-    "0123456789"
-    "۰۱۲۳۴۵۶۷۸۹"
-    "٠١٢٣٤٥٦٧٨٩"
-    + PERSIAN_PLATE_LETTERS
-    + "DS"
-)
-
-
 @dataclass(frozen=True)
 class OCRToken:
     text: str
@@ -90,6 +72,16 @@ def get_ocr_status():
         "crnn_confidence": float(crnn.get("confidence", 0.0)),
         "crnn_error": crnn.get("error", ""),
         "crnn_threads": int(crnn.get("threads", 0)),
+    })
+    cnn = get_cnn_status()
+    status.update({
+        "cnn_attempted": bool(cnn.get("attempted")),
+        "cnn_model_loaded": bool(cnn.get("model_loaded")),
+        "cnn_model_path": cnn.get("model_path", ""),
+        "cnn_raw_text": cnn.get("raw_text", ""),
+        "cnn_confidence": float(cnn.get("confidence", 0.0)),
+        "cnn_error": cnn.get("error", ""),
+        "cnn_threads": int(cnn.get("threads", 0)),
     })
     return status
 
@@ -185,52 +177,6 @@ def _variants(image: np.ndarray | None) -> list[np.ndarray]:
             unique.append(variant)
 
     return unique
-
-
-def _easyocr_model_dir() -> Path:
-    configured = os.environ.get(
-        "BCVISION_EASYOCR_MODEL_DIR",
-        "",
-    ).strip()
-    if configured:
-        return Path(configured).expanduser()
-
-    try:
-        from app.config import DATA_DIR
-
-        return Path(DATA_DIR) / "models" / "easyocr"
-    except Exception:
-        return Path.home() / ".EasyOCR" / "model"
-
-
-def _get_easyocr_reader():
-    global _easy_reader, _easy_reader_key
-
-    model_dir = _easyocr_model_dir()
-    key = str(model_dir.resolve())
-
-    if _easy_reader is not None and _easy_reader_key == key:
-        return _easy_reader
-
-    import easyocr
-
-    model_dir.mkdir(parents=True, exist_ok=True)
-    allow_download = (
-        os.environ.get("BCVISION_EASYOCR_DOWNLOAD", "0")
-        == "1"
-    )
-    _easy_reader = easyocr.Reader(
-        ["fa", "en"],
-        gpu=False,
-        verbose=False,
-        model_storage_directory=str(model_dir),
-        user_network_directory=str(
-            model_dir / "user_network"
-        ),
-        download_enabled=allow_download,
-    )
-    _easy_reader_key = key
-    return _easy_reader
 
 
 def _token_variants(
@@ -558,148 +504,6 @@ def _assemble_detections(
     return format_iran_plate(best_text), best_score
 
 
-def _easyocr(image) -> tuple[str, float]:
-    variants = _variants(image)
-    if not variants:
-        return "", 0.0
-
-    try:
-        reader = _get_easyocr_reader()
-        best = ("", 0.0)
-        total_candidates = 0
-
-        # EasyOCR's Reader owns mutable Torch modules.  The generic fallback
-        # is rare and remains shared to avoid duplicating its large model for
-        # every camera, so protect its read transaction.
-        with _easy_reader_lock:
-            for variant in variants:
-                raw = reader.readtext(
-                    variant,
-                    detail=1,
-                    paragraph=False,
-                    allowlist=EASYOCR_ALLOWLIST,
-                    decoder="beamsearch",
-                    beamWidth=5,
-                    text_threshold=0.45,
-                    low_text=0.25,
-                    link_threshold=0.25,
-                    mag_ratio=1.0,
-                )
-                detections = []
-
-                for box, text, confidence in raw:
-                    xs = [
-                        float(point[0])
-                        for point in box
-                    ]
-                    ys = [
-                        float(point[1])
-                        for point in box
-                    ]
-                    detections.append({
-                        "text": text,
-                        "confidence": confidence,
-                        "x_center": sum(xs) / len(xs),
-                        "y_center": sum(ys) / len(ys),
-                    })
-
-                total_candidates += len(detections)
-                candidate = _assemble_detections(detections)
-
-                if candidate[1] > best[1]:
-                    best = candidate
-
-        _last_status.update(
-            engine="easyocr",
-            easyocr_error="",
-            candidate_count=total_candidates,
-        )
-        return best
-
-    except Exception as exc:
-        _last_status["easyocr_error"] = (
-            f"{type(exc).__name__}: {exc}"
-        )
-        return "", 0.0
-
-
-def _tesseract(image) -> tuple[str, float]:
-    """Recognize only diplomatic D/S plates as a secondary fallback."""
-
-    variants = _variants(image)
-    if not variants:
-        return "", 0.0
-
-    try:
-        import pytesseract
-
-        best = ("", 0.0)
-        config = (
-            "--psm 7 "
-            "-c tessedit_char_whitelist="
-            "0123456789DS"
-        )
-
-        for variant in variants:
-            data = pytesseract.image_to_data(
-                variant,
-                config=config,
-                output_type=pytesseract.Output.DICT,
-            )
-            detections = []
-
-            for (
-                text,
-                confidence,
-                left,
-                width,
-                top,
-                height,
-            ) in zip(
-                data.get("text", []),
-                data.get("conf", []),
-                data.get("left", []),
-                data.get("width", []),
-                data.get("top", []),
-                data.get("height", []),
-            ):
-                if not normalize_plate(text):
-                    continue
-
-                detections.append({
-                    "text": text,
-                    "confidence": (
-                        max(0.0, float(confidence))
-                        / 100.0
-                    ),
-                    "x_center": (
-                        float(left)
-                        + float(width) / 2.0
-                    ),
-                    "y_center": (
-                        float(top)
-                        + float(height) / 2.0
-                    ),
-                })
-
-            candidate = _assemble_detections(detections)
-
-            if candidate[1] > best[1]:
-                best = candidate
-
-        _last_status.update(
-            engine="tesseract",
-            tesseract_error="",
-        )
-        return best
-
-    except Exception as exc:
-        _last_status["tesseract_error"] = (
-            f"{type(exc).__name__}: {exc}"
-        )
-        return "", 0.0
-
-
 def read_plate_candidate(
     image,
     engine_key=None,
@@ -712,10 +516,10 @@ def read_plate_candidate(
         "BCVISION_OCR_ENGINE",
         "hybrid",
     ).strip().lower()
-    if mode not in {"hybrid", "crnn", "legacy"}:
+    if mode not in {"hybrid", "crnn", "cnn"}:
         mode = "hybrid"
 
-    if mode != "legacy":
+    if mode != "cnn":
         crnn_text, crnn_confidence = read_plate_crnn(
             image,
             engine_key=engine_key,
@@ -739,27 +543,21 @@ def read_plate_candidate(
     if mode == "crnn" or not allow_legacy:
         return "", 0.0, "crnn-onnx"
 
-    easy_text, easy_confidence = _easyocr(image)
-    if plausible_plate(easy_text):
-        return (
-            format_iran_plate(easy_text),
-            float(easy_confidence),
-            "easyocr",
+    cnn_text, cnn_confidence = read_plate_cnn(
+        image,
+        engine_key=engine_key,
+    )
+    if plausible_plate(cnn_text):
+        _last_status.update(
+            engine="cnn-onnx",
+            cnn_error="",
         )
-
-    tess_text, tess_confidence = _tesseract(image)
-    tess_norm = normalize_plate(tess_text)
-
-    if (
-        plausible_plate(tess_text)
-        and len(tess_norm) == 8
-        and tess_norm[2] in {"D", "S"}
-    ):
         return (
-            format_iran_plate(tess_text),
-            min(0.60, float(tess_confidence)),
-            "tesseract",
+            format_iran_plate(cnn_text),
+            float(cnn_confidence),
+            "cnn-onnx",
         )
+    _last_status["cnn_error"] = get_cnn_status().get("error", "")
 
     return "", 0.0, "none"
 

@@ -1,13 +1,19 @@
 # Third-party notices
 
-## Platrix Iranian CRNN OCR model
+## Platrix Iranian ANPR models
 
-BC Vision can download and execute `ocr_crnn.onnx` from:
+BC Vision can download and execute these Platrix ONNX assets:
 
 - Model: https://huggingface.co/Dibachain/Platrix
 - Reference project: https://github.com/AliAkrami1375/Platrix
-- Verified SHA-256:
+- `plate_yolo.onnx` SHA-256:
+  `a54e475c402e6036bb5c70f1a6ff75179e76098a5c8039bb5d148c0b6421f5c6`
+- `plate_yolo_fallback.onnx` SHA-256:
+  `a6974fcb0a79755c270d50f1ebefd4d96d765c879a29051a19aac00dfda8b5af`
+- `ocr_crnn.onnx` SHA-256:
   `45f8c45f29eb1ee91f6274cb8d9c328da1a2050ea7d8596bae61f4a6b9f9fb1e`
+- `ocr_cnn.onnx` SHA-256:
+  `7d573c51cc855a8e080f1f88597477f4fb5a2b9cafa1bb125bd6038e441f5bca`
 
 MIT License
 

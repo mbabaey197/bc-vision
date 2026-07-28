@@ -168,6 +168,24 @@ def init_db():
             FOREIGN KEY(event_id) REFERENCES plate_events(id)
                 ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS anpr_training_runs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            status TEXT NOT NULL DEFAULT 'queued',
+            device TEXT NOT NULL DEFAULT 'auto',
+            epochs INTEGER NOT NULL DEFAULT 12,
+            train_samples INTEGER NOT NULL DEFAULT 0,
+            validation_samples INTEGER NOT NULL DEFAULT 0,
+            baseline_accuracy REAL DEFAULT 0,
+            candidate_accuracy REAL DEFAULT 0,
+            candidate_path TEXT DEFAULT '',
+            candidate_sha256 TEXT DEFAULT '',
+            message TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            started_at TEXT,
+            finished_at TEXT,
+            applied_at TEXT,
+            applied_by TEXT DEFAULT ''
+        );
         """)
 
         _add_missing_columns(con, "users", {
@@ -208,6 +226,13 @@ def init_db():
             "processing_ms": "REAL DEFAULT 0",
             "review_status": "TEXT NOT NULL DEFAULT 'confirmed-ai'",
         })
+        _add_missing_columns(con, "anpr_feedback", {
+            "sample_path": "TEXT DEFAULT ''",
+            "sample_sha256": "TEXT DEFAULT ''",
+            "dataset_split": "TEXT DEFAULT ''",
+            "training_status": "TEXT DEFAULT 'pending'",
+            "trained_run_id": "INTEGER",
+        })
         _backfill_plate_norm(con)
         con.executescript("""
         CREATE INDEX IF NOT EXISTS idx_plate_events_created_at
@@ -220,6 +245,10 @@ def init_db():
             ON anpr_feedback(observed_norm,status);
         CREATE INDEX IF NOT EXISTS idx_anpr_feedback_event
             ON anpr_feedback(event_id);
+        CREATE INDEX IF NOT EXISTS idx_anpr_feedback_training
+            ON anpr_feedback(training_status,dataset_split);
+        CREATE INDEX IF NOT EXISTS idx_anpr_training_runs_created
+            ON anpr_training_runs(created_at);
         """)
 
         _add_missing_columns(con, "cameras", {

@@ -5,7 +5,7 @@
 - GitHub repository: `mahdibabaey197/bc-vision`
 - Default branch: `main`
 - Product: BC Vision
-- Current application version in source: `2.2.0-rc11`
+- Current application version in source: `2.2.0-rc12`
 - Windows persistent data root: `C:\ProgramData\BCVision\data`
 
 ## Release contract
@@ -22,16 +22,18 @@ Application data and AI models must remain outside the replaceable application d
 
 The Iranian plate-recognition subsystem now includes:
 
-- verified Iranian YOLO detector model support
+- verified lightweight Iranian YOLOv8 detectors through ONNX Runtime
 - hardened OpenCV detector fallback
 - low-light, high-exposure, blur and contrast preprocessing
 - perspective correction for angled plates
 - Persian, Arabic and English digit normalization
 - spatial reconstruction of split OCR tokens
 - position-aware OCR confusion repair
-- EasyOCR Persian/English recognition
+- segmentation-free Iranian CRNN+CTC recognition
+- Iranian character CNN fallback
 - image quality scoring
-- multi-frame tracking and weighted consensus
+- ByteTrack-style two-pass association, Kalman filtering, Optical Flow and
+  weighted multi-frame consensus
 - isolated bad-read rejection
 - canonical duplicate suppression
 - vehicle direction estimation
@@ -42,32 +44,25 @@ The Iranian plate-recognition subsystem now includes:
 - backward-compatible SQLite migrations and canonical `plate_norm`
 - persistent, SHA-256-verified AI model management
 - AI-aware PyInstaller build configuration
-- serialized shared-model inference for multi-camera correctness
+- independent bounded per-camera ONNX sessions
 - conditional mild-motion deblurring with dedicated-AI reread
-- whole-plate Iranian CRNN+CTC OCR through ONNX Runtime
 - per-camera ONNX sessions with a hard two-thread ceiling
-- A/B evidence fusion between whole-plate and character-level readers
+- persistent feedback datasets and gated CRNN candidate promotion
+- Jalali visible dates and Persian digits for all visible dates and times
 
 ## ANPR model execution contract
 
-The verified `best.pt` asset is a combined Iranian plate/character model, not
-a single-class plate-only detector. Full-frame inference must select class
-`30` (plate), followed by two independent crop readers: the character branch
-of `best.pt`, and a segmentation-free Iranian CRNN+CTC model executed through
-ONNX Runtime. Their alternatives are retained for multi-frame voting.
-EasyOCR/Tesseract are reserved for the final crop-level fallback. Vehicle
-attributes are calculated only after stable plate consensus, immediately
-before event persistence.
-
-The CPU-oriented defaults are 640px for plate localization, 416px for
-character recognition, no test-time augmentation, and at most four plate
-candidates per processed frame. A successful zero-result model inference
-triggers the geometry fallback for difficult small, oblique or overexposed
-plates. The live worker rate-limits this second pass adaptively from measured
-processing latency so it does not run continuously on a slow CPU.
+The production path uses a 12.6 MB primary ONNX plate detector at 416px. A
+12.3 MB secondary ONNX detector at 640px runs only after a zero-result primary
+pass, followed by hardened OpenCV geometry if needed. OCR first uses the
+segmentation-free Iranian CRNN+CTC model; the 2.2 MB Iranian character CNN runs
+only when CRNN has no valid result and eight real glyph regions exist.
+The retired 119 MB combined `best.pt`, Ultralytics, EasyOCR and Tesseract are
+not loaded or packaged. Vehicle attributes are calculated only after stable
+plate consensus, immediately before event persistence.
 
 Each camera inference is hard-capped to two native compute threads across
-OpenMP, BLAS, OpenCV and Torch. Deployments may reduce the per-camera budget
+OpenMP, BLAS, OpenCV, ONNX Runtime and Torch. Deployments may reduce the per-camera budget
 to one with `BCVISION_CPU_THREADS=1`; larger values are clamped to two.
 Concurrent camera capacity is calculated from logical CPU count while
 reserving two logical processors for decoding, the dashboard and Windows.
@@ -77,11 +72,10 @@ Every session uses `intra_op_num_threads <= 2`,
 `inter_op_num_threads = 1`, sequential graph execution and disabled worker
 spinning.
 
-Ultralytics predictor state is not shared safely across simultaneous
-`predict()` calls. The detector therefore owns one model instance and lock per
-bounded runtime slot. A camera always maps to the same slot; cameras in
-different slots can infer concurrently, while additional cameras queue safely
-and continue replacing stale frames.
+The detector and both OCR readers own a separate bounded Session and lock for
+each camera key. Calls for one camera are serialized; different cameras can
+infer concurrently within the global capacity. Additional cameras queue
+safely and continue replacing stale frames.
 
 Mild-blur recovery is conditional and defaults on. The original crop is read
 first; only a soft or uncertain crop is restored and read once more by the
@@ -98,7 +92,7 @@ pass with `BCVISION_BLUR_RECOVERY=0`.
 
 ## Validated runtime
 
-The target Windows Python 3.13 environment successfully imported and executed:
+The RC11 Windows Python 3.13 environment successfully imported and executed:
 
 - Torch `2.13.0+cpu`
 - TorchVision `0.28.0+cpu`
@@ -110,6 +104,10 @@ Persian EasyOCR reader creation and inference were verified with the persistent 
 ONNX Runtime `1.28.0` and the verified CRNN model are RC11 Windows acceptance
 dependencies; packaged inference remains a release gate until the candidate
 workflow completes.
+
+RC12 removes TorchVision, EasyOCR and Ultralytics from inference. Torch remains
+packaged only for an administrator-initiated controlled CRNN training job;
+normal camera processing uses ONNX Runtime.
 
 ## Automated validation
 
@@ -128,8 +126,12 @@ The current regression suite covers:
 - background camera auto-start and clean shutdown
 - backward-compatible database migration
 - model hash verification
-- shared-model concurrent-call serialization
+- per-camera ONNX serialization and cross-camera concurrency
 - conservative blur-recovery gating and result selection
+- ByteTrack low-confidence association and Kalman identity continuity
+- immutable operator sample capture and SHA-256 verification
+- additive training-run database migration and gated candidate promotion
+- Persian digits for all visible date/time fields
 
 The latest full-suite and system optimization result is recorded in
 `agent-results/latest/PROJECT_OPTIMIZATION_PHASE_1.md`: `64 passed, 1 skipped`,
@@ -386,6 +388,42 @@ the GUI subsystem, exercised clean install and in-place update, ran offline
 ANPR self-tests before and after update, preserved SQLite and model markers,
 and uploaded the release bundle. Accuracy comparison on labelled frames from
 `01.mp4` and real multi-camera performance measurement remain release gates.
+
+## RC12 ONNX modernization, tracking and controlled training
+
+Version `2.2.0-rc12` replaces the remaining production ANPR components. Plate
+localization now uses verified 12.6 MB and 12.3 MB Platrix YOLOv8 ONNX models;
+the secondary model runs only on a primary miss. Full-crop CRNN remains the
+first OCR reader, and a verified 2.2 MB Iranian character CNN is the only OCR
+fallback. The 119 MB combined model, Ultralytics, EasyOCR and Tesseract are no
+longer loaded, installed or collected by PyInstaller.
+
+Track association is two-pass in the ByteTrack style: high-confidence
+detections are matched first and remaining low-confidence detections can keep
+an existing identity in the second pass. A constant-velocity Kalman filter
+predicts and smooths boxes at detector times. Existing forward/backward
+Optical Flow and template recovery continue to advance that filtered box on
+every display frame between detector runs.
+
+Every confirmed correction copies its plate crop into persistent immutable
+training storage, records SHA-256 and assigns a deterministic train/validation
+split. An administrator can start a bounded background CRNN training job only
+after minimum sample and diversity thresholds are satisfied. Candidate models
+are evaluated against the active model on the isolated validation split and
+cannot be applied after a regression or below the minimum score. Promotion
+re-verifies SHA-256, copies the model into persistent custom storage and
+atomically updates the active manifest. Existing vendor and custom models,
+events and feedback rows remain recoverable.
+
+Visible application dates remain Jalali and every visible date/time digit is
+Persian, including license expiration, event time, replay timing and the demo
+overlay. Database timestamps, filenames, API contracts and JavaScript numeric
+control values remain machine-stable ASCII.
+
+The initial local RC12 regression is `131 passed, 1 skipped`; the skip is the
+real-model integration test, which is enabled in the Windows AI acceptance
+job. Windows installer/updater acceptance and release identifiers must be
+added here after the GitHub gates complete.
 
 ## Uploaded video live-source fix
 
