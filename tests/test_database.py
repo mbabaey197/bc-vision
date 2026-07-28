@@ -103,7 +103,16 @@ def test_old_database_migrates_without_data_loss(
             "corrected_norm",
             "submitted_by",
             "status",
+            "sample_path",
+            "sample_sha256",
+            "dataset_split",
+            "training_status",
+            "trained_run_id",
         } <= feedback_columns
+        assert con.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type='table' AND name='anpr_training_runs'"
+        ).fetchone()[0] == 1
         row = con.execute(
             "SELECT * FROM plate_events WHERE id=1"
         ).fetchone()

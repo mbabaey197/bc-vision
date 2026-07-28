@@ -69,6 +69,8 @@ rmdir /s /q dist 2>nul
     --hidden-import app.ai.detector ^
     --hidden-import app.ai.ocr ^
     --hidden-import app.ai.onnx_crnn ^
+    --hidden-import app.ai.onnx_cnn ^
+    --hidden-import app.ai.onnx_detector ^
     --hidden-import app.ai.pipeline ^
     --hidden-import app.ai.plate_recovery ^
     --hidden-import app.ai.plate_rules ^
@@ -76,19 +78,17 @@ rmdir /s /q dist 2>nul
     --hidden-import app.ai.video_test ^
     --hidden-import app.ai.live_worker ^
     --hidden-import app.ai.model_manager ^
+    --hidden-import app.ai.training ^
+    --hidden-import app.ai.training_worker ^
     --add-data ".model-seed;model-seed" ^
     --collect-all av ^
     --collect-all fastapi ^
     --collect-all starlette ^
     --collect-all uvicorn ^
     --collect-all cv2 ^
-    --collect-all easyocr ^
+    --collect-all onnx ^
     --collect-all onnxruntime ^
-    --collect-all ultralytics ^
     --collect-all torch ^
-    --collect-all torchvision ^
-    --collect-all skimage ^
-    --collect-all scipy ^
     launcher.py
 if errorlevel 1 goto :error
 

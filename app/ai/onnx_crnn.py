@@ -165,13 +165,11 @@ def _session_options(ort):
 def _verified_model_path() -> Path:
     global _invalid_model_cache, _verified_model_cache
     from .model_manager import (
-        CRNN_SHA256,
-        CRNN_SIZE,
-        crnn_path,
+        active_crnn_model,
         verify_file,
     )
 
-    path = crnn_path()
+    path, expected_sha256, expected_size = active_crnn_model()
     try:
         stat = path.stat()
     except OSError as exc:
@@ -190,7 +188,7 @@ def _verified_model_path() -> Path:
             raise FileNotFoundError(
                 f"Verified CRNN ONNX model not found: {path}"
             )
-    if not verify_file(path, CRNN_SHA256, CRNN_SIZE):
+    if not verify_file(path, expected_sha256, expected_size):
         with _cache_lock:
             _invalid_model_cache = cache_key
         raise FileNotFoundError(

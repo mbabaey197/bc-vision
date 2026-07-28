@@ -109,10 +109,15 @@ def test_packaged_self_test_can_require_offline_anpr_models():
 
     assert '"--verify-anpr" in sys.argv' in launcher
     assert "prepare_models(download=False)" in launcher
+    assert "detect_plates_onnx(" in launcher
     assert "read_plate_crnn(" in launcher
+    assert "warmup_cnn(" in launcher
     assert '--add-data ".model-seed;model-seed"' in build
     assert "--collect-all av" in build
+    assert "--collect-all onnx" in build
     assert "--collect-all onnxruntime" in build
+    assert "--collect-all easyocr" not in build
+    assert "--collect-all ultralytics" not in build
     assert 'copy /Y "THIRD_PARTY_NOTICES.md"' in build
 
 

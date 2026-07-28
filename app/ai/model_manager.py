@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -16,15 +17,23 @@ import tempfile
 import urllib.request
 
 DETECTOR_URL = (
-    "https://huggingface.co/makhresearch/"
-    "persian-license-plate-detector/resolve/main/"
-    "best.pt?download=true"
+    "https://huggingface.co/Dibachain/Platrix/resolve/main/"
+    "plate_yolo.onnx?download=true"
 )
 DETECTOR_SHA256 = (
-    "258104262d3a16a6bc613938cc1dd0198"
-    "da8a7ddeab4843197666cb9ce0db756"
+    "A54E475C402E6036BB5C70F1A6FF7517"
+    "9E76098A5C8039BB5D148C0B6421F5C6"
 )
-DETECTOR_SIZE = 119_237_050
+DETECTOR_SIZE = 12_608_775
+DETECTOR_FALLBACK_URL = (
+    "https://huggingface.co/Dibachain/Platrix/resolve/main/"
+    "plate_yolo_fallback.onnx?download=true"
+)
+DETECTOR_FALLBACK_SHA256 = (
+    "A6974FCB0A79755C270D50F1EBEFD4D9"
+    "6D765C879A29051A19AAC00DFDA8B5AF"
+)
+DETECTOR_FALLBACK_SIZE = 12_265_080
 CRNN_URL = (
     "https://huggingface.co/Dibachain/Platrix/resolve/main/"
     "ocr_crnn.onnx?download=true"
@@ -34,16 +43,15 @@ CRNN_SHA256 = (
     "A1A2050EA7D8596BAE61F4A6B9F9FB1E"
 )
 CRNN_SIZE = 10_452_525
-EASYOCR_HASHES = {
-    "arabic.pth": (
-        "2A9AFD42C374DEB98AED0B53C9B77D75"
-        "E1D00D4E0501F3B0276C54190C89B1A8"
-    ),
-    "craft_mlt_25k.pth": (
-        "4A5EFBFB48B4081100544E75E1E2B57F"
-        "8DE3D84F213004B14B85FD4B3748DB17"
-    ),
-}
+CNN_URL = (
+    "https://huggingface.co/Dibachain/Platrix/resolve/main/"
+    "ocr_cnn.onnx?download=true"
+)
+CNN_SHA256 = (
+    "7D573C51CC855A8E080F1F88597477F4"
+    "FB5A2B9CAFA1BB125BD6038E441F5BCA"
+)
+CNN_SIZE = 2_226_402
 
 
 def _data_dir() -> Path:
@@ -61,17 +69,22 @@ def detector_path() -> Path:
     ).strip()
     if configured:
         return Path(configured).expanduser()
-    return _data_dir() / "models" / "plate" / "best.pt"
+    return _data_dir() / "models" / "plate" / "plate_yolo.onnx"
 
 
-def easyocr_dir() -> Path:
+def detector_fallback_path() -> Path:
     configured = os.environ.get(
-        "BCVISION_EASYOCR_MODEL_DIR",
+        "BCVISION_PLATE_FALLBACK_MODEL",
         "",
     ).strip()
     if configured:
         return Path(configured).expanduser()
-    return _data_dir() / "models" / "easyocr"
+    return (
+        _data_dir()
+        / "models"
+        / "plate"
+        / "plate_yolo_fallback.onnx"
+    )
 
 
 def crnn_path() -> Path:
@@ -82,6 +95,112 @@ def crnn_path() -> Path:
     if configured:
         return Path(configured).expanduser()
     return _data_dir() / "models" / "crnn" / "ocr_crnn.onnx"
+
+
+def cnn_path() -> Path:
+    configured = os.environ.get(
+        "BCVISION_CNN_MODEL",
+        "",
+    ).strip()
+    if configured:
+        return Path(configured).expanduser()
+    return _data_dir() / "models" / "cnn" / "ocr_cnn.onnx"
+
+
+def _active_crnn_manifest_path() -> Path:
+    return (
+        _data_dir()
+        / "models"
+        / "crnn"
+        / "active-model.json"
+    )
+
+
+def active_crnn_model() -> tuple[Path, str, int]:
+    """Return the verified promoted model or the fixed vendor model."""
+
+    manifest = _active_crnn_manifest_path()
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        filename = str(payload.get("filename", "")).strip()
+        digest = str(payload.get("sha256", "")).strip().upper()
+        size = int(payload.get("size", 0))
+        custom_root = (
+            _data_dir()
+            / "models"
+            / "crnn"
+            / "custom"
+        ).resolve()
+        candidate = (custom_root / filename).resolve()
+        candidate.relative_to(custom_root)
+        if (
+            filename
+            and digest
+            and size > 0
+            and verify_file(candidate, digest, size)
+        ):
+            return candidate, digest, size
+    except Exception:
+        pass
+    return crnn_path(), CRNN_SHA256, CRNN_SIZE
+
+
+def promote_crnn_candidate(
+    candidate: Path,
+    expected_sha256: str,
+    source_run_id: int,
+) -> dict:
+    candidate = Path(candidate)
+    digest = str(expected_sha256).upper()
+    size = candidate.stat().st_size if candidate.is_file() else 0
+    if size <= 0 or not verify_file(candidate, digest, size):
+        raise ValueError("Candidate CRNN SHA-256 verification failed")
+    custom_root = (
+        _data_dir()
+        / "models"
+        / "crnn"
+        / "custom"
+    )
+    custom_root.mkdir(parents=True, exist_ok=True)
+    filename = f"run-{int(source_run_id)}-{digest[:16]}.onnx"
+    target = custom_root / filename
+    if not verify_file(target, digest, size):
+        temporary = target.with_suffix(".tmp")
+        shutil.copy2(candidate, temporary)
+        if not verify_file(temporary, digest, size):
+            temporary.unlink(missing_ok=True)
+            raise ValueError("Promoted CRNN copy verification failed")
+        os.replace(temporary, target)
+    manifest = _active_crnn_manifest_path()
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    temporary_manifest = manifest.with_suffix(".tmp")
+    temporary_manifest.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "filename": filename,
+                "sha256": digest,
+                "size": size,
+                "source_run_id": int(source_run_id),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    os.replace(temporary_manifest, manifest)
+    try:
+        from .onnx_crnn import clear_crnn_sessions
+
+        clear_crnn_sessions()
+    except Exception:
+        pass
+    return {
+        "path": str(target),
+        "sha256": digest,
+        "size": size,
+        "source_run_id": int(source_run_id),
+    }
 
 
 def packaged_seed_dir() -> Path | None:
@@ -213,7 +332,7 @@ def ensure_detector_model(download=True) -> Path:
         "",
     ).strip()
     if source_dir:
-        source = Path(source_dir) / "best.pt"
+        source = Path(source_dir) / "plate_yolo.onnx"
         if _copy_verified(
             source,
             target,
@@ -223,7 +342,7 @@ def ensure_detector_model(download=True) -> Path:
             return target
     seed = packaged_seed_dir()
     if seed and _copy_verified(
-        seed / "plate" / "best.pt",
+        seed / "plate" / "plate_yolo.onnx",
         target,
         DETECTOR_SHA256,
         DETECTOR_SIZE,
@@ -238,6 +357,47 @@ def ensure_detector_model(download=True) -> Path:
         target,
         DETECTOR_SHA256,
         DETECTOR_SIZE,
+    )
+
+
+def ensure_detector_fallback_model(download=True) -> Path:
+    target = detector_fallback_path()
+    if verify_file(
+        target,
+        DETECTOR_FALLBACK_SHA256,
+        DETECTOR_FALLBACK_SIZE,
+    ):
+        return target
+    source_dir = os.environ.get(
+        "BCVISION_MODEL_SOURCE_DIR",
+        "",
+    ).strip()
+    if source_dir:
+        source = Path(source_dir) / "plate_yolo_fallback.onnx"
+        if _copy_verified(
+            source,
+            target,
+            DETECTOR_FALLBACK_SHA256,
+            DETECTOR_FALLBACK_SIZE,
+        ):
+            return target
+    seed = packaged_seed_dir()
+    if seed and _copy_verified(
+        seed / "plate" / "plate_yolo_fallback.onnx",
+        target,
+        DETECTOR_FALLBACK_SHA256,
+        DETECTOR_FALLBACK_SIZE,
+    ):
+        return target
+    if not download:
+        raise FileNotFoundError(
+            f"Verified fallback detector model not found: {target}"
+        )
+    return _download_verified(
+        DETECTOR_FALLBACK_URL,
+        target,
+        DETECTOR_FALLBACK_SHA256,
+        DETECTOR_FALLBACK_SIZE,
     )
 
 
@@ -285,90 +445,67 @@ def ensure_crnn_model(download=True) -> Path:
     return result
 
 
-def ensure_easyocr_models(download=True) -> Path:
-    target = easyocr_dir()
-    target.mkdir(parents=True, exist_ok=True)
-    if all(
-        verify_file(target / name, digest)
-        for name, digest in EASYOCR_HASHES.items()
-    ):
+def ensure_cnn_model(download=True) -> Path:
+    target = cnn_path()
+    if verify_file(target, CNN_SHA256, CNN_SIZE):
         return target
-
     source_dir = os.environ.get(
-        "BCVISION_EASYOCR_SOURCE_DIR",
-        "",
+        "BCVISION_CNN_SOURCE_DIR",
+        os.environ.get("BCVISION_MODEL_SOURCE_DIR", ""),
     ).strip()
     if source_dir:
-        source = Path(source_dir)
-        for name, digest in EASYOCR_HASHES.items():
-            candidate = source / name
-            if verify_file(candidate, digest):
-                shutil.copy2(candidate, target / name)
-        if all(
-            verify_file(target / name, digest)
-            for name, digest in EASYOCR_HASHES.items()
+        source = Path(source_dir) / "ocr_cnn.onnx"
+        if _copy_verified(
+            source,
+            target,
+            CNN_SHA256,
+            CNN_SIZE,
         ):
             return target
     seed = packaged_seed_dir()
-    if seed:
-        for name, digest in EASYOCR_HASHES.items():
-            _copy_verified(
-                seed / "easyocr" / name,
-                target / name,
-                digest,
-            )
-        if all(
-            verify_file(target / name, digest)
-            for name, digest in EASYOCR_HASHES.items()
-        ):
-            return target
-
+    if seed and _copy_verified(
+        seed / "cnn" / "ocr_cnn.onnx",
+        target,
+        CNN_SHA256,
+        CNN_SIZE,
+    ):
+        return target
     if not download:
         raise FileNotFoundError(
-            f"Verified EasyOCR models not found: {target}"
+            f"Verified CNN ONNX model not found: {target}"
         )
-
-    import easyocr
-    easyocr.Reader(
-        ["fa", "en"],
-        gpu=False,
-        verbose=False,
-        model_storage_directory=str(target),
-        user_network_directory=str(
-            target / "user_network"
-        ),
-        download_enabled=True,
+    return _download_verified(
+        CNN_URL,
+        target,
+        CNN_SHA256,
+        CNN_SIZE,
     )
-    invalid = [
-        name
-        for name, digest in EASYOCR_HASHES.items()
-        if not verify_file(target / name, digest)
-    ]
-    if invalid:
-        raise ValueError(
-            "EasyOCR model verification failed: "
-            + ", ".join(invalid)
-        )
-    return target
 
 
 def prepare_models(download=True) -> dict:
     detector = ensure_detector_model(download=download)
+    detector_fallback = ensure_detector_fallback_model(
+        download=download,
+    )
     crnn = ensure_crnn_model(download=download)
-    ocr = ensure_easyocr_models(download=download)
+    cnn = ensure_cnn_model(download=download)
     return {
         "detector": str(detector),
+        "detector_fallback": str(detector_fallback),
         "crnn": str(crnn),
-        "easyocr": str(ocr),
+        "cnn": str(cnn),
     }
 
 
 def prepare_seed(seed_dir: Path, download=True) -> dict:
     detector = ensure_detector_model(download=download)
+    detector_fallback = ensure_detector_fallback_model(
+        download=download,
+    )
     crnn = ensure_crnn_model(download=download)
-    ocr = ensure_easyocr_models(download=download)
+    cnn = ensure_cnn_model(download=download)
     seed = Path(seed_dir)
-    detector_target = seed / "plate" / "best.pt"
+    detector_target = seed / "plate" / "plate_yolo.onnx"
     if not _copy_verified(
         detector,
         detector_target,
@@ -376,6 +513,16 @@ def prepare_seed(seed_dir: Path, download=True) -> dict:
         DETECTOR_SIZE,
     ):
         raise ValueError("Detector seed verification failed")
+    detector_fallback_target = (
+        seed / "plate" / "plate_yolo_fallback.onnx"
+    )
+    if not _copy_verified(
+        detector_fallback,
+        detector_fallback_target,
+        DETECTOR_FALLBACK_SHA256,
+        DETECTOR_FALLBACK_SIZE,
+    ):
+        raise ValueError("Fallback detector seed verification failed")
     crnn_target = seed / "crnn" / "ocr_crnn.onnx"
     if not _copy_verified(
         crnn,
@@ -384,24 +531,30 @@ def prepare_seed(seed_dir: Path, download=True) -> dict:
         CRNN_SIZE,
     ):
         raise ValueError("CRNN seed verification failed")
-    for name, digest in EASYOCR_HASHES.items():
-        if not _copy_verified(
-            ocr / name,
-            seed / "easyocr" / name,
-            digest,
-        ):
-            raise ValueError(f"EasyOCR seed verification failed: {name}")
+    cnn_target = seed / "cnn" / "ocr_cnn.onnx"
+    if not _copy_verified(
+        cnn,
+        cnn_target,
+        CNN_SHA256,
+        CNN_SIZE,
+    ):
+        raise ValueError("CNN seed verification failed")
     return {
         "detector": str(detector_target),
+        "detector_fallback": str(detector_fallback_target),
         "crnn": str(crnn_target),
-        "easyocr": str(seed / "easyocr"),
+        "cnn": str(cnn_target),
     }
 
 
 def model_status() -> dict:
     detector = detector_path()
+    detector_fallback = detector_fallback_path()
     crnn = crnn_path()
-    ocr = easyocr_dir()
+    cnn = cnn_path()
+    active_crnn, active_crnn_sha, active_crnn_size = (
+        active_crnn_model()
+    )
     return {
         "detector_path": str(detector),
         "detector_ready": verify_file(
@@ -409,17 +562,33 @@ def model_status() -> dict:
             DETECTOR_SHA256,
             DETECTOR_SIZE,
         ),
+        "detector_fallback_path": str(detector_fallback),
+        "detector_fallback_ready": verify_file(
+            detector_fallback,
+            DETECTOR_FALLBACK_SHA256,
+            DETECTOR_FALLBACK_SIZE,
+        ),
         "crnn_path": str(crnn),
         "crnn_ready": verify_file(
             crnn,
             CRNN_SHA256,
             CRNN_SIZE,
         ),
-        "easyocr_path": str(ocr),
-        "easyocr_ready": all(
-            verify_file(ocr / name, digest)
-            for name, digest in EASYOCR_HASHES.items()
+        "active_crnn_path": str(active_crnn),
+        "active_crnn_sha256": active_crnn_sha,
+        "active_crnn_ready": verify_file(
+            active_crnn,
+            active_crnn_sha,
+            active_crnn_size,
         ),
+        "custom_crnn_active": active_crnn.resolve() != crnn.resolve(),
+        "cnn_path": str(cnn),
+        "cnn_ready": verify_file(
+            cnn,
+            CNN_SHA256,
+            CNN_SIZE,
+        ),
+        "easyocr_ready": False,
     }
 
 
@@ -455,8 +624,9 @@ def main(argv=None):
         print(f"{key.upper()}={value}")
     return 0 if (
         status["detector_ready"]
+        and status["detector_fallback_ready"]
         and status["crnn_ready"]
-        and status["easyocr_ready"]
+        and status["cnn_ready"]
     ) else 1
 
 

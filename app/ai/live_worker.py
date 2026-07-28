@@ -92,14 +92,14 @@ class LiveANPRWorker:
                 self._model_state = {
                     "detector_ready": False,
                     "crnn_ready": False,
-                    "easyocr_ready": False,
+                    "cnn_ready": False,
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             self._model_state_at = now
         status = dict(self._model_state)
         status["ocr_ready"] = bool(
             status.get("crnn_ready")
-            or status.get("easyocr_ready")
+            or status.get("cnn_ready")
         )
         status["ready"] = bool(
             status.get("detector_ready")
@@ -542,8 +542,10 @@ class LiveANPRWorker:
                     row.get("ocr_engine") == "crnn-onnx"
                 )
                 state.character_reader_selected += int(
-                    row.get("ocr_engine")
-                    == "dedicated-character-detector"
+                    row.get("ocr_engine") in {
+                        "dedicated-character-detector",
+                        "cnn-onnx",
+                    }
                 )
             if rows:
                 state.no_plate_streak = 0
@@ -552,11 +554,24 @@ class LiveANPRWorker:
                     12,
                     state.no_plate_streak + 1,
                 )
+            stable = state.tracker.update(
+                rows,
+                timestamp=timestamp,
+                frame=frame,
+            )
             state.latest_detections = [
                     {
-                        "bbox": tuple(row["bbox"]),
+                        "bbox": tuple(
+                            row.get("tracking_bbox")
+                            or row["bbox"]
+                        ),
                         "plate": row.get("plate", "ناخوانا"),
                         "confidence": float(row.get("confidence", 0.0)),
+                        "track_id": int(row.get("track_id") or 0),
+                        "tracking_engine": row.get(
+                            "tracking_engine",
+                            "bytetrack-kalman+optical-flow",
+                        ),
                         "valid": bool(row.get("valid")),
                         "best_effort": bool(
                             row.get("best_effort")
@@ -586,11 +601,6 @@ class LiveANPRWorker:
             state.detection_revision += 1
             state.last_processed_at = time.time()
             state.last_processing_ms = processing_seconds * 1000.0
-            stable = state.tracker.update(
-                rows,
-                timestamp=timestamp,
-                frame=frame,
-            )
             duplicate_seconds = max(
                 0.0,
                 float(config.get("duplicate_seconds", 30)),

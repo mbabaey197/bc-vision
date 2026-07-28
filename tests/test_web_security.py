@@ -359,7 +359,8 @@ def test_uploaded_video_flows_through_worker_to_sqlite_and_dashboard(
         lambda: {
             "ready": True,
             "detector_ready": True,
-            "easyocr_ready": True,
+            "crnn_ready": True,
+            "cnn_ready": True,
         },
     )
 

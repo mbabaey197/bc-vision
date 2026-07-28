@@ -18,16 +18,19 @@ import cv2
 import numpy as np
 
 from .plate_recovery import recover_mild_blur, should_attempt_recovery
+from .onnx_detector import (
+    detect_plates_onnx,
+    detector_status as onnx_detector_status,
+)
 from .plate_rules import (
     format_iran_plate,
     normalize_plate,
     plausible_plate,
 )
 
-try:
-    from ultralytics import YOLO
-except Exception:
-    YOLO = None
+# RC12 no longer loads Ultralytics in the production path.  This compatibility
+# name remains for old imports while the dedicated detector is ONNX-only.
+YOLO = None
 
 _models: dict[int, object] = {}
 _model_keys: dict[int, str] = {}
@@ -96,46 +99,54 @@ def _configure_cpu_threads() -> int:
 
 
 def _model_paths() -> list[Path]:
-    paths: list[Path] = []
-    configured = os.environ.get("BCVISION_PLATE_MODEL", "").strip()
-    if configured:
-        paths.append(Path(configured).expanduser())
-    try:
-        from app.config import DATA_DIR
-        paths.extend([
-            Path(DATA_DIR) / "models" / "plate" / "best.pt",
-            Path(DATA_DIR) / "models" / "plate" / "plate.pt",
-            Path(DATA_DIR) / "models" / "plate" / "model.onnx",
-        ])
-    except Exception:
-        pass
-    module_dir = Path(__file__).resolve().parent
-    paths.extend([
-        module_dir / "models" / "best.pt",
-        module_dir / "models" / "plate.pt",
-        module_dir / "models" / "model.onnx",
-    ])
-    unique = []
-    seen = set()
-    for path in paths:
-        key = str(path.resolve())
-        if key not in seen:
-            seen.add(key)
-            unique.append(path)
-    return unique
+    # Kept as a compatibility hook for older tests/extensions.  The combined
+    # 119 MB detector/character model was retired and is never auto-discovered.
+    return []
 
 
 def detector_status() -> dict:
-    path = next((path for path in _model_paths() if path.is_file()), None)
+    light = onnx_detector_status()
+    try:
+        from .model_manager import (
+            DETECTOR_SHA256,
+            DETECTOR_SIZE,
+            detector_path,
+            verify_file,
+        )
+        verified_path = detector_path()
+        model_exists = verify_file(
+            verified_path,
+            DETECTOR_SHA256,
+            DETECTOR_SIZE,
+        )
+    except Exception:
+        verified_path = None
+        model_exists = False
     return {
-        "yolo_available": YOLO is not None,
-        "model_path": str(path) if path else "",
-        "model_exists": bool(path),
-        "model_loaded": bool(_models),
-        "model_instances": len(_models),
+        "engine": "yolov8-onnx-light",
+        "onnx_model_loaded": bool(light.get("model_loaded")),
+        "onnx_model_path": light.get("primary_path", ""),
+        "onnx_fallback_loaded": bool(
+            light.get("fallback_loaded")
+        ),
+        "onnx_fallback_used": bool(light.get("fallback_used")),
+        "onnx_error": light.get("error", ""),
+        "legacy_yolo_available": False,
+        "legacy_model_path": "",
+        "legacy_model_exists": False,
+        "legacy_model_loaded": False,
+        "legacy_model_instances": 0,
+        # Backward-compatible status fields now describe the primary engine.
+        "model_path": (
+            light.get("primary_path", "")
+            or (str(verified_path) if verified_path else "")
+        ),
+        "model_exists": model_exists,
+        "model_loaded": bool(light.get("model_loaded")),
+        "model_instances": 1 if light.get("model_loaded") else 0,
         "parallel_camera_limit": parallel_camera_limit(),
         "threads_per_camera": threads_per_camera(),
-        "model_error": _model_error,
+        "model_error": light.get("error") or _model_error,
     }
 
 
@@ -150,33 +161,8 @@ def _runtime_slot(engine_key=None) -> int:
 
 
 def load_model(engine_key=None):
-    global _model_error
-    slot = _runtime_slot(engine_key)
-    with _model_lock:
-        _configure_cpu_threads()
-        model_path = next(
-            (path for path in _model_paths() if path.is_file()),
-            None,
-        )
-        key = str(model_path.resolve()) if model_path else ""
-        if slot in _models and _model_keys.get(slot) == key:
-            return _models[slot]
-        if YOLO is None or model_path is None:
-            return None
-        try:
-            model = YOLO(str(model_path))
-            # Ultralytics may reset Torch's global thread pool while importing
-            # or constructing the model. Reapply the CPU budget afterwards.
-            _configure_cpu_threads()
-            _models[slot] = model
-            _model_keys[slot] = key
-            _inference_locks.setdefault(slot, threading.RLock())
-            _model_error = ""
-        except Exception as exc:
-            _models.pop(slot, None)
-            _model_keys.pop(slot, None)
-            _model_error = f"{type(exc).__name__}: {exc}"
-        return _models.get(slot)
+    """Compatibility stub: the retired combined PyTorch model is not loaded."""
+    return None
 
 
 def _clip_box(box, width: int, height: int):
@@ -850,106 +836,30 @@ def detect_plates(
 ):
     if frame is None or getattr(frame, "size", 0) == 0:
         return []
-    height, width = frame.shape[:2]
-    model = load_model() if engine_key is None else load_model(engine_key)
-    found = []
-    if model is not None:
-        # Ultralytics mutates predictor state during predict().  A shared model
-        # used concurrently by live-camera workers can silently return empty
-        # detections.  Serialize the full detector+character transaction.
-        slot = _runtime_slot(engine_key)
-        inference_lock = _inference_locks.setdefault(
-            slot,
-            threading.RLock(),
+    light_rows = detect_plates_onnx(
+        frame,
+        min_confidence=min_confidence,
+        max_results=min(max_results, 4),
+        engine_key=engine_key,
+    )
+    if light_rows:
+        return light_rows
+
+    light_status = onnx_detector_status()
+    if light_status.get("model_loaded"):
+        fallback = _opencv_candidates(
+            frame,
+            max_results=min(max_results, 3),
         )
-        with inference_lock:
-            try:
-                plate_class_ids = _plate_class_ids(model)
-                model_max_results = (
-                    min(max_results, 4)
-                    if plate_class_ids == [IRANIAN_PLATE_CLASS_ID]
-                    else max_results
-                )
-                results = model.predict(
-                    frame,
-                    verbose=False,
-                    conf=max(0.05, float(min_confidence)),
-                    iou=0.42,
-                    imgsz=max(
-                        512,
-                        min(
-                            960,
-                            int(os.environ.get(
-                                "BCVISION_DETECTOR_IMAGE_SIZE",
-                                "640",
-                            )),
-                        ),
-                    ),
-                    max_det=model_max_results,
-                    classes=plate_class_ids,
-                    augment=(
-                        os.environ.get("BCVISION_YOLO_TTA", "0") == "1"
-                    ),
-                )
-                for result in results:
-                    for box in result.boxes:
-                        confidence = float(box.conf[0])
-                        class_id = int(box.cls[0])
-                        if (
-                            plate_class_ids is not None
-                            and class_id not in plate_class_ids
-                        ):
-                            continue
-                        x1, y1, x2, y2 = _clip_box(
-                            box.xyxy[0].tolist(),
-                            width,
-                            height,
-                        )
-                        if x2 <= x1 or y2 <= y1:
-                            continue
-                        pad_x = max(2, int((x2 - x1) * 0.035))
-                        pad_y = max(2, int((y2 - y1) * 0.10))
-                        x1, y1, x2, y2 = _clip_box(
-                            (
-                                x1 - pad_x,
-                                y1 - pad_y,
-                                x2 + pad_x,
-                                y2 + pad_y,
-                            ),
-                            width,
-                            height,
-                        )
-                        found.append({
-                            "crop": frame[y1:y2, x1:x2].copy(),
-                            "bbox": (x1, y1, x2, y2),
-                            "confidence": confidence,
-                            "method": "yolo",
-                        })
-                if found:
-                    found = _nms(found)[:model_max_results]
-                    if plate_class_ids == [IRANIAN_PLATE_CLASS_ID]:
-                        _recognize_plate_crops(model, found)
-                    return found
-                # A detector miss is not proof that no plate exists. Iranian
-                # CCTV plates that are small, oblique or overexposed can be
-                # recovered by the geometry fallback. The live worker applies
-                # an adaptive rate limit so this second pass cannot saturate
-                # a slow CPU continuously.
-                fallback = _opencv_candidates(
-                    frame,
-                    max_results=min(max_results, 3),
-                )
-                return [
-                    row
-                    for row in fallback
-                    if row["confidence"] >= min(
-                        0.45,
-                        max(0.08, float(min_confidence) * 0.65),
-                    )
-                ][:max_results]
-            except Exception as exc:
-                global _model_error
-                _model_error = f"{type(exc).__name__}: {exc}"
+        return [
+            row
+            for row in fallback
+            if row["confidence"] >= min(
+                0.45,
+                max(0.08, float(min_confidence) * 0.65),
+            )
+        ][:max_results]
+
     fallback = _opencv_candidates(frame, max_results=max_results)
     return [row for row in fallback if row["confidence"] >= min(0.45, max(0.08, float(min_confidence) * 0.65))][:max_results]
 

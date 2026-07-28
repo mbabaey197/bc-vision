@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 import threading
 import time
 
@@ -243,15 +244,14 @@ def test_recovery_result_requires_evidence_before_changing_digit():
 
 
 def test_parallel_detector_calls_are_serialized(monkeypatch):
+    from app.ai import onnx_detector
+
     active = 0
     maximum_active = 0
     state_lock = threading.Lock()
 
-    class Model:
-        names = {index: str(index) for index in range(32)}
-
-        @staticmethod
-        def predict(*_args, **_kwargs):
+    class Session:
+        def run(self, *_args, **_kwargs):
             nonlocal active, maximum_active
             with state_lock:
                 active += 1
@@ -259,31 +259,45 @@ def test_parallel_detector_calls_are_serialized(monkeypatch):
             time.sleep(0.03)
             with state_lock:
                 active -= 1
-            return [type("Result", (), {"boxes": []})()]
+            return [np.zeros((1, 5, 1), dtype=np.float32)]
 
-    model = Model()
+    entry = onnx_detector._SessionEntry(
+        primary=Session(),
+        primary_input="images",
+        fallback=None,
+        fallback_input="",
+        run_lock=threading.Lock(),
+    )
     monkeypatch.setattr(
-        "app.ai.detector.load_model",
-        lambda: model,
+        onnx_detector,
+        "_verified_paths",
+        lambda: (Path("plate_yolo.onnx"), None),
+    )
+    monkeypatch.setattr(
+        onnx_detector,
+        "_load_session",
+        lambda engine_key=None: entry,
     )
     frame = np.zeros((180, 320, 3), dtype=np.uint8)
     with ThreadPoolExecutor(max_workers=2) as executor:
-        rows = list(executor.map(detect_plates, [frame, frame]))
+        rows = list(executor.map(
+            onnx_detector.detect_plates_onnx,
+            [frame, frame],
+        ))
 
     assert rows == [[], []]
     assert maximum_active == 1
 
 
 def test_different_camera_slots_can_run_in_parallel(monkeypatch):
+    from app.ai import onnx_detector
+
     active = 0
     maximum_active = 0
     state_lock = threading.Lock()
 
-    class Model:
-        names = {index: str(index) for index in range(32)}
-
-        @staticmethod
-        def predict(*_args, **_kwargs):
+    class Session:
+        def run(self, *_args, **_kwargs):
             nonlocal active, maximum_active
             with state_lock:
                 active += 1
@@ -291,24 +305,36 @@ def test_different_camera_slots_can_run_in_parallel(monkeypatch):
             time.sleep(0.04)
             with state_lock:
                 active -= 1
-            return [type("Result", (), {"boxes": []})()]
+            return [np.zeros((1, 5, 1), dtype=np.float32)]
 
+    entries = {
+        key: onnx_detector._SessionEntry(
+            primary=Session(),
+            primary_input="images",
+            fallback=None,
+            fallback_input="",
+            run_lock=threading.Lock(),
+        )
+        for key in (0, 1)
+    }
     monkeypatch.setattr(
-        "app.ai.detector.parallel_camera_limit",
-        lambda: 2,
+        onnx_detector,
+        "_verified_paths",
+        lambda: (Path("plate_yolo.onnx"), None),
     )
     monkeypatch.setattr(
-        "app.ai.detector.load_model",
-        lambda _engine_key=None: Model(),
-    )
-    monkeypatch.setattr(
-        "app.ai.detector._opencv_candidates",
-        lambda *_args, **_kwargs: [],
+        onnx_detector,
+        "_load_session",
+        lambda engine_key=None: entries[engine_key],
     )
     frame = np.zeros((180, 320, 3), dtype=np.uint8)
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [
-            executor.submit(detect_plates, frame, engine_key=engine_key)
+            executor.submit(
+                onnx_detector.detect_plates_onnx,
+                frame,
+                engine_key=engine_key,
+            )
             for engine_key in (0, 1)
         ]
         rows = [future.result() for future in futures]

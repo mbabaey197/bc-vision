@@ -24,6 +24,12 @@ from urllib.parse import quote
 from pathlib import Path
 from app.ai.plate_rules import iran_plate_parts, persian_digits
 from app.ai.feedback import invalidate_feedback_cache, validate_correction
+from app.ai.training import (
+    apply_candidate,
+    capture_feedback_sample,
+    latest_training_status,
+    start_training,
+)
 
 try:
     import psutil
@@ -84,13 +90,20 @@ def jalali_datetime(value, with_seconds=True):
     if not dt: return '—'
     jy,jm,jd=_gregorian_to_jalali(dt.year,dt.month,dt.day)
     t=dt.strftime('%H:%M:%S' if with_seconds else '%H:%M')
-    return f'{jy:04d}/{jm:02d}/{jd:02d} - {t}'
+    return persian_digits(f'{jy:04d}/{jm:02d}/{jd:02d} - {t}')
 
 def jalali_date(value):
     dt=_parse_dt(value)
     if not dt:return ''
     jy,jm,jd=_gregorian_to_jalali(dt.year,dt.month,dt.day)
-    return f'{jy:04d}/{jm:02d}/{jd:02d}'
+    return persian_digits(f'{jy:04d}/{jm:02d}/{jd:02d}')
+
+def display_expiration(value):
+    text=str(value or '').strip()
+    if not text or text == 'دائمی':
+        return text or '—'
+    converted=jalali_date(text)
+    return converted or persian_digits(text)
 
 def normalize_plate(text):
     if not text:return ''
@@ -205,6 +218,7 @@ def page(title, body, username=None, request=None):
         shell_start=f"""<div class='app-shell'><aside class='sidebar' id='sidebar'><a class='brand-row' href='/dashboard'><span class='brand-mark'>BC</span><span class='brand-copy'><b>BC Vision</b><small>{COMPANY_NAME}</small></span></a><button class='sidebar-toggle' id='sidebarToggle' title='جمع کردن منو'>‹</button><nav class='nav-menu'>{links}</nav><div class='sidebar-foot'><a href='/logout'><span class='nav-icon'>⇥</span><span class='nav-label'>خروج از حساب</span></a></div></aside><main class='main' id='main'><header class='topbar'><button class='top-action mobile-menu' id='mobileMenu'>☰</button><div class='top-title'>{escape(title)}</div><div class='resource-strip'><div class='resource-chip' id='head-cpu'><span class='resource-dot'></span><span class='label'>CPU</span><span id='head-cpu-value'>—</span></div><div class='resource-chip' id='head-ram'><span class='resource-dot'></span><span class='label'>RAM</span><span id='head-ram-value'>—</span></div><div class='resource-chip' id='head-disk'><span class='resource-dot'></span><span class='label'>DISK</span><span id='head-disk-value'>—</span></div></div><button class='top-action' id='themeToggle' title='حالت تاریک'>◐</button><div class='user-chip'><span class='avatar'>{escape(username[:1].upper())}</span><span>{escape(username)}</span></div></header>"""
         shell_end='</main></div>'
     common_js="""<script>
+window.faDigits=function(value){return String(value).replace(/[0-9]/g,d=>'۰۱۲۳۴۵۶۷۸۹'[Number(d)]).replace('.', '٫')};
 (function(){
  const root=document.documentElement, saved=localStorage.getItem('bc-theme')||'light';root.dataset.theme=saved;
  const st=document.getElementById('sidebar'),mn=document.getElementById('main');
@@ -527,6 +541,8 @@ def media(request:Request,path:str=''):
 def events(request:Request,q:str='',camera:str='',status:str='',vehicle_type:str='',vehicle_color:str='',date_from:str='',date_to:str=''):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
+    date_from=persian_digits(date_from.strip())
+    date_to=persian_digits(date_to.strip())
     where=[];params=[]
     if q: where.append('e.plate_text LIKE ?');params.append(f'%{q}%')
     if camera: where.append('e.camera_name=?');params.append(camera)
@@ -598,7 +614,7 @@ def correct_event_plate(
         if not row:
             return JSONResponse({'error': 'event not found'}, 404)
         observed_text = row['plate_text'] or ''
-        con.execute(
+        feedback_cursor = con.execute(
             "INSERT INTO anpr_feedback("
             "event_id,observed_text,observed_norm,corrected_text,"
             "corrected_norm,plate_image_path,image_path,submitted_by"
@@ -614,6 +630,7 @@ def correct_event_plate(
                 username,
             ),
         )
+        feedback_id = int(feedback_cursor.lastrowid)
         columns = {
             column[1]
             for column in con.execute(
@@ -637,6 +654,7 @@ def correct_event_plate(
         f"event={event_id}; corrected={corrected_norm}",
     )
     invalidate_feedback_cache()
+    capture_feedback_sample(feedback_id)
     return RedirectResponse('/dashboard?corrected=1', 303)
 
 
@@ -653,16 +671,16 @@ def event_detail(event_id:int, request:Request):
     video_ok=bool(r['video_path'] and Path(r['video_path']).is_file())
     image_ok=bool(r['image_path'] and Path(r['image_path']).is_file())
     plate_ok=bool(r['plate_image_path'] and Path(r['plate_image_path']).is_file())
-    video=(f"<video id='eventVideo' controls preload='metadata' src='/media?path={quote(r['video_path'])}'></video><div class='replay-controls'><button type='button' onclick='jumpToEvent()'>رفتن به لحظه عبور</button><button type='button' class='secondary' onclick='stepFrame(-1)'>فریم قبل</button><button type='button' class='secondary' onclick='stepFrame(1)'>فریم بعد</button><button type='button' class='secondary' onclick='setSpeed(.25)'>¼×</button><button type='button' class='secondary' onclick='setSpeed(.5)'>½×</button><button type='button' class='secondary' onclick='setSpeed(1)'>1×</button><button type='button' class='secondary' onclick='setSpeed(2)'>2×</button><span id='speedLabel' class='muted'>سرعت: 1×</span></div>" if video_ok else "<div class='alert'>فایل ویدئوی این تردد موجود نیست یا طبق تنظیمات نگهداری حذف شده است.</div>")
+    video=(f"<video id='eventVideo' controls preload='metadata' src='/media?path={quote(r['video_path'])}'></video><div class='replay-controls'><button type='button' onclick='jumpToEvent()'>رفتن به لحظه عبور</button><button type='button' class='secondary' onclick='stepFrame(-1)'>فریم قبل</button><button type='button' class='secondary' onclick='stepFrame(1)'>فریم بعد</button><button type='button' class='secondary' onclick='setSpeed(.25)'>۰٫۲۵×</button><button type='button' class='secondary' onclick='setSpeed(.5)'>۰٫۵×</button><button type='button' class='secondary' onclick='setSpeed(1)'>۱×</button><button type='button' class='secondary' onclick='setSpeed(2)'>۲×</button><span id='speedLabel' class='muted'>سرعت: ۱×</span></div>" if video_ok else "<div class='alert'>فایل ویدئوی این تردد موجود نیست یا طبق تنظیمات نگهداری حذف شده است.</div>")
     vehicle=(f"<img onclick='showImage(this.src)' src='/media?path={quote(r['image_path'])}'>" if image_ok else "<div class='muted'>تصویر خودرو موجود نیست</div>")
     plate=(f"<img onclick='showImage(this.src)' src='/media?path={quote(r['plate_image_path'])}'>" if plate_ok else "<div class='muted'>تصویر پلاک موجود نیست</div>")
     owner=' / '.join(x for x in [r['owner_name'],r['vehicle_model'],r['vehicle_color']] if x) or 'ثبت نشده'
     body=f"""<div class='wrap'><div class='toolbar'><h1 style='margin-left:auto'>جزئیات تردد شماره {r['id']}</h1><a class='btn secondary' href='/events'>بازگشت به ترددها</a></div>
-    <div class='replay-layout'><div class='card video-panel'><h3>پخش ویدئو از لحظه عبور</h3><div class='time-badge'>زمان ثبت در ویدئو: {second:.2f} ثانیه</div>{video}</div>
+    <div class='replay-layout'><div class='card video-panel'><h3>پخش ویدئو از لحظه عبور</h3><div class='time-badge'>زمان ثبت در ویدئو: {persian_digits(f"{second:.2f}").replace(".", "٫")} ثانیه</div>{video}</div>
     <div><div class='card'><h3>اطلاعات تردد</h3><div class='event-meta'><div class='meta-item' style='grid-column:1/-1'><small>پلاک</small>{iran_plate_html(r['plate_text'])}</div><div class='meta-item'><small>وضعیت</small>{event_status_badge(st)}</div><div class='meta-item'><small>دوربین</small>{escape(r['camera_name'] or '—')}</div><div class='meta-item'><small>اطمینان</small>{persian_digits(f"{(r['confidence'] or 0)*100:.1f}")}٪</div><div class='meta-item'><small>تاریخ و ساعت شمسی</small>{persian_digits(jalali_datetime(r['created_at']))}</div><div class='meta-item'><small>روش تشخیص</small>{escape(r['detector_method'] or '—')}</div><div class='meta-item'><small>نوع خودرو</small>{escape(r['vehicle_type'] or 'نامشخص')}</div><div class='meta-item'><small>رنگ خودرو</small>{escape(r['vehicle_color'] or 'نامشخص')}</div><div class='meta-item'><small>اطمینان تشخیص خودرو</small>{persian_digits(f"{(r['vehicle_confidence'] or 0)*100:.1f}")}٪</div><div class='meta-item'><small>مالک / خودرو</small>{escape(owner)}</div><div class='meta-item'><small>شماره تماس</small>{persian_digits(r['phone'] or '—')}</div></div></div>
     <div class='card'><h3>تصاویر ثبت‌شده</h3><div class='detail-images'><div>{vehicle}<small>تصویر خودرو</small></div><div>{plate}<small>تصویر پلاک</small></div></div></div></div></div></div>
     <div id='imgModal' class='modal-img' onclick='this.classList.remove("open")'><button>بستن</button><img id='modalImage'></div>
-    <script>const eventSecond={second:.3f};const v=document.getElementById('eventVideo');function jumpToEvent(){{if(!v)return;v.currentTime=Math.max(0,eventSecond-.5);v.play().catch(()=>{{}})}}function stepFrame(dir){{if(!v)return;v.pause();v.currentTime=Math.max(0,v.currentTime+dir/25)}}function setSpeed(rate){{if(!v)return;v.playbackRate=rate;document.getElementById('speedLabel').textContent='سرعت: '+rate+'×'}}function showImage(src){{document.getElementById('modalImage').src=src;document.getElementById('imgModal').classList.add('open')}}if(v){{v.addEventListener('loadedmetadata',jumpToEvent,{{once:true}})}}</script>"""
+    <script>const eventSecond={second:.3f};const v=document.getElementById('eventVideo');function jumpToEvent(){{if(!v)return;v.currentTime=Math.max(0,eventSecond-.5);v.play().catch(()=>{{}})}}function stepFrame(dir){{if(!v)return;v.pause();v.currentTime=Math.max(0,v.currentTime+dir/25)}}function setSpeed(rate){{if(!v)return;v.playbackRate=rate;document.getElementById('speedLabel').textContent='سرعت: '+window.faDigits(rate)+'×'}}function showImage(src){{document.getElementById('modalImage').src=src;document.getElementById('imgModal').classList.add('open')}}if(v){{v.addEventListener('loadedmetadata',jumpToEvent,{{once:true}})}}</script>"""
     return page('جزئیات تردد',body,u,request)
 
 @app.get('/watchlist')
@@ -887,6 +905,46 @@ def settings(request:Request,saved:int=0,restart:int=0,error:str=''):
     usage_html=(f"<div class='drive-card'><div class='meter-label'><b>{escape(usage['path'])}</b><span>{usage['percent']}٪</span></div><div class='storage-progress'><span style='width:{usage['percent']}%'></span></div><span class='muted'>آزاد: {_fmt_bytes(usage['free'])} از {_fmt_bytes(usage['total'])}</span></div>" if usage['ok'] else f"<div class='alert'>مسیر ذخیره‌سازی در دسترس نیست: {escape(usage.get('error',''))}</div>")
     checked=lambda k: 'checked' if get_setting(k,'0')=='1' else ''
     selected=lambda k,v: 'selected' if get_setting(k,'')==v else ''
+    training=latest_training_status(); training_run=training.get('run')
+    training_labels={
+        'queued':'در صف','running':'در حال آموزش',
+        'candidate-ready':'مدل نامزد آماده اعمال',
+        'rejected':'ردشده به‌دلیل افت دقت',
+        'applied':'اعمال‌شده','error':'خطای آموزش',
+        'interrupted':'متوقف‌شده با بستن برنامه',
+    }
+    training_state=(
+        training_labels.get(
+            training_run['status'],
+            training_run['status'],
+        )
+        if training_run else 'بدون آموزش'
+    )
+    training_metrics=(
+        "<p class='muted'>دقت مدل فعال: "
+        + persian_digits(f"{float(training_run['baseline_accuracy'] or 0)*100:.1f}")
+        + "٪ | دقت مدل نامزد: "
+        + persian_digits(f"{float(training_run['candidate_accuracy'] or 0)*100:.1f}")
+        + "٪</p>"
+        if training_run and training_run['status'] in {
+            'candidate-ready','rejected','applied'
+        }
+        else ""
+    )
+    training_action=(
+        f"<form method='post' action='/settings/ai/training/apply'>"
+        f"<input type='hidden' name='run_id' value='{training_run['id']}'>"
+        "<button>اعمال مدل نامزد تأییدشده</button></form>"
+        if training_run and training_run['status']=='candidate-ready'
+        else (
+            "<form method='post' action='/settings/ai/training/start'>"
+            "<label>دوره آموزش</label><input type='number' name='epochs' "
+            "min='4' max='40' value='12'><button>شروع آموزش کنترل‌شده</button>"
+            "</form>"
+            if training['ready']
+            else "<span class='muted'>با افزایش اصلاحات تأییدشده، آموزش فعال می‌شود.</span>"
+        )
+    )
     body=f"""<div class='wrap'><h1>تنظیمات</h1>{msg}
     <div class='card'><h3>نمایش زنده</h3><form method='post' action='/settings/display'><div class='two-col'><div><label>تعداد ستون نمایش زنده</label><select name='dashboard_grid'>{''.join(f'<option value={x} '+('selected' if get_setting('dashboard_grid','2')==str(x) else '')+f'>{x} ستون</option>' for x in [1,2,3,4])}</select></div><div><label>تعداد فریم نمایش در ثانیه</label><input type='number' min='1' max='15' name='live_fps' value='{get_setting('live_fps','5')}'></div><div><label>عرض تصویر لایو</label><select name='stream_width'>{''.join(f'<option value={x} '+('selected' if get_setting('stream_width','640')==str(x) else '')+f'>{x}px</option>' for x in [480,640,960,1280])}</select></div><div><label>کیفیت JPEG</label><input type='number' min='30' max='95' name='jpeg_quality' value='{get_setting('jpeg_quality','70')}'></div></div><label>رمز جدید مدیر (اختیاری)</label><input type='password' name='new_password'><button>ذخیره تنظیمات نمایش</button></form></div>
     <div class='card' id='storage'><h3>ذخیره‌سازی</h3><p class='muted'>درایو یا پوشه اصلی و مسیر جداگانه هر نوع اطلاعات را انتخاب کنید.</p>{usage_html}<form method='post' action='/settings/storage' style='margin-top:18px'><label>مسیر اصلی ذخیره‌سازی</label><input class='code' name='storage_root' value='{escape(root)}' placeholder='D:\\BCVisionData'><div class='storage-grid'><div><label>تصاویر خودرو</label><input class='code' name='snapshot_path' value='{escape(snap)}'></div><div><label>تصاویر پلاک</label><input class='code' name='plate_path' value='{escape(plates)}'></div><div><label>ویدئوها</label><input class='code' name='video_path' value='{escape(videos)}'></div><div><label>نسخه‌های پشتیبان</label><input class='code' name='backup_path' value='{escape(backups)}'></div></div>
@@ -914,6 +972,15 @@ def settings(request:Request,saved:int=0,restart:int=0,error:str=''):
 <button>ذخیره تنظیمات AI</button>
 </form>
 </div>
+<div class='card' id='ai-training'><h3>یادگیری از اصلاحات اپراتور</h3>
+<p class='muted'>تصاویر اصلاح‌شده در دیتاست محلی نگهداری می‌شوند. مدل نامزد
+فقط پس از آزمون روی مجموعه جدا و بدون افت نسبت به مدل فعال قابل اعمال است.</p>
+<div class='stats-grid'>
+<div class='stat-card'><span class='muted'>نمونه آموزشی</span><div class='stat'>{persian_digits(training['train_samples'])}</div></div>
+<div class='stat-card'><span class='muted'>نمونه اعتبارسنجی</span><div class='stat'>{persian_digits(training['validation_samples'])}</div></div>
+<div class='stat-card'><span class='muted'>پلاک یکتا</span><div class='stat'>{persian_digits(training['unique_plates'])}</div></div>
+<div class='stat-card'><span class='muted'>وضعیت</span><div style='font-weight:900;margin-top:12px'>{escape(str(training_state))}</div></div>
+</div>{training_metrics}{training_action}</div>
 <div class='card'><form method='post' action='/backup'><button class='secondary'>دریافت نسخه پشتیبان دیتابیس</button></form></div><div class='card'><b>وضعیت موتور تصویر:</b> {'آماده' if CV_OK else 'OpenCV بارگذاری نشده است'}</div></div>"""
     return page('تنظیمات',body,u,request)
 
@@ -1000,7 +1067,7 @@ def license_page(request:Request,ok:int=0,error:str='',message:str=''):
     <div class='grid'><div class='card'><span class='muted'>وضعیت</span><div class='{badge}' style='font-size:20px;margin-top:10px'>{escape(s['message'])}</div></div>
     <div class='card'><span class='muted'>پلن</span><div class='stat'>{escape(labels.get(s['plan'],s['plan']))}</div></div>
     <div class='card'><span class='muted'>ظرفیت دوربین</span><div class='stat'>{s['camera_limit']}</div></div>
-    <div class='card'><span class='muted'>تاریخ انقضا</span><div style='font-weight:900;font-size:18px'>{escape(str(s['expires_at']))}</div></div></div>
+    <div class='card'><span class='muted'>تاریخ انقضا</span><div style='font-weight:900;font-size:18px'>{escape(display_expiration(s['expires_at']))}</div></div></div>
     <div class='card'><b>امکانات فعال</b><div style='margin-top:12px'>{chips or '—'}</div></div>
     <div class='card'><b>شناسه دستگاه</b><input class='code' readonly value='{machine_id()}' onclick='this.select()'><p class='muted'>برای صدور لایسنس آفلاین، این شناسه را برای مدیر فروش ارسال کنید.</p></div>
     <div class='grid'>
@@ -1064,6 +1131,60 @@ def save_ai_settings(request:Request, ai_accelerator:str=Form('auto'), ai_qualit
     set_setting('ai_confidence', max(1,min(99,ai_confidence)))
     set_setting('ai_frames', max(1,min(20,ai_frames)))
     return RedirectResponse('/settings?saved=1',302)
+
+
+@app.post('/settings/ai/training/start')
+def start_ai_training(
+    request: Request,
+    epochs: int = Form(12),
+):
+    username = auth(request)
+    if not username:
+        return RedirectResponse('/login', 302)
+    if not has_permission(request, 'system.manage'):
+        return access_denied()
+    try:
+        result = start_training(
+            device=get_setting('ai_accelerator', 'auto'),
+            epochs=epochs,
+        )
+        audit(
+            request,
+            'anpr_training_start',
+            f"run={result['run_id']}; epochs={max(4,min(40,epochs))}",
+        )
+        return RedirectResponse('/settings?saved=1#ai-training', 303)
+    except ValueError as exc:
+        return RedirectResponse(
+            '/settings?error=' + quote(str(exc)) + '#ai-training',
+            303,
+        )
+
+
+@app.post('/settings/ai/training/apply')
+def apply_ai_training(
+    request: Request,
+    run_id: int = Form(...),
+):
+    username = auth(request)
+    if not username:
+        return RedirectResponse('/login', 302)
+    if not has_permission(request, 'system.manage'):
+        return access_denied()
+    try:
+        result = apply_candidate(run_id, username)
+        audit(
+            request,
+            'anpr_training_apply',
+            f"run={run_id}; sha256={result['sha256']}",
+        )
+        return RedirectResponse('/settings?saved=1#ai-training', 303)
+    except ValueError as exc:
+        return RedirectResponse(
+            '/settings?error=' + quote(str(exc)) + '#ai-training',
+            303,
+        )
+
 
 @app.post('/backup')
 def backup_database(request:Request):

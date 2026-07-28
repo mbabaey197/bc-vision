@@ -1,72 +1,90 @@
 # BC Vision ANPR models
 
-BC Vision stores AI model files in the persistent data directory instead of the
-application directory. Installer and one-click updates therefore do not delete
-models, settings, events, snapshots, or the database.
+BC Vision stores AI models in the persistent data directory. Installer and
+one-click updates therefore preserve models, promoted custom CRNNs, training
+samples, settings, events, snapshots and the SQLite database.
 
-## Iranian plate and character detector
+## Lightweight Iranian plate detectors
 
-- Model repository: `makhresearch/persian-license-plate-detector`
-- Source: `https://huggingface.co/makhresearch/persian-license-plate-detector`
-- File: `best.pt`
-- Expected size: `119237050` bytes
-- SHA-256: `258104262D3A16A6BC613938CC1DD0198DA8A7DDEAB4843197666CB9CE0DB756`
-- License declared by the model repository: MIT
+Both detector models come from the MIT-licensed Platrix model repository:
+`https://huggingface.co/Dibachain/Platrix`.
 
-This is a 32-class model. Class `30` is the full plate; the remaining
-documented classes represent Persian plate characters. BC Vision must first
-filter the full-frame result to class `30`, then run character recognition on
-the resulting plate crop. Treating every class as a full plate produces false
-candidates and excessive OCR load.
+- `plate_yolo.onnx`
+  - Input size: `416`
+  - Expected size: `12608775` bytes
+  - SHA-256:
+    `A54E475C402E6036BB5C70F1A6FF75179E76098A5C8039BB5D148C0B6421F5C6`
+- `plate_yolo_fallback.onnx`
+  - Input size: `640`
+  - Expected size: `12265080` bytes
+  - SHA-256:
+    `A6974FCB0A79755C270D50F1EBEFD4D96D765C879A29051A19AAC00DFDA8B5AF`
 
-The application downloads this model only over HTTPS. It is moved into the
-active model path only after both the exact size and SHA-256 digest match.
+The primary detector runs first. The second ONNX detector runs only after a
+zero-result primary pass. Hardened OpenCV geometry is the final localization
+fallback. The retired 119 MB combined `best.pt` model and Ultralytics are not
+loaded or packaged by RC12.
 
-## EasyOCR Persian recognition models
+## Iranian OCR models
 
-- `arabic.pth`
-  - SHA-256: `2A9AFD42C374DEB98AED0B53C9B77D75E1D00D4E0501F3B0276C54190C89B1A8`
-- `craft_mlt_25k.pth`
-  - SHA-256: `4A5EFBFB48B4081100544E75E1E2B57F8DE3D84F213004B14B85FD4B3748DB17`
+- `ocr_crnn.onnx`
+  - Segmentation-free whole-plate CRNN+CTC reader
+  - Expected size: `10452525` bytes
+  - SHA-256:
+    `45F8C45F29EB1EE91F6274CB8D9C328DA1A2050EA7D8596BAE61F4A6B9F9FB1E`
+- `ocr_cnn.onnx`
+  - Eight-glyph Iranian character fallback
+  - Expected size: `2226402` bytes
+  - SHA-256:
+    `7D573C51CC855A8E080F1F88597477F4FB5A2B9CAFA1BB125BD6038E441F5BCA`
 
-EasyOCR downloads are also verified before the models are considered ready.
+CRNN reads the full crop first. The CNN is attempted only if CRNN has no valid
+complete Iranian plate and exactly eight real glyph regions can be segmented.
+Missing characters are never invented. EasyOCR and Tesseract are no longer in
+the RC12 production path or Windows package.
 
 ## Persistent Windows paths
 
-By default, models are stored below:
-
 ```text
-C:\ProgramData\BCVision\data\models\plate\best.pt
-C:\ProgramData\BCVision\data\models\easyocr\arabic.pth
-C:\ProgramData\BCVision\data\models\easyocr\craft_mlt_25k.pth
+C:\ProgramData\BCVision\data\models\plate\plate_yolo.onnx
+C:\ProgramData\BCVision\data\models\plate\plate_yolo_fallback.onnx
+C:\ProgramData\BCVision\data\models\crnn\ocr_crnn.onnx
+C:\ProgramData\BCVision\data\models\cnn\ocr_cnn.onnx
+C:\ProgramData\BCVision\data\models\crnn\custom\...
+C:\ProgramData\BCVision\data\anpr-training\...
 ```
 
-Environment variables can override the locations:
+Environment variables can override vendor model locations:
 
 ```text
 BCVISION_PLATE_MODEL
-BCVISION_EASYOCR_MODEL_DIR
+BCVISION_PLATE_FALLBACK_MODEL
+BCVISION_CRNN_MODEL
+BCVISION_CNN_MODEL
 BCVISION_MODEL_SOURCE_DIR
-BCVISION_EASYOCR_SOURCE_DIR
-BCVISION_DETECTOR_IMAGE_SIZE
-BCVISION_CHARACTER_IMAGE_SIZE
+BCVISION_CRNN_SOURCE_DIR
+BCVISION_CNN_SOURCE_DIR
+BCVISION_ONNX_DETECTOR_SIZE
 BCVISION_CPU_THREADS
 ```
 
-Default inference sizes are `640` for full-frame plate localization and `416`
-for the cropped character pass. These defaults were selected from the real
-1920×1080 reference video to reduce CPU time while retaining plate detections.
-The character crops are processed sequentially to bound peak RAM.
-CPU inference uses at most six worker threads by default and leaves at least
-one logical processor available to the application and operating system. Set
-`BCVISION_CPU_THREADS` from `1` through `8` to tune the budget for the
-deployment machine.
+Every model is accepted only after exact size and SHA-256 verification.
+Per-camera ONNX Runtime sessions use at most two intra-operation threads, one
+inter-operation thread, sequential execution and disabled worker spinning.
+
+## Operator training and promotion
+
+Confirmed corrections copy the corresponding plate crop into an immutable
+local dataset with a SHA-256 digest and deterministic train/validation split.
+Training runs outside live inference and create a candidate CRNN. The candidate
+is evaluated against the currently active model on the isolated validation
+split. It cannot be applied when it regresses or scores below the promotion
+threshold. Applying a verified candidate copies it into persistent storage,
+records its digest and run ID, and atomically changes the active manifest.
 
 ## Operational limitation
 
-No ANPR implementation can guarantee correct recognition when the plate has no
-recoverable pixels, is fully hidden, is outside the frame, or is severely
-overexposed. BC Vision reduces failure rates through YOLO localization,
-perspective correction, multiple exposure variants, Persian OCR, positional
-repair, and multi-frame voting. Camera placement, shutter speed, focus,
-resolution, and lighting remain part of overall system accuracy.
+Software cannot recover a plate whose pixels are absent, fully hidden,
+destroyed by severe motion blur or saturation, or outside the frame. Camera
+placement, focus, shutter speed, resolution, plate pixel height and lighting
+remain part of end-to-end accuracy.

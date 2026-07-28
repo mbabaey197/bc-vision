@@ -121,8 +121,9 @@ def prepare_anpr_models():
         log(f"ANPR model status before preparation: {before}")
         if (
             before["detector_ready"]
+            and before["detector_fallback_ready"]
             and before["crnn_ready"]
-            and before["easyocr_ready"]
+            and before["cnn_ready"]
         ):
             log("ANPR models are already verified and ready")
             return
@@ -230,40 +231,37 @@ def run_self_test() -> int:
         anpr_ready = not verify_anpr
         if verify_anpr:
             import numpy as np
-            import easyocr
             import onnxruntime
-            from ultralytics import YOLO
             from app.ai.model_manager import prepare_models
+            from app.ai.onnx_cnn import warmup_cnn
             from app.ai.onnx_crnn import (
                 get_crnn_status,
                 read_plate_crnn,
             )
+            from app.ai.onnx_detector import (
+                detect_plates_onnx,
+                detector_status,
+            )
 
             models = prepare_models(download=False)
-            detector = YOLO(models["detector"])
-            detector.predict(
-                source=np.zeros((96, 160, 3), dtype=np.uint8),
-                imgsz=160,
-                device="cpu",
-                verbose=False,
-            )
-            easyocr.Reader(
-                ["fa", "en"],
-                gpu=False,
-                verbose=False,
-                model_storage_directory=models["easyocr"],
-                user_network_directory=str(
-                    Path(models["easyocr"]) / "user_network"
-                ),
-                download_enabled=False,
+            detect_plates_onnx(
+                np.zeros((96, 160, 3), dtype=np.uint8),
+                engine_key="packaged-self-test",
             )
             read_plate_crnn(
                 np.zeros((32, 128, 3), dtype=np.uint8),
                 engine_key="packaged-self-test",
             )
+            cnn = warmup_cnn(engine_key="packaged-self-test")
             anpr_ready = bool(
                 onnxruntime.__version__
+                and models["detector"]
+                and models["detector_fallback"]
+                and models["crnn"]
+                and models["cnn"]
+                and detector_status()["model_loaded"]
                 and get_crnn_status()["model_loaded"]
+                and cnn["model_loaded"]
             )
 
         result.update({

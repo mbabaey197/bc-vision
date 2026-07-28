@@ -1,19 +1,8 @@
-# BC Vision ANPR AI runtime
-# Verified on Windows with Python 3.13.1
+# BC Vision RC12 ONNX inference and controlled CRNN training runtime.
+# The production detector/OCR path has no EasyOCR, Tesseract or Ultralytics.
 
-easyocr==1.7.2
-scikit-image==0.26.0
-scipy==1.18.0
-python-bidi==0.6.11
-pyclipper==1.4.0
-shapely==2.1.2
-ninja==1.13.0
 torch==2.13.0
-torchvision==0.28.0
-ultralytics==8.4.106
-ultralytics-thop==2.0.20
-polars==1.43.0
-nvidia-ml-py==13.610.43
+onnx==1.22.0
 onnxruntime==1.28.0
 flatbuffers==25.12.19
 protobuf==7.35.1

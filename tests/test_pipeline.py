@@ -441,7 +441,7 @@ def test_partial_character_evidence_is_kept_instead_of_unreadable():
     assert partial[0]["needs_review"] is True
 
 
-def test_failed_dedicated_reader_uses_generic_ocr_on_good_crop(
+def test_failed_crnn_uses_character_cnn_on_good_crop(
     monkeypatch,
 ):
     rng = np.random.default_rng(7)
@@ -463,7 +463,7 @@ def test_failed_dedicated_reader_uses_generic_ocr_on_good_crop(
         lambda *_args, **_kwargs: (
             "55-ط-639-74",
             0.81,
-            "easyocr",
+            "cnn-onnx",
         ),
     )
 
@@ -621,3 +621,35 @@ def test_consensus_records_support_from_both_dedicated_readers():
     assert emitted[0]["plate_norm"] == "31ط55674"
     assert emitted[0]["ocr_engine"] == "multi-engine-consensus"
     assert emitted[0]["ocr_disagreement"] is False
+
+
+def test_bytetrack_second_pass_keeps_low_confidence_detection_identity():
+    tracker = PlateConsensusTracker(min_votes=3)
+    first = {
+        "bbox": (20, 20, 120, 55),
+        "confidence": 0.82,
+        "detector_confidence": 0.82,
+        "quality_score": 0.60,
+        "valid": False,
+        "plate": "",
+        "plate_norm": "",
+    }
+    tracker.update([first], timestamp=1.0)
+    original_track = first["track_id"]
+
+    low_confidence = {
+        **first,
+        "bbox": (27, 21, 127, 56),
+        "confidence": 0.24,
+        "detector_confidence": 0.24,
+    }
+    low_confidence.pop("track_id", None)
+    low_confidence.pop("tracking_bbox", None)
+    low_confidence.pop("tracking_engine", None)
+    tracker.update([low_confidence], timestamp=1.1)
+
+    assert low_confidence["track_id"] == original_track
+    assert low_confidence["tracking_engine"] == (
+        "bytetrack-kalman+optical-flow"
+    )
+    assert len(low_confidence["tracking_bbox"]) == 4
