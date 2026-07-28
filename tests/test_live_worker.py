@@ -380,7 +380,7 @@ def test_every_received_frame_can_improve_pending_ocr_selection(
 
     assert state.frame_counter == 3
     assert selected == 200
-# RC7 regression coverage for adaptive live-frame processing.
+# RC7-RC9 regression coverage for adaptive live-frame processing.
 
 
 def test_empty_inference_enters_backoff_and_clears_overlay(
