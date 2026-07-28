@@ -161,7 +161,8 @@ def test_unreadable_capture_upgrades_on_same_track_with_clearest_frame():
     first = tracker.update([unreadable], timestamp=0.0, frame=dark)
     assert len(first) == 1
     assert first[0]["capture_only"] is True
-    assert first[0]["plate"] == "ناخوانا"
+    assert first[0]["plate"] == "در حال بررسی"
+    assert first[0]["provisional"] is True
     track_id = first[0]["track_id"]
 
     recognized = result(
@@ -182,6 +183,71 @@ def test_unreadable_capture_upgrades_on_same_track_with_clearest_frame():
     assert recognized_rows[0]["track_id"] == track_id
     assert recognized_rows[0]["plate_norm"] == "31ط55674"
     assert int(recognized_rows[0]["capture_frame"].mean()) == 210
+
+
+def test_unreadable_is_delayed_until_repeated_failed_reads():
+    tracker = PlateConsensusTracker(
+        emit_unreadable=True,
+        min_unreadable_observations=3,
+        min_unreadable_seconds=0.8,
+    )
+    frame = np.full((100, 200, 3), 120, dtype=np.uint8)
+    unreadable = result(
+        "ناخوانا",
+        0.35,
+        bbox=(20, 30, 150, 65),
+        quality=0.65,
+    )
+    unreadable.update({
+        "valid": False,
+        "plate_norm": "",
+        "detector_confidence": 0.82,
+        "dedicated_ocr_attempted": True,
+        "generic_ocr_attempted": True,
+    })
+
+    first = tracker.update([unreadable], timestamp=0.0, frame=frame)
+    second = tracker.update([unreadable], timestamp=0.4, frame=frame)
+    third = tracker.update([unreadable], timestamp=0.9, frame=frame)
+
+    assert first[0]["plate"] == "در حال بررسی"
+    assert all(row["plate"] != "ناخوانا" for row in first + second)
+    finalized = [
+        row for row in third
+        if row.get("unreadable_final")
+    ]
+    assert len(finalized) == 1
+    assert finalized[0]["plate"] == "ناخوانا"
+
+
+def test_failed_dedicated_reader_uses_generic_ocr_on_good_crop(
+    monkeypatch,
+):
+    rng = np.random.default_rng(7)
+    crop = rng.integers(0, 255, (48, 180, 3), dtype=np.uint8)
+    monkeypatch.setattr(
+        "app.ai.pipeline.detect_plates",
+        lambda *_args, **_kwargs: [{
+            "crop": crop,
+            "bbox": (10, 20, 190, 68),
+            "confidence": 0.88,
+            "method": "yolo",
+            "direct_text": "",
+            "direct_ocr_confidence": 0.0,
+            "direct_ocr_attempted": True,
+        }],
+    )
+    monkeypatch.setattr(
+        "app.ai.pipeline.read_plate",
+        lambda _crop: ("55-ط-639-74", 0.81),
+    )
+
+    rows = process_frame(
+        np.full((100, 220, 3), 100, dtype=np.uint8)
+    )
+
+    assert rows[0]["plate_norm"] == "55ط63974"
+    assert rows[0]["generic_ocr_attempted"] is True
 
 
 def test_no_duplicate_emission_during_cooldown():
