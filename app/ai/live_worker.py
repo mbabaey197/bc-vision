@@ -48,6 +48,8 @@ class _CameraState:
     last_processed_at: float = 0.0
     last_processing_ms: float = 0.0
     processing_seconds_ema: float = 0.0
+    no_plate_streak: int = 0
+    next_inference_at: float = 0.0
     latest_detections: list = field(default_factory=list)
     latest_detections_at: float = 0.0
     latest_detection_frame: object | None = None
@@ -336,6 +338,25 @@ class LiveANPRWorker:
         )
         return round(0.72 * sharpness + 0.28 * exposure, 5)
 
+    @staticmethod
+    def _post_inference_delay(
+        processing_seconds_ema: float,
+        no_plate_streak: int,
+    ) -> float:
+        processing_gap = max(
+            0.20,
+            min(1.60, float(processing_seconds_ema) * 0.55),
+        )
+        empty_gap = (
+            min(
+                3.20,
+                0.40 * (2 ** min(3, int(no_plate_streak) - 1)),
+            )
+            if no_plate_streak
+            else 0.0
+        )
+        return max(processing_gap, empty_gap)
+
     def submit(self, camera_id: int, camera_name: str, frame):
         if (
             self._stopped
@@ -390,16 +411,42 @@ class LiveANPRWorker:
             # Do not let a slow CPU run ANPR continuously with no breathing
             # room. Keep the newest frame and cap inference frequency
             # adaptively; this reduces load without lowering image quality.
-            minimum_interval = (
+            minimum_interval = max(
+                0.0,
+                state.next_inference_at - now,
+                (
                 max(
                     0.20,
                     min(1.25, state.processing_seconds_ema * 0.45),
                 )
                 if state.processing_seconds_ema
                 else 0.0
+                ),
             )
-            if now - state.last_submitted_at < minimum_interval:
+            if (
+                now - state.last_submitted_at < minimum_interval
+                or now < state.next_inference_at
+            ):
+                pending_score = (
+                    float(state.pending[4])
+                    if state.pending is not None and len(state.pending) > 4
+                    else -1.0
+                )
+                if (
+                    state.pending is None
+                    or selection_score >= pending_score
+                ):
+                    state.pending = payload
                 return
+            if state.pending is not None:
+                pending_score = float(state.pending[4])
+                pending_at = float(state.pending[3])
+                if (
+                    pending_score > selection_score
+                    and now - pending_at < 0.8
+                ):
+                    payload = state.pending
+                state.pending = None
             state.last_submitted_at = now
             state.busy = True
         self._executor.submit(self._process, state, payload)
@@ -444,7 +491,13 @@ class LiveANPRWorker:
             state.processed_frames += 1
             state.detected_candidates += len(rows)
             if rows:
-                state.latest_detections = [
+                state.no_plate_streak = 0
+            else:
+                state.no_plate_streak = min(
+                    12,
+                    state.no_plate_streak + 1,
+                )
+            state.latest_detections = [
                     {
                         "bbox": tuple(row["bbox"]),
                         "plate": row.get("plate", "ناخوانا"),
@@ -453,9 +506,12 @@ class LiveANPRWorker:
                     }
                     for row in rows
                 ]
-                state.latest_detection_frame = frame.copy()
-                state.latest_detections_at = time.time()
-                state.detection_revision += 1
+            state.latest_detection_frame = frame.copy()
+            state.latest_detections_at = time.time()
+            # Empty inference is also a new display state. Publishing its
+            # revision clears an old box immediately instead of leaving it on
+            # screen until a wall-clock timeout.
+            state.detection_revision += 1
             state.last_processed_at = time.time()
             state.last_processing_ms = processing_seconds * 1000.0
             stable = state.tracker.update(
@@ -529,16 +585,17 @@ class LiveANPRWorker:
             state.last_error = f"{type(exc).__name__}: {exc}"
         finally:
             with self._lock:
-                next_payload = state.pending
-                state.pending = None
-                if next_payload is None or self._stopped:
-                    state.busy = False
-                else:
-                    self._executor.submit(
-                        self._process,
-                        state,
-                        next_payload,
+                # Always leave real idle time after an expensive transaction.
+                # Previously a queued frame was submitted immediately here,
+                # which kept detector/OCR threads continuously busy even when
+                # every inference returned no plate.
+                state.next_inference_at = time.monotonic() + (
+                    self._post_inference_delay(
+                        state.processing_seconds_ema,
+                        state.no_plate_streak,
                     )
+                )
+                state.busy = False
 
     def status(self, camera_id: int) -> dict:
         with self._lock:
@@ -564,6 +621,12 @@ class LiveANPRWorker:
                 "last_processing_ms": round(
                     state.last_processing_ms,
                     1,
+                ),
+                "idle_mode": bool(state.no_plate_streak >= 2),
+                "no_plate_streak": state.no_plate_streak,
+                "next_inference_seconds": round(
+                    max(0.0, state.next_inference_at - time.monotonic()),
+                    2,
                 ),
                 "consensus_window_seconds": round(
                     state.tracker.max_age_seconds,
