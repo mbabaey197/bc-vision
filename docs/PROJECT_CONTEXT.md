@@ -5,7 +5,7 @@
 - GitHub repository: `mahdibabaey197/bc-vision`
 - Default branch: `main`
 - Product: BC Vision
-- Current application version in source: `2.2.0-rc8`
+- Current application version in source: `2.2.0-rc9`
 - Windows persistent data root: `C:\ProgramData\BCVision\data`
 
 ## Release contract
@@ -61,10 +61,10 @@ triggers the geometry fallback for difficult small, oblique or overexposed
 plates. The live worker rate-limits this second pass adaptively from measured
 processing latency so it does not run continuously on a slow CPU.
 
-The model loader reapplies a six-thread maximum CPU budget after Ultralytics
+The model loader reapplies a four-thread maximum CPU budget after Ultralytics
 model construction, because Ultralytics can otherwise reset Torch to use
-nearly all logical processors. At least one logical processor is left
-available on smaller systems. Deployments can override this with
+nearly all logical processors. Two logical processors are reserved when the
+host has enough cores. Deployments can override this with
 `BCVISION_CPU_THREADS=1..8`.
 
 Ultralytics predictor state is not shared safely across simultaneous
@@ -249,6 +249,43 @@ guessed. If later observations produce valid per-character consensus, the
 same database row and image paths are upgraded rather than inserting a
 duplicate event. The dashboard recent-events table shows the vehicle image
 and plate crop directly beside the recognized plate value.
+
+## RC9 accuracy, idle CPU and uploaded-video playback
+
+Version `2.2.0-rc9` no longer labels the first failed OCR observation as
+`ناخوانا`. A physical plate capture is initially stored as
+`در حال بررسی`, retaining its vehicle snapshot and plate crop. It becomes
+`ناخوانا` only after at least three failed observations across at least
+0.8 seconds. Tracks containing partial plausible reads receive two additional
+observations before an unreadable result is allowed. Valid multi-frame
+consensus upgrades the same event without creating a duplicate.
+
+When the dedicated Iranian character detector cannot assemble a valid
+eight-character sequence, a sufficiently large, credible and usable plate
+crop receives one fallback read through the bundled generic OCR path.
+Generic OCR is not invoked when no physical plate was localized.
+
+An empty detector result now publishes an explicit empty overlay revision,
+and failed optical-flow compensation clears the overlay instead of redrawing
+detector coordinates from an older frame. This removes both stale-box paths
+identified in RC8.
+
+The live worker no longer dispatches a pending frame immediately after an
+expensive inference. It enforces idle time after every transaction and grows
+the no-plate gap from 0.4 to 0.8, 1.6 and at most 3.2 seconds. A physical plate
+detection resets the no-plate streak. The dashboard reports when a camera is
+in this low-consumption state.
+
+Uploaded-video camera cards now contain Play and Pause controls. Pausing
+stops decoding and ANPR submission while preserving the last displayed frame;
+resuming continues from the current video position.
+
+OpenVINO/ONNX and PP-OCRv5 Arabic were reviewed as future candidates. The
+runtime was not replaced in RC9 because doing so without an Iranian-plate
+ground-truth set would make accuracy and installer compatibility unverified.
+OpenVINO export is the preferred next CPU benchmark, while PP-OCRv5 should be
+evaluated only as a crop-level fallback against the current dedicated Iranian
+character model.
 
 ## Uploaded video live-source fix
 
