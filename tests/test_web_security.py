@@ -77,6 +77,33 @@ def test_system_role_can_change_ai_settings(monkeypatch):
     assert ("ai_confidence", 80) in writes
 
 
+def test_uploaded_video_playback_endpoint(monkeypatch):
+    _as_role(monkeypatch, "operator")
+    calls = []
+    monkeypatch.setattr(
+        main.manager,
+        "set_playback",
+        lambda camera_id, action: calls.append(
+            (camera_id, action)
+        ) or True,
+    )
+    monkeypatch.setattr(main, "audit", lambda *_args: None)
+
+    with TestClient(main.app) as client:
+        pause = client.post(
+            "/api/cameras/12/playback",
+            json={"action": "pause"},
+        )
+        play = client.post(
+            "/api/cameras/12/playback",
+            json={"action": "play"},
+        )
+
+    assert pause.status_code == 200
+    assert play.status_code == 200
+    assert calls == [(12, "pause"), (12, "play")]
+
+
 def test_storage_children_must_be_distinct_and_below_root(tmp_path):
     root = tmp_path / "bcvision-data"
     paths = main._storage_paths(

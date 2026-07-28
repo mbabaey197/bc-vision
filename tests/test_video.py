@@ -184,3 +184,42 @@ def test_uploaded_video_stream_produces_real_jpeg(tmp_path):
     assert stream.latest
     assert stream.latest.startswith(b"\xff\xd8")
     assert stream.latest.endswith(b"\xff\xd9")
+
+
+def test_uploaded_video_can_pause_and_resume(tmp_path, monkeypatch):
+    video_path = tmp_path / "playback.avi"
+    _write_video(video_path, frames=20)
+    stream = CameraStream(
+        94,
+        f"video://{video_path}",
+        "Playback controls",
+        fps=30,
+    )
+    published = []
+    monkeypatch.setattr(
+        stream,
+        "_publish",
+        lambda frame: published.append(frame),
+    )
+
+    stream.start()
+    for _ in range(100):
+        if len(published) >= 3:
+            break
+        time.sleep(0.01)
+    assert stream.pause() is True
+    paused_count = len(published)
+    time.sleep(0.12)
+    assert len(published) <= paused_count + 1
+    assert stream.state.paused is True
+
+    assert stream.resume() is True
+    for _ in range(100):
+        if len(published) >= paused_count + 3:
+            break
+        time.sleep(0.01)
+    stream.stop()
+    stream.thread.join(timeout=2)
+
+    assert len(published) >= paused_count + 3
+    assert stream.state.paused is False

@@ -380,4 +380,79 @@ def test_every_received_frame_can_improve_pending_ocr_selection(
 
     assert state.frame_counter == 3
     assert selected == 200
-# RC7 regression coverage for adaptive live-frame processing.
+# RC7-RC9 regression coverage for adaptive live-frame processing.
+
+
+def test_empty_inference_enters_backoff_and_clears_overlay(
+    monkeypatch,
+):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState()
+    state.config = {
+        "enabled": 1,
+        "lpr_enabled": 1,
+        "lpr_confidence": 50,
+        "duplicate_seconds": 0,
+        "roi_x": 0,
+        "roi_y": 0,
+        "roi_w": 100,
+        "roi_h": 100,
+    }
+    worker._states[15] = state
+    frame = np.zeros((80, 160, 3), dtype=np.uint8)
+    detected = {
+        "plate": "در حال بررسی",
+        "plate_norm": "",
+        "valid": False,
+        "confidence": 0.51,
+        "detector_confidence": 0.82,
+        "ocr_confidence": 0.0,
+        "quality_score": 0.7,
+        "bbox": (20, 25, 130, 60),
+        "crop": frame[25:60, 20:130],
+        "method": "test",
+    }
+    outputs = iter(([detected], [], [], []))
+    monkeypatch.setattr(
+        live_worker,
+        "process_frame",
+        lambda *_args, **_kwargs: list(next(outputs)),
+    )
+    monkeypatch.setattr(
+        live_worker,
+        "apply_learned_correction",
+        lambda result: result,
+    )
+    monkeypatch.setattr(worker, "_persist", lambda *_args: 1)
+
+    for timestamp in (0.0, 1.0, 2.0, 3.0):
+        state.busy = True
+        worker._process(
+            state,
+            (15, "idle camera", frame.copy(), timestamp),
+        )
+
+    snapshot = worker.detection_snapshot(
+        15,
+        after_revision=3,
+    )
+    status = worker.status(15)
+    worker.shutdown()
+
+    assert state.detection_revision == 4
+    assert snapshot["revision"] == 4
+    assert snapshot["detections"] == []
+    assert status["idle_mode"] is True
+    assert status["no_plate_streak"] == 3
+    assert status["next_inference_seconds"] >= 1.0
+
+
+def test_no_plate_backoff_grows_but_recognition_stays_responsive():
+    delay = live_worker.LiveANPRWorker._post_inference_delay
+
+    assert delay(0.25, 0) == 0.20
+    assert delay(0.25, 1) == 0.40
+    assert delay(0.25, 2) == 0.80
+    assert delay(0.25, 3) == 1.60
+    assert delay(0.25, 4) == 3.20
+    assert delay(0.25, 10) == 3.20

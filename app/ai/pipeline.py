@@ -79,11 +79,30 @@ def process_frame(frame, min_detection_confidence=0.25):
         ocr_confidence = float(
             item.get("direct_ocr_confidence", 0.0)
         )
-        if (
+        generic_ocr_attempted = False
+        # The dedicated Iranian character detector is the preferred reader,
+        # but an incomplete eight-character sequence must not end the read.
+        # Use the already bundled generic OCR only for a credible, usable
+        # plate crop. This recovers difficult glyphs without running generic
+        # OCR on frames where no physical plate was localized.
+        generic_fallback_eligible = bool(
             not plausible_plate(text)
-            and not item.get("direct_ocr_attempted")
-        ):
-            text, ocr_confidence = read_plate(crop)
+            and (
+                not item.get("direct_ocr_attempted")
+                or (
+                    float(item.get("confidence", 0.0)) >= 0.38
+                    and quality["score"] >= 0.30
+                    and crop.shape[0] >= 18
+                    and crop.shape[1] >= 64
+                )
+            )
+        )
+        if generic_fallback_eligible:
+            generic_ocr_attempted = True
+            fallback_text, fallback_confidence = read_plate(crop)
+            if plausible_plate(fallback_text):
+                text = fallback_text
+                ocr_confidence = fallback_confidence
         valid = plausible_plate(text)
         combined = _combined_confidence(
             item["confidence"],
@@ -102,6 +121,10 @@ def process_frame(frame, min_detection_confidence=0.25):
             "bbox": item["bbox"],
             "crop": crop,
             "method": item["method"],
+            "dedicated_ocr_attempted": bool(
+                item.get("direct_ocr_attempted")
+            ),
+            "generic_ocr_attempted": generic_ocr_attempted,
             "recovery_attempted": bool(
                 item.get("recovery_attempted")
             ),
@@ -170,6 +193,7 @@ class _Track:
     emitted_plate: str = ""
     emitted_at: float = 0.0
     capture_event_emitted: bool = False
+    unreadable_finalized: bool = False
     capture_event_score: float = -1.0
     best_capture_score: float = -1.0
     best_capture_result: dict | None = None
@@ -187,6 +211,8 @@ class PlateConsensusTracker:
         min_position_ratio=0.60,
         min_position_margin=0.18,
         emit_unreadable=False,
+        min_unreadable_observations=3,
+        min_unreadable_seconds=0.8,
     ):
         # One or two frames are never enough for a definitive CCTV read.
         self.min_votes = max(3, int(min_votes))
@@ -195,6 +221,14 @@ class PlateConsensusTracker:
         self.min_position_ratio = min(0.95, max(0.50, float(min_position_ratio)))
         self.min_position_margin = min(0.90, max(0.05, float(min_position_margin)))
         self.emit_unreadable = bool(emit_unreadable)
+        self.min_unreadable_observations = max(
+            self.min_votes,
+            int(min_unreadable_observations),
+        )
+        self.min_unreadable_seconds = max(
+            0.2,
+            float(min_unreadable_seconds),
+        )
         self._tracks: dict[int, _Track] = {}
         self._next_track_id = 1
 
@@ -226,12 +260,20 @@ class PlateConsensusTracker:
         return True
 
     @staticmethod
-    def _capture_result(track: _Track, refresh=False) -> dict | None:
+    def _capture_result(
+        track: _Track,
+        refresh=False,
+        final_unreadable=False,
+    ) -> dict | None:
         if track.best_capture_result is None or track.best_frame is None:
             return None
         result = deepcopy(track.best_capture_result)
         result.update({
-            "plate": "ناخوانا",
+            "plate": (
+                "ناخوانا"
+                if final_unreadable
+                else "در حال بررسی"
+            ),
             "plate_norm": "",
             "valid": False,
             "ocr_confidence": 0.0,
@@ -240,10 +282,34 @@ class PlateConsensusTracker:
             "last_seen": track.last_seen,
             "capture_only": True,
             "capture_refresh": bool(refresh),
+            "provisional": not bool(final_unreadable),
+            "unreadable_final": bool(final_unreadable),
             "capture_frame": track.best_frame.copy(),
             "consensus_votes": 0,
         })
         return result
+
+    def _unreadable_ready(
+        self,
+        track: _Track,
+        timestamp: float,
+    ) -> bool:
+        if track.unreadable_finalized or track.emitted_plate:
+            return False
+        observations = list(track.observations)
+        if len(observations) < self.min_unreadable_observations:
+            return False
+        if timestamp - track.first_seen < self.min_unreadable_seconds:
+            return False
+        valid_count = sum(bool(row.get("valid")) for row in observations)
+        # If partial plausible reads exist, allow two more observations for
+        # temporal voting before declaring the track genuinely unreadable.
+        required = (
+            self.min_unreadable_observations
+            if valid_count == 0
+            else self.min_unreadable_observations + 2
+        )
+        return len(observations) >= required
 
     def _match(self, result: dict, timestamp: float) -> _Track | None:
         best = None
@@ -437,6 +503,10 @@ class PlateConsensusTracker:
             capture_improved = self._consider_capture(track, result, frame)
             consensus = self._consensus(track)
             if consensus is None:
+                unreadable_ready = (
+                    self.emit_unreadable
+                    and self._unreadable_ready(track, timestamp)
+                )
                 if self.emit_unreadable and not track.capture_event_emitted:
                     capture = self._capture_result(track)
                     if capture is not None:
@@ -445,6 +515,7 @@ class PlateConsensusTracker:
                         emitted.append(capture)
                 elif (
                     self.emit_unreadable
+                    and not unreadable_ready
                     and capture_improved
                     and track.best_capture_score
                     > track.capture_event_score + 0.04
@@ -453,6 +524,17 @@ class PlateConsensusTracker:
                     if capture is not None:
                         track.capture_event_score = track.best_capture_score
                         emitted.append(capture)
+                if (
+                    unreadable_ready
+                ):
+                    unreadable = self._capture_result(
+                        track,
+                        refresh=True,
+                        final_unreadable=True,
+                    )
+                    if unreadable is not None:
+                        track.unreadable_finalized = True
+                        emitted.append(unreadable)
                 continue
 
             changed = consensus["plate_norm"] != track.emitted_plate
@@ -473,4 +555,22 @@ class PlateConsensusTracker:
             consensus = self._consensus(track)
             if consensus is not None:
                 rows.append(consensus)
+            elif (
+                self.emit_unreadable
+                and self._unreadable_ready(
+                    track,
+                    max(
+                        track.last_seen,
+                        track.first_seen + self.min_unreadable_seconds,
+                    ),
+                )
+            ):
+                unreadable = self._capture_result(
+                    track,
+                    refresh=True,
+                    final_unreadable=True,
+                )
+                if unreadable is not None:
+                    track.unreadable_finalized = True
+                    rows.append(unreadable)
         return rows

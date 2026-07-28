@@ -65,7 +65,10 @@ IRANIAN_PLATE_CLASS_ID = 30
 
 
 def _cpu_thread_limit() -> int:
-    default = min(6, max(1, (os.cpu_count() or 1) - 1))
+    # Leave two logical processors for decoding, the dashboard and Windows.
+    # Four inference threads are enough to keep the compact model responsive
+    # without letting Torch/OpenCV occupy nearly the whole machine.
+    default = min(4, max(1, (os.cpu_count() or 1) - 2))
     try:
         configured = int(
             os.environ.get(
