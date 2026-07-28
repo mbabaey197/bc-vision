@@ -4,5 +4,6 @@
 torch==2.13.0
 onnx==1.22.0
 onnxruntime==1.28.0
+opencv-python-headless==5.0.0.93
 flatbuffers==25.12.19
 protobuf==7.35.1
