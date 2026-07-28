@@ -379,8 +379,13 @@ Local verification after RC11 implementation is `121 passed, 1 skipped`.
 Unit tests use deterministic CTC logits and a controlled ONNX session double;
 an additional real ONNX Runtime `1.28.0` smoke executed a generated ONNX graph
 through preprocessing, inference and CTC formatting with the two-thread cap.
-Loading the production model on Windows, packaging, clean installation, update
-persistence and accuracy comparison on `01.mp4` remain release gates.
+Windows PR run `30348185238` loaded and executed the verified YOLO, EasyOCR,
+ONNX Runtime and production CRNN assets successfully. Windows candidate run
+`30348180982` built the portable executable, installer and updater, verified
+the GUI subsystem, exercised clean install and in-place update, ran offline
+ANPR self-tests before and after update, preserved SQLite and model markers,
+and uploaded the release bundle. Accuracy comparison on labelled frames from
+`01.mp4` and real multi-camera performance measurement remain release gates.
 
 ## Uploaded video live-source fix
 

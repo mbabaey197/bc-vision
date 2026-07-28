@@ -40,6 +40,21 @@ Version: `2.2.0-rc11`
   full input, inference, CTC and Iranian-format path as `31-ط-556-74`, with
   reported thread limit `2`.
 
+## Verified on Windows
+
+- PR validation run `30348185238`: passed.
+- Windows release-candidate run `30348180982`: passed.
+- Real verified YOLO, EasyOCR, ONNX Runtime and production CRNN model load and
+  inference: passed on Windows Python 3.13.
+- Full Windows source regression: `121 passed, 1 skipped`.
+- Portable executable build and GUI-subsystem verification: passed.
+- Installer and one-click updater builds: passed.
+- Clean install and installed offline ANPR self-test: passed.
+- In-place update and updated offline ANPR self-test: passed.
+- SQLite setting marker and persistent model marker survived update: passed.
+- Uninstall preserved the persistent database and model directory: passed.
+- Release bundle and SHA-256 manifest upload: passed.
+
 ## Model contract
 
 - Source: `Dibachain/Platrix`
@@ -51,10 +66,5 @@ Version: `2.2.0-rc11`
 
 ## Pending release gates
 
-- Load and execute the real verified model on Windows Python 3.13.
-- Build the portable Windows directory, installer and one-click updater.
-- Verify the installed and updated executable with offline detector, CRNN and
-  EasyOCR inference.
-- Confirm database, settings, media and model preservation across update.
 - Compare RC10 and RC11 against labelled frames from `01.mp4`.
 - Measure multi-camera CPU and memory use with two threads per camera.
