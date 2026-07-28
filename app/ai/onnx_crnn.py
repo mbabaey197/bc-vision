@@ -22,6 +22,7 @@ from .plate_rules import format_iran_plate, normalize_plate, plausible_plate
 
 CRNN_HEIGHT = 32
 CRNN_WIDTH = 128
+MIN_CAMERA_SESSION_CACHE = 3
 CRNN_LABELS = [
     "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
     "ا", "ب", "ت", "ث", "ج", "ح", "د", "ز", "س", "ش", "ص",
@@ -161,16 +162,6 @@ def _session_options(ort):
     return options
 
 
-def _runtime_slot(engine_key=None) -> int:
-    if engine_key is None:
-        return 0
-    try:
-        numeric = int(engine_key)
-    except (TypeError, ValueError):
-        numeric = sum(ord(character) for character in str(engine_key))
-    return abs(numeric) % parallel_camera_limit()
-
-
 def _verified_model_path() -> Path:
     global _invalid_model_cache, _verified_model_cache
     from .model_manager import (
@@ -213,8 +204,10 @@ def _verified_model_path() -> Path:
 
 def _load_session(engine_key=None) -> _SessionEntry:
     path = _verified_model_path()
-    slot = str(_runtime_slot(engine_key))
-    cache_key = (slot, str(path.resolve()))
+    camera_key = str(
+        engine_key if engine_key is not None else "default"
+    )
+    cache_key = (camera_key, str(path.resolve()))
 
     with _cache_lock:
         cached = _sessions.get(cache_key)
@@ -236,7 +229,17 @@ def _load_session(engine_key=None) -> _SessionEntry:
             run_lock=threading.Lock(),
         )
         _sessions[cache_key] = entry
-        while len(_sessions) > parallel_camera_limit():
+        # Concurrent inference remains capped by parallel_camera_limit(), but
+        # keep the default three cameras' sessions distinct even on a
+        # two-core host where only one inference may run at a time.  Mapping
+        # camera IDs through modulo made cameras 1 and 2 share one session on
+        # Windows runners and could make live cameras evict/recreate sessions
+        # continuously.
+        cache_limit = max(
+            MIN_CAMERA_SESSION_CACHE,
+            parallel_camera_limit(),
+        )
+        while len(_sessions) > cache_limit:
             _sessions.popitem(last=False)
         return entry
 

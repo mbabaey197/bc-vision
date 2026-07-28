@@ -71,9 +71,11 @@ OpenMP, BLAS, OpenCV and Torch. Deployments may reduce the per-camera budget
 to one with `BCVISION_CPU_THREADS=1`; larger values are clamped to two.
 Concurrent camera capacity is calculated from logical CPU count while
 reserving two logical processors for decoding, the dashboard and Windows.
-Every concurrent camera runtime slot owns a separate ONNX Runtime session with
-`intra_op_num_threads <= 2`, `inter_op_num_threads = 1`, sequential graph
-execution and disabled worker spinning.
+Each of the default three camera keys keeps a distinct bounded ONNX Runtime
+session even when a small host permits only one simultaneous inference.
+Every session uses `intra_op_num_threads <= 2`,
+`inter_op_num_threads = 1`, sequential graph execution and disabled worker
+spinning.
 
 Ultralytics predictor state is not shared safely across simultaneous
 `predict()` calls. The detector therefore owns one model instance and lock per
@@ -366,12 +368,12 @@ stored in additive `plate_events` columns. Per-camera runtime status also
 reports whole-plate attempts, agreements, disagreements and selection counts,
 so the A/B result can be measured without replacing or deleting old events.
 
-Each camera key maps deterministically to one bounded ONNX runtime slot.
+Each of the default three camera keys retains a distinct bounded ONNX session.
 Session options enforce at most two intra-operation threads, one
 inter-operation thread, sequential execution and disabled thread spinning.
-The session cache cannot exceed the existing maximum concurrent-camera
-capacity, so additional cameras reuse slots instead of repeatedly allocating
-models.
+Concurrent inference remains separately limited by available CPU capacity;
+the bounded LRU cache prevents modulo collisions between camera IDs on
+small-core Windows hosts.
 
 Local verification after RC11 implementation is `121 passed, 1 skipped`.
 Unit tests use deterministic CTC logits and a controlled ONNX session double;

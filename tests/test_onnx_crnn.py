@@ -98,6 +98,13 @@ def test_per_camera_onnx_sessions_use_two_thread_ceiling(
         "crnn_path",
         lambda: model_path,
     )
+    # GitHub's Windows runner can expose only two logical CPUs, reducing
+    # concurrent inference to one.  Session identity must still be per camera.
+    monkeypatch.setattr(
+        onnx_crnn,
+        "parallel_camera_limit",
+        lambda: 1,
+    )
     monkeypatch.setenv("BCVISION_CPU_THREADS", "9")
     onnx_crnn.clear_crnn_sessions()
 
@@ -109,9 +116,14 @@ def test_per_camera_onnx_sessions_use_two_thread_ceiling(
         np.full((40, 160, 3), 150, dtype=np.uint8),
         engine_key=2,
     )
+    repeated = onnx_crnn.read_plate_crnn(
+        np.full((40, 160, 3), 150, dtype=np.uint8),
+        engine_key=1,
+    )
 
     assert first[0] == "31-ط-556-74"
     assert second[0] == "31-ط-556-74"
+    assert repeated[0] == "31-ط-556-74"
     assert len(created) == 2
     assert all(
         session.options.intra_op_num_threads == 2

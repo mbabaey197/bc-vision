@@ -8,7 +8,7 @@ Version: `2.2.0-rc11`
 - Executes the CRNN model through ONNX Runtime on CPU.
 - Stores the verified model under persistent application data.
 - Pins model size and SHA-256 before load, download, seed or update.
-- Maps each camera key to a bounded ONNX runtime slot with its own session.
+- Keeps distinct bounded ONNX sessions for the default three camera keys.
 - Hard-caps ONNX intra-operation threads at two per camera.
 - Uses one inter-operation thread, sequential execution and no thread spinning.
 - Keeps the RC10 character detector as an independent A/B reader.
@@ -29,6 +29,10 @@ Version: `2.2.0-rc11`
 - Whitespace validation: passed.
 - CTC repeat/blank collapse: passed.
 - Per-camera session separation: passed.
+- A Windows two-core runner exposed a modulo collision between camera IDs 1
+  and 2. The cache now uses the exact camera key, retains three distinct
+  sessions independently of the concurrency limit, and has deterministic
+  low-core regression coverage.
 - Attempted thread override `9` was clamped to `2`: passed.
 - Missing/unverified model failed closed and left legacy fallback available.
 - Stronger CRNN disagreement kept both reads and required review.
