@@ -89,6 +89,14 @@ def test_cpu_thread_limit_is_clamped(monkeypatch):
     assert _cpu_thread_limit() == 8
 
 
+def test_default_cpu_budget_leaves_room_for_streaming(monkeypatch):
+    monkeypatch.delenv("BCVISION_CPU_THREADS", raising=False)
+    monkeypatch.setattr("app.ai.detector.os.cpu_count", lambda: 8)
+    assert _cpu_thread_limit() == 4
+    monkeypatch.setattr("app.ai.detector.os.cpu_count", lambda: 4)
+    assert _cpu_thread_limit() == 2
+
+
 def test_cpu_thread_limit_is_applied(monkeypatch):
     applied = []
     monkeypatch.setenv("BCVISION_CPU_THREADS", "3")
