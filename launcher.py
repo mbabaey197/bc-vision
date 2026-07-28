@@ -22,6 +22,10 @@ def app_dir() -> Path:
 BASE = app_dir()
 os.chdir(BASE)
 
+from app.cpu_budget import configure_process_cpu_budget
+
+configure_process_cpu_budget()
+
 from app.config import LOG_PATH
 
 LOG = LOG_PATH
@@ -115,7 +119,11 @@ def prepare_anpr_models():
 
         before = model_status()
         log(f"ANPR model status before preparation: {before}")
-        if before["detector_ready"] and before["easyocr_ready"]:
+        if (
+            before["detector_ready"]
+            and before["crnn_ready"]
+            and before["easyocr_ready"]
+        ):
             log("ANPR models are already verified and ready")
             return
         prepared = prepare_models(download=True)
@@ -223,8 +231,13 @@ def run_self_test() -> int:
         if verify_anpr:
             import numpy as np
             import easyocr
+            import onnxruntime
             from ultralytics import YOLO
             from app.ai.model_manager import prepare_models
+            from app.ai.onnx_crnn import (
+                get_crnn_status,
+                read_plate_crnn,
+            )
 
             models = prepare_models(download=False)
             detector = YOLO(models["detector"])
@@ -244,7 +257,14 @@ def run_self_test() -> int:
                 ),
                 download_enabled=False,
             )
-            anpr_ready = True
+            read_plate_crnn(
+                np.zeros((32, 128, 3), dtype=np.uint8),
+                engine_key="packaged-self-test",
+            )
+            anpr_ready = bool(
+                onnxruntime.__version__
+                and get_crnn_status()["model_loaded"]
+            )
 
         result.update({
             "ok": (

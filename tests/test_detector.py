@@ -6,12 +6,15 @@ import cv2
 import numpy as np
 
 from app.ai.detector import (
+    _EXPECTED_CHARACTER_CENTERS,
     _choose_recovery_result,
     _configure_cpu_threads,
     _cpu_thread_limit,
     _iou,
     _nms,
     _plate_class_ids,
+    _select_partial_position_hypotheses,
+    _select_plate_hypotheses,
     _select_plate_sequence,
     detect_plates,
     detector_status,
@@ -86,20 +89,20 @@ def test_cpu_thread_limit_is_clamped(monkeypatch):
     monkeypatch.setenv("BCVISION_CPU_THREADS", "0")
     assert _cpu_thread_limit() == 1
     monkeypatch.setenv("BCVISION_CPU_THREADS", "99")
-    assert _cpu_thread_limit() == 8
+    assert _cpu_thread_limit() == 2
 
 
-def test_default_cpu_budget_leaves_room_for_streaming(monkeypatch):
+def test_default_cpu_budget_is_two_per_camera(monkeypatch):
     monkeypatch.delenv("BCVISION_CPU_THREADS", raising=False)
     monkeypatch.setattr("app.ai.detector.os.cpu_count", lambda: 8)
-    assert _cpu_thread_limit() == 4
+    assert _cpu_thread_limit() == 2
     monkeypatch.setattr("app.ai.detector.os.cpu_count", lambda: 4)
     assert _cpu_thread_limit() == 2
 
 
 def test_cpu_thread_limit_is_applied(monkeypatch):
     applied = []
-    monkeypatch.setenv("BCVISION_CPU_THREADS", "3")
+    monkeypatch.setenv("BCVISION_CPU_THREADS", "2")
     monkeypatch.setattr(
         "app.ai.detector.cv2.setNumThreads",
         lambda value: applied.append(("opencv", value)),
@@ -110,9 +113,17 @@ def test_cpu_thread_limit_is_applied(monkeypatch):
         def set_num_threads(value):
             applied.append(("torch", value))
 
+        @staticmethod
+        def set_num_interop_threads(value):
+            applied.append(("torch-interop", value))
+
     monkeypatch.setitem(__import__("sys").modules, "torch", Torch())
-    assert _configure_cpu_threads() == 3
-    assert applied == [("opencv", 3), ("torch", 3)]
+    assert _configure_cpu_threads() == 2
+    assert applied == [
+        ("opencv", 2),
+        ("torch", 2),
+        ("torch-interop", 2),
+    ]
 
 
 def _characters(text, confidences):
@@ -161,6 +172,60 @@ def test_character_decoder_selects_highest_confidence_plate_template():
     assert text == "18-ب-987-32"
 
 
+def test_character_decoder_preserves_overlapping_semantic_alternative():
+    characters = _characters(
+        "31ط55674",
+        [0.91, 0.90, 0.78, 0.88, 0.89, 0.90, 0.87, 0.86],
+    )
+    # The model's highest-confidence class at the letter position is a digit.
+    # The old global NMS discarded the lower-confidence valid Persian letter.
+    characters.append({
+        "class_id": 8,
+        "confidence": 0.93,
+        "x_center": characters[2]["x_center"],
+        "bbox": characters[2]["bbox"],
+    })
+
+    hypotheses = _select_plate_hypotheses(characters)
+
+    assert hypotheses
+    assert hypotheses[0]["plate_norm"] == "31ط55674"
+
+
+def test_partial_character_decoder_keeps_position_evidence():
+    class_ids = {
+        **{str(value): value for value in range(10)},
+        "ط": 19,
+    }
+    text = "31ط55674"
+    rows = []
+    for position, character in enumerate(text):
+        if position == 4:
+            continue
+        center = _EXPECTED_CHARACTER_CENTERS[position] * 200.0
+        rows.append({
+            "class_id": class_ids[character],
+            "confidence": 0.82,
+            "x_center": center,
+            "bbox": (
+                center - 5,
+                2,
+                center + 5,
+                26,
+            ),
+        })
+
+    hypotheses = _select_partial_position_hypotheses(
+        rows,
+        crop_width=200,
+    )
+
+    assert hypotheses
+    assert hypotheses[0]["coverage"] == 7
+    assert 4 not in hypotheses[0]["positions"]
+    assert hypotheses[0]["positions"][2]["character"] == "ط"
+
+
 def test_recovery_result_requires_evidence_before_changing_digit():
     original = ("18-ب-987-33", 0.80)
     assert _choose_recovery_result(
@@ -207,6 +272,49 @@ def test_parallel_detector_calls_are_serialized(monkeypatch):
 
     assert rows == [[], []]
     assert maximum_active == 1
+
+
+def test_different_camera_slots_can_run_in_parallel(monkeypatch):
+    active = 0
+    maximum_active = 0
+    state_lock = threading.Lock()
+
+    class Model:
+        names = {index: str(index) for index in range(32)}
+
+        @staticmethod
+        def predict(*_args, **_kwargs):
+            nonlocal active, maximum_active
+            with state_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            time.sleep(0.04)
+            with state_lock:
+                active -= 1
+            return [type("Result", (), {"boxes": []})()]
+
+    monkeypatch.setattr(
+        "app.ai.detector.parallel_camera_limit",
+        lambda: 2,
+    )
+    monkeypatch.setattr(
+        "app.ai.detector.load_model",
+        lambda _engine_key=None: Model(),
+    )
+    monkeypatch.setattr(
+        "app.ai.detector._opencv_candidates",
+        lambda *_args, **_kwargs: [],
+    )
+    frame = np.zeros((180, 320, 3), dtype=np.uint8)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(detect_plates, frame, engine_key=engine_key)
+            for engine_key in (0, 1)
+        ]
+        rows = [future.result() for future in futures]
+
+    assert rows == [[], []]
+    assert maximum_active == 2
 
 
 def test_verified_model_uses_only_plate_class():

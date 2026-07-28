@@ -194,6 +194,9 @@ def init_db():
             "video_second": "REAL DEFAULT 0",
             "detector_method": "TEXT",
             "ocr_confidence": "REAL DEFAULT 0",
+            "ocr_engine": "TEXT DEFAULT ''",
+            "ocr_alternative": "TEXT DEFAULT ''",
+            "ocr_disagreement": "INTEGER NOT NULL DEFAULT 0",
             "vehicle_type": "TEXT DEFAULT 'نامشخص'",
             "vehicle_color": "TEXT DEFAULT 'نامشخص'",
             "vehicle_brand": "TEXT DEFAULT 'نامشخص'",
@@ -203,6 +206,7 @@ def init_db():
             "consensus_votes": "INTEGER DEFAULT 1",
             "source": "TEXT DEFAULT 'video'",
             "processing_ms": "REAL DEFAULT 0",
+            "review_status": "TEXT NOT NULL DEFAULT 'confirmed-ai'",
         })
         _backfill_plate_norm(con)
         con.executescript("""

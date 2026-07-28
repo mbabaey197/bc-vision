@@ -50,3 +50,23 @@ def test_easyocr_is_bootstrapped_from_packaged_seed(tmp_path, monkeypatch):
 
     assert model_manager.ensure_easyocr_models(download=False) == target
     assert all((target / name).is_file() for name in hashes)
+
+
+def test_crnn_is_bootstrapped_from_packaged_seed(tmp_path, monkeypatch):
+    payload = b"crnn-onnx-seed"
+    digest = __import__("hashlib").sha256(payload).hexdigest()
+    seed = tmp_path / "seed"
+    source = seed / "crnn" / "ocr_crnn.onnx"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(payload)
+    target = tmp_path / "data" / "crnn" / "ocr_crnn.onnx"
+
+    monkeypatch.setattr(model_manager, "CRNN_SHA256", digest)
+    monkeypatch.setattr(model_manager, "CRNN_SIZE", len(payload))
+    monkeypatch.setattr(model_manager, "packaged_seed_dir", lambda: seed)
+    monkeypatch.setattr(model_manager, "crnn_path", lambda: target)
+    monkeypatch.delenv("BCVISION_CRNN_SOURCE_DIR", raising=False)
+    monkeypatch.delenv("BCVISION_MODEL_SOURCE_DIR", raising=False)
+
+    assert model_manager.ensure_crnn_model(download=False) == target
+    assert target.read_bytes() == payload

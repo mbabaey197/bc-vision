@@ -107,13 +107,89 @@ class CameraStream:
         return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
     @staticmethod
+    def _clip_box(box, width, height):
+        x1, y1, x2, y2 = (int(round(value)) for value in box)
+        x1 = max(0, min(width - 1, x1))
+        y1 = max(0, min(height - 1, y1))
+        x2 = max(x1 + 1, min(width, x2))
+        y2 = max(y1 + 1, min(height, y2))
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            return None
+        return x1, y1, x2, y2
+
+    @staticmethod
+    def _template_track(previous_gray, current_gray, box):
+        """Fallback tracking for plates with too few stable KLT corners."""
+
+        height, width = current_gray.shape[:2]
+        x1, y1, x2, y2 = box
+        template = previous_gray[y1:y2, x1:x2]
+        if (
+            template.size == 0
+            or template.shape[0] < 8
+            or template.shape[1] < 16
+            or float(template.std()) < 4.0
+        ):
+            return None
+
+        box_w, box_h = x2 - x1, y2 - y1
+        search_x1 = max(0, x1 - box_w * 3)
+        search_y1 = max(0, y1 - box_h * 4)
+        search_x2 = min(width, x2 + box_w * 3)
+        search_y2 = min(height, y2 + box_h * 4)
+        search = current_gray[
+            int(search_y1):int(search_y2),
+            int(search_x1):int(search_x2),
+        ]
+        best = None
+        for scale in (0.84, 0.92, 1.0, 1.08, 1.16):
+            target_w = max(12, int(round(template.shape[1] * scale)))
+            target_h = max(6, int(round(template.shape[0] * scale)))
+            if target_w > search.shape[1] or target_h > search.shape[0]:
+                continue
+            candidate = cv2.resize(
+                template,
+                (target_w, target_h),
+                interpolation=(
+                    cv2.INTER_AREA
+                    if scale < 1.0
+                    else cv2.INTER_CUBIC
+                ),
+            )
+            response = cv2.matchTemplate(
+                search,
+                candidate,
+                cv2.TM_CCOEFF_NORMED,
+            )
+            _, score, _, location = cv2.minMaxLoc(response)
+            if not np.isfinite(score):
+                continue
+            if best is None or score > best[0]:
+                best = (float(score), location, target_w, target_h)
+        if best is None or best[0] < 0.38:
+            return None
+        score, (match_x, match_y), target_w, target_h = best
+        tracked = CameraStream._clip_box(
+            (
+                int(search_x1) + match_x,
+                int(search_y1) + match_y,
+                int(search_x1) + match_x + target_w,
+                int(search_y1) + match_y + target_h,
+            ),
+            width,
+            height,
+        )
+        if tracked is None:
+            return None
+        return tracked, score
+
+    @staticmethod
     def _track_overlay_rows(previous_frame, current_frame, rows):
         if (
             previous_frame is None
             or current_frame is None
-            or previous_frame.shape[:2] != current_frame.shape[:2]
         ):
-            return [dict(row) for row in rows]
+            return []
         previous_gray = (
             previous_frame
             if previous_frame.ndim == 2
@@ -125,61 +201,159 @@ class CameraStream:
             else CameraStream._gray(current_frame)
         )
         height, width = current_gray.shape[:2]
-        tracked = []
-        for source in rows:
-            x1, y1, x2, y2 = (
-                max(0, int(value)) for value in source["bbox"]
+        previous_height, previous_width = previous_gray.shape[:2]
+        scale_x = width / max(1, previous_width)
+        scale_y = height / max(1, previous_height)
+        scaled_rows = []
+        if (previous_height, previous_width) != (height, width):
+            previous_gray = cv2.resize(
+                previous_gray,
+                (width, height),
+                interpolation=cv2.INTER_AREA,
             )
-            x2, y2 = min(width, x2), min(height, y2)
-            if x2 - x1 < 4 or y2 - y1 < 4:
+            for source in rows:
+                row = dict(source)
+                x1, y1, x2, y2 = source["bbox"]
+                row["bbox"] = (
+                    x1 * scale_x,
+                    y1 * scale_y,
+                    x2 * scale_x,
+                    y2 * scale_y,
+                )
+                scaled_rows.append(row)
+        else:
+            scaled_rows = [dict(row) for row in rows]
+
+        tracked = []
+        for source in scaled_rows:
+            box = CameraStream._clip_box(
+                source["bbox"],
+                width,
+                height,
+            )
+            if box is None:
                 continue
+            x1, y1, x2, y2 = box
             mask = np.zeros_like(previous_gray)
             mask[y1:y2, x1:x2] = 255
             points = cv2.goodFeaturesToTrack(
                 previous_gray,
                 mask=mask,
-                maxCorners=36,
-                qualityLevel=0.01,
+                maxCorners=64,
+                qualityLevel=0.006,
                 minDistance=3,
                 blockSize=5,
             )
-            if points is None or len(points) < 3:
-                continue
-            moved, status, _ = cv2.calcOpticalFlowPyrLK(
-                previous_gray,
-                current_gray,
-                points,
-                None,
-                winSize=(21, 21),
-                maxLevel=3,
-                criteria=(
-                    cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
-                    20,
-                    0.03,
-                ),
-            )
-            if moved is None or status is None:
-                continue
-            valid = status.reshape(-1) == 1
-            if int(valid.sum()) < 3:
-                continue
-            delta = moved.reshape(-1, 2)[valid] - points.reshape(-1, 2)[valid]
-            dx, dy = np.median(delta, axis=0)
-            if not np.isfinite(dx) or not np.isfinite(dy):
-                continue
+            moved_box = None
+            tracking_confidence = 0.0
+            if points is not None and len(points) >= 3:
+                moved, status_forward, _ = cv2.calcOpticalFlowPyrLK(
+                    previous_gray,
+                    current_gray,
+                    points,
+                    None,
+                    winSize=(25, 25),
+                    maxLevel=4,
+                    criteria=(
+                        cv2.TERM_CRITERIA_EPS
+                        | cv2.TERM_CRITERIA_COUNT,
+                        24,
+                        0.02,
+                    ),
+                )
+                backward = status_backward = None
+                if moved is not None and status_forward is not None:
+                    backward, status_backward, _ = cv2.calcOpticalFlowPyrLK(
+                        current_gray,
+                        previous_gray,
+                        moved,
+                        None,
+                        winSize=(25, 25),
+                        maxLevel=4,
+                        criteria=(
+                            cv2.TERM_CRITERIA_EPS
+                            | cv2.TERM_CRITERIA_COUNT,
+                            24,
+                            0.02,
+                        ),
+                    )
+                if (
+                    moved is not None
+                    and backward is not None
+                    and status_forward is not None
+                    and status_backward is not None
+                ):
+                    original_points = points.reshape(-1, 2)
+                    moved_points = moved.reshape(-1, 2)
+                    backward_points = backward.reshape(-1, 2)
+                    roundtrip = np.linalg.norm(
+                        original_points - backward_points,
+                        axis=1,
+                    )
+                    valid = (
+                        (status_forward.reshape(-1) == 1)
+                        & (status_backward.reshape(-1) == 1)
+                        & np.isfinite(roundtrip)
+                        & (roundtrip <= 2.2)
+                    )
+                    if int(valid.sum()) >= 3:
+                        source_points = original_points[valid]
+                        target_points = moved_points[valid]
+                        transform, inliers = cv2.estimateAffinePartial2D(
+                            source_points,
+                            target_points,
+                            method=cv2.RANSAC,
+                            ransacReprojThreshold=2.5,
+                            maxIters=120,
+                            confidence=0.96,
+                        )
+                        if transform is not None:
+                            affine_scale = float(
+                                np.hypot(
+                                    transform[0, 0],
+                                    transform[0, 1],
+                                )
+                            )
+                            if 0.68 <= affine_scale <= 1.42:
+                                corners = np.array(
+                                    [
+                                        [x1, y1, 1.0],
+                                        [x2, y1, 1.0],
+                                        [x2, y2, 1.0],
+                                        [x1, y2, 1.0],
+                                    ],
+                                    dtype=np.float32,
+                                )
+                                transformed = corners @ transform.T
+                                moved_box = CameraStream._clip_box(
+                                    (
+                                        transformed[:, 0].min(),
+                                        transformed[:, 1].min(),
+                                        transformed[:, 0].max(),
+                                        transformed[:, 1].max(),
+                                    ),
+                                    width,
+                                    height,
+                                )
+                                tracking_confidence = min(
+                                    1.0,
+                                    float(valid.mean()),
+                                )
+            if moved_box is None:
+                fallback = CameraStream._template_track(
+                    previous_gray,
+                    current_gray,
+                    box,
+                )
+                if fallback is None:
+                    continue
+                moved_box, tracking_confidence = fallback
             row = dict(source)
-            moved_box = (
-                max(0, min(width - 1, int(round(x1 + dx)))),
-                max(0, min(height - 1, int(round(y1 + dy)))),
-                max(1, min(width, int(round(x2 + dx)))),
-                max(1, min(height, int(round(y2 + dy)))),
-            )
-            if (
-                moved_box[2] <= moved_box[0]
-                or moved_box[3] <= moved_box[1]
-            ):
-                continue
             row["bbox"] = moved_box
+            row["tracking_confidence"] = round(
+                float(tracking_confidence),
+                4,
+            )
             tracked.append(row)
         return tracked
 
@@ -249,7 +423,10 @@ class CameraStream:
         try:
             for result in self._live_overlays(frame):
                 x1, y1, x2, y2 = result["bbox"]
-                color = (36, 220, 96) if result.get("valid") else (0, 190, 255)
+                # The rectangle represents a physical plate detection, not OCR
+                # confidence.  Keep it green and let the label/confidence show
+                # that the text may still need operator review.
+                color = (36, 220, 96)
                 cv2.rectangle(display, (x1, y1), (x2, y2), color, 3)
                 confidence = int(float(result.get("confidence", 0)) * 100)
                 label = f"PLATE {confidence}%"

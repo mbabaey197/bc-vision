@@ -159,6 +159,44 @@ def test_live_overlay_tracks_plate_motion_between_inference_frames():
     assert abs(y2 - 96) <= 2
 
 
+def test_live_overlay_tracks_plate_motion_and_scale_change():
+    rng = np.random.default_rng(20260728)
+    previous = np.zeros((180, 300, 3), dtype=np.uint8)
+    texture = rng.integers(
+        20,
+        240,
+        (40, 100, 3),
+        dtype=np.uint8,
+    )
+    previous[60:100, 80:180] = texture
+    current = np.zeros_like(previous)
+    enlarged = app.streams.cv2.resize(
+        texture,
+        (112, 45),
+        interpolation=app.streams.cv2.INTER_CUBIC,
+    )
+    current[70:115, 101:213] = enlarged
+
+    tracked = CameraStream._track_overlay_rows(
+        previous,
+        current,
+        [{
+            "bbox": (80, 60, 180, 100),
+            "plate": "12-ب-345-67",
+            "confidence": 0.9,
+            "valid": True,
+        }],
+    )
+
+    assert len(tracked) == 1
+    x1, y1, x2, y2 = tracked[0]["bbox"]
+    assert abs(x1 - 101) <= 5
+    assert abs(y1 - 70) <= 5
+    assert abs(x2 - 213) <= 6
+    assert abs(y2 - 115) <= 5
+    assert tracked[0]["tracking_confidence"] > 0
+
+
 def test_empty_detection_revision_clears_old_overlay(monkeypatch):
     stream = CameraStream(
         camera_id=8,

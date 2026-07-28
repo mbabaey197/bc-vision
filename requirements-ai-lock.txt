@@ -14,3 +14,6 @@ ultralytics==8.4.106
 ultralytics-thop==2.0.20
 polars==1.43.0
 nvidia-ml-py==13.610.43
+onnxruntime==1.28.0
+flatbuffers==25.12.19
+protobuf==7.35.1

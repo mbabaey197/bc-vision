@@ -13,6 +13,7 @@ pytestmark = pytest.mark.skipif(
 
 def test_verified_models_and_real_engines_load():
     import easyocr
+    import onnxruntime
     import torch
     import torchvision
     import ultralytics
@@ -24,12 +25,18 @@ def test_verified_models_and_real_engines_load():
     )
     from app.ai.model_manager import model_status, prepare_models
     from app.ai.ocr import _get_easyocr_reader
+    from app.ai.onnx_crnn import (
+        get_crnn_status,
+        read_plate_crnn,
+    )
 
     prepared = prepare_models(download=True)
     status = model_status()
     assert status["detector_ready"]
+    assert status["crnn_ready"]
     assert status["easyocr_ready"]
     assert prepared["detector"] == status["detector_path"]
+    assert prepared["crnn"] == status["crnn_path"]
     assert prepared["easyocr"] == status["easyocr_path"]
 
     tensor = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
@@ -38,6 +45,7 @@ def test_verified_models_and_real_engines_load():
     assert torchvision.__version__
     assert ultralytics.__version__
     assert easyocr.__version__
+    assert onnxruntime.__version__
 
     model = load_model()
     assert model is not None
@@ -60,3 +68,9 @@ def test_verified_models_and_real_engines_load():
         paragraph=False,
     )
     assert isinstance(output, list)
+
+    read_plate_crnn(
+        np.zeros((32, 128, 3), dtype=np.uint8),
+        engine_key="integration-test",
+    )
+    assert get_crnn_status()["model_loaded"] is True

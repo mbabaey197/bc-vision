@@ -90,6 +90,93 @@ def test_position_voting_corrects_wrong_middle_digit():
     assert emitted[-1]["plate"] == "55-ط-639-74"
 
 
+def test_temporal_consensus_recovers_consistent_second_hypothesis():
+    tracker = PlateConsensusTracker(emit_cooldown=10)
+    correct = "31ط55674"
+    emitted = []
+    for index, wrong in enumerate((
+        "30ط55674",
+        "32ط55674",
+        "33ط55674",
+    )):
+        row = result(
+            wrong,
+            0.82,
+            bbox=(100 + index * 2, 100, 300 + index * 2, 150),
+        )
+        row["plate_hypotheses"] = [
+            {
+                "plate_norm": wrong,
+                "confidence": 0.82,
+                "score": 0.82,
+            },
+            {
+                "plate_norm": correct,
+                "confidence": 0.78,
+                "score": 0.78,
+            },
+        ]
+        emitted.extend(
+            tracker.update([row], timestamp=index * 0.1)
+        )
+
+    assert emitted
+    assert emitted[-1]["plate_norm"] == correct
+    assert emitted[-1]["consensus_votes"] == 3
+
+
+def test_equal_character_hypotheses_remain_unreadable():
+    tracker = PlateConsensusTracker(emit_cooldown=10)
+    for index in range(4):
+        row = result(
+            "31-ط-556-74",
+            0.80,
+            bbox=(100 + index * 2, 100, 300 + index * 2, 150),
+        )
+        row["plate_hypotheses"] = [
+            {"plate_norm": "31ط55674", "score": 0.80},
+            {"plate_norm": "31ل55674", "score": 0.80},
+        ]
+        assert tracker.update([row], timestamp=index * 0.1) == []
+
+    assert tracker.flush() == []
+
+
+def test_incomplete_character_frames_combine_by_position():
+    tracker = PlateConsensusTracker(emit_cooldown=10)
+    correct = "31ط55674"
+    emitted = []
+    for index, missing_position in enumerate((0, 3, 6, 7)):
+        row = result(
+            "ناخوانا",
+            0.62,
+            bbox=(100 + index * 2, 100, 300 + index * 2, 150),
+        )
+        row.update({
+            "plate_norm": "",
+            "valid": False,
+            "position_hypotheses": [{
+                "positions": {
+                    position: {
+                        "character": character,
+                        "confidence": 0.80,
+                    }
+                    for position, character in enumerate(correct)
+                    if position != missing_position
+                },
+                "coverage": 7,
+                "score": 0.80,
+            }],
+        })
+        emitted.extend(
+            tracker.update([row], timestamp=index * 0.1)
+        )
+
+    assert emitted
+    assert emitted[-1]["plate_norm"] == correct
+    assert emitted[-1]["consensus_votes"] == 3
+
+
 def test_reference_plate_with_region_digits_is_preserved():
     tracker = PlateConsensusTracker(emit_cooldown=10)
     emitted = []
@@ -220,6 +307,140 @@ def test_unreadable_is_delayed_until_repeated_failed_reads():
     assert finalized[0]["plate"] == "ناخوانا"
 
 
+def test_complete_low_confidence_hypothesis_is_exposed_for_review(
+    monkeypatch,
+):
+    crop = np.full((44, 170, 3), 145, dtype=np.uint8)
+    monkeypatch.setattr(
+        "app.ai.pipeline.detect_plates",
+        lambda *_args, **_kwargs: [{
+            "crop": crop,
+            "bbox": (10, 20, 180, 64),
+            "confidence": 0.72,
+            "method": "yolo-plate+chars",
+            "direct_text": "",
+            "direct_ocr_confidence": 0.0,
+            "direct_ocr_attempted": True,
+            "plate_hypotheses": [{
+                "plate_norm": "31ط55674",
+                "confidence": 0.38,
+                "score": 0.41,
+            }],
+        }],
+    )
+    monkeypatch.setattr(
+        "app.ai.pipeline.read_plate_candidate",
+        lambda *_args, **_kwargs: ("", 0.0, "none"),
+    )
+
+    rows = process_frame(
+        np.full((100, 220, 3), 100, dtype=np.uint8)
+    )
+
+    assert rows[0]["plate"] == "31-ط-556-74"
+    assert rows[0]["valid"] is True
+    assert rows[0]["best_effort"] is True
+    assert rows[0]["needs_review"] is True
+
+
+def test_ambiguous_complete_evidence_becomes_reviewable_best_effort():
+    tracker = PlateConsensusTracker(
+        emit_unreadable=True,
+        min_unreadable_observations=3,
+        min_unreadable_seconds=0.8,
+    )
+    frame = np.full((100, 220, 3), 130, dtype=np.uint8)
+    base = result(
+        "ناخوانا",
+        0.42,
+        bbox=(20, 30, 170, 70),
+        quality=0.7,
+    )
+    base.update({
+        "valid": False,
+        "plate_norm": "",
+        "detector_confidence": 0.84,
+        "position_hypotheses": [
+            {
+                "positions": {
+                    index: {"character": character}
+                    for index, character in enumerate("31ط55674")
+                },
+                "score": 0.5,
+            },
+            {
+                "positions": {
+                    index: {"character": character}
+                    for index, character in enumerate("31ط55874")
+                },
+                "score": 0.5,
+            },
+        ],
+    })
+
+    emitted = []
+    for index in range(5):
+        emitted.extend(
+            tracker.update(
+                [base],
+                timestamp=index * 0.25,
+                frame=frame,
+            )
+        )
+
+    final = [
+        row for row in emitted
+        if row.get("best_effort") and not row.get("capture_only")
+    ]
+    assert len(final) == 1
+    assert final[0]["valid"] is True
+    assert final[0]["needs_review"] is True
+    assert final[0]["plate"] != "ناخوانا"
+
+
+def test_partial_character_evidence_is_kept_instead_of_unreadable():
+    tracker = PlateConsensusTracker(
+        emit_unreadable=True,
+        min_unreadable_observations=3,
+        min_unreadable_seconds=0.8,
+    )
+    frame = np.full((100, 220, 3), 130, dtype=np.uint8)
+    base = result(
+        "ناخوانا",
+        0.38,
+        bbox=(20, 30, 170, 70),
+        quality=0.7,
+    )
+    base.update({
+        "valid": False,
+        "plate_norm": "",
+        "detector_confidence": 0.84,
+        "position_hypotheses": [{
+            "positions": {
+                index: {"character": character}
+                for index, character in enumerate("31ط556")
+            },
+            "score": 0.48,
+        }],
+    })
+
+    emitted = []
+    for index in range(5):
+        emitted.extend(
+            tracker.update(
+                [base],
+                timestamp=index * 0.25,
+                frame=frame,
+            )
+        )
+
+    partial = [row for row in emitted if row.get("partial_final")]
+    assert len(partial) == 1
+    assert partial[0]["plate"].startswith("31-ط-556")
+    assert "؟" in partial[0]["plate"]
+    assert partial[0]["needs_review"] is True
+
+
 def test_failed_dedicated_reader_uses_generic_ocr_on_good_crop(
     monkeypatch,
 ):
@@ -238,8 +459,12 @@ def test_failed_dedicated_reader_uses_generic_ocr_on_good_crop(
         }],
     )
     monkeypatch.setattr(
-        "app.ai.pipeline.read_plate",
-        lambda _crop: ("55-ط-639-74", 0.81),
+        "app.ai.pipeline.read_plate_candidate",
+        lambda *_args, **_kwargs: (
+            "55-ط-639-74",
+            0.81,
+            "easyocr",
+        ),
     )
 
     rows = process_frame(
@@ -285,7 +510,7 @@ def test_plate_similarity_handles_formatting():
     assert plate_similarity("", "31ط55674") == 0.0
 
 
-def test_direct_yolo_text_skips_expensive_ocr_and_vehicle_ai(
+def test_direct_yolo_text_is_compared_with_crnn_without_vehicle_ai(
     monkeypatch,
 ):
     crop = np.full((40, 160, 3), 180, dtype=np.uint8)
@@ -302,9 +527,11 @@ def test_direct_yolo_text_skips_expensive_ocr_and_vehicle_ai(
         }],
     )
     monkeypatch.setattr(
-        "app.ai.pipeline.read_plate",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("EasyOCR should not run")
+        "app.ai.pipeline.read_plate_candidate",
+        lambda *_args, **_kwargs: (
+            "27-ط-253-74",
+            0.91,
+            "crnn-onnx",
         ),
     )
     monkeypatch.setattr(
@@ -321,4 +548,76 @@ def test_direct_yolo_text_skips_expensive_ocr_and_vehicle_ai(
     assert len(rows) == 1
     assert rows[0]["plate"] == "27-ط-253-74"
     assert rows[0]["valid"] is True
+    assert rows[0]["whole_plate_ocr_attempted"] is True
+    assert rows[0]["ocr_engine"].startswith(
+        "multi-engine-agreement"
+    )
     assert rows[0]["vehicle_type"] == "نامشخص"
+
+
+def test_stronger_crnn_disagreement_is_reviewable_and_keeps_both_reads(
+    monkeypatch,
+):
+    crop = np.full((42, 168, 3), 170, dtype=np.uint8)
+    monkeypatch.setattr(
+        "app.ai.pipeline.detect_plates",
+        lambda *_args, **_kwargs: [{
+            "crop": crop,
+            "bbox": (10, 20, 178, 62),
+            "confidence": 0.86,
+            "method": "yolo-plate+chars",
+            "direct_text": "31-ط-556-74",
+            "direct_ocr_confidence": 0.64,
+            "direct_ocr_attempted": True,
+        }],
+    )
+    monkeypatch.setattr(
+        "app.ai.pipeline.read_plate_candidate",
+        lambda *_args, **_kwargs: (
+            "31-ط-558-74",
+            0.88,
+            "crnn-onnx",
+        ),
+    )
+
+    rows = process_frame(
+        np.full((100, 220, 3), 100, dtype=np.uint8),
+        engine_key=9,
+    )
+
+    row = rows[0]
+    assert row["plate"] == "31-ط-558-74"
+    assert row["ocr_engine"] == "crnn-onnx"
+    assert row["ocr_alternative"] == "31-ط-556-74"
+    assert row["ocr_disagreement"] is True
+    assert row["needs_review"] is True
+    assert {
+        hypothesis["plate_norm"]
+        for hypothesis in row["plate_hypotheses"]
+    } == {"31ط55674", "31ط55874"}
+
+
+def test_consensus_records_support_from_both_dedicated_readers():
+    tracker = PlateConsensusTracker(min_votes=3)
+    observation = result("31-ط-556-74", 0.90)
+    observation.update({
+        "ocr_engine": "multi-engine-agreement:crnn-onnx",
+        "ocr_disagreement": False,
+        "plate_hypotheses": [
+            {
+                "plate_norm": "31ط55674",
+                "confidence": 0.88,
+                "score": 0.88,
+                "engine": "dedicated-character-detector+crnn-onnx",
+            }
+        ],
+    })
+
+    tracker.update([observation], timestamp=0.0)
+    tracker.update([observation], timestamp=0.2)
+    emitted = tracker.update([observation], timestamp=0.4)
+
+    assert len(emitted) == 1
+    assert emitted[0]["plate_norm"] == "31ط55674"
+    assert emitted[0]["ocr_engine"] == "multi-engine-consensus"
+    assert emitted[0]["ocr_disagreement"] is False

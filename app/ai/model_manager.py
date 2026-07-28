@@ -25,6 +25,15 @@ DETECTOR_SHA256 = (
     "da8a7ddeab4843197666cb9ce0db756"
 )
 DETECTOR_SIZE = 119_237_050
+CRNN_URL = (
+    "https://huggingface.co/Dibachain/Platrix/resolve/main/"
+    "ocr_crnn.onnx?download=true"
+)
+CRNN_SHA256 = (
+    "45F8C45F29EB1EE91F6274CB8D9C328D"
+    "A1A2050EA7D8596BAE61F4A6B9F9FB1E"
+)
+CRNN_SIZE = 10_452_525
 EASYOCR_HASHES = {
     "arabic.pth": (
         "2A9AFD42C374DEB98AED0B53C9B77D75"
@@ -63,6 +72,16 @@ def easyocr_dir() -> Path:
     if configured:
         return Path(configured).expanduser()
     return _data_dir() / "models" / "easyocr"
+
+
+def crnn_path() -> Path:
+    configured = os.environ.get(
+        "BCVISION_CRNN_MODEL",
+        "",
+    ).strip()
+    if configured:
+        return Path(configured).expanduser()
+    return _data_dir() / "models" / "crnn" / "ocr_crnn.onnx"
 
 
 def packaged_seed_dir() -> Path | None:
@@ -222,6 +241,50 @@ def ensure_detector_model(download=True) -> Path:
     )
 
 
+def ensure_crnn_model(download=True) -> Path:
+    target = crnn_path()
+    if verify_file(target, CRNN_SHA256, CRNN_SIZE):
+        return target
+    source_dir = os.environ.get(
+        "BCVISION_CRNN_SOURCE_DIR",
+        os.environ.get("BCVISION_MODEL_SOURCE_DIR", ""),
+    ).strip()
+    if source_dir:
+        source = Path(source_dir) / "ocr_crnn.onnx"
+        if _copy_verified(
+            source,
+            target,
+            CRNN_SHA256,
+            CRNN_SIZE,
+        ):
+            return target
+    seed = packaged_seed_dir()
+    if seed and _copy_verified(
+        seed / "crnn" / "ocr_crnn.onnx",
+        target,
+        CRNN_SHA256,
+        CRNN_SIZE,
+    ):
+        return target
+    if not download:
+        raise FileNotFoundError(
+            f"Verified CRNN ONNX model not found: {target}"
+        )
+    result = _download_verified(
+        CRNN_URL,
+        target,
+        CRNN_SHA256,
+        CRNN_SIZE,
+    )
+    try:
+        from .onnx_crnn import clear_crnn_sessions
+
+        clear_crnn_sessions()
+    except Exception:
+        pass
+    return result
+
+
 def ensure_easyocr_models(download=True) -> Path:
     target = easyocr_dir()
     target.mkdir(parents=True, exist_ok=True)
@@ -291,15 +354,18 @@ def ensure_easyocr_models(download=True) -> Path:
 
 def prepare_models(download=True) -> dict:
     detector = ensure_detector_model(download=download)
+    crnn = ensure_crnn_model(download=download)
     ocr = ensure_easyocr_models(download=download)
     return {
         "detector": str(detector),
+        "crnn": str(crnn),
         "easyocr": str(ocr),
     }
 
 
 def prepare_seed(seed_dir: Path, download=True) -> dict:
     detector = ensure_detector_model(download=download)
+    crnn = ensure_crnn_model(download=download)
     ocr = ensure_easyocr_models(download=download)
     seed = Path(seed_dir)
     detector_target = seed / "plate" / "best.pt"
@@ -310,6 +376,14 @@ def prepare_seed(seed_dir: Path, download=True) -> dict:
         DETECTOR_SIZE,
     ):
         raise ValueError("Detector seed verification failed")
+    crnn_target = seed / "crnn" / "ocr_crnn.onnx"
+    if not _copy_verified(
+        crnn,
+        crnn_target,
+        CRNN_SHA256,
+        CRNN_SIZE,
+    ):
+        raise ValueError("CRNN seed verification failed")
     for name, digest in EASYOCR_HASHES.items():
         if not _copy_verified(
             ocr / name,
@@ -319,12 +393,14 @@ def prepare_seed(seed_dir: Path, download=True) -> dict:
             raise ValueError(f"EasyOCR seed verification failed: {name}")
     return {
         "detector": str(detector_target),
+        "crnn": str(crnn_target),
         "easyocr": str(seed / "easyocr"),
     }
 
 
 def model_status() -> dict:
     detector = detector_path()
+    crnn = crnn_path()
     ocr = easyocr_dir()
     return {
         "detector_path": str(detector),
@@ -332,6 +408,12 @@ def model_status() -> dict:
             detector,
             DETECTOR_SHA256,
             DETECTOR_SIZE,
+        ),
+        "crnn_path": str(crnn),
+        "crnn_ready": verify_file(
+            crnn,
+            CRNN_SHA256,
+            CRNN_SIZE,
         ),
         "easyocr_path": str(ocr),
         "easyocr_ready": all(
@@ -373,6 +455,7 @@ def main(argv=None):
         print(f"{key.upper()}={value}")
     return 0 if (
         status["detector_ready"]
+        and status["crnn_ready"]
         and status["easyocr_ready"]
     ) else 1
 

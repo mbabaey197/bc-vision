@@ -87,6 +87,9 @@ def test_old_database_migrates_without_data_loss(
             "quality_score",
             "consensus_votes",
             "source",
+            "ocr_engine",
+            "ocr_alternative",
+            "ocr_disagreement",
         } <= columns
         feedback_columns = {
             row[1]
