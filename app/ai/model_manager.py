@@ -555,7 +555,7 @@ def model_status() -> dict:
     active_crnn, active_crnn_sha, active_crnn_size = (
         active_crnn_model()
     )
-    return {
+    status = {
         "detector_path": str(detector),
         "detector_ready": verify_file(
             detector,
@@ -590,6 +590,18 @@ def model_status() -> dict:
         ),
         "easyocr_ready": False,
     }
+    try:
+        from .next_models import next_models_status
+
+        next_status = next_models_status()
+    except Exception as exc:
+        next_status = {
+            "ready": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    status["next_engine_ready"] = bool(next_status.get("ready"))
+    status["next_engine"] = next_status
+    return status
 
 
 def main(argv=None):

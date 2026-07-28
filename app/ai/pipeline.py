@@ -703,20 +703,13 @@ class PlateConsensusTracker:
         for track in self._tracks.values():
             if timestamp - track.last_seen > self.max_age_seconds:
                 continue
-            overlap = bbox_iou(
-                track.predicted_bbox or track.bbox,
-                result["bbox"],
+            score, overlap, proximity, size_ratio = (
+                self._association_score(track, result)
             )
-            text_score = 0.0
-            if result.get("valid"):
-                for observation in track.observations:
-                    if observation.get("valid"):
-                        text_score = max(
-                            text_score,
-                            plate_similarity(result["plate"], observation["plate"]),
-                        )
-            score = max(overlap, text_score * 0.88)
-            if score > best_score and (overlap >= 0.18 or text_score >= 0.74):
+            if score > best_score and (
+                overlap >= 0.18
+                or (proximity >= 0.62 and size_ratio >= 0.55)
+            ):
                 best, best_score = track, score
         return best
 
@@ -737,23 +730,42 @@ class PlateConsensusTracker:
 
     @staticmethod
     def _association_score(track: _Track, result: dict) -> tuple:
-        overlap = bbox_iou(
-            track.predicted_bbox or track.bbox,
-            result["bbox"],
+        predicted = track.predicted_bbox or track.bbox
+        detected = result["bbox"]
+        overlap = bbox_iou(predicted, detected)
+        px1, py1, px2, py2 = (
+            float(value) for value in predicted
         )
-        text_score = 0.0
-        if result.get("valid"):
-            for observation in track.observations:
-                if observation.get("valid"):
-                    text_score = max(
-                        text_score,
-                        plate_similarity(
-                            result.get("plate", ""),
-                            observation.get("plate", ""),
-                        ),
-                    )
-        score = max(overlap, text_score * 0.88)
-        return score, overlap, text_score
+        dx1, dy1, dx2, dy2 = (
+            float(value) for value in detected
+        )
+        predicted_width = max(2.0, px2 - px1)
+        predicted_height = max(2.0, py2 - py1)
+        detected_width = max(2.0, dx2 - dx1)
+        detected_height = max(2.0, dy2 - dy1)
+        center_distance = math.hypot(
+            (px1 + px2 - dx1 - dx2) / 2.0,
+            (py1 + py2 - dy1 - dy2) / 2.0,
+        )
+        scale = max(
+            predicted_width,
+            predicted_height,
+            detected_width,
+            detected_height,
+        )
+        proximity = max(0.0, 1.0 - center_distance / (scale * 1.6))
+        predicted_area = predicted_width * predicted_height
+        detected_area = detected_width * detected_height
+        size_ratio = min(predicted_area, detected_area) / max(
+            predicted_area,
+            detected_area,
+        )
+        score = (
+            0.65 * overlap
+            + 0.25 * proximity
+            + 0.10 * size_ratio
+        )
+        return score, overlap, proximity, size_ratio
 
     def _associate(self, results, timestamp: float) -> dict[int, _Track]:
         """ByteTrack-style two-pass association over high/low detections."""
@@ -789,14 +801,15 @@ class PlateConsensusTracker:
             pairs = []
             for index in indices:
                 for track in available.values():
-                    score, overlap, text_score = (
+                    score, overlap, proximity, size_ratio = (
                         self._association_score(track, results[index])
                     )
                     accepted = (
                         overlap >= (0.08 if second_pass else 0.12)
                         or (
-                            not second_pass
-                            and text_score >= 0.74
+                            proximity
+                            >= (0.52 if second_pass else 0.62)
+                            and size_ratio >= 0.55
                         )
                     )
                     if accepted:
@@ -804,7 +817,8 @@ class PlateConsensusTracker:
                             (
                                 score,
                                 overlap,
-                                text_score,
+                                proximity,
+                                size_ratio,
                                 -track.misses,
                                 index,
                                 track.track_id,
@@ -973,6 +987,18 @@ class PlateConsensusTracker:
 
         if len(evidence) < self.min_votes:
             return None
+        # Keep only the five clearest plate crops. Long tracks otherwise let
+        # many blurred frames overwhelm the few frames that contain the actual
+        # character detail.
+        evidence = sorted(
+            evidence,
+            key=lambda row: (
+                self._observation_weight(row),
+                float(row.get("quality_score", 0.0)),
+                float(row.get("detector_confidence", 0.0)),
+            ),
+            reverse=True,
+        )[:5]
 
         winner_chars = []
         winner_counts = []

@@ -46,6 +46,29 @@ def test_consensus_requires_three_repeated_observations():
     assert emitted[0]["consensus_votes"] == 3
 
 
+def test_equal_ocr_text_never_links_distant_vehicles():
+    tracker = PlateConsensusTracker(
+        min_votes=3,
+        max_age_seconds=3.0,
+    )
+    tracker.update([
+        result(
+            "31-ط-556-74",
+            0.91,
+            bbox=(20, 30, 180, 70),
+        )
+    ], timestamp=0.0)
+    tracker.update([
+        result(
+            "31-ط-556-74",
+            0.92,
+            bbox=(900, 500, 1060, 540),
+        )
+    ], timestamp=0.1)
+
+    assert len(tracker.active_track_ids()) == 2
+
+
 def test_position_voting_corrects_lam_tah_confusion():
     tracker = PlateConsensusTracker(emit_cooldown=10)
     observations = [

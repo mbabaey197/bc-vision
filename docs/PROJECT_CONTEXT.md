@@ -5,7 +5,7 @@
 - GitHub repository: `mahdibabaey197/bc-vision`
 - Default branch: `main`
 - Product: BC Vision
-- Current application version in source: `2.2.0-rc12`
+- Current application version in source: `2.2.0-rc13`
 - Windows persistent data root: `C:\ProgramData\BCVision\data`
 
 ## Release contract
@@ -49,6 +49,11 @@ The Iranian plate-recognition subsystem now includes:
 - per-camera ONNX sessions with a hard two-thread ceiling
 - persistent feedback datasets and gated CRNN candidate promotion
 - Jalali visible dates and Persian digits for all visible dates and times
+- dormant signed RC13 OBB/Hezar engine with baseline, shadow and next modes
+- mandatory OBB perspective rectification before candidate OCR
+- five-best-frame probability voting and strict ambiguity rejection
+- geometric-only track association; OCR text never links vehicle tracks
+- Golden Dataset promotion gate and atomic runtime rollback
 
 ## ANPR model execution contract
 
@@ -132,6 +137,10 @@ The current regression suite covers:
 - immutable operator sample capture and SHA-256 verification
 - additive training-run database migration and gated candidate promotion
 - Persian digits for all visible date/time fields
+- traditional and end-to-end YOLO26-OBB output contracts
+- signed candidate manifest verification and tamper rejection
+- candidate shadow isolation and runtime rollback
+- group-aware dataset splitting without track/plate leakage
 
 The latest full-suite and system optimization result is recorded in
 `agent-results/latest/PROJECT_OPTIMIZATION_PHASE_1.md`: `64 passed, 1 skipped`,
@@ -448,8 +457,41 @@ The verified regression result for this combined branch is
 reported `16 passed`. Compile and whitespace checks also passed. Windows
 packaging and installed-build acceptance are still required before release.
 
-## Repository security observation
+## RC13 next ANPR engine scaffold
 
-GitHub reported the repository visibility as public on 2026-07-27, while the
-recorded project requirement is private. This external setting must be
-corrected separately with explicit visibility-change authority.
+Version `2.2.0-rc13` adds the complete runtime boundary needed for the new
+detector/OCR pair while preserving RC12 as the default customer path. The
+candidate detector accepts both traditional YOLO OBB tensors and the
+end-to-end `N x 7` contract, maps the rotated corners back through letterbox
+geometry, and applies a perspective warp before OCR. The candidate OCR keeps
+multiple constrained CTC hypotheses, calculates per-position margins and
+returns `ناخوانا` when confidence or any character margin is insufficient.
+
+Engine mode is `baseline`, `shadow` or `next`. Shadow executes the candidate
+without changing persisted or displayed customer results. A runtime exception
+in `next` atomically selects baseline. The candidate bundle requires a signed
+Ed25519 manifest plus exact SHA-256 and size verification for both ONNX files.
+No untrained or placeholder model file is included.
+
+Track association no longer uses OCR text. It relies on predicted overlap,
+normalized center distance and size consistency, preventing the same wrong OCR
+string from joining two separate vehicles. Consensus uses the five
+highest-quality observations and votes by character probability. A short
+three-frame burst follows first plate visibility; exponential idle backoff
+continues only while no plate is visible.
+
+The Golden Dataset gate compares exact full-plate accuracy, false accepts,
+latency and scenario slices. Related frames are grouped during
+train/validation splitting so one vehicle or confirmed plate cannot leak
+across both sets. Final promotion remains blocked until signed trained weights
+and labelled real-camera videos are available.
+
+Local RC13 regression is `143 passed, 1 skipped`. The skip is the existing real
+ONNX integration test that requires the Windows model bundle. Windows
+installer/update validation and real-video accuracy remain pending release
+gates and are not claimed by this local test.
+
+## Repository visibility authorization
+
+The repository is public. On 2026-07-28 the owner explicitly authorized
+publishing the RC13 branch and Draft PR to this public repository.

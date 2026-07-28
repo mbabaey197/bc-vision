@@ -10,6 +10,7 @@ import threading
 
 import cv2
 
+from .dataset_split import stable_split_for_group
 from .plate_rules import normalize_plate, plausible_plate
 
 
@@ -95,11 +96,10 @@ def capture_feedback_sample(feedback_id: int) -> dict:
         temporary.unlink(missing_ok=True)
         return {"ready": False, "reason": "hash-mismatch"}
     os.replace(temporary, target)
-    split = (
-        "validation"
-        if int(digest[:8], 16) % 5 == 0
-        else "train"
-    )
+    # All frames carrying the same confirmed plate stay in one split.  The
+    # previous image-hash split could put neighbouring frames of one vehicle
+    # in both train and validation and inflate validation accuracy.
+    split = stable_split_for_group(label)
     with connect() as con:
         con.execute(
             "UPDATE anpr_feedback SET sample_path=?,sample_sha256=?,"
@@ -140,11 +140,7 @@ def _verified_samples() -> list[dict]:
             "image_path": str(path),
             "sha256": str(row["sample_sha256"]).upper(),
             "plate": label,
-            "split": (
-                row["dataset_split"]
-                if row["dataset_split"] in {"train", "validation"}
-                else "train"
-            ),
+            "split": stable_split_for_group(label),
         })
     return samples
 

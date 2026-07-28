@@ -72,10 +72,49 @@ Every model is accepted only after exact size and SHA-256 verification.
 Per-camera ONNX Runtime sessions use at most two intra-operation threads, one
 inter-operation thread, sequential execution and disabled worker spinning.
 
+## RC13 candidate bundle
+
+RC13 adds a second, fail-safe engine contract without replacing the verified
+RC12 models:
+
+- a rotated YOLO26-OBB detector exported to ONNX;
+- a fine-tuned Iranian Hezar/CRNN OCR exported to ONNX;
+- mandatory perspective rectification from the four OBB corners;
+- constrained CTC beam search with multiple plate hypotheses;
+- `baseline`, `shadow` and `next` runtime modes.
+
+The candidate engine is not enabled merely because two ONNX files exist. Its
+`active-models.json` must use schema `1`, identify `bcvision-rc13`, list the
+exact filename, size and SHA-256 of both files, and carry an Ed25519 signature
+verified by `model_public_key.pem`. Missing, modified or unsigned bundles fail
+closed to `baseline`.
+
+```text
+C:\ProgramData\BCVision\data\models\next\active-models.json
+C:\ProgramData\BCVision\data\models\next\model_public_key.pem
+C:\ProgramData\BCVision\data\models\next\<detector>.onnx
+C:\ProgramData\BCVision\data\models\next\<ocr>.onnx
+C:\ProgramData\BCVision\data\models\next\runtime-state.json
+```
+
+Optional environment overrides:
+
+```text
+BCVISION_NEXT_MANIFEST
+BCVISION_ANPR_MODEL_PUBLIC_KEY
+BCVISION_ANPR_MODE=baseline|shadow|next
+```
+
+No trained YOLO26-OBB or fine-tuned Hezar weights are committed in RC13. Those
+weights must be produced from licensed data, signed, and pass the fixed real
+camera Golden Dataset in shadow mode before `next` can be activated.
+
 ## Operator training and promotion
 
 Confirmed corrections copy the corresponding plate crop into an immutable
-local dataset with a SHA-256 digest and deterministic train/validation split.
+local dataset with a SHA-256 digest and deterministic group-aware
+train/validation split. Frames with the same confirmed plate never cross the
+split boundary.
 Training runs outside live inference and create a candidate CRNN. The candidate
 is evaluated against the currently active model on the isolated validation
 split. It cannot be applied when it regresses or scores below the promotion

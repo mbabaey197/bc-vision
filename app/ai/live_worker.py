@@ -23,6 +23,7 @@ from .pipeline import (
 )
 from .plate_rules import normalize_plate
 from .feedback import apply_learned_correction
+from .next_engine import engine_router
 
 
 @dataclass
@@ -62,6 +63,11 @@ class _CameraState:
     latest_detection_frame: object | None = None
     detection_revision: int = 0
     last_submitted_at: float = 0.0
+    burst_frames_remaining: int = 0
+    plate_visible: bool = False
+    shadow_frames: int = 0
+    shadow_candidates: int = 0
+    shadow_errors: int = 0
 
 
 class LiveANPRWorker:
@@ -450,12 +456,19 @@ class LiveANPRWorker:
                 0.0,
                 state.next_inference_at - now,
                 (
-                max(
-                    0.20,
-                    min(1.25, state.processing_seconds_ema * 0.45),
-                )
-                if state.processing_seconds_ema
-                else 0.0
+                    0.0
+                    if state.burst_frames_remaining
+                    else (
+                        max(
+                            0.20,
+                            min(
+                                1.25,
+                                state.processing_seconds_ema * 0.45,
+                            ),
+                        )
+                        if state.processing_seconds_ema
+                        else 0.0
+                    )
                 ),
             )
             if (
@@ -502,16 +515,26 @@ class LiveANPRWorker:
                     float(config.get("lpr_confidence", 60)) / 100.0,
                 ),
             )
+            outcome = engine_router.process(
+                source,
+                baseline=lambda: process_frame(
+                    source,
+                    min_confidence * 0.45,
+                    engine_key=camera_id,
+                ),
+                min_detection_confidence=min_confidence * 0.45,
+                engine_key=camera_id,
+            )
             rows = [
                 apply_learned_correction(
                     self._translate(row, offset_x, offset_y)
                 )
-                for row in process_frame(
-                    source,
-                    min_confidence * 0.45,
-                    engine_key=camera_id,
-                )
+                for row in outcome.primary
             ]
+            if outcome.mode == "shadow":
+                state.shadow_frames += 1
+                state.shadow_candidates += len(outcome.shadow)
+                state.shadow_errors += int(bool(outcome.error))
             processing_seconds = time.perf_counter() - started
             if state.processing_seconds_ema:
                 state.processing_seconds_ema = (
@@ -548,8 +571,16 @@ class LiveANPRWorker:
                     }
                 )
             if rows:
+                if not state.plate_visible:
+                    state.burst_frames_remaining = 3
+                elif state.burst_frames_remaining:
+                    state.burst_frames_remaining -= 1
+                state.plate_visible = True
                 state.no_plate_streak = 0
             else:
+                state.plate_visible = False
+                if state.burst_frames_remaining:
+                    state.burst_frames_remaining -= 1
                 state.no_plate_streak = min(
                     12,
                     state.no_plate_streak + 1,
@@ -679,10 +710,12 @@ class LiveANPRWorker:
                 # which kept detector/OCR threads continuously busy even when
                 # every inference returned no plate.
                 state.next_inference_at = time.monotonic() + (
-                    self._post_inference_delay(
-                        state.processing_seconds_ema,
-                        state.no_plate_streak,
-                    )
+                    0.04
+                    if state.burst_frames_remaining
+                    else self._post_inference_delay(
+                            state.processing_seconds_ema,
+                            state.no_plate_streak,
+                        )
                 )
                 state.busy = False
 
@@ -726,6 +759,13 @@ class LiveANPRWorker:
                     max(0.0, state.next_inference_at - time.monotonic()),
                     2,
                 ),
+                "burst_frames_remaining": state.burst_frames_remaining,
+                "anpr_engine": engine_router.status(camera_id),
+                "shadow": {
+                    "frames": state.shadow_frames,
+                    "candidates": state.shadow_candidates,
+                    "errors": state.shadow_errors,
+                },
                 "consensus_window_seconds": round(
                     state.tracker.max_age_seconds,
                     2,
