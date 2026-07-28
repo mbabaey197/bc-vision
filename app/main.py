@@ -164,7 +164,7 @@ label{display:block;font-weight:700;color:var(--bc-text);margin-bottom:3px}input
 @media(max-width:440px){.stats-grid{grid-template-columns:1fr}.top-title{font-size:15px}}
 .thumb{width:110px;height:62px;object-fit:cover;border-radius:9px;border:1px solid var(--bc-border);background:#eef2f7;cursor:pointer}.plate-thumb{width:130px;height:48px}.recent-plate-result{display:flex;align-items:center;gap:10px;min-width:275px}.recent-plate-result .plate-thumb{flex:0 0 auto}.recent-vehicle-thumb{width:126px;height:72px;object-fit:cover;border-radius:10px;border:1px solid var(--bc-border);background:#eef2f7}.recent-media-missing{display:inline-flex;width:126px;height:72px;align-items:center;justify-content:center;border:1px dashed var(--bc-border);border-radius:10px;color:var(--bc-muted);font-size:12px}.status-pill{display:inline-block;padding:3px 9px;border-radius:999px;font-size:12px;font-weight:900}.status-pill.ok{background:#e5f7ef;color:#147a50}.status-pill.bad{background:#ffe8e8;color:#b42318}.status-pill.vip{background:#fff3cd;color:#8a6100}.event-blocked{background:rgba(214,69,69,.07)}.event-vip{background:rgba(229,161,26,.08)}.filter-grid{display:grid;grid-template-columns:repeat(5,minmax(140px,1fr));gap:10px;align-items:end}.modal-img{position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:5000;display:none;place-items:center;padding:30px}.modal-img.open{display:grid}.modal-img img{max-width:95vw;max-height:90vh;border-radius:14px}.modal-img button{position:absolute;top:20px;left:20px}@media(max-width:900px){.filter-grid{grid-template-columns:1fr 1fr}}
 .login-page{min-height:100vh;display:grid;grid-template-columns:minmax(320px,520px) 1fr;background:linear-gradient(135deg,#071b3f 0%,#0b2e63 52%,#087cf0 100%);direction:ltr;overflow:hidden}.login-panel{direction:rtl;background:var(--bc-surface);padding:clamp(26px,5vw,68px);display:flex;align-items:center;justify-content:center;box-shadow:20px 0 60px rgba(0,0,0,.18);z-index:2}.login-box{width:100%;max-width:410px}.login-logo{display:flex;align-items:center;gap:13px;margin-bottom:34px}.login-logo .brand-mark{width:58px;height:58px;min-width:58px;font-size:22px}.login-logo h1{margin:0;font-size:28px}.login-logo p{margin:0;color:var(--bc-muted)}.login-title{font-size:25px;font-weight:900;margin:0 0 5px}.login-subtitle{color:var(--bc-muted);margin:0 0 26px}.password-wrap{position:relative}.password-wrap input{padding-left:48px}.password-toggle{position:absolute;left:7px;top:10px;width:36px;height:36px;background:transparent!important;color:var(--bc-muted)!important;box-shadow:none;padding:0}.password-toggle:hover{transform:none;background:var(--bc-surface2)!important}.login-submit{width:100%;height:46px;font-size:15px;margin-top:5px}.login-help{display:flex;justify-content:space-between;gap:12px;margin-top:17px;font-size:12px;color:var(--bc-muted)}.login-visual{direction:rtl;color:#fff;display:flex;align-items:center;justify-content:center;padding:60px;position:relative}.login-visual:before,.login-visual:after{content:'';position:absolute;border-radius:50%;background:rgba(255,255,255,.08)}.login-visual:before{width:420px;height:420px;left:-130px;top:-170px}.login-visual:after{width:300px;height:300px;right:8%;bottom:-140px}.login-hero{max-width:670px;position:relative;z-index:1}.login-hero h2{font-size:clamp(32px,4vw,54px);font-weight:900;line-height:1.35;margin:0 0 16px}.login-hero p{font-size:17px;opacity:.82;max-width:570px}.login-features{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:34px}.login-feature{padding:17px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.08);backdrop-filter:blur(10px);border-radius:15px}.login-feature b{display:block;font-size:15px;margin-bottom:3px}.login-feature span{font-size:12px;opacity:.75}.login-version{position:absolute;bottom:24px;left:30px;opacity:.62;font-size:12px}@media(max-width:900px){.login-page{grid-template-columns:1fr}.login-visual{display:none}.login-panel{min-height:100vh;padding:24px}.login-help{flex-direction:column}}
-.anpr-status{display:block;padding:7px 12px;color:#c8d5df;background:#0c141a;font-size:11px;line-height:1.7;border-top:1px solid #263945}.anpr-status.bad{color:#ffb4ab;background:#301716}
+.anpr-status{display:block;padding:7px 12px;color:#c8d5df;background:#0c141a;font-size:11px;line-height:1.7;border-top:1px solid #263945}.anpr-status.bad{color:#ffb4ab;background:#301716}.playback-controls{display:flex;gap:7px;padding:8px 11px;background:#0c141a;border-top:1px solid #263945}.playback-controls button{padding:6px 12px;font-size:12px;box-shadow:none}.playback-controls button.active{background:#16a36b}
 .iran-plate{display:inline-flex;direction:ltr;align-items:stretch;height:54px;min-width:250px;border:2px solid #15191f;border-radius:7px;overflow:hidden;background:#fff;color:#111;font-family:Tahoma,"Segoe UI",sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.14)}.iran-plate.compact{height:42px;min-width:205px}.plate-blue{width:32px;background:#0868b7;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:12px;line-height:1}.plate-blue small{font-size:7px;margin-top:3px}.plate-main{display:flex;align-items:center;justify-content:space-evenly;gap:8px;flex:1;padding:0 9px;font-size:21px}.compact .plate-main{font-size:17px;gap:6px;padding:0 7px}.plate-iran{width:54px;border-left:2px solid #15191f;display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1}.plate-iran small{font-size:9px}.plate-iran b{font-size:17px;margin-top:4px}.compact .plate-iran{width:46px}.compact .plate-iran b{font-size:14px}.plate-unreadable{display:inline-block;padding:6px 10px;border-radius:7px;background:#fff1c7;color:#714f00;font-weight:800}.correction-form{display:flex;gap:7px;align-items:center;min-width:265px}.correction-form input:not([type=checkbox]){margin:0;min-width:170px;padding:7px 9px}.correction-form button{padding:7px 10px;white-space:nowrap}.feedback-note{font-size:12px;color:var(--bc-muted);margin-top:8px}
 </style>"""
 
@@ -314,7 +314,31 @@ def dashboard(request:Request):
             "FROM plate_events ORDER BY id DESC LIMIT 6"
         ).fetchall()
     lic=license_status()
-    tiles=''.join(f"<div class='camera-tile'><div class='camera-head'><span>{escape(c['name'])}</span><span class='badge' id='st-{c['id']}'>در حال اتصال</span></div><img loading='lazy' src='/live/{c['id']}?t={int(time.time())}' alt='{escape(c['name'])}'><span class='anpr-status' id='anpr-{c['id']}'>پلاک‌خوان: در انتظار اولین فریم</span><div class='camera-head'><small>{escape(c['location'] or 'بدون موقعیت')}</small><a style='color:#bdefff' href='/cameras/{c['id']}/snapshot'>گرفتن عکس</a></div></div>" for c in cams)
+    def camera_tile(c):
+        camera_id=int(c['id'])
+        is_video=str(c['rtsp_url']).startswith('video://')
+        controls=(
+            f"<div class='playback-controls'>"
+            f"<button type='button' id='play-{camera_id}' "
+            f"onclick=\"videoPlayback({camera_id},'play')\">▶ پخش</button>"
+            f"<button type='button' class='secondary' id='pause-{camera_id}' "
+            f"onclick=\"videoPlayback({camera_id},'pause')\">⏸ توقف</button>"
+            f"</div>"
+            if is_video else ""
+        )
+        return (
+            f"<div class='camera-tile'><div class='camera-head'>"
+            f"<span>{escape(c['name'])}</span><span class='badge' "
+            f"id='st-{camera_id}'>در حال اتصال</span></div>"
+            f"<img loading='lazy' src='/live/{camera_id}?t={int(time.time())}' "
+            f"alt='{escape(c['name'])}'><span class='anpr-status' "
+            f"id='anpr-{camera_id}'>پلاک‌خوان: در انتظار اولین فریم</span>"
+            f"{controls}<div class='camera-head'><small>"
+            f"{escape(c['location'] or 'بدون موقعیت')}</small>"
+            f"<a style='color:#bdefff' href='/cameras/{camera_id}/snapshot'>"
+            f"گرفتن عکس</a></div></div>"
+        )
+    tiles=''.join(camera_tile(c) for c in cams)
     if not tiles: tiles="<div class='card empty-state'><h3>هنوز دوربینی فعال نیست</h3><p class='muted'>برای شروع، دوربین واقعی خود را اضافه کنید.</p><a class='btn' href='/cameras/new'>افزودن اولین دوربین</a></div>"
     ids=','.join(str(c['id']) for c in cams)
     recent_rows=''.join(
@@ -322,7 +346,8 @@ def dashboard(request:Request):
     ) or "<tr><td colspan='6'>هنوز پلاکی ثبت نشده است.</td></tr>"
     js=f"""<script>
 const ids=[{ids}];
-async function cameraStatus(){{for(const id of ids){{try{{let r=await fetch('/api/cameras/'+id+'/status');let s=await r.json();let e=document.getElementById('st-'+id),a=document.getElementById('anpr-'+id),n=v=>Number(v||0).toLocaleString('fa-IR');e.textContent=s.online?'آنلاین':'آفلاین';e.className='badge '+(s.online?'online':'');const p=s.anpr||{{}},m=p.models||{{}};if(!m.ready){{a.textContent='پلاک‌خوان آماده نیست: مدل تشخیص یا OCR نصب نشده است';a.className='anpr-status bad'}}else if(p.last_error){{a.textContent='خطای پلاک‌خوان: '+p.last_error;a.className='anpr-status bad'}}else{{a.textContent='پردازش: '+n(p.processed_frames)+' فریم | تشخیص: '+n(p.detected_candidates)+' | ثبت: '+n(p.emitted_events);a.className='anpr-status'}}}}catch(e){{}}}}}}
+async function cameraStatus(){{for(const id of ids){{try{{let r=await fetch('/api/cameras/'+id+'/status');let s=await r.json();let e=document.getElementById('st-'+id),a=document.getElementById('anpr-'+id),n=v=>Number(v||0).toLocaleString('fa-IR');e.textContent=s.paused?'متوقف':(s.online?'آنلاین':'آفلاین');e.className='badge '+(s.online?'online':'');const play=document.getElementById('play-'+id),pause=document.getElementById('pause-'+id);if(play)play.classList.toggle('active',!s.paused);if(pause)pause.classList.toggle('active',!!s.paused);const p=s.anpr||{{}},m=p.models||{{}};if(!m.ready){{a.textContent='پلاک‌خوان آماده نیست: مدل تشخیص یا OCR نصب نشده است';a.className='anpr-status bad'}}else if(p.last_error){{a.textContent='خطای پلاک‌خوان: '+p.last_error;a.className='anpr-status bad'}}else{{const idle=p.idle_mode?' | حالت کم‌مصرف':'';a.textContent='پردازش: '+n(p.processed_frames)+' فریم | تشخیص: '+n(p.detected_candidates)+' | ثبت: '+n(p.emitted_events)+idle;a.className='anpr-status'}}}}catch(e){{}}}}}}
+async function videoPlayback(id,action){{try{{const r=await fetch('/api/cameras/'+id+'/playback',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action}})}});if(!r.ok)throw new Error();await cameraStatus()}}catch(e){{alert('تغییر وضعیت پخش انجام نشد.')}}}}
 let latestEventId={recent[0]['id'] if recent else 0};
 async function refreshRecentEvents(){{
  try{{
@@ -380,6 +405,25 @@ def live(camera_id:int,request:Request):
 def cam_status(camera_id:int,request:Request):
     if not auth(request):return JSONResponse({'error':'unauthorized'},401)
     return JSONResponse(manager.status(camera_id))
+
+@app.post('/api/cameras/{camera_id}/playback')
+async def camera_playback(camera_id:int,request:Request):
+    if not auth(request):
+        return JSONResponse({'error':'unauthorized'},401)
+    try:
+        payload=await request.json()
+    except Exception:
+        payload={}
+    action=str(payload.get('action','')).strip().lower()
+    if action not in {'play','pause'}:
+        return JSONResponse({'error':'invalid action'},400)
+    if not manager.set_playback(camera_id,action):
+        return JSONResponse(
+            {'error':'uploaded video stream is not active'},
+            404,
+        )
+    audit(request,'video_playback',f'camera={camera_id}; action={action}')
+    return JSONResponse({'ok':True,'action':action})
 
 @app.get('/cameras')
 def cameras(request:Request,msg:str=''):
