@@ -11,6 +11,9 @@ from .pipeline import (
     process_frame,
 )
 from .plate_rules import normalize_plate
+from .next_engine import engine_router
+from .next_models import next_models_status
+from .review_policy import auto_confirm_guess
 
 
 class VideoTester:
@@ -129,29 +132,66 @@ def process_video(
     min_confidence=0.20,
     duplicate_seconds=2.5,
     roi=None,
+    include_candidate_shadow=False,
 ):
     tester = VideoTester(video_path)
     info = tester.info()
+    candidate_status = (
+        next_models_status()
+        if include_candidate_shadow
+        else {"ready": False, "error": ""}
+    )
+    shadow_enabled = bool(
+        include_candidate_shadow and candidate_status.get("ready")
+    )
+    info["candidate_shadow_requested"] = bool(
+        include_candidate_shadow
+    )
+    info["candidate_shadow_error"] = (
+        ""
+        if shadow_enabled
+        else str(candidate_status.get("error") or "")
+    )
     fps = max(info["fps"], 1.0)
     plate_dir = Path(plate_dir)
     snapshot_dir = Path(snapshot_dir)
     plate_dir.mkdir(parents=True, exist_ok=True)
     snapshot_dir.mkdir(parents=True, exist_ok=True)
-    tracker = PlateConsensusTracker(
-        min_votes=2,
-        max_age_seconds=max(1.2, float(frame_step) * 4.0 / fps),
-        emit_cooldown=max(0.0, float(duplicate_seconds)),
-        emit_unreadable=True,
-    )
+    trackers = {
+        lane: PlateConsensusTracker(
+            min_votes=2,
+            max_age_seconds=max(
+                1.2,
+                float(frame_step) * 4.0 / fps,
+            ),
+            emit_cooldown=max(0.0, float(duplicate_seconds)),
+            emit_unreadable=True,
+        )
+        for lane in (
+            ("baseline", "candidate-shadow")
+            if shadow_enabled
+            else ("baseline",)
+        )
+    }
     events = []
-    events_by_track: dict[int, int] = {}
-    seen: dict[str, float] = {}
+    events_by_track: dict[tuple[str, int], int] = {}
+    seen: dict[tuple[str, str], float] = {}
     frame_no = 0
     last_frame = None
+    shadow_error = info["candidate_shadow_error"]
 
-    def accept(rows, frame):
+    def accept(rows, frame, lane="baseline"):
         for result in rows:
+            result = dict(result)
+            result["engine_lane"] = lane
             capture_only = bool(result.get("capture_only"))
+            if lane == "candidate-shadow":
+                result["experimental"] = True
+                result["needs_review"] = True
+                if not capture_only:
+                    result = auto_confirm_guess(result)
+                elif result.get("valid"):
+                    result["read_status"] = "experimental-guess"
             if (
                 not capture_only
                 and result["confidence"] < float(min_confidence)
@@ -160,17 +200,18 @@ def process_video(
             key = result.get("plate_norm") or normalize_plate(result.get("plate"))
             now_sec = frame_no / fps
             track_id = int(result.get("track_id") or 0)
-            event_index = events_by_track.get(track_id)
+            track_key = (lane, track_id)
+            event_index = events_by_track.get(track_key)
             if (
                 event_index is None
                 and key
-                and key in seen
-                and now_sec - seen[key]
+                and (lane, key) in seen
+                and now_sec - seen[(lane, key)]
                 < max(0.0, float(duplicate_seconds))
             ):
                 continue
             if key:
-                seen[key] = now_sec
+                seen[(lane, key)] = now_sec
             capture_frame = result.pop("capture_frame", None)
             persistence_frame = (
                 capture_frame
@@ -194,7 +235,7 @@ def process_video(
                 existing=existing,
             )
             if event_index is None:
-                events_by_track[track_id] = len(events)
+                events_by_track[track_key] = len(events)
                 events.append(saved)
             else:
                 events[event_index] = saved
@@ -212,19 +253,66 @@ def process_video(
             if frame_no % max(1, int(frame_step)) != 0:
                 continue
             source, offset_x, offset_y = _roi_frame(frame, roi)
-            results = [
+            if shadow_enabled:
+                outcome = engine_router.process(
+                    source,
+                    baseline=lambda: process_frame(
+                        source,
+                        min_confidence,
+                    ),
+                    min_detection_confidence=min_confidence,
+                    mode="shadow",
+                )
+                primary = outcome.primary
+                shadow = outcome.shadow
+                if outcome.error:
+                    shadow_error = outcome.error
+            else:
+                primary = process_frame(source, min_confidence)
+                shadow = []
+            primary = [
                 _translate_result(result, offset_x, offset_y)
-                for result in process_frame(source, min_confidence)
+                for result in primary
             ]
-            stable = tracker.update(
-                results,
+            stable = trackers["baseline"].update(
+                primary,
                 timestamp=frame_no / fps,
                 frame=frame,
             )
-            if accept(stable, frame):
+            if accept(stable, frame, "baseline"):
                 return info, events
+            if shadow_enabled:
+                shadow = [
+                    _translate_result(result, offset_x, offset_y)
+                    for result in shadow
+                ]
+                stable_shadow = trackers["candidate-shadow"].update(
+                    shadow,
+                    timestamp=frame_no / fps,
+                    frame=frame,
+                )
+                if accept(
+                    stable_shadow,
+                    frame,
+                    "candidate-shadow",
+                ):
+                    return info, events
         if last_frame is not None:
-            accept(tracker.flush(), last_frame)
+            accept(
+                trackers["baseline"].flush(),
+                last_frame,
+                "baseline",
+            )
+            if shadow_enabled:
+                accept(
+                    trackers["candidate-shadow"].flush(),
+                    last_frame,
+                    "candidate-shadow",
+                )
     finally:
         tester.close()
+    info["candidate_shadow_requested"] = bool(
+        include_candidate_shadow
+    )
+    info["candidate_shadow_error"] = shadow_error
     return info, events
