@@ -14,6 +14,7 @@ import numpy as np
 from .detector import detect_plates
 from .ocr import read_plate_candidate
 from .plate_rules import format_iran_plate, normalize_plate, plausible_plate
+from .review_policy import auto_confirm_guess
 from .vehicle_intelligence import analyze_vehicle
 
 
@@ -315,6 +316,11 @@ def process_frame(
         valid = plausible_plate(text)
         best_effort = False
         needs_review = ocr_disagreement
+        raw_guess_text = ""
+        raw_guess_norm = ""
+        raw_guess_confidence = 0.0
+        raw_guess_engine = ""
+        raw_guess_reason = ""
         if ocr_disagreement:
             best_effort = True
         if valid and all(
@@ -329,10 +335,9 @@ def process_frame(
                 "score": float(ocr_confidence),
             })
         elif not valid and plate_hypotheses:
-            # The character detector often has a complete second hypothesis
-            # even when its strict decoder rejects the primary read.  Surface
-            # that real hypothesis as a reviewable suggestion instead of
-            # throwing it away as "ناخوانا".
+            # Preserve the actual best hypothesis for operator review, but do
+            # not turn a rejected single-frame hypothesis into accepted truth.
+            # It is displayed and measured as an experimental guess only.
             suggestion = max(
                 plate_hypotheses,
                 key=lambda row: (
@@ -346,9 +351,13 @@ def process_frame(
                 float(ocr_confidence),
                 float(suggestion["confidence"]),
             )
-            valid = True
             best_effort = True
             needs_review = True
+            raw_guess_text = suggestion["plate"]
+            raw_guess_norm = suggestion["plate_norm"]
+            raw_guess_confidence = float(suggestion["confidence"])
+            raw_guess_engine = str(suggestion["engine"])
+            raw_guess_reason = "strict-decoder-rejected"
         elif not valid and position_hypotheses:
             # Preserve 5–7 observed positions.  Question marks explicitly mean
             # "not seen"; they are not guessed characters and remain easy for
@@ -371,6 +380,15 @@ def process_frame(
             )
             best_effort = True
             needs_review = True
+            raw_guess_text = text
+            raw_guess_confidence = float(partial["score"])
+            raw_guess_engine = ocr_engine
+            raw_guess_reason = "partial-character-evidence"
+        if valid:
+            raw_guess_norm = normalize_plate(text)
+            raw_guess_text = format_iran_plate(raw_guess_norm)
+            raw_guess_confidence = float(ocr_confidence)
+            raw_guess_engine = ocr_engine
         combined = _combined_confidence(
             item["confidence"],
             ocr_confidence,
@@ -422,6 +440,27 @@ def process_frame(
             "valid": valid,
             "best_effort": best_effort,
             "needs_review": needs_review,
+            "read_status": (
+                "experimental-guess"
+                if best_effort and needs_review
+                else "confirmed-ai"
+                if valid
+                else "unreadable"
+            ),
+            "raw_guess_text": raw_guess_text,
+            "raw_guess_norm": raw_guess_norm,
+            "raw_guess_confidence": raw_guess_confidence,
+            "raw_guess_engine": raw_guess_engine,
+            "raw_guess_reason": raw_guess_reason,
+            "model_revision": raw_guess_engine or ocr_engine,
+            "experimental": bool(best_effort and needs_review),
+            "hypotheses_accepted_for_consensus": bool(
+                (valid and not needs_review)
+                or (
+                    not plate_hypotheses
+                    and bool(position_hypotheses)
+                )
+            ),
             "vehicle_type": "نامشخص",
             "vehicle_color": "نامشخص",
             "vehicle_brand": "نامشخص",
@@ -640,32 +679,65 @@ class PlateConsensusTracker:
         if track.best_capture_result is None or track.best_frame is None:
             return None
         result = deepcopy(track.best_capture_result)
+        raw_guess_norm = normalize_plate(
+            result.get("raw_guess_norm")
+            or result.get("raw_guess_text")
+            or (
+                result.get("plate")
+                if result.get("best_effort")
+                else ""
+            )
+        )
+        has_raw_guess = plausible_plate(raw_guess_norm)
+        raw_guess_text = (
+            format_iran_plate(raw_guess_norm)
+            if has_raw_guess
+            else str(result.get("raw_guess_text") or "")
+        )
         result.update({
             "plate": (
-                "ناخوانا"
-                if final_unreadable
-                else "در حال بررسی"
+                raw_guess_text
+                if raw_guess_text
+                else (
+                    "ناخوانا"
+                    if final_unreadable
+                    else "در حال بررسی"
+                )
             ),
             "plate_norm": "",
             "valid": False,
-            "ocr_confidence": 0.0,
+            "ocr_confidence": float(
+                result.get("raw_guess_confidence")
+                or result.get("ocr_confidence", 0.0)
+            ),
             "track_id": track.track_id,
             "first_seen": track.first_seen,
             "last_seen": track.last_seen,
             "capture_only": True,
             "capture_refresh": bool(refresh),
             "provisional": not bool(final_unreadable),
-            "unreadable_final": bool(final_unreadable),
-            "best_effort": False,
+            "unreadable_final": bool(
+                final_unreadable and not raw_guess_text
+            ),
+            "best_effort": bool(raw_guess_text),
             "needs_review": True,
             "read_status": (
-                "unreadable"
-                if final_unreadable
-                else "processing"
+                "experimental-guess"
+                if raw_guess_text
+                else (
+                    "unreadable"
+                    if final_unreadable
+                    else "processing"
+                )
             ),
+            "raw_guess_text": raw_guess_text,
+            "raw_guess_norm": raw_guess_norm if has_raw_guess else "",
+            "experimental": bool(raw_guess_text),
             "capture_frame": track.best_frame.copy(),
             "consensus_votes": 0,
         })
+        if final_unreadable and has_raw_guess:
+            return auto_confirm_guess(result)
         return result
 
     def _unreadable_ready(
@@ -886,10 +958,30 @@ class PlateConsensusTracker:
         return confidence * max(0.25, quality)
 
     @staticmethod
-    def _position_probabilities(row: dict) -> list[dict[str, float]]:
+    def _position_probabilities(
+        row: dict,
+        include_rejected=False,
+    ) -> list[dict[str, float]]:
         candidates = {}
         primary = normalize_plate(row.get("plate", ""))
-        if row.get("valid") and plausible_plate(primary):
+        consensus_allowed = bool(
+            row.get(
+                "hypotheses_accepted_for_consensus",
+                (
+                    row.get("valid")
+                    and not row.get("needs_review")
+                )
+                or (
+                    bool(row.get("position_hypotheses"))
+                    and not bool(row.get("plate_hypotheses"))
+                ),
+            )
+        )
+        if (
+            row.get("valid")
+            and (include_rejected or consensus_allowed)
+            and plausible_plate(primary)
+        ):
             candidates[primary] = max(
                 0.05,
                 float(
@@ -897,7 +989,11 @@ class PlateConsensusTracker:
                     or row.get("confidence", 0.0)
                 ),
             )
-        for hypothesis in row.get("plate_hypotheses", []):
+        for hypothesis in (
+            row.get("plate_hypotheses", [])
+            if include_rejected or consensus_allowed
+            else []
+        ):
             normalized = normalize_plate(
                 hypothesis.get("plate_norm")
                 or hypothesis.get("plate")
@@ -927,7 +1023,11 @@ class PlateConsensusTracker:
             }
             for plate, weight in candidates.items()
         ]
-        for hypothesis in row.get("position_hypotheses", []):
+        for hypothesis in (
+            row.get("position_hypotheses", [])
+            if include_rejected or consensus_allowed
+            else []
+        ):
             positions = {}
             for raw_position, raw_value in hypothesis.get(
                 "positions",
@@ -979,7 +1079,10 @@ class PlateConsensusTracker:
     def _consensus(self, track: _Track) -> dict | None:
         evidence = []
         for row in track.observations:
-            probabilities = self._position_probabilities(row)
+            probabilities = self._position_probabilities(
+                row,
+                include_rejected=False,
+            )
             if probabilities:
                 copied = deepcopy(row)
                 copied["_position_probabilities"] = probabilities
@@ -1109,6 +1212,15 @@ class PlateConsensusTracker:
         result["best_effort"] = False
         result["needs_review"] = False
         result["read_status"] = "confirmed-ai"
+        result["experimental"] = False
+        result["raw_guess_text"] = result["plate"]
+        result["raw_guess_norm"] = winner_norm
+        result["raw_guess_confidence"] = float(
+            result.get("ocr_confidence", result["confidence"])
+        )
+        result["raw_guess_engine"] = str(
+            result.get("ocr_engine", "")
+        )
 
         engine_support = defaultdict(float)
         alternative_support = defaultdict(float)
@@ -1231,7 +1343,10 @@ class PlateConsensusTracker:
 
         evidence = []
         for row in track.observations:
-            probabilities = self._position_probabilities(row)
+            probabilities = self._position_probabilities(
+                row,
+                include_rejected=True,
+            )
             if any(probabilities):
                 evidence.append((row, probabilities))
         if not evidence:
@@ -1310,11 +1425,15 @@ class PlateConsensusTracker:
                 if complete
                 else _partial_plate_text(winners)
             ),
-            "plate_norm": normalized if complete else "",
-            "valid": complete,
+            "plate_norm": "",
+            "valid": False,
             "best_effort": True,
             "needs_review": True,
-            "read_status": "probable" if complete else "partial",
+            "read_status": (
+                "experimental-guess"
+                if complete
+                else "partial"
+            ),
             "confidence": round(confidence, 4),
             "track_id": track.track_id,
             "first_seen": track.first_seen,
@@ -1324,9 +1443,25 @@ class PlateConsensusTracker:
             "provisional": False,
             "unreadable_final": False,
             "partial_final": not complete,
+            "raw_guess_text": (
+                format_iran_plate(normalized)
+                if complete
+                else _partial_plate_text(winners)
+            ),
+            "raw_guess_norm": normalized if complete else "",
+            "raw_guess_confidence": round(confidence, 4),
+            "raw_guess_reason": (
+                "multi-frame-rejected-hypotheses"
+                if complete
+                else "partial-character-evidence"
+            ),
+            "experimental": True,
+            "hypotheses_accepted_for_consensus": False,
             "consensus_votes": min(vote_counts.values()),
             "consensus_observations": len(evidence),
         })
+        if complete:
+            basis = auto_confirm_guess(basis)
         if track.best_frame is not None:
             basis["capture_frame"] = track.best_frame.copy()
         if track.best_capture_result is not None:
