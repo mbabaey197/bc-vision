@@ -140,6 +140,40 @@ def test_roi_and_translation():
     assert row["vehicle_bbox"] == (20, 20, 40, 40)
 
 
+def test_operator_assisted_rows_replaces_only_unreadable_overlap():
+    baseline = [{
+        "bbox": (20, 20, 140, 60),
+        "plate": "ناخوانا",
+        "valid": False,
+        "needs_review": True,
+    }, {
+        "bbox": (180, 20, 300, 60),
+        "plate": "12-ب-345-67",
+        "plate_norm": "12ب34567",
+        "valid": True,
+        "needs_review": False,
+    }]
+    shadow = [{
+        "bbox": (22, 21, 142, 61),
+        "plate": "31-ط-556-74",
+        "raw_guess_norm": "31ط55674",
+        "valid": False,
+    }, {
+        "bbox": (182, 21, 302, 61),
+        "plate": "12-ب-345-76",
+        "raw_guess_norm": "12ب34576",
+        "valid": False,
+    }]
+
+    selected = live_worker.operator_assisted_rows(baseline, shadow)
+
+    assert len(selected) == 2
+    assert selected[0]["raw_guess_norm"] == "31ط55674"
+    assert selected[0]["assisted_candidate"] is True
+    assert selected[0]["needs_review"] is True
+    assert selected[1]["plate_norm"] == "12ب34567"
+
+
 def test_submit_is_non_blocking_and_drops_to_latest(monkeypatch):
     worker = live_worker.LiveANPRWorker(max_workers=1)
     monkeypatch.setattr(
