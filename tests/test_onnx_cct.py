@@ -9,7 +9,11 @@ from app.ai.onnx_cct import (
     decode_cct_hypotheses,
     prepare_cct_input,
 )
-from tools.benchmark_cct_video import _persist_emitted_rows
+from tools.benchmark_cct_video import (
+    _persist_emitted_rows,
+    _raw_guess_from_hypotheses,
+    _update_nearest_raw,
+)
 from tools.render_cct_benchmark_report import render_report
 
 
@@ -187,6 +191,34 @@ def test_cct_benchmark_row_keeps_crop_next_to_recognized_text(tmp_path):
     assert "crop" not in rows[0]
 
 
+def test_cct_benchmark_keeps_rejected_raw_guess_separate_from_truth():
+    crop = np.full((24, 96, 3), 180, dtype=np.uint8)
+    observation = _raw_guess_from_hypotheses(
+        [{
+            "plate": "31-ط-556-75",
+            "plate_norm": "31ط55675",
+            "confidence": 0.73,
+        }],
+        accepted=False,
+        reason="position-margin",
+        frame_number=20,
+        fps=8.0,
+        detection={
+            "confidence": 0.81,
+            "bbox": (1, 2, 30, 12),
+            "method": "yolov8-onnx-light",
+            "crop": crop,
+        },
+    )
+    nearest = {}
+    _update_nearest_raw(nearest, observation, {"31ط55674"})
+
+    assert observation["accepted"] is False
+    assert observation["plate_norm"] == "31ط55675"
+    assert nearest["31ط55674"]["character_distance"] == 1
+    assert nearest["31ط55674"]["crop"] is not crop
+
+
 def test_cct_html_report_embeds_crop_beside_the_same_row_text(tmp_path):
     crop_dir = tmp_path / "crops"
     crop_dir.mkdir()
@@ -204,6 +236,18 @@ def test_cct_html_report_embeds_crop_beside_the_same_row_text(tmp_path):
         "detections": 3,
         "emitted_count": 1,
         "elapsed_seconds": 1.25,
+        "raw_exact_truth_count": 0,
+        "nearest_raw_by_truth": [{
+            "truth": "31-ط-556-74",
+            "plate": "31-ط-556-75",
+            "plate_norm": "31ط55675",
+            "crop_path": "crops/plate-0001.jpg",
+            "character_distance": 1,
+            "confidence": 0.73,
+            "video_second": 2.5,
+            "exact_observations": 0,
+            "accepted": False,
+        }],
         "emitted": [{
             "plate": "31-ط-556-74",
             "plate_norm": "31ط55674",
@@ -218,9 +262,17 @@ def test_cct_html_report_embeds_crop_beside_the_same_row_text(tmp_path):
     report = render_report([("CCT-S-v2", result)])
 
     assert "31-ط-556-74" in report
+    assert "31-ط-556-75" in report
+    assert "حدس آزمایشی" in report
     assert "مطابق Golden" in report
     assert "data:image/jpeg;base64," in report
-    assert report.index("data:image/jpeg;base64,") < report.index(
+    emitted_section = report.index(
+        "خروجی‌های پذیرفته‌شدهٔ Tracker"
+    )
+    assert report.index(
+        "data:image/jpeg;base64,",
+        emitted_section,
+    ) < report.index(
         "31-ط-556-74",
-        report.index("<tbody>"),
+        emitted_section,
     )
