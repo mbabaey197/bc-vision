@@ -219,6 +219,75 @@ def test_oversized_video_upload_is_removed(tmp_path, monkeypatch):
     assert list(video_dir.iterdir()) == []
 
 
+def test_video_test_displays_plate_crop_and_text_on_one_row(
+    tmp_path,
+    monkeypatch,
+):
+    _as_role(monkeypatch, "operator")
+    storage = tmp_path / "storage"
+    videos = storage / "videos"
+    plates = storage / "plates"
+    snapshots = storage / "snapshots"
+    backups = storage / "backups"
+    for folder in (videos, plates, snapshots, backups):
+        folder.mkdir(parents=True)
+    settings = {
+        "storage_root": str(storage),
+        "video_path": str(videos),
+        "plate_path": str(plates),
+        "snapshot_path": str(snapshots),
+        "backup_path": str(backups),
+    }
+    monkeypatch.setattr(
+        main,
+        "get_setting",
+        lambda key, default="": settings.get(key, default),
+    )
+
+    def fake_process(video_path, plate_dir, snapshot_dir, **kwargs):
+        assert Path(video_path).is_file()
+        assert kwargs["frame_step"] == 1
+        Path(plate_dir).mkdir(parents=True)
+        crop = Path(plate_dir) / "plate-1.jpg"
+        crop.write_bytes(b"jpeg")
+        return (
+            {
+                "frames": 12,
+                "fps": 8.0,
+                "width": 1920,
+                "height": 1080,
+                "duration": 1.5,
+            },
+            [{
+                "plate": "31-ط-556-74",
+                "plate_norm": "31ط55674",
+                "plate_path": str(crop),
+                "confidence": 0.91,
+                "video_second": 0.75,
+                "ocr_engine": "fast-plate-ocr-cct",
+                "valid": True,
+                "needs_review": False,
+            }],
+        )
+
+    monkeypatch.setattr(
+        "app.ai.video_test.process_video",
+        fake_process,
+    )
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/ai/video-test/upload",
+            files={"video": ("golden.mp4", b"fixture", "video/mp4")},
+        )
+
+    assert response.status_code == 200
+    assert "تصویر پلاک / متن تشخیص‌داده‌شده" in response.text
+    assert "31-ط-556-74" in response.text
+    assert "fast-plate-ocr-cct" in response.text
+    assert "/media?path=" in response.text
+
+
 def test_camera_video_upload_registers_live_source_without_batch_processing(
     tmp_path,
     monkeypatch,

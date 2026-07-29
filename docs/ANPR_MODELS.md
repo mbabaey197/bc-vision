@@ -72,19 +72,20 @@ Every model is accepted only after exact size and SHA-256 verification.
 Per-camera ONNX Runtime sessions use at most two intra-operation threads, one
 inter-operation thread, sequential execution and disabled worker spinning.
 
-## RC13 candidate bundle
+## RC14 candidate bundle
 
-RC13 adds a second, fail-safe engine contract without replacing the verified
+RC14 extends the fail-safe engine contract without replacing the verified
 RC12 models:
 
 - a rotated YOLO26-OBB detector exported to ONNX;
-- a fine-tuned Iranian Hezar/CRNN OCR exported to ONNX;
+- a custom FastPlateOCR CCT-S/XS Iranian OCR exported to ONNX;
 - mandatory perspective rectification from the four OBB corners;
-- constrained CTC beam search with multiple plate hypotheses;
+- fixed-position Iranian-layout decoding with multiple plate hypotheses;
 - `baseline`, `shadow` and `next` runtime modes.
 
 The candidate engine is not enabled merely because two ONNX files exist. Its
-`active-models.json` must use schema `1`, identify `bcvision-rc13`, list the
+`active-models.json` must use schema `1`, identify either the compatible
+`bcvision-rc13` engine or the new `bcvision-rc14` engine, list the
 exact filename, size and SHA-256 of both files, and carry an Ed25519 signature
 verified by `model_public_key.pem`. Missing, modified or unsigned bundles fail
 closed to `baseline`.
@@ -105,9 +106,45 @@ BCVISION_ANPR_MODEL_PUBLIC_KEY
 BCVISION_ANPR_MODE=baseline|shadow|next
 ```
 
-No trained YOLO26-OBB or fine-tuned Hezar weights are committed in RC13. Those
+No trained YOLO26-OBB or promoted CCT weights are committed in RC14. Those
 weights must be produced from licensed data, signed, and pass the fixed real
 camera Golden Dataset in shadow mode before `next` can be activated.
+
+The signed OCR entry must declare its runtime. RC14 accepts the historical
+`hezar-ctc-onnx` contract and the new `fast-plate-ocr-cct` contract. A CCT
+entry also signs its alphabet, eight output slots, input dimensions, layout,
+dtype, colour mode and rejection thresholds. Unknown runtimes or incomplete
+CCT contracts fail closed before ONNX Runtime is started. CCT entries require
+the `bcvision-rc14` engine identifier; legacy RC13 bundles remain Hezar-only.
+
+### FastPlateOCR CCT-S/XS training and benchmark
+
+`fast-plate-ocr` v1.1.0 is MIT licensed and is used only by the offline
+training/export environment. Installed BC Vision systems continue to run only
+the exported ONNX file through the existing bounded ONNX Runtime sessions.
+
+- `tools/generate_cct_synthetic_dataset.py` creates a reproducible synthetic
+  Iranian-plate dataset with disjoint train/validation plate identities and
+  balanced coverage of every supported Persian and diplomatic letter.
+- `tools/prepare_cct_dataset.py` imports only explicitly licensed,
+  operator-labelled company crops and rejects Golden Dataset rows.
+- `tools/train_fastplate_cct.py` trains CCT-XS-v2 or CCT-S-v2, exports a
+  fixed-batch uint8 NHWC ONNX file, verifies its SHA-256 and measures exact
+  held-out accuracy and CPU latency. The validated training environment is
+  Python 3.12 with TensorFlow CPU. An optional released FastPlateOCR model can
+  initialize only shape-compatible backbone tensors; OCR, region and
+  incompatible slot-query tensors are never transferred.
+- `tools/benchmark_cct_video.py` processes every selected video frame with the
+  current detector and multi-frame tracker. It can require the exact video
+  SHA-256 before execution.
+
+The public IR-LPR dataset is not used by this path because its repository
+declares GPL-3.0. BC Vision's proprietary candidate training accepts
+company-owned, operator-confirmed, CC0 or CC-BY-4.0 data only. The fixed
+`01.mp4` Golden Dataset remains benchmark-only and must not enter training.
+Synthetic generation also requires an approved commercial font license and
+does not accept a third-party plate dataset hidden behind the synthetic
+manifest.
 
 ### Hezar v2 export and isolated benchmark
 
@@ -120,7 +157,7 @@ export whose ONNX Runtime output differs materially from PyTorch.
 detector for an isolated OCR comparison before an OBB weight exists. Truth
 plates must be supplied explicitly; other outputs remain unverified.
 
-The local `01.mp4` benchmark on 2026-07-28 processed all 546 frames. Baseline
+The historical `01.mp4` benchmark on 2026-07-28 processed all 546 frames. Baseline
 and ready-made Hezar v2 each matched only 1 of the 3 known plates, while Hezar
 was 37.3% slower. The checkpoint was therefore not promoted. See
 `agent-results/latest/ANPR_HEZAR_VIDEO_BENCHMARK_RC13.md`.

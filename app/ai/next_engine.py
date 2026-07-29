@@ -1,11 +1,16 @@
-"""Fail-safe baseline/shadow/next routing for the RC13 ANPR engine."""
+"""Fail-safe baseline/shadow/next routing for the RC14 ANPR engine."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 import threading
 import time
 
-from .next_models import engine_mode, rollback_to_baseline
+from .next_models import (
+    engine_mode,
+    rollback_to_baseline,
+    verified_next_manifest,
+)
+from .onnx_cct import cct_status, read_plate_cct
 from .onnx_hezar import hezar_status, read_plate_hezar
 from .onnx_obb import detect_plates_obb, obb_status
 
@@ -19,6 +24,29 @@ class EngineFrameResult:
     shadow_ms: float
     degraded: bool = False
     error: str = ""
+
+
+def _read_candidate_ocr(crop, engine_key=None) -> tuple[dict, dict, str]:
+    manifest = verified_next_manifest()
+    runtime = str(
+        manifest["models"]["ocr"].get(
+            "runtime",
+            "hezar-ctc-onnx",
+        )
+    ).strip().lower()
+    if runtime == "fast-plate-ocr-cct":
+        return (
+            read_plate_cct(crop, engine_key=engine_key),
+            cct_status(),
+            runtime,
+        )
+    if runtime == "hezar-ctc-onnx":
+        return (
+            read_plate_hezar(crop, engine_key=engine_key),
+            hezar_status(),
+            runtime,
+        )
+    raise RuntimeError(f"Unsupported candidate OCR runtime: {runtime}")
 
 
 def process_frame_next(
@@ -40,20 +68,22 @@ def process_frame_next(
         and not detector_state.get("model_loaded")
     ):
         raise RuntimeError(
-            "RC13 detector failed: "
+            "RC14 detector failed: "
             + str(detector_state.get("error", "unknown error"))
         )
     for detection in detections:
         crop = detection["crop"]
         quality = image_quality(crop)
-        ocr = read_plate_hezar(crop, engine_key=engine_key)
-        ocr_state = hezar_status()
+        ocr, ocr_state, ocr_engine = _read_candidate_ocr(
+            crop,
+            engine_key=engine_key,
+        )
         if (
             ocr_state.get("attempted")
             and not ocr_state.get("model_loaded")
         ):
             raise RuntimeError(
-                "RC13 OCR failed: "
+                "RC14 OCR failed: "
                 + str(ocr_state.get("error", "unknown error"))
             )
         valid = bool(ocr["accepted"])
@@ -67,17 +97,26 @@ def process_frame_next(
         position_hypotheses = []
         for hypothesis in ocr["hypotheses"]:
             plate = hypothesis["plate_norm"]
+            raw_positions = hypothesis.get("positions", {})
             position_hypotheses.append({
                 "positions": {
                     position: {
                         "character": character,
-                        "confidence": hypothesis["confidence"],
+                        "confidence": float(
+                            raw_positions.get(
+                                position,
+                                {},
+                            ).get(
+                                "confidence",
+                                hypothesis["confidence"],
+                            )
+                        ),
                     }
                     for position, character in enumerate(plate)
                 },
                 "coverage": len(plate),
                 "score": hypothesis["confidence"],
-                "engine": "hezar-ctc-onnx",
+                "engine": ocr_engine,
             })
         results.append({
             **detection,
@@ -87,7 +126,7 @@ def process_frame_next(
             "confidence": round(min(1.0, confidence), 4),
             "detector_confidence": float(detection["confidence"]),
             "ocr_confidence": float(ocr["confidence"]),
-            "ocr_engine": "hezar-ctc-onnx",
+            "ocr_engine": ocr_engine,
             "quality_score": float(quality["score"]),
             "quality": quality,
             "plate_hypotheses": ocr["hypotheses"],

@@ -5,7 +5,7 @@
 - GitHub repository: `mahdibabaey197/bc-vision`
 - Default branch: `main`
 - Product: BC Vision
-- Current application version in source: `2.2.0-rc13`
+- Current application version in source: `2.2.0-rc14`
 - Windows persistent data root: `C:\ProgramData\BCVision\data`
 
 ## Release contract
@@ -49,7 +49,7 @@ The Iranian plate-recognition subsystem now includes:
 - per-camera ONNX sessions with a hard two-thread ceiling
 - persistent feedback datasets and gated CRNN candidate promotion
 - Jalali visible dates and Persian digits for all visible dates and times
-- dormant signed RC13 OBB/Hezar engine with baseline, shadow and next modes
+- dormant signed RC14 OBB/CCT engine with baseline, shadow and next modes
 - mandatory OBB perspective rectification before candidate OCR
 - five-best-frame probability voting and strict ambiguity rejection
 - geometric-only track association; OCR text never links vehicle tracks
@@ -501,6 +501,57 @@ elapsed time was 92.751 seconds versus 67.542 seconds. The candidate therefore
 failed promotion and RC12 remains the active customer engine. No model weight
 was committed. RC13 regression after the decoder/export additions is
 `145 passed, 1 skipped`.
+
+## RC14 FastPlateOCR CCT candidate
+
+Version `2.2.0-rc14` replaces Hezar as the intended next OCR architecture with
+custom FastPlateOCR CCT-XS-v2 and CCT-S-v2 candidates. Hezar remains available
+only for reproducing its failed benchmark. The CCT production reader uses
+NumPy, OpenCV and ONNX Runtime only; Keras and Torch are confined to the
+offline training environment.
+
+The signed model manifest selects the OCR runtime. A CCT manifest entry must
+also bind the alphabet, eight fixed output positions, input dimensions,
+fixed NHWC layout, uint8 dtype, RGB conversion, resize policy and strict
+ambiguity thresholds. The ONNX graph must expose the exact signed
+`1x64x128x3 -> 1x8x37` contract. Unsupported runtimes, legacy engine IDs used
+with CCT, and incomplete contracts fail closed to baseline.
+
+Training data must carry a machine-readable provenance manifest. The new tools
+accept company-owned/operator-confirmed, CC0 or CC-BY-4.0 crops, keep complete
+vehicle/plate groups in one split, and reject rows marked as Golden,
+benchmark or test data. The GPL-3.0 IR-LPR repository is deliberately excluded
+from the proprietary model path. A reproducible synthetic Iranian plate
+generator is included to bootstrap training without importing a third-party
+plate dataset. Transfer learning copies only shape-compatible feature
+backbone tensors from released FastPlateOCR models; OCR/region heads and
+incompatible slot-query tensors are deliberately reinitialized for the
+Iranian eight-position alphabet. Python 3.12 and TensorFlow CPU form the
+validated offline training environment.
+
+Promotion still requires both CCT variants to run on the exact same
+operator-labelled Golden Dataset. The winner must improve exact full-plate
+accuracy over RC12, avoid a false-accept or scenario-slice regression, and
+remain faster than the recorded `67.542` second all-frame baseline on
+`01.mp4`. A synthetic validation result alone can never activate `next`.
+
+The exact fixed video was supplied again and verified by SHA-256 on
+2026-07-28. Both Stage-2 candidates processed all 546 frames but matched
+`0/3` known truth plates. CCT-XS emitted 214 rows containing 99 unverified
+unique strings in `82.165` seconds; CCT-S emitted 204 rows containing 113
+unverified unique strings in `153.530` seconds. Both are rejected and RC12
+remains active. Inspection of the saved OCR crops showed that the source is a
+four-camera composite and the fallback detector repeatedly selects OSD date,
+clock and camera-name text. The next iteration needs a dedicated plate
+detector plus labelled real company footage; synthetic OCR accuracy is not a
+substitute.
+
+The legacy `/ai/video-test` preparation-only page now runs actual full-frame
+ANPR. It displays one row per tracked passage with the exact saved plate crop,
+recognized text or `ناخوانا`, confidence, video time and OCR engine. The
+standalone Golden benchmark can also persist every crop and render a
+self-contained RTL HTML report with the crop and its recognized text on the
+same row. Golden/test crops remain prohibited from entering training.
 
 ## Repository visibility authorization
 

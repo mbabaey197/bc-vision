@@ -1,4 +1,4 @@
-"""Verified RC13 model bundle activation and fail-safe engine selection.
+"""Verified RC13/RC14 model bundle activation and fail-safe engine selection.
 
 The next ANPR engine is intentionally dormant until a signed manifest and both
 ONNX files are present.  A failed verification or runtime rollback always
@@ -10,18 +10,25 @@ import base64
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import threading
 import time
 
 from .model_manager import verify_file
+from .plate_rules import ALLOWED_PLATE_LETTERS
 
 
 MANIFEST_SCHEMA = 1
 RUNTIME_SCHEMA = 1
 ENGINE_MODES = {"baseline", "shadow", "next"}
 REQUIRED_MODELS = ("detector", "ocr")
+SUPPORTED_ENGINE_IDS = {"bcvision-rc13", "bcvision-rc14"}
+OCR_RUNTIMES = {
+    "hezar-ctc-onnx",
+    "fast-plate-ocr-cct",
+}
 MANIFEST_CACHE_SECONDS = 30.0
 _cache_lock = threading.RLock()
 _verified_cache: tuple[tuple, float, dict] | None = None
@@ -103,6 +110,94 @@ def _safe_model_path(root: Path, filename: str) -> Path:
     return candidate
 
 
+def _validate_ocr_runtime(spec: dict, engine_id: str) -> str:
+    runtime = str(
+        spec.get("runtime", "hezar-ctc-onnx")
+    ).strip().lower()
+    if runtime not in OCR_RUNTIMES:
+        raise ValueError(f"Unsupported next-model OCR runtime: {runtime}")
+    if runtime == "fast-plate-ocr-cct":
+        if engine_id != "bcvision-rc14":
+            raise ValueError(
+                "FastPlateOCR CCT requires the bcvision-rc14 engine"
+            )
+        alphabet = str(spec.get("alphabet", ""))
+        slots = int(spec.get("max_plate_slots", 0))
+        width = int(spec.get("input_width", 0))
+        height = int(spec.get("input_height", 0))
+        layout = str(spec.get("input_layout", "")).strip().lower()
+        dtype = str(spec.get("input_dtype", "")).strip().lower()
+        color_mode = str(
+            spec.get("image_color_mode", "")
+        ).strip().lower()
+        keep_aspect_ratio = spec.get("keep_aspect_ratio")
+        interpolation = str(
+            spec.get("interpolation", "")
+        ).strip().lower()
+        padding_color = spec.get("padding_color")
+        thresholds = {
+            name: spec.get(name)
+            for name in (
+                "min_confidence",
+                "min_position_confidence",
+                "min_position_margin",
+                "min_hypothesis_margin",
+            )
+        }
+        numeric_thresholds = all(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            for value in thresholds.values()
+        )
+        beam_width = spec.get("beam_width")
+        top_k = spec.get("top_k")
+        if (
+            slots != 8
+            or alphabet
+            != "0123456789" + ALLOWED_PLATE_LETTERS + "_"
+            or len(set(alphabet)) != len(alphabet)
+            or width != 128
+            or height != 64
+            or layout != "nhwc"
+            or dtype != "uint8"
+            or color_mode != "rgb"
+            or keep_aspect_ratio is not False
+            or interpolation not in {
+                "nearest",
+                "linear",
+                "cubic",
+                "area",
+                "lanczos4",
+            }
+            or not isinstance(padding_color, list)
+            or len(padding_color) != 3
+            or any(
+                not isinstance(value, int) or not 0 <= value <= 255
+                for value in padding_color
+            )
+            or not numeric_thresholds
+            or not 0.5 <= float(thresholds["min_confidence"]) <= 1.0
+            or not 0.3
+            <= float(thresholds["min_position_confidence"])
+            <= 1.0
+            or not 0.01
+            <= float(thresholds["min_position_margin"])
+            <= 1.0
+            or not 0.005
+            <= float(thresholds["min_hypothesis_margin"])
+            <= 1.0
+            or not isinstance(beam_width, int)
+            or isinstance(beam_width, bool)
+            or not 2 <= beam_width <= 64
+            or not isinstance(top_k, int)
+            or isinstance(top_k, bool)
+            or not 2 <= top_k <= min(10, beam_width)
+        ):
+            raise ValueError("Invalid signed FastPlateOCR CCT contract")
+    return runtime
+
+
 def _file_fingerprint(paths) -> tuple:
     values = []
     for path in paths:
@@ -143,7 +238,8 @@ def verified_next_manifest() -> dict:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if int(payload.get("schema", 0)) != MANIFEST_SCHEMA:
         raise ValueError("Unsupported next-model manifest schema")
-    if str(payload.get("engine", "")) != "bcvision-rc13":
+    engine_id = str(payload.get("engine", ""))
+    if engine_id not in SUPPORTED_ENGINE_IDS:
         raise ValueError("Unexpected next-model engine identifier")
     _verify_signature(payload)
 
@@ -170,11 +266,17 @@ def verified_next_manifest() -> dict:
             raise ValueError(
                 f"Next-model SHA-256 verification failed: {name}"
             )
+        runtime = (
+            _validate_ocr_runtime(spec, engine_id)
+            if name == "ocr"
+            else str(spec.get("runtime", "yolo26-obb-onnx"))
+        )
         resolved[name] = {
             **spec,
             "path": str(model_path),
             "sha256": digest,
             "size": size,
+            "runtime": runtime,
         }
     result = deepcopy(payload)
     result["manifest_path"] = str(path)
@@ -205,6 +307,7 @@ def next_models_status() -> dict:
             "manifest_path": manifest["manifest_path"],
             "detector_path": manifest["models"]["detector"]["path"],
             "ocr_path": manifest["models"]["ocr"]["path"],
+            "ocr_runtime": manifest["models"]["ocr"]["runtime"],
             "error": "",
         }
     except Exception as exc:
@@ -214,6 +317,7 @@ def next_models_status() -> dict:
             "manifest_path": str(next_manifest_path()),
             "detector_path": "",
             "ocr_path": "",
+            "ocr_runtime": "",
             "error": f"{type(exc).__name__}: {exc}",
         }
 
@@ -264,7 +368,7 @@ def _write_engine_mode(
     if selected not in ENGINE_MODES:
         raise ValueError("Unknown ANPR engine mode")
     if selected != "baseline" and not next_models_status()["ready"]:
-        raise ValueError("Verified RC13 models are not ready")
+        raise ValueError("Verified next-generation models are not ready")
     previous = requested_engine_mode()
     payload = {
         "schema": RUNTIME_SCHEMA,

@@ -1290,6 +1290,37 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(...), vid
         return upload_error(f'خطا در آماده‌سازی ویدئو: {e}',500)
 
 # ---------- Video AI Test Upload ----------
+def _video_test_result_row(event, index):
+    plate_path = str(event.get('plate_path') or '')
+    plate_image = (
+        f"<a href='/media?path={quote(plate_path)}' target='_blank'>"
+        f"<img class='thumb plate-thumb' "
+        f"src='/media?path={quote(plate_path)}' "
+        f"alt='تصویر پلاک ردیف {index}'></a>"
+        if plate_path and Path(plate_path).is_file()
+        else "<span class='recent-media-missing' "
+        "style='width:130px;height:48px'>بدون تصویر پلاک</span>"
+    )
+    plate_text = str(event.get('plate') or 'ناخوانا')
+    confidence = max(0.0, min(1.0, float(event.get('confidence') or 0.0)))
+    video_second = max(0.0, float(event.get('video_second') or 0.0))
+    engine = str(event.get('ocr_engine') or event.get('method') or '—')
+    status = (
+        "<span class='read-badge confirmed'>خوانش قطعی</span>"
+        if event.get('valid') and not event.get('needs_review')
+        else "<span class='read-badge unreadable'>ناخوانا / نیازمند بررسی</span>"
+    )
+    return (
+        f"<tr><td>{persian_digits(index)}</td>"
+        f"<td><div class='recent-plate-result'>{plate_image}"
+        f"<div data-recognized-text='{escape(plate_text)}'>"
+        f"{iran_plate_html(plate_text, True)}{status}</div></div></td>"
+        f"<td>{persian_digits(round(confidence * 100, 1))}٪</td>"
+        f"<td>{persian_digits(round(video_second, 2))} ثانیه</td>"
+        f"<td class='code'>{escape(engine)}</td></tr>"
+    )
+
+
 @app.get('/ai/video-test', response_class=HTMLResponse)
 def ai_video_test_page(request: Request):
     u=auth(request)
@@ -1297,12 +1328,20 @@ def ai_video_test_page(request: Request):
         return RedirectResponse('/login',302)
     if not has_permission(request,'video.process'):return access_denied()
     return page('تست ویدئو',"""
-    <div style="direction:rtl;font-family:Tahoma;padding:30px">
-    <h2>🧠 تست پلاک‌خوان با فایل ویدئو</h2>
-    <form action="/ai/video-test/upload" method="post" enctype="multipart/form-data">
-      <input type="file" name="video" accept=".mp4,.avi,.mkv,.mov" />
-      <button type="submit">شروع تست AI</button>
-    </form>
+    <div class="wrap">
+      <div class="toolbar"><h1>تست واقعی پلاک‌خوان با ویدئو</h1></div>
+      <div class="card">
+        <p class="muted">تمام فریم‌ها پردازش می‌شوند. از هر تردد، بهترین
+        تصویر پلاک و متن تشخیص‌داده‌شده در یک ردیف نمایش داده می‌شود؛
+        نتیجه مبهم با عنوان «ناخوانا» باقی می‌ماند.</p>
+        <form action="/ai/video-test/upload" method="post"
+              enctype="multipart/form-data">
+          <label>فایل ویدئو</label>
+          <input type="file" name="video"
+                 accept=".mp4,.avi,.mkv,.mov,.m4v" required>
+          <button type="submit">شروع پردازش کامل</button>
+        </form>
+      </div>
     </div>
     """,u,request)
 
@@ -1320,18 +1359,71 @@ async def ai_video_test_upload(request: Request, video: UploadFile = File(...)):
     except ValueError as e:
         return page('خطای ویدئو',f"<div class='wrap'><div class='alert'>{escape(str(e))}</div></div>",u,request)
     try:
-        from app.ai.video_test import VideoTester
-        tester = VideoTester(target)
-        info = tester.info()
-        tester.close()
-        return page('نتیجه آماده‌سازی ویدئو',f"""
-        <div style="direction:rtl;font-family:Tahoma;padding:30px">
-        <h2>نتیجه آماده‌سازی ویدئو</h2>
-        <p>فایل: {escape(video.filename or '')}</p>
-        <p>فریم: {info['frames']}</p>
-        <p>FPS: {info['fps']}</p>
-        <p>رزولوشن: {info['width']}x{info['height']}</p>
-        <p>مرحله بعد: اتصال همین ورودی به موتور تشخیص پلاک</p>
+        from app.ai.video_test import process_video
+        run_name = target.stem
+        plate_dir = (
+            _configured_storage_child('plate_path', PLATE_DIR)
+            / 'video-tests'
+            / run_name
+        )
+        snapshot_dir = (
+            _configured_storage_child('snapshot_path', SNAPSHOT_DIR)
+            / 'video-tests'
+            / run_name
+        )
+        started = time.perf_counter()
+        info, events = process_video(
+            target,
+            plate_dir,
+            snapshot_dir,
+            frame_step=1,
+            max_events=10000,
+            min_confidence=0.20,
+            duplicate_seconds=2.5,
+        )
+        elapsed = time.perf_counter() - started
+        readable = sum(
+            1
+            for event in events
+            if event.get('valid') and not event.get('needs_review')
+        )
+        rows = ''.join(
+            _video_test_result_row(event, index)
+            for index, event in enumerate(events, start=1)
+        ) or (
+            "<tr><td colspan='5'>هیچ پلاکی در این ویدئو تشخیص داده نشد."
+            "</td></tr>"
+        )
+        return page('نتیجه تست پلاک‌خوان',f"""
+        <div class="wrap">
+          <div class="toolbar">
+            <h1>نتیجه تست پلاک‌خوان</h1>
+            <a class="btn secondary" href="/ai/video-test">تست ویدئوی دیگر</a>
+          </div>
+          <div class="card">
+            <div class="stat-grid">
+              <div class="stat"><small>فریم</small>
+                <b>{persian_digits(info['frames'])}</b></div>
+              <div class="stat"><small>تردد تشخیص‌داده‌شده</small>
+                <b>{persian_digits(len(events))}</b></div>
+              <div class="stat"><small>خوانش قطعی</small>
+                <b>{persian_digits(readable)}</b></div>
+              <div class="stat"><small>زمان پردازش</small>
+                <b>{persian_digits(round(elapsed, 2))} ثانیه</b></div>
+            </div>
+            <p class="muted">فایل: {escape(video.filename or '')} —
+            {persian_digits(info['width'])}×{persian_digits(info['height'])}
+            در {persian_digits(info['fps'])} FPS</p>
+          </div>
+          <div class="card">
+            <div class="table-wrap"><table>
+              <thead><tr><th>ردیف</th>
+                <th>تصویر پلاک / متن تشخیص‌داده‌شده</th>
+                <th>اطمینان</th><th>زمان ویدئو</th><th>موتور</th>
+              </tr></thead>
+              <tbody>{rows}</tbody>
+            </table></div>
+          </div>
         </div>
         """,u,request)
     except Exception as e:
