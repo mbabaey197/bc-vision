@@ -253,3 +253,27 @@ def test_pretrained_transfer_rejects_different_backbone_shape():
 
     with pytest.raises(ValueError, match="does not match"):
         _copy_pretrained_backbone(source, target)
+
+
+def test_training_rejects_pretrained_and_resume_together(tmp_path):
+    from tools.train_fastplate_cct import train_and_export
+
+    dataset = tmp_path / "dataset"
+    output = tmp_path / "output"
+    pretrained = tmp_path / "pretrained.keras"
+    resume = tmp_path / "resume.keras"
+    pretrained.write_bytes(b"pretrained")
+    resume.write_bytes(b"resume")
+
+    with pytest.raises(ValueError, match="either pretrained backbone"):
+        train_and_export(
+            dataset=dataset,
+            output=output,
+            variant="xs",
+            pretrained_backbone=pretrained,
+            resume_checkpoint=resume,
+            checkpoint_metric="char",
+            epochs=4,
+            batch_size=4,
+            seed=1,
+        )
