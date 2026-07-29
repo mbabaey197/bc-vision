@@ -24,7 +24,16 @@ MANIFEST_SCHEMA = 1
 RUNTIME_SCHEMA = 1
 ENGINE_MODES = {"baseline", "shadow", "next"}
 REQUIRED_MODELS = ("detector", "ocr")
-SUPPORTED_ENGINE_IDS = {"bcvision-rc13", "bcvision-rc14"}
+SUPPORTED_ENGINE_IDS = {
+    "bcvision-rc13",
+    "bcvision-rc14",
+    "bcvision-rc15",
+}
+DETECTOR_RUNTIMES = {
+    "baseline-yolov8-onnx",
+    "yolo26-obb-onnx",
+    "ppyoloe-r-onnx",
+}
 OCR_RUNTIMES = {
     "hezar-ctc-onnx",
     "fast-plate-ocr-cct",
@@ -117,9 +126,9 @@ def _validate_ocr_runtime(spec: dict, engine_id: str) -> str:
     if runtime not in OCR_RUNTIMES:
         raise ValueError(f"Unsupported next-model OCR runtime: {runtime}")
     if runtime == "fast-plate-ocr-cct":
-        if engine_id != "bcvision-rc14":
+        if engine_id not in {"bcvision-rc14", "bcvision-rc15"}:
             raise ValueError(
-                "FastPlateOCR CCT requires the bcvision-rc14 engine"
+                "FastPlateOCR CCT requires the bcvision-rc14/rc15 engine"
             )
         alphabet = str(spec.get("alphabet", ""))
         slots = int(spec.get("max_plate_slots", 0))
@@ -198,6 +207,77 @@ def _validate_ocr_runtime(spec: dict, engine_id: str) -> str:
     return runtime
 
 
+def _validate_detector_runtime(spec: dict, engine_id: str) -> str:
+    runtime = str(
+        spec.get("runtime", "yolo26-obb-onnx")
+    ).strip().lower()
+    if runtime not in DETECTOR_RUNTIMES:
+        raise ValueError(
+            f"Unsupported next-model detector runtime: {runtime}"
+        )
+    if runtime == "baseline-yolov8-onnx":
+        if (
+            engine_id != "bcvision-rc15"
+            or spec.get("reuse_verified_baseline") is not True
+        ):
+            raise ValueError(
+                "Baseline detector reuse requires the bcvision-rc15 engine"
+            )
+        return runtime
+    if runtime != "ppyoloe-r-onnx":
+        return runtime
+    if engine_id != "bcvision-rc15":
+        raise ValueError(
+            "PP-YOLOE-R requires the bcvision-rc15 engine"
+        )
+    width = spec.get("input_width")
+    height = spec.get("input_height")
+    mean = spec.get("mean")
+    std = spec.get("std")
+    score_threshold = spec.get("score_threshold")
+    nms_threshold = spec.get("nms_threshold")
+    max_results = spec.get("max_results")
+
+    def numeric_triplet(values):
+        return (
+            isinstance(values, list)
+            and len(values) == 3
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                for value in values
+            )
+        )
+
+    if (
+        not isinstance(width, int)
+        or isinstance(width, bool)
+        or not isinstance(height, int)
+        or isinstance(height, bool)
+        or not 320 <= width <= 1280
+        or not 320 <= height <= 1280
+        or width % 32
+        or height % 32
+        or spec.get("keep_ratio") is not True
+        or int(spec.get("pad_to_stride", 0)) != 32
+        or not numeric_triplet(mean)
+        or not numeric_triplet(std)
+        or any(float(value) <= 0 for value in std)
+        or not isinstance(score_threshold, (int, float))
+        or isinstance(score_threshold, bool)
+        or not 0.01 <= float(score_threshold) <= 0.95
+        or not isinstance(nms_threshold, (int, float))
+        or isinstance(nms_threshold, bool)
+        or not 0.01 <= float(nms_threshold) <= 0.90
+        or not isinstance(max_results, int)
+        or isinstance(max_results, bool)
+        or not 1 <= max_results <= 32
+    ):
+        raise ValueError("Invalid signed PP-YOLOE-R detector contract")
+    return runtime
+
+
 def _file_fingerprint(paths) -> tuple:
     values = []
     for path in paths:
@@ -241,6 +321,22 @@ def verified_next_manifest() -> dict:
     engine_id = str(payload.get("engine", ""))
     if engine_id not in SUPPORTED_ENGINE_IDS:
         raise ValueError("Unexpected next-model engine identifier")
+    usage_scope = str(
+        payload.get("usage_scope", "production-candidate")
+    ).strip().lower()
+    if usage_scope not in {
+        "production-candidate",
+        "research-shadow-only",
+    }:
+        raise ValueError("Unexpected next-model usage scope")
+    if usage_scope == "research-shadow-only" and (
+        payload.get("distribution_allowed") is not False
+        or payload.get("activation_allowed") is not False
+    ):
+        raise ValueError(
+            "Research-only model bundle must be non-distributable and "
+            "Shadow-only"
+        )
     _verify_signature(payload)
 
     models = payload.get("models")
@@ -252,6 +348,11 @@ def verified_next_manifest() -> dict:
         spec = models.get(name)
         if not isinstance(spec, dict):
             raise ValueError(f"Missing next-model entry: {name}")
+        runtime = (
+            _validate_ocr_runtime(spec, engine_id)
+            if name == "ocr"
+            else _validate_detector_runtime(spec, engine_id)
+        )
         filename = str(spec.get("filename", "")).strip()
         digest = str(spec.get("sha256", "")).strip().upper()
         size = int(spec.get("size", 0))
@@ -261,16 +362,29 @@ def verified_next_manifest() -> dict:
             or size <= 0
         ):
             raise ValueError(f"Invalid next-model entry: {name}")
-        model_path = _safe_model_path(root, filename)
+        if name == "detector" and runtime == "baseline-yolov8-onnx":
+            from .model_manager import (
+                DETECTOR_SHA256,
+                DETECTOR_SIZE,
+                detector_path,
+            )
+
+            if (
+                filename != "plate_yolo.onnx"
+                or digest != DETECTOR_SHA256
+                or size != DETECTOR_SIZE
+            ):
+                raise ValueError(
+                    "Baseline detector reuse must bind the verified "
+                    "BC Vision detector"
+                )
+            model_path = detector_path()
+        else:
+            model_path = _safe_model_path(root, filename)
         if not verify_file(model_path, digest, size):
             raise ValueError(
                 f"Next-model SHA-256 verification failed: {name}"
             )
-        runtime = (
-            _validate_ocr_runtime(spec, engine_id)
-            if name == "ocr"
-            else str(spec.get("runtime", "yolo26-obb-onnx"))
-        )
         resolved[name] = {
             **spec,
             "path": str(model_path),
@@ -279,6 +393,7 @@ def verified_next_manifest() -> dict:
             "runtime": runtime,
         }
     result = deepcopy(payload)
+    result["usage_scope"] = usage_scope
     result["manifest_path"] = str(path)
     result["models"] = resolved
     fingerprint = _file_fingerprint([
@@ -306,8 +421,12 @@ def next_models_status() -> dict:
             "release_id": str(manifest.get("release_id", "")),
             "manifest_path": manifest["manifest_path"],
             "detector_path": manifest["models"]["detector"]["path"],
+            "detector_runtime": manifest["models"]["detector"][
+                "runtime"
+            ],
             "ocr_path": manifest["models"]["ocr"]["path"],
             "ocr_runtime": manifest["models"]["ocr"]["runtime"],
+            "usage_scope": manifest["usage_scope"],
             "error": "",
         }
     except Exception as exc:
@@ -316,8 +435,10 @@ def next_models_status() -> dict:
             "release_id": "",
             "manifest_path": str(next_manifest_path()),
             "detector_path": "",
+            "detector_runtime": "",
             "ocr_path": "",
             "ocr_runtime": "",
+            "usage_scope": "",
             "error": f"{type(exc).__name__}: {exc}",
         }
 
@@ -356,7 +477,15 @@ def engine_mode() -> str:
     requested = requested_engine_mode()
     if requested == "baseline":
         return requested
-    return requested if next_models_status()["ready"] else "baseline"
+    status = next_models_status()
+    if not status["ready"]:
+        return "baseline"
+    if (
+        requested == "next"
+        and status.get("usage_scope") == "research-shadow-only"
+    ):
+        return "baseline"
+    return requested
 
 
 def _write_engine_mode(
@@ -367,8 +496,16 @@ def _write_engine_mode(
     selected = str(mode).strip().lower()
     if selected not in ENGINE_MODES:
         raise ValueError("Unknown ANPR engine mode")
-    if selected != "baseline" and not next_models_status()["ready"]:
+    status = next_models_status()
+    if selected != "baseline" and not status["ready"]:
         raise ValueError("Verified next-generation models are not ready")
+    if (
+        selected == "next"
+        and status.get("usage_scope") == "research-shadow-only"
+    ):
+        raise ValueError(
+            "Research-only models can run only in Shadow mode"
+        )
     previous = requested_engine_mode()
     payload = {
         "schema": RUNTIME_SCHEMA,
