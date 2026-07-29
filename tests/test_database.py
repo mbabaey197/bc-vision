@@ -90,6 +90,15 @@ def test_old_database_migrates_without_data_loss(
             "ocr_engine",
             "ocr_alternative",
             "ocr_disagreement",
+            "raw_guess_text",
+            "raw_guess_norm",
+            "raw_guess_confidence",
+            "raw_guess_engine",
+            "raw_guess_reason",
+            "model_revision",
+            "experimental",
+            "confirmation_source",
+            "operator_reviewed",
         } <= columns
         feedback_columns = {
             row[1]
@@ -108,6 +117,11 @@ def test_old_database_migrates_without_data_loss(
             "dataset_split",
             "training_status",
             "trained_run_id",
+            "observed_engine",
+            "observed_confidence",
+            "observed_model_revision",
+            "character_distance",
+            "exact_match",
         } <= feedback_columns
         assert con.execute(
             "SELECT COUNT(*) FROM sqlite_master "
