@@ -158,8 +158,13 @@ def init_db():
             event_id INTEGER NOT NULL,
             observed_text TEXT NOT NULL,
             observed_norm TEXT NOT NULL DEFAULT '',
+            observed_engine TEXT NOT NULL DEFAULT '',
+            observed_confidence REAL NOT NULL DEFAULT 0,
+            observed_model_revision TEXT NOT NULL DEFAULT '',
             corrected_text TEXT NOT NULL,
             corrected_norm TEXT NOT NULL,
+            character_distance INTEGER NOT NULL DEFAULT 0,
+            exact_match INTEGER NOT NULL DEFAULT 0,
             plate_image_path TEXT DEFAULT '',
             image_path TEXT DEFAULT '',
             submitted_by TEXT DEFAULT '',
@@ -225,6 +230,15 @@ def init_db():
             "source": "TEXT DEFAULT 'video'",
             "processing_ms": "REAL DEFAULT 0",
             "review_status": "TEXT NOT NULL DEFAULT 'confirmed-ai'",
+            "confirmation_source": "TEXT NOT NULL DEFAULT 'ai-strict'",
+            "operator_reviewed": "INTEGER NOT NULL DEFAULT 0",
+            "raw_guess_text": "TEXT NOT NULL DEFAULT ''",
+            "raw_guess_norm": "TEXT NOT NULL DEFAULT ''",
+            "raw_guess_confidence": "REAL NOT NULL DEFAULT 0",
+            "raw_guess_engine": "TEXT NOT NULL DEFAULT ''",
+            "raw_guess_reason": "TEXT NOT NULL DEFAULT ''",
+            "model_revision": "TEXT NOT NULL DEFAULT ''",
+            "experimental": "INTEGER NOT NULL DEFAULT 0",
         })
         _add_missing_columns(con, "anpr_feedback", {
             "sample_path": "TEXT DEFAULT ''",
@@ -232,6 +246,11 @@ def init_db():
             "dataset_split": "TEXT DEFAULT ''",
             "training_status": "TEXT DEFAULT 'pending'",
             "trained_run_id": "INTEGER",
+            "observed_engine": "TEXT NOT NULL DEFAULT ''",
+            "observed_confidence": "REAL NOT NULL DEFAULT 0",
+            "observed_model_revision": "TEXT NOT NULL DEFAULT ''",
+            "character_distance": "INTEGER NOT NULL DEFAULT 0",
+            "exact_match": "INTEGER NOT NULL DEFAULT 0",
         })
         _backfill_plate_norm(con)
         con.executescript("""
@@ -247,6 +266,8 @@ def init_db():
             ON anpr_feedback(event_id);
         CREATE INDEX IF NOT EXISTS idx_anpr_feedback_training
             ON anpr_feedback(training_status,dataset_split);
+        CREATE INDEX IF NOT EXISTS idx_anpr_feedback_model_revision
+            ON anpr_feedback(observed_model_revision,created_at);
         CREATE INDEX IF NOT EXISTS idx_anpr_training_runs_created
             ON anpr_training_runs(created_at);
         """)
@@ -298,6 +319,7 @@ def init_db():
             "retention_plates_days": "90",
             "retention_videos_days": "7",
             "retention_events_days": "0",
+            "anpr_auto_confirm_guesses": "1",
         }
         for key, value in defaults.items():
             con.execute(
