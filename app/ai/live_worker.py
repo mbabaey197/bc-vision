@@ -19,11 +19,45 @@ from app.cpu_budget import parallel_camera_limit, threads_per_camera
 from .pipeline import (
     PlateConsensusTracker,
     add_vehicle_analysis,
+    bbox_iou,
     process_frame,
 )
 from .plate_rules import normalize_plate
 from .feedback import apply_learned_correction
 from .next_engine import engine_router
+from .review_policy import (
+    auto_confirm_guess,
+    tag_assisted_candidate,
+)
+
+
+def operator_assisted_rows(primary: list, shadow: list) -> list:
+    """Prefer a complete Shadow guess over an overlapping unreadable row.
+
+    Strict baseline reads retain priority. Candidate output stays tagged as
+    experimental until the tracker has enough temporal evidence to emit one
+    automatically confirmed, operator-reviewable event.
+    """
+
+    selected = [dict(row) for row in primary]
+    for raw_candidate in shadow:
+        candidate = tag_assisted_candidate(raw_candidate)
+        if candidate is None or not candidate.get("bbox"):
+            continue
+        overlaps = [
+            (bbox_iou(row.get("bbox"), candidate["bbox"]), index)
+            for index, row in enumerate(selected)
+            if row.get("bbox")
+        ]
+        overlap, index = max(overlaps, default=(0.0, -1))
+        if overlap >= 0.28:
+            baseline = selected[index]
+            if baseline.get("valid") and not baseline.get("needs_review"):
+                continue
+            selected[index] = candidate
+        else:
+            selected.append(candidate)
+    return selected
 
 
 @dataclass
@@ -330,11 +364,56 @@ class LiveANPRWorker:
                 "unreadable"
                 if result.get("unreadable_final")
                 else (
-                    "suggested"
-                    if result.get("needs_review")
-                    else "confirmed-ai"
+                    "auto-confirmed"
+                    if result.get("auto_confirmed")
+                    else (
+                        "suggested"
+                        if result.get("needs_review")
+                        else "confirmed-ai"
+                    )
                 )
             ),
+            "confirmation_source": result.get(
+                "confirmation_source",
+                (
+                    "operator-learned"
+                    if result.get("operator_learned")
+                    else "ai-strict"
+                ),
+            ),
+            "operator_reviewed": int(bool(
+                result.get("operator_reviewed")
+            )),
+            "raw_guess_text": result.get(
+                "raw_guess_text",
+                result.get("plate", ""),
+            ),
+            "raw_guess_norm": result.get(
+                "raw_guess_norm",
+                normalize_plate(result.get("plate")),
+            ),
+            "raw_guess_confidence": float(
+                result.get(
+                    "raw_guess_confidence",
+                    result.get("ocr_confidence", 0.0),
+                )
+            ),
+            "raw_guess_engine": result.get(
+                "raw_guess_engine",
+                result.get("ocr_engine", ""),
+            ),
+            "raw_guess_reason": result.get(
+                "raw_guess_reason",
+                "",
+            ),
+            "model_revision": result.get(
+                "model_revision",
+                result.get("ocr_engine", ""),
+            ),
+            "experimental": int(bool(
+                result.get("experimental")
+                or result.get("needs_review")
+            )),
         }
         with connect() as con:
             columns = {
@@ -525,12 +604,36 @@ class LiveANPRWorker:
                 min_detection_confidence=min_confidence * 0.45,
                 engine_key=camera_id,
             )
-            rows = [
+            primary_rows = [
                 apply_learned_correction(
                     self._translate(row, offset_x, offset_y)
                 )
                 for row in outcome.primary
             ]
+            shadow_rows = [
+                {
+                    **self._translate(row, offset_x, offset_y),
+                    "engine_lane": "candidate-shadow",
+                    "experimental": True,
+                    "needs_review": True,
+                }
+                for row in outcome.shadow
+            ]
+            assisted_enabled = (
+                self._setting("anpr_auto_confirm_guesses", "1") == "1"
+            )
+            rows = (
+                operator_assisted_rows(primary_rows, shadow_rows)
+                if outcome.mode == "shadow"
+                and assisted_enabled
+                and shadow_rows
+                else primary_rows
+            )
+            display_rows = (
+                rows
+                if outcome.mode == "shadow" and assisted_enabled
+                else rows + shadow_rows
+            )
             if outcome.mode == "shadow":
                 state.shadow_frames += 1
                 state.shadow_candidates += len(outcome.shadow)
@@ -590,6 +693,15 @@ class LiveANPRWorker:
                 timestamp=timestamp,
                 frame=frame,
             )
+            stable = [
+                auto_confirm_guess(row)
+                if (
+                    row.get("assisted_candidate")
+                    and not row.get("capture_only")
+                )
+                else row
+                for row in stable
+            ]
             state.latest_detections = [
                     {
                         "bbox": tuple(
@@ -621,8 +733,33 @@ class LiveANPRWorker:
                         "ocr_disagreement": bool(
                             row.get("ocr_disagreement")
                         ),
+                        "raw_guess_text": row.get(
+                            "raw_guess_text",
+                            row.get("plate", ""),
+                        ),
+                        "raw_guess_confidence": float(
+                            row.get(
+                                "raw_guess_confidence",
+                                row.get("ocr_confidence", 0.0),
+                            )
+                        ),
+                        "raw_guess_reason": row.get(
+                            "raw_guess_reason",
+                            "",
+                        ),
+                        "model_revision": row.get(
+                            "model_revision",
+                            row.get("ocr_engine", ""),
+                        ),
+                        "engine_lane": row.get(
+                            "engine_lane",
+                            "baseline",
+                        ),
+                        "experimental": bool(
+                            row.get("experimental")
+                        ),
                     }
-                    for row in rows
+                    for row in display_rows
                 ]
             state.latest_detection_frame = frame.copy()
             state.latest_detections_at = time.time()
