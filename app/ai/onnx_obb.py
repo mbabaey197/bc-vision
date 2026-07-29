@@ -21,6 +21,7 @@ MIN_CAMERA_SESSION_CACHE = 3
 class _SessionEntry:
     session: object
     input_name: str
+    input_names: tuple[str, ...]
     run_lock: threading.Lock
 
 
@@ -197,6 +198,72 @@ def decode_obb_output(
     return kept
 
 
+def decode_ppyoloe_r_outputs(
+    pred_bboxes,
+    pred_scores,
+    min_confidence=0.25,
+    nms_threshold=0.1,
+    max_results=8,
+) -> list[dict]:
+    """Decode official PaddleDetection PP-YOLOE-R ONNX outputs.
+
+    The exported graph returns ``B x N x 8`` quadrilaterals and
+    ``B x C x N`` class scores. This matches PaddleDetection's official
+    ``configs/rotate/tools/onnx_infer.py`` contract.
+    """
+
+    boxes = np.asarray(pred_bboxes, dtype=np.float32)
+    scores = np.asarray(pred_scores, dtype=np.float32)
+    if boxes.ndim == 3 and boxes.shape[0] == 1:
+        boxes = boxes[0]
+    if scores.ndim == 3 and scores.shape[0] == 1:
+        scores = scores[0]
+    if boxes.ndim != 2 or boxes.shape[1] != 8:
+        raise ValueError(
+            "Unexpected PP-YOLOE-R bbox shape: "
+            + str(tuple(np.asarray(pred_bboxes).shape))
+        )
+    if scores.ndim != 2:
+        raise ValueError(
+            "Unexpected PP-YOLOE-R score shape: "
+            + str(tuple(np.asarray(pred_scores).shape))
+        )
+    if scores.shape[1] != boxes.shape[0]:
+        if scores.shape[0] == boxes.shape[0]:
+            scores = scores.T
+        else:
+            raise ValueError(
+                "PP-YOLOE-R boxes/scores candidate count differs"
+            )
+
+    threshold = max(0.01, min(0.99, float(min_confidence)))
+    iou_threshold = max(0.01, min(0.90, float(nms_threshold)))
+    rows = []
+    for class_id, class_scores in enumerate(scores):
+        for index in np.flatnonzero(class_scores >= threshold):
+            corners = boxes[int(index)].reshape(4, 2)
+            if abs(float(cv2.contourArea(corners))) < 20.0:
+                continue
+            rows.append({
+                "corners": corners,
+                "confidence": float(class_scores[int(index)]),
+                "class_id": int(class_id),
+                "angle": float(cv2.minAreaRect(corners)[2]),
+            })
+    rows.sort(key=lambda row: row["confidence"], reverse=True)
+    kept = []
+    for row in rows:
+        if all(
+            _rotated_iou(row["corners"], other["corners"])
+            <= iou_threshold
+            for other in kept
+        ):
+            kept.append(row)
+            if len(kept) >= max(1, int(max_results)):
+                break
+    return kept
+
+
 def _rotated_iou(left, right) -> float:
     left_points = np.asarray(left, dtype=np.float32).reshape(4, 2)
     right_points = np.asarray(right, dtype=np.float32).reshape(4, 2)
@@ -229,6 +296,74 @@ def _letterbox(image: np.ndarray, size: int):
     rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
     tensor = np.transpose(rgb, (2, 0, 1)).astype(np.float32) / 255.0
     return tensor[None], ratio, (float(left), float(top))
+
+
+def prepare_ppyoloe_r_input(image: np.ndarray, spec: dict):
+    """Apply the signed PaddleDetection test-time preprocessing contract."""
+
+    height, width = image.shape[:2]
+    target_h = int(spec["input_height"])
+    target_w = int(spec["input_width"])
+    ratio = min(
+        target_h / max(1, height),
+        target_w / max(1, width),
+    )
+    resized_h = max(1, int(round(height * ratio)))
+    resized_w = max(1, int(round(width * ratio)))
+    resized = cv2.resize(
+        image,
+        (resized_w, resized_h),
+        interpolation=cv2.INTER_AREA if ratio < 1.0 else cv2.INTER_LINEAR,
+    )
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(
+        np.float32,
+    ) / 255.0
+    mean = np.asarray(spec["mean"], dtype=np.float32).reshape(1, 1, 3)
+    std = np.asarray(spec["std"], dtype=np.float32).reshape(1, 1, 3)
+    normalized = (rgb - mean) / std
+    stride = int(spec.get("pad_to_stride", 32))
+    pad_h = int(math.ceil(resized_h / stride) * stride)
+    pad_w = int(math.ceil(resized_w / stride) * stride)
+    canvas = np.zeros((pad_h, pad_w, 3), dtype=np.float32)
+    canvas[:resized_h, :resized_w] = normalized
+    tensor = np.transpose(canvas, (2, 0, 1))[None]
+    im_shape = np.asarray(
+        [[resized_h, resized_w]],
+        dtype=np.float32,
+    )
+    scale_factor = np.asarray(
+        [[resized_h / height, resized_w / width]],
+        dtype=np.float32,
+    )
+    return tensor, im_shape, scale_factor
+
+
+def _ppyoloe_r_feeds(
+    input_names,
+    tensor,
+    im_shape,
+    scale_factor,
+) -> dict:
+    feeds = {}
+    for name in input_names:
+        key = str(name).lower()
+        if key == "image" or key.endswith(":image"):
+            feeds[name] = tensor
+        elif "im_shape" in key or "image_shape" in key:
+            feeds[name] = im_shape
+        elif "scale_factor" in key or key.endswith("scale"):
+            feeds[name] = scale_factor
+        else:
+            raise ValueError(
+                f"Unknown PP-YOLOE-R ONNX input: {name}"
+            )
+    required = {id(tensor), id(im_shape), id(scale_factor)}
+    supplied = {id(value) for value in feeds.values()}
+    if not required <= supplied:
+        raise ValueError(
+            "PP-YOLOE-R ONNX graph is missing a required input"
+        )
+    return feeds
 
 
 def _session_options(ort):
@@ -265,6 +400,9 @@ def _load_session(engine_key=None):
         entry = _SessionEntry(
             session=session,
             input_name=session.get_inputs()[0].name,
+            input_names=tuple(
+                item.name for item in session.get_inputs()
+            ),
             run_lock=threading.Lock(),
         )
         _sessions[cache_key] = entry
@@ -286,27 +424,73 @@ def detect_plates_obb(
     try:
         entry, manifest = _load_session(engine_key)
         detector_spec = manifest["models"]["detector"]
-        input_size = max(
-            320,
-            min(1280, int(detector_spec.get("input_size", 640))),
-        )
-        tensor, ratio, (pad_x, pad_y) = _letterbox(frame, input_size)
-        with entry.run_lock:
-            output = entry.session.run(
-                None,
-                {entry.input_name: tensor},
-            )[0]
-        decoded = decode_obb_output(
-            output,
-            min_confidence=min_confidence,
-            max_results=max_results * 2,
-        )
+        runtime = str(
+            detector_spec.get("runtime", "yolo26-obb-onnx")
+        ).strip().lower()
+        coordinates_are_original = False
+        if runtime == "ppyoloe-r-onnx":
+            tensor, im_shape, scale_factor = prepare_ppyoloe_r_input(
+                frame,
+                detector_spec,
+            )
+            feeds = _ppyoloe_r_feeds(
+                entry.input_names,
+                tensor,
+                im_shape,
+                scale_factor,
+            )
+            with entry.run_lock:
+                outputs = entry.session.run(None, feeds)
+            if len(outputs) < 2:
+                raise ValueError(
+                    "PP-YOLOE-R ONNX graph returned fewer than two outputs"
+                )
+            decoded = decode_ppyoloe_r_outputs(
+                outputs[0],
+                outputs[1],
+                min_confidence=max(
+                    float(min_confidence),
+                    float(detector_spec["score_threshold"]),
+                ),
+                nms_threshold=float(
+                    detector_spec["nms_threshold"]
+                ),
+                max_results=min(
+                    int(max_results) * 2,
+                    int(detector_spec["max_results"]),
+                ),
+            )
+            coordinates_are_original = True
+            ratio, pad_x, pad_y = 1.0, 0.0, 0.0
+        else:
+            input_size = max(
+                320,
+                min(
+                    1280,
+                    int(detector_spec.get("input_size", 640)),
+                ),
+            )
+            tensor, ratio, (pad_x, pad_y) = _letterbox(
+                frame,
+                input_size,
+            )
+            with entry.run_lock:
+                output = entry.session.run(
+                    None,
+                    {entry.input_name: tensor},
+                )[0]
+            decoded = decode_obb_output(
+                output,
+                min_confidence=min_confidence,
+                max_results=max_results * 2,
+            )
         height, width = frame.shape[:2]
         results = []
         for row in decoded:
             corners = row["corners"].copy()
-            corners[:, 0] = (corners[:, 0] - pad_x) / ratio
-            corners[:, 1] = (corners[:, 1] - pad_y) / ratio
+            if not coordinates_are_original:
+                corners[:, 0] = (corners[:, 0] - pad_x) / ratio
+                corners[:, 1] = (corners[:, 1] - pad_y) / ratio
             corners[:, 0] = np.clip(corners[:, 0], 0, width - 1)
             corners[:, 1] = np.clip(corners[:, 1], 0, height - 1)
             crop = rectify_plate(frame, corners)
@@ -322,13 +506,14 @@ def detect_plates_obb(
                 "corners": corners.tolist(),
                 "confidence": row["confidence"],
                 "angle": row["angle"],
-                "method": "yolo26-obb-onnx",
+                "method": runtime,
                 "direct_ocr_attempted": False,
             })
             if len(results) >= max_results:
                 break
         with _cache_lock:
             _last_status.update(
+                engine=runtime,
                 attempted=True,
                 model_loaded=True,
                 model_path=detector_spec["path"],
