@@ -54,6 +54,7 @@ if errorlevel 1 goto :error
 rmdir /s /q build 2>nul
 rmdir /s /q dist 2>nul
 
+rem RC15 operator-assisted ANPR modules are packaged explicitly.
 "%BUILD_PY%" -m PyInstaller ^
     --noconfirm ^
     --clean ^
