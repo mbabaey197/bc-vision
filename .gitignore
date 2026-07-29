@@ -14,3 +14,6 @@ tools/keys/
 license.json
 .buildvenv/
 .coverage
+training-data/
+training-runs/
+ir-lpr/
