@@ -1,5 +1,41 @@
 # Third-party notices
 
+## IR-LPR research dataset
+
+BC Vision includes an offline importer for the separately downloaded IR-LPR
+dataset:
+
+- Project: https://github.com/mut-deep/IR-LPR
+- Paper: https://arxiv.org/abs/2209.04680
+- Repository license: GNU General Public License v3.0
+- Repository license Git blob:
+  `f288702d2fa16d3cdf0035b15a9fcbc552cd88e7`
+
+No IR-LPR image, annotation, archive or trained weight is committed or bundled.
+Any candidate trained with IR-LPR is marked non-distributable,
+`research-shadow-only` and cannot become the active BC Vision engine. This
+notice is a software safety policy, not a legal opinion about whether model
+weights are derivative works.
+
+## PaddleDetection PP-YOLOE-R
+
+BC Vision's rotated-detector configuration and ONNX preprocessing/output
+contract are adapted from PaddleDetection release 2.9:
+
+- Project: https://github.com/PaddlePaddle/PaddleDetection
+- PP-YOLOE-R configuration:
+  `configs/rotate/ppyoloe_r/`
+- Official ONNX example:
+  `configs/rotate/tools/onnx_infer.py`
+- License: Apache License 2.0
+- Copyright: PaddlePaddle Authors
+
+The Apache License 2.0 text is available at:
+https://www.apache.org/licenses/LICENSE-2.0
+
+No PaddleDetection trained plate weight is bundled. The BC Vision detector
+must be trained on separately licensed Iranian camera data.
+
 ## Platrix Iranian ANPR models
 
 BC Vision can download and execute these Platrix ONNX assets:
