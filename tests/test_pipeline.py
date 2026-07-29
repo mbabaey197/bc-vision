@@ -361,12 +361,14 @@ def test_complete_low_confidence_hypothesis_is_exposed_for_review(
     )
 
     assert rows[0]["plate"] == "31-ط-556-74"
-    assert rows[0]["valid"] is True
+    assert rows[0]["valid"] is False
     assert rows[0]["best_effort"] is True
     assert rows[0]["needs_review"] is True
+    assert rows[0]["raw_guess_norm"] == "31ط55674"
+    assert rows[0]["read_status"] == "experimental-guess"
 
 
-def test_ambiguous_complete_evidence_becomes_reviewable_best_effort():
+def test_ambiguous_complete_evidence_becomes_auto_confirmed_for_review():
     tracker = PlateConsensusTracker(
         emit_unreadable=True,
         min_unreadable_observations=3,
@@ -419,6 +421,63 @@ def test_ambiguous_complete_evidence_becomes_reviewable_best_effort():
     assert final[0]["valid"] is True
     assert final[0]["needs_review"] is True
     assert final[0]["plate"] != "ناخوانا"
+    assert final[0]["raw_guess_norm"]
+    assert final[0]["plate_norm"] == final[0]["raw_guess_norm"]
+    assert final[0]["auto_confirmed"] is True
+    assert final[0]["read_status"] == "auto-confirmed"
+    assert final[0]["experimental"] is True
+
+
+def test_rejected_hypotheses_never_become_strict_consensus():
+    tracker = PlateConsensusTracker(
+        emit_unreadable=True,
+        min_unreadable_observations=3,
+        min_unreadable_seconds=0.8,
+    )
+    frame = np.full((100, 220, 3), 130, dtype=np.uint8)
+    rejected = result(
+        "31-ط-556-74",
+        0.42,
+        bbox=(20, 30, 170, 70),
+        quality=0.7,
+    )
+    rejected.update({
+        "valid": False,
+        "needs_review": True,
+        "best_effort": True,
+        "plate_norm": "",
+        "raw_guess_text": "31-ط-556-74",
+        "raw_guess_norm": "31ط55674",
+        "hypotheses_accepted_for_consensus": False,
+        "plate_hypotheses": [{
+            "plate_norm": "31ط55674",
+            "confidence": 0.95,
+            "score": 0.95,
+        }],
+    })
+
+    emitted = []
+    for index in range(6):
+        emitted.extend(
+            tracker.update(
+                [rejected],
+                timestamp=index * 0.25,
+                frame=frame,
+            )
+        )
+
+    assert not any(
+        row.get("read_status") == "confirmed-ai"
+        for row in emitted
+    )
+    auto_confirmed = [
+        row for row in emitted
+        if row.get("read_status") == "auto-confirmed"
+    ]
+    assert len(auto_confirmed) == 1
+    assert auto_confirmed[0]["plate_norm"] == "31ط55674"
+    assert auto_confirmed[0]["needs_review"] is True
+    assert auto_confirmed[0]["confirmation_source"] == "ai-auto-guess"
 
 
 def test_partial_character_evidence_is_kept_instead_of_unreadable():
