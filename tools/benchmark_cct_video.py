@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import hashlib
 import json
 from pathlib import Path
@@ -12,7 +13,8 @@ import cv2
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.ai.detector import detect_plates
+from app.ai.detector import detect_plates, detector_status
+from app.ai.evaluation import character_distance
 from app.ai.onnx_cct import (
     _validate_session_contract,
     accept_cct_hypotheses,
@@ -82,6 +84,105 @@ def _persist_emitted_rows(
     return serialized
 
 
+def _raw_guess_from_hypotheses(
+    hypotheses: list[dict],
+    *,
+    accepted: bool,
+    reason: str,
+    frame_number: int,
+    fps: float,
+    detection: dict,
+) -> dict | None:
+    if not hypotheses:
+        return None
+    best = hypotheses[0]
+    normalized = normalize_plate(
+        best.get("plate_norm") or best.get("plate")
+    )
+    if not plausible_plate(normalized):
+        return None
+    return {
+        "plate": format_iran_plate(normalized),
+        "plate_norm": normalized,
+        "confidence": float(best.get("confidence", 0.0)),
+        "accepted": bool(accepted),
+        "reason": str(reason or ""),
+        "frame": int(frame_number),
+        "video_second": round(frame_number / fps, 3),
+        "detector_confidence": float(
+            detection.get("confidence", 0.0)
+        ),
+        "bbox": detection.get("bbox"),
+        "method": str(detection.get("method", "")),
+        "crop": detection.get("crop"),
+    }
+
+
+def _update_nearest_raw(
+    nearest: dict[str, dict],
+    observation: dict,
+    truth_plates: set[str],
+) -> None:
+    observed = str(observation["plate_norm"])
+    for truth in truth_plates:
+        candidate = {
+            **observation,
+            "truth": format_iran_plate(truth),
+            "truth_norm": truth,
+            "character_distance": character_distance(observed, truth),
+        }
+        previous = nearest.get(truth)
+        candidate_rank = (
+            int(candidate["character_distance"]),
+            -float(candidate["confidence"]),
+            int(candidate["frame"]),
+        )
+        previous_rank = (
+            int(previous["character_distance"]),
+            -float(previous["confidence"]),
+            int(previous["frame"]),
+        ) if previous else None
+        if previous_rank is None or candidate_rank < previous_rank:
+            crop = candidate.get("crop")
+            if crop is not None and getattr(crop, "size", 0):
+                candidate["crop"] = crop.copy()
+            nearest[truth] = candidate
+
+
+def _persist_nearest_raw(
+    nearest: dict[str, dict],
+    *,
+    artifact_dir: Path | None,
+) -> list[dict]:
+    raw_dir = artifact_dir / "raw-nearest" if artifact_dir else None
+    if raw_dir is not None:
+        raw_dir.mkdir(parents=True, exist_ok=True)
+    serialized = []
+    for index, truth in enumerate(sorted(nearest), start=1):
+        result = dict(nearest[truth])
+        crop = result.get("crop")
+        if (
+            raw_dir is not None
+            and crop is not None
+            and getattr(crop, "size", 0)
+        ):
+            filename = f"truth-{index:02d}.jpg"
+            crop_path = raw_dir / filename
+            if not cv2.imwrite(
+                str(crop_path),
+                crop,
+                [cv2.IMWRITE_JPEG_QUALITY, 94],
+            ):
+                raise OSError(
+                    f"Could not save nearest raw crop: {crop_path}"
+                )
+            result["crop_path"] = str(
+                Path("raw-nearest") / filename
+            )
+        serialized.append(_serializable(result))
+    return serialized
+
+
 def _session_options(ort):
     options = ort.SessionOptions()
     options.intra_op_num_threads = threads_per_camera()
@@ -141,6 +242,14 @@ def benchmark(
     processed_frames = 0
     detection_count = 0
     emitted = []
+    normalized_truth = {
+        normalize_plate(value)
+        for value in truth_plates
+        if plausible_plate(value)
+    }
+    raw_guess_count = 0
+    raw_guess_frequencies: Counter[str] = Counter()
+    nearest_raw: dict[str, dict] = {}
     started = time.perf_counter()
     try:
         while True:
@@ -185,6 +294,24 @@ def benchmark(
                     ),
                 )
                 quality = image_quality(crop)
+                raw_guess = _raw_guess_from_hypotheses(
+                    hypotheses,
+                    accepted=bool(ocr["accepted"]),
+                    reason=str(ocr.get("reason", "")),
+                    frame_number=frame_number,
+                    fps=fps,
+                    detection=item,
+                )
+                if raw_guess is not None:
+                    raw_guess_count += 1
+                    raw_guess_frequencies[
+                        str(raw_guess["plate_norm"])
+                    ] += 1
+                    _update_nearest_raw(
+                        nearest_raw,
+                        raw_guess,
+                        normalized_truth,
+                    )
                 normalized = normalize_plate(
                     ocr.get("plate_norm", "")
                 )
@@ -201,7 +328,11 @@ def benchmark(
                     "plate": (
                         format_iran_plate(normalized)
                         if valid
-                        else "ناخوانا"
+                        else (
+                            raw_guess["plate"]
+                            if raw_guess is not None
+                            else "ناخوانا"
+                        )
                     ),
                     "plate_norm": normalized if valid else "",
                     "confidence": confidence,
@@ -216,8 +347,34 @@ def benchmark(
                     "plate_hypotheses": hypotheses,
                     "position_hypotheses": [],
                     "valid": valid,
-                    "best_effort": False,
+                    "best_effort": bool(not valid and raw_guess),
                     "needs_review": not valid,
+                    "read_status": (
+                        "confirmed-ai"
+                        if valid
+                        else "experimental-guess"
+                        if raw_guess is not None
+                        else "unreadable"
+                    ),
+                    "raw_guess_text": (
+                        raw_guess["plate"]
+                        if raw_guess is not None
+                        else ""
+                    ),
+                    "raw_guess_norm": (
+                        raw_guess["plate_norm"]
+                        if raw_guess is not None
+                        else ""
+                    ),
+                    "raw_guess_confidence": (
+                        raw_guess["confidence"]
+                        if raw_guess is not None
+                        else 0.0
+                    ),
+                    "raw_guess_engine": "fast-plate-ocr-cct",
+                    "raw_guess_reason": str(ocr.get("reason", "")),
+                    "experimental": not valid,
+                    "hypotheses_accepted_for_consensus": valid,
                 })
             emitted.extend(
                 _persist_emitted_rows(
@@ -242,11 +399,19 @@ def benchmark(
             fps=fps,
         )
     )
-    normalized_truth = {
-        normalize_plate(value)
-        for value in truth_plates
-        if plausible_plate(value)
-    }
+    for truth, row in nearest_raw.items():
+        row["exact_observations"] = int(
+            raw_guess_frequencies.get(truth, 0)
+        )
+    nearest_raw_rows = _persist_nearest_raw(
+        nearest_raw,
+        artifact_dir=artifact_dir,
+    )
+    raw_exact_truth = sorted(
+        truth
+        for truth, row in nearest_raw.items()
+        if int(row["character_distance"]) == 0
+    )
     emitted_norms = {
         normalize_plate(result.get("plate_norm", ""))
         for result in emitted
@@ -264,6 +429,7 @@ def benchmark(
         "frames": frame_number,
         "processed_frames": processed_frames,
         "detections": detection_count,
+        "detector": detector_status(),
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "truth_count": len(normalized_truth),
         "matched_truth_count": len(matched_truth),
@@ -278,6 +444,22 @@ def benchmark(
         "missed_truth": [
             format_iran_plate(value)
             for value in missed_truth
+        ],
+        "raw_guess_observation_count": raw_guess_count,
+        "raw_guess_unique_count": len(raw_guess_frequencies),
+        "raw_exact_truth_count": len(raw_exact_truth),
+        "raw_exact_truth": [
+            format_iran_plate(value)
+            for value in raw_exact_truth
+        ],
+        "nearest_raw_by_truth": nearest_raw_rows,
+        "top_raw_guesses": [
+            {
+                "plate": format_iran_plate(plate),
+                "plate_norm": plate,
+                "observations": count,
+            }
+            for plate, count in raw_guess_frequencies.most_common(25)
         ],
         "emitted_unique_count": len(emitted_norms),
         "unmatched_emitted_unique_count": len(unmatched_emitted),
@@ -335,6 +517,7 @@ def main(argv=None) -> int:
         "matched_truth_count": result["matched_truth_count"],
         "matched_truth": result["matched_truth"],
         "truth_recall": result["truth_recall"],
+        "raw_exact_truth_count": result["raw_exact_truth_count"],
         "unmatched_emitted_unique_count": (
             result["unmatched_emitted_unique_count"]
         ),
