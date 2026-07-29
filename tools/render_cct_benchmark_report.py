@@ -77,17 +77,63 @@ def _result_section(label: str, result: dict) -> str:
         rows.append(
             "<tr><td colspan='7' class='empty'>هیچ خروجی ثبت نشد.</td></tr>"
         )
+    raw_rows = []
+    for index, event in enumerate(
+        result.get("nearest_raw_by_truth", []),
+        start=1,
+    ):
+        crop_path = artifact_dir / str(event.get("crop_path") or "")
+        image_uri = _image_data_uri(crop_path)
+        image = (
+            f"<img src='{image_uri}' alt='نزدیک‌ترین حدس خام {index}'>"
+            if image_uri
+            else "<span class='missing'>تصویر ذخیره نشده</span>"
+        )
+        distance = int(event.get("character_distance") or 0)
+        status = (
+            "<span class='status match'>حدس خام دقیق</span>"
+            if distance == 0
+            else "<span class='status review'>حدس آزمایشی</span>"
+        )
+        raw_rows.append(
+            "<tr>"
+            f"<td>{escape(str(event.get('truth') or '—'))}</td>"
+            f"<td class='crop'>{image}</td>"
+            f"<td><strong dir='ltr'>{escape(str(event.get('plate') or '—'))}</strong>{status}</td>"
+            f"<td>{distance}</td>"
+            f"<td>{round(float(event.get('confidence') or 0.0) * 100, 1)}%</td>"
+            f"<td>{round(float(event.get('video_second') or 0.0), 3)}s</td>"
+            f"<td>{int(event.get('exact_observations') or 0)}</td>"
+            f"<td>{'بله' if event.get('accepted') else 'خیر'}</td>"
+            "</tr>"
+        )
+    if not raw_rows:
+        raw_rows.append(
+            "<tr><td colspan='8' class='empty'>هیچ حدس خامی ثبت نشد.</td></tr>"
+        )
     matched = int(result.get("matched_truth_count") or 0)
     truth_count = int(result.get("truth_count") or 0)
+    raw_matched = int(result.get("raw_exact_truth_count") or 0)
     return (
         f"<section><h2>{escape(label)}</h2>"
         "<div class='metrics'>"
         f"<div><small>فریم پردازش‌شده</small><b>{int(result.get('processed_frames') or 0)}</b></div>"
         f"<div><small>تشخیص اولیه</small><b>{int(result.get('detections') or 0)}</b></div>"
         f"<div><small>تطابق Golden</small><b>{matched}/{truth_count}</b></div>"
+        f"<div><small>حدس خام دقیق</small><b>{raw_matched}/{truth_count}</b></div>"
         f"<div><small>خروجی Track</small><b>{int(result.get('emitted_count') or 0)}</b></div>"
         f"<div><small>زمان CPU</small><b>{float(result.get('elapsed_seconds') or 0.0):.3f}s</b></div>"
         "</div>"
+        "<h3>نزدیک‌ترین حدس خام به هر پلاک Golden</h3>"
+        "<p>این ردیف‌ها برای مشاهدهٔ خطا هستند و نتیجهٔ قطعی یا برچسب آموزشی محسوب نمی‌شوند.</p>"
+        "<div class='table-wrap'><table><thead><tr>"
+        "<th>پلاک واقعی</th><th>تصویر Crop</th><th>بهترین حدس خام</th>"
+        "<th>خطای کاراکتری</th><th>اطمینان OCR</th><th>زمان</th>"
+        "<th>تکرار حدس دقیق</th><th>پذیرفته شد؟</th>"
+        "</tr></thead><tbody>"
+        + "".join(raw_rows)
+        + "</tbody></table></div>"
+        "<h3>خروجی‌های پذیرفته‌شدهٔ Tracker</h3>"
         "<div class='table-wrap'><table><thead><tr>"
         "<th>ردیف</th><th>تصویر پلاک</th><th>متن تشخیص‌داده‌شده</th>"
         "<th>اطمینان کل</th><th>اطمینان OCR</th><th>زمان</th><th>Track</th>"
@@ -120,7 +166,7 @@ main{{max-width:1380px;margin:auto;padding:28px}}
 h1{{margin:0 0 10px}}h2{{margin-top:0}}
 .lead{{color:#536170;line-height:1.9;margin-bottom:24px}}
 section{{background:#fff;border:1px solid #dce5ee;border-radius:18px;padding:20px;margin:18px 0;box-shadow:0 8px 24px #17334d12}}
-.metrics{{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:10px;margin:14px 0 18px}}
+.metrics{{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:10px;margin:14px 0 18px}}
 .metrics div{{background:#f5f8fb;border-radius:12px;padding:12px}}
 .metrics small{{display:block;color:#667787;margin-bottom:6px}}.metrics b{{font-size:20px}}
 .table-wrap{{overflow:auto}}table{{width:100%;border-collapse:collapse;min-width:940px}}
