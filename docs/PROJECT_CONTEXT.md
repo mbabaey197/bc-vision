@@ -5,7 +5,7 @@
 - GitHub repository: `mahdibabaey197/bc-vision`
 - Default branch: `main`
 - Product: BC Vision
-- Current application version in source: `2.2.0-rc14`
+- Current application version in source: `2.2.0-rc15`
 - Windows persistent data root: `C:\ProgramData\BCVision\data`
 
 ## Release contract
@@ -517,17 +517,22 @@ ambiguity thresholds. The ONNX graph must expose the exact signed
 `1x64x128x3 -> 1x8x37` contract. Unsupported runtimes, legacy engine IDs used
 with CCT, and incomplete contracts fail closed to baseline.
 
-Training data must carry a machine-readable provenance manifest. The new tools
-accept company-owned/operator-confirmed, CC0 or CC-BY-4.0 crops, keep complete
-vehicle/plate groups in one split, and reject rows marked as Golden,
-benchmark or test data. The GPL-3.0 IR-LPR repository is deliberately excluded
-from the proprietary model path. A reproducible synthetic Iranian plate
-generator is included to bootstrap training without importing a third-party
-plate dataset. Transfer learning copies only shape-compatible feature
-backbone tensors from released FastPlateOCR models; OCR/region heads and
-incompatible slot-query tensors are deliberately reinitialized for the
-Iranian eight-position alphabet. Python 3.12 and TensorFlow CPU form the
-validated offline training environment.
+Training data must carry a machine-readable provenance manifest. The
+commercial path accepts company-owned/operator-confirmed, CC0 or CC-BY-4.0
+crops, keeps complete vehicle/plate groups in one split, and rejects rows
+marked as Golden, benchmark or test data. The GPL-3.0 IR-LPR repository is
+still excluded from the proprietary production model path, but the owner
+requested an isolated research comparison on 2026-07-29. The dedicated
+`prepare_ir_lpr_dataset.py` adapter therefore marks all IR-LPR derivatives
+non-distributable and Shadow-only, preserves its official test split and
+removes cross-split image/plate-identity leakage. A signed research bundle is
+blocked from activating `next`. A reproducible synthetic Iranian plate
+generator remains available to bootstrap commercial training without
+importing a third-party plate dataset. Transfer learning copies only
+shape-compatible feature backbone tensors from released FastPlateOCR models;
+OCR/region heads and incompatible slot-query tensors are deliberately
+reinitialized for the Iranian eight-position alphabet. Python 3.12 and
+TensorFlow CPU form the validated offline training environment.
 
 Promotion still requires both CCT variants to run on the exact same
 operator-labelled Golden Dataset. The winner must improve exact full-plate
@@ -553,7 +558,86 @@ standalone Golden benchmark can also persist every crop and render a
 self-contained RTL HTML report with the crop and its recognized text on the
 same row. Golden/test crops remain prohibited from entering training.
 
+## RC15 PP-YOLOE-R and observable raw guesses
+
+Version `2.2.0-rc15` implements the selected next detector runtime instead of
+renaming the RC14 YOLO scaffold. A signed `bcvision-rc15` bundle can declare
+`ppyoloe-r-onnx`; preprocessing supplies the three official PaddleDetection
+inputs and the decoder consumes the official rotated boxes/scores tensors.
+The contract, preprocessing thresholds and every model file remain covered by
+the signed manifest and SHA-256 verification.
+
+The detector data preparation tool accepts only company-owned/operator
+confirmed, CC0 or CC-BY-4.0 images. It writes rotated COCO annotations for
+PP-YOLOE-R and includes unlabelled hard-negative images so timestamp, camera
+name, signs and headlights can be taught as background. Golden data and
+train/validation source leakage fail closed.
+
+Raw OCR hypotheses are now first-class diagnostic data. A rejected full-plate
+hypothesis is shown together with confidence, engine, signed model revision
+and rejection reason. In the owner-approved operator-assisted policy, a
+complete multi-frame guess can become an operational
+`review_status=auto-confirmed` event with a canonical plate value. This status
+is distinct from strict multi-frame consensus and human confirmation:
+`confirmation_source=ai-auto-guess`, `operator_reviewed=0` and
+`experimental=1` remain set until an authorized operator confirms or corrects
+the complete Iranian plate. AI-only guesses never become training labels.
+
+Baseline and candidate Shadow results run through separate trackers on the
+video-test page and are labelled by lane. In live operator-assisted mode, an
+overlapping strict Baseline read always wins; a complete Shadow guess may
+replace only an unreadable Baseline row. The resulting event is visibly
+AI-confirmed and remains operator-reviewable. This does not activate the
+research model as `next`, does not include it in an installer and does not
+turn its output into ground truth. Operator feedback records exact-match and
+Levenshtein character distance; Settings reports exact full-plate accuracy
+and mean character error overall and per immutable model revision.
+
 ## Repository visibility authorization
 
 The repository is public. On 2026-07-28 the owner explicitly authorized
 publishing the RC13 branch and Draft PR to this public repository.
+
+## RC15 IR-LPR research result
+
+The three official IR-LPR plate-crop archives were uploaded on 2026-07-29 and
+passed ZIP integrity and SHA-256 checks. The importer produced 17,371 train,
+2,007 validation and 3,903 test OCR crops with zero cross-split image or plate
+identity overlap. Golden video data was not imported.
+
+CCT-XS-v2 was fine-tuned in four two-epoch CPU stages from only the compatible
+feature layers of the official FastPlateOCR global checkpoint. The final
+Stage-4 ONNX achieved 87.45% raw exact accuracy and 97.61% character accuracy
+on the untouched 3,903-image IR-LPR test split. Its SHA-256 is
+`AD8D77D69CD0C914CB0CB3E0AC4E18709C446F78625A440D8F2D7AD2FB669482`.
+
+The verified fixed Golden video then produced 807 detector candidates across
+all 546 frames. Strict Tracker output matched `1/3`, equal to RC12; observable
+raw OCR matched `2/3`. `55-ط-639-74` was exact in 19 observations and
+confirmed. `84-ب-571-33` was exact in only one observation and correctly
+failed the three-vote gate. The closest read for `31-ط-556-74` was
+`31-ط-566-74`, one character away. There were 39 unverified emitted unique
+strings, so promotion failed.
+
+The derived model remains `research-shadow-only`, non-distributable and
+excluded from installers because IR-LPR is GPL-3.0 research data. RC12 remains
+active. The detailed record is
+`agent-results/latest/ANPR_IR_LPR_RESEARCH_RC15.md`.
+
+After reviewing the visual guesses, the owner approved using complete guesses
+as operator-assisted events on 2026-07-29. The strict Golden result remains
+`1/3`; the new label describes workflow state, not measured truth. Operators
+can confirm an unchanged guess or correct it from the dashboard/event detail.
+Only that human action creates `anpr_feedback`, captures the immutable crop and
+allows later controlled training. The implementation record is
+`agent-results/latest/ANPR_OPERATOR_ASSISTED_RC15.md`.
+
+For private internal evaluation, RC15 also supports a signed
+`baseline-yolov8-onnx` detector-reuse contract. Shadow CCT OCR runs on the
+already verified Baseline detector crops, exactly matching the detector/OCR
+pairing used for the Golden result and avoiding an untrained candidate
+detector. `tools/build_internal_cct_model_installer.py` creates a private
+one-click model pack outside Git; it verifies the embedded detector and OCR,
+installs under the configured persistent data root and selects Shadow mode.
+The public Setup, Updater, source archive and GitHub repository still exclude
+the IR-LPR-derived weight.
