@@ -1,6 +1,7 @@
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import cv2
@@ -247,6 +248,7 @@ def test_video_test_displays_plate_crop_and_text_on_one_row(
     def fake_process(video_path, plate_dir, snapshot_dir, **kwargs):
         assert Path(video_path).is_file()
         assert kwargs["frame_step"] == 1
+        assert kwargs["include_candidate_shadow"] is True
         Path(plate_dir).mkdir(parents=True)
         crop = Path(plate_dir) / "plate-1.jpg"
         crop.write_bytes(b"jpeg")
@@ -267,6 +269,19 @@ def test_video_test_displays_plate_crop_and_text_on_one_row(
                 "ocr_engine": "fast-plate-ocr-cct",
                 "valid": True,
                 "needs_review": False,
+            }, {
+                "plate": "ناخوانا",
+                "raw_guess_text": "84-ب-579-32",
+                "raw_guess_norm": "84ب57932",
+                "raw_guess_reason": "position-margin",
+                "plate_path": str(crop),
+                "confidence": 0.43,
+                "video_second": 1.0,
+                "ocr_engine": "fast-plate-ocr-cct",
+                "valid": False,
+                "needs_review": True,
+                "experimental": True,
+                "engine_lane": "candidate-shadow",
             }],
         )
 
@@ -284,8 +299,89 @@ def test_video_test_displays_plate_crop_and_text_on_one_row(
     assert response.status_code == 200
     assert "تصویر پلاک / متن تشخیص‌داده‌شده" in response.text
     assert "31-ط-556-74" in response.text
+    assert "84-ب-579-32" in response.text
+    assert "حدس خام مدل آزمایشی" in response.text
+    assert "position-margin" in response.text
     assert "fast-plate-ocr-cct" in response.text
     assert "/media?path=" in response.text
+
+
+def test_auto_confirmed_event_requires_operator_action_before_training(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "operator-review.db"
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    database.init_db()
+    captured = []
+    monkeypatch.setattr(
+        main,
+        "capture_feedback_sample",
+        lambda feedback_id: captured.append(feedback_id),
+    )
+    _as_role(monkeypatch, "operator")
+    with database.connect() as con:
+        event_id = con.execute(
+            "INSERT INTO plate_events("
+            "plate_text,plate_norm,confidence,review_status,"
+            "confirmation_source,experimental,raw_guess_text,"
+            "raw_guess_norm,raw_guess_confidence,raw_guess_engine,"
+            "model_revision"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "31-ط-556-74",
+                "31ط55674",
+                0.69,
+                "auto-confirmed",
+                "ai-auto-guess",
+                1,
+                "31-ط-556-74",
+                "31ط55674",
+                0.93,
+                "fast-plate-ocr-cct",
+                "rc15-stage4",
+            ),
+        ).lastrowid
+
+    with database.connect() as con:
+        dashboard_row = con.execute(
+            "SELECT id,plate_text,camera_name,confidence,created_at,"
+            "image_path,plate_image_path,review_status "
+            "FROM plate_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+    dashboard_html = main.dashboard_event_row(dashboard_row)
+    response = main.correct_event_plate(
+        event_id,
+        SimpleNamespace(client=None),
+        "31 ط 556 ایران 74",
+    )
+
+    assert "تأیید خودکار مدل" in dashboard_html
+    assert response.status_code == 303
+    with database.connect() as con:
+        event = con.execute(
+            "SELECT review_status,confirmation_source,"
+            "operator_reviewed,experimental FROM plate_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+        feedback = con.execute(
+            "SELECT id,observed_norm,corrected_norm,exact_match,"
+            "submitted_by FROM anpr_feedback WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+    assert dict(event) == {
+        "review_status": "confirmed",
+        "confirmation_source": "operator",
+        "operator_reviewed": 1,
+        "experimental": 0,
+    }
+    assert feedback["observed_norm"] == "31ط55674"
+    assert feedback["corrected_norm"] == "31ط55674"
+    assert feedback["exact_match"] == 1
+    assert feedback["submitted_by"] == "operator"
+    assert captured == [feedback["id"]]
 
 
 def test_camera_video_upload_registers_live_source_without_batch_processing(
