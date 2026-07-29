@@ -30,6 +30,7 @@ from app.ai.onnx_cct import (
     decode_cct_hypotheses,
     prepare_cct_input,
 )
+from app.ai.evaluation import character_distance
 from app.ai.plate_rules import normalize_plate
 
 
@@ -39,6 +40,7 @@ ALLOWED_DATA_LICENSES = {
     "operator-confirmed-company-owned",
     "cc0-1.0",
     "cc-by-4.0",
+    "gpl-3.0-ir-lpr-research-only",
 }
 ALLOWED_FONT_LICENSES = {
     "apache-2.0",
@@ -81,6 +83,20 @@ def _dataset_contract(dataset: Path) -> dict:
         raise ValueError(
             "Golden benchmark data must never be used for CCT training"
         )
+    research_only = (
+        license_name == "gpl-3.0-ir-lpr-research-only"
+    )
+    if research_only and (
+        manifest.get("research_only") is not True
+        or manifest.get("distribution_allowed") is not False
+        or str(manifest.get("activation_policy", "")).strip().lower()
+        != "shadow-only"
+        or manifest.get("official_test_split") is not True
+    ):
+        raise ValueError(
+            "IR-LPR must remain research-only, non-distributable and "
+            "Shadow-only with an independent test split"
+        )
     if license_name == "synthetic-bcvision-company-owned":
         font_license = str(
             manifest.get("font_license", "")
@@ -96,10 +112,15 @@ def _dataset_contract(dataset: Path) -> dict:
     validation = dataset / "val" / "annotations.csv"
     if not train.is_file() or not validation.is_file():
         raise ValueError("Train and validation annotations are required")
+    test = dataset / "test" / "annotations.csv"
+    if research_only and not test.is_file():
+        raise ValueError("IR-LPR research training requires its test split")
     return {
         "manifest": manifest,
         "train": train,
         "validation": validation,
+        "test": test if test.is_file() else None,
+        "research_only": research_only,
     }
 
 
@@ -214,7 +235,10 @@ def _run_official_training(
     train_annotations: Path,
     validation_annotations: Path,
     output: Path,
-    initialized_backbone: Path | None,
+    initialized_weights: Path | None,
+    checkpoint_metric: str,
+    augmentation_path: Path | None,
+    learning_rate: float,
     epochs: int,
     batch_size: int,
     seed: int,
@@ -241,21 +265,30 @@ def _run_official_training(
         "--early-stopping-patience",
         str(max(4, min(12, epochs // 3))),
         "--early-stopping-metric",
-        "val_plate_acc",
+        (
+            "val_plate_char_acc"
+            if checkpoint_metric == "char"
+            else "val_plate_acc"
+        ),
         "--label-smoothing",
         "0.01",
         "--weight-decay",
         "0.0005",
         "--lr",
-        "0.0005",
+        str(learning_rate),
         "--seed",
         str(seed),
         "--workers",
         "1",
         "--no-use-multiprocessing",
     ]
-    if initialized_backbone is not None:
-        arguments.extend(["--weights-path", str(initialized_backbone)])
+    if initialized_weights is not None:
+        arguments.extend(["--weights-path", str(initialized_weights)])
+    if augmentation_path is not None:
+        arguments.extend([
+            "--augmentation-path",
+            str(augmentation_path),
+        ])
     train_command.main(args=arguments, standalone_mode=False)
     candidates = sorted(
         (output / "keras-runs").rglob("best.keras"),
@@ -350,6 +383,10 @@ def _benchmark(
         session.run(None, {input_meta.name: tensor})
 
     raw_exact = 0
+    raw_character_matches = 0
+    raw_character_total = 0
+    raw_character_distance = 0
+    position_matches = [0] * 8
     accepted_exact = 0
     accepted = 0
     started = time.perf_counter()
@@ -367,6 +404,18 @@ def _benchmark(
             else ""
         )
         raw_exact += raw == row["expected"]
+        raw_character_matches += sum(
+            observed == expected
+            for observed, expected in zip(raw, row["expected"])
+        )
+        raw_character_total += len(row["expected"])
+        raw_character_distance += character_distance(
+            raw,
+            row["expected"],
+        )
+        for index, expected in enumerate(row["expected"]):
+            if index < len(raw) and raw[index] == expected:
+                position_matches[index] += 1
         accepted += bool(result["accepted"])
         accepted_exact += (
             bool(result["accepted"])
@@ -381,6 +430,18 @@ def _benchmark(
         "validation_samples": len(rows),
         "raw_exact_matches": raw_exact,
         "raw_exact_accuracy": round(raw_exact / len(rows), 6),
+        "raw_character_accuracy": round(
+            raw_character_matches / raw_character_total,
+            6,
+        ),
+        "raw_mean_character_error": round(
+            raw_character_distance / len(rows),
+            6,
+        ),
+        "raw_position_accuracy": [
+            round(matches / len(rows), 6)
+            for matches in position_matches
+        ],
         "accepted_samples": accepted,
         "accepted_exact_matches": accepted_exact,
         "accepted_exact_accuracy": round(
@@ -416,9 +477,19 @@ def train_and_export(
     epochs: int,
     batch_size: int,
     seed: int,
+    resume_checkpoint: Path | None = None,
+    checkpoint_metric: str = "char",
+    augmentation_path: Path | None = None,
+    learning_rate: float = 0.0005,
 ) -> dict:
     dataset = dataset.resolve()
     output = output.resolve()
+    if pretrained_backbone is not None and resume_checkpoint is not None:
+        raise ValueError(
+            "Choose either pretrained backbone transfer or resume checkpoint"
+        )
+    if checkpoint_metric not in {"char", "exact"}:
+        raise ValueError("Checkpoint metric must be char or exact")
     if output.exists():
         raise FileExistsError(
             f"Output already exists; choose a new directory: {output}"
@@ -435,15 +506,17 @@ def train_and_export(
     )
     if not model_config.is_file() or not plate_config.is_file():
         raise FileNotFoundError("BC Vision CCT configuration is missing")
-    if (
-        pretrained_backbone is not None
-        and not pretrained_backbone.is_file()
-    ):
-        raise FileNotFoundError(pretrained_backbone)
-    initialized_backbone = None
+    for source in (pretrained_backbone, resume_checkpoint):
+        if source is not None and not source.is_file():
+            raise FileNotFoundError(source)
+    if augmentation_path is not None and not augmentation_path.is_file():
+        raise FileNotFoundError(augmentation_path)
+    if not 0 < learning_rate <= 0.1:
+        raise ValueError("Learning rate must be between zero and 0.1")
+    initialized_weights = resume_checkpoint
     transferred_layers = []
     if pretrained_backbone is not None:
-        initialized_backbone, transferred_layers = (
+        initialized_weights, transferred_layers = (
             _prepare_pretrained_backbone(
                 source_path=pretrained_backbone,
                 model_config_path=model_config,
@@ -458,7 +531,10 @@ def train_and_export(
         train_annotations=contract["train"],
         validation_annotations=contract["validation"],
         output=output,
-        initialized_backbone=initialized_backbone,
+        initialized_weights=initialized_weights,
+        checkpoint_metric=checkpoint_metric,
+        augmentation_path=augmentation_path,
+        learning_rate=learning_rate,
         epochs=epochs,
         batch_size=batch_size,
         seed=seed,
@@ -474,6 +550,15 @@ def train_and_export(
         model=model,
         validation=contract["validation"],
         alphabet=alphabet,
+    )
+    test_metrics = (
+        _benchmark(
+            model=model,
+            validation=contract["test"],
+            alphabet=alphabet,
+        )
+        if contract["test"] is not None
+        else None
     )
     metadata = {
         "schema": 1,
@@ -498,6 +583,13 @@ def train_and_export(
         "min_hypothesis_margin": 0.025,
         "beam_width": 16,
         "top_k": 5,
+        "usage_scope": (
+            "research-shadow-only"
+            if contract["research_only"]
+            else "production-candidate"
+        ),
+        "distribution_allowed": not contract["research_only"],
+        "activation_allowed": not contract["research_only"],
         "training": {
             "keras_backend": os.environ.get("KERAS_BACKEND", ""),
             "dataset_license": contract["manifest"],
@@ -518,9 +610,27 @@ def train_and_export(
             "pretrained_excluded_layers": sorted(
                 EXCLUDED_PRETRAINED_LAYERS
             ),
+            "resume_checkpoint_path": (
+                str(resume_checkpoint.resolve())
+                if resume_checkpoint
+                else ""
+            ),
+            "resume_checkpoint_sha256": (
+                _sha256(resume_checkpoint)
+                if resume_checkpoint
+                else ""
+            ),
+            "checkpoint_metric": checkpoint_metric,
+            "augmentation_path": (
+                str(augmentation_path.resolve())
+                if augmentation_path
+                else "fastplateocr-default"
+            ),
+            "learning_rate": float(learning_rate),
             "checkpoint": str(checkpoint),
         },
         "validation": metrics,
+        "test": test_metrics,
     }
     (output / "candidate-metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2),
@@ -548,6 +658,29 @@ def main(argv=None) -> int:
             "layers; OCR and region heads are always excluded"
         ),
     )
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        help=(
+            "Resume all compatible model weights from a previous "
+            "FastPlateOCR .keras checkpoint"
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-metric",
+        choices=["char", "exact"],
+        default="char",
+        help=(
+            "Use character accuracy while learning from scratch; switch to "
+            "exact plate accuracy only for a mature model"
+        ),
+    )
+    parser.add_argument(
+        "--augmentation-path",
+        type=Path,
+        help="Optional Albumentations YAML used for this training stage",
+    )
+    parser.add_argument("--learning-rate", type=float, default=0.0005)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=20260728)
@@ -561,7 +694,19 @@ def main(argv=None) -> int:
             if args.pretrained_backbone
             else None
         ),
-        epochs=max(4, min(200, int(args.epochs))),
+        resume_checkpoint=(
+            args.resume_checkpoint.resolve()
+            if args.resume_checkpoint
+            else None
+        ),
+        checkpoint_metric=args.checkpoint_metric,
+        augmentation_path=(
+            args.augmentation_path.resolve()
+            if args.augmentation_path
+            else None
+        ),
+        learning_rate=float(args.learning_rate),
+        epochs=max(1, min(200, int(args.epochs))),
         batch_size=max(4, min(256, int(args.batch_size))),
         seed=int(args.seed),
     )
@@ -571,6 +716,9 @@ def main(argv=None) -> int:
         "sha256": result["sha256"],
         "size": result["size"],
         "validation": result["validation"],
+        "test": result["test"],
+        "usage_scope": result["usage_scope"],
+        "distribution_allowed": result["distribution_allowed"],
     }, ensure_ascii=False))
     return 0
 
