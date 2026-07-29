@@ -1,8 +1,10 @@
 from pathlib import Path
 import time
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
+import pytest
 
 import app.ai.video_test as video_test
 import app.streams as streams
@@ -80,6 +82,106 @@ def test_video_emits_one_consensus_event(tmp_path, monkeypatch):
     assert events[0]["consensus_votes"] >= 2
     assert Path(events[0]["plate_path"]).is_file()
     assert Path(events[0]["image_path"]).is_file()
+
+
+def test_video_shadow_fails_closed_once_when_bundle_is_missing(
+    tmp_path,
+    monkeypatch,
+):
+    video_path = tmp_path / "sample.avi"
+    _write_video(video_path, frames=3)
+    monkeypatch.setattr(
+        video_test,
+        "next_models_status",
+        lambda: {
+            "ready": False,
+            "error": "signed candidate bundle is missing",
+        },
+    )
+    monkeypatch.setattr(
+        video_test.engine_router,
+        "process",
+        lambda *_args, **_kwargs: pytest.fail(
+            "router must not run without a verified bundle"
+        ),
+    )
+    monkeypatch.setattr(
+        video_test,
+        "process_frame",
+        lambda *_args, **_kwargs: [],
+    )
+
+    info, events = video_test.process_video(
+        video_path,
+        tmp_path / "plates",
+        tmp_path / "snapshots",
+        frame_step=1,
+        include_candidate_shadow=True,
+    )
+
+    assert events == []
+    assert info["candidate_shadow_requested"] is True
+    assert "signed candidate bundle is missing" in (
+        info["candidate_shadow_error"]
+    )
+
+
+def test_video_shadow_complete_consensus_is_auto_confirmed(
+    tmp_path,
+    monkeypatch,
+):
+    video_path = tmp_path / "sample.avi"
+    _write_video(video_path, frames=6)
+    monkeypatch.setattr(
+        video_test,
+        "next_models_status",
+        lambda: {"ready": True, "error": ""},
+    )
+
+    def candidate(frame):
+        return {
+            "plate": "31-ط-556-74",
+            "plate_norm": "31ط55674",
+            "raw_guess_text": "31-ط-556-74",
+            "raw_guess_norm": "31ط55674",
+            "valid": True,
+            "confidence": 0.88,
+            "detector_confidence": 0.90,
+            "ocr_confidence": 0.86,
+            "quality_score": 0.80,
+            "bbox": (80, 80, 240, 120),
+            "crop": frame[80:120, 80:240].copy(),
+            "method": "candidate-test",
+            "ocr_engine": "fast-plate-ocr-cct",
+        }
+
+    monkeypatch.setattr(
+        video_test.engine_router,
+        "process",
+        lambda frame, **_kwargs: SimpleNamespace(
+            primary=[],
+            shadow=[candidate(frame)],
+            error="",
+        ),
+    )
+
+    _, events = video_test.process_video(
+        video_path,
+        tmp_path / "plates",
+        tmp_path / "snapshots",
+        frame_step=1,
+        include_candidate_shadow=True,
+    )
+
+    confirmed = [
+        event for event in events
+        if event.get("auto_confirmed")
+    ]
+    assert len(confirmed) == 1
+    assert confirmed[0]["plate_norm"] == "31ط55674"
+    assert confirmed[0]["read_status"] == "auto-confirmed"
+    assert confirmed[0]["needs_review"] is True
+    assert confirmed[0]["experimental"] is True
 
 
 def test_uploaded_video_stream_loops_without_becoming_offline(tmp_path, monkeypatch):
