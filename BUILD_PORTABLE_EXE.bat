@@ -77,6 +77,12 @@ rmdir /s /q dist 2>nul
     --hidden-import app.ai.vehicle_intelligence ^
     --hidden-import app.ai.video_test ^
     --hidden-import app.ai.live_worker ^
+    --hidden-import app.ai.evaluation ^
+    --hidden-import app.ai.next_engine ^
+    --hidden-import app.ai.next_models ^
+    --hidden-import app.ai.onnx_cct ^
+    --hidden-import app.ai.onnx_obb ^
+    --hidden-import app.ai.review_policy ^
     --hidden-import app.ai.model_manager ^
     --hidden-import app.ai.training ^
     --hidden-import app.ai.training_worker ^
