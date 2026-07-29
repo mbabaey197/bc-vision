@@ -1,0 +1,63 @@
+name: Export verified RC15 deliverables
+
+on:
+  push:
+    branches:
+      - agent/rc15-artifact-export
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download verified RC15 candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: BCVision-2.2.0-rc15-windows
+          path: candidate
+          repository: mahdibabaey197/bc-vision
+          run-id: 30467066847
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify candidate checksums
+        shell: bash
+        run: |
+          cd candidate
+          sha256sum --check SHA256SUMS.txt
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: BCVision-2.2.0-rc15-installer
+          path: |
+            candidate/BCVision_Setup_v2.2.0-rc15.exe
+            candidate/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload updater
+        uses: actions/upload-artifact@v4
+        with:
+          name: BCVision-2.2.0-rc15-updater
+          path: |
+            candidate/BCVision_Update_v2.2.0-rc15.exe
+            candidate/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload source
+        uses: actions/upload-artifact@v4
+        with:
+          name: BCVision-2.2.0-rc15-source
+          path: |
+            candidate/BC_Vision_v2.2.0-rc15_Source.zip
+            candidate/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
