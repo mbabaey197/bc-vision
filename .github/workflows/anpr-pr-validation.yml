@@ -4,6 +4,10 @@
 name: ANPR PR validation
 
 on:
+  # Temporary fallback for PR #29 only; this branch is never merged.
+  push:
+    branches:
+      - agent/pr28-ci-validation-20260731
   pull_request:
     branches:
       - main
