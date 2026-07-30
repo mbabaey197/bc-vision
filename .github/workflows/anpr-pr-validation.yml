@@ -32,8 +32,6 @@ jobs:
   regression:
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 20
-    env:
-      BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\regression
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
@@ -57,6 +55,7 @@ jobs:
       - name: Compile and test
         shell: cmd
         env:
+          BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\regression
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
           python -m compileall -q app/ai app/database.py app/streams.py
@@ -66,7 +65,6 @@ jobs:
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 45
     env:
-      BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\ai-runtime
       BCVISION_RUN_AI_INTEGRATION: "1"
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
@@ -98,6 +96,7 @@ jobs:
       - name: Verify real engines and models
         shell: cmd
         env:
+          BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\ai-runtime
           BCVISION_PLATE_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo.onnx
           BCVISION_PLATE_FALLBACK_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo_fallback.onnx
           BCVISION_CRNN_MODEL: ${{ runner.temp }}\bcvision-models\crnn\ocr_crnn.onnx
