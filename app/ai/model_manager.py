@@ -8,12 +8,16 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import shutil
+import ssl
 import sys
 import tempfile
+import time
+import urllib.error
 import urllib.request
 
 DETECTOR_URL = (
@@ -365,6 +369,8 @@ def _download_verified(
     expected_sha256: str,
     expected_size: int,
     timeout=90,
+    attempts=3,
+    retry_delay=2,
 ) -> Path:
     if not url.lower().startswith("https://"):
         raise ValueError("Only HTTPS model downloads are allowed")
@@ -373,49 +379,63 @@ def _download_verified(
     if verify_file(target, expected_sha256, expected_size):
         return target
 
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "BCVision-ANPR/2.2"},
+    network_errors = (
+        urllib.error.URLError,
+        TimeoutError,
+        ConnectionError,
+        http.client.IncompleteRead,
+        ssl.SSLError,
     )
-    temp_path = None
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=timeout,
-        ) as response:
-            with tempfile.NamedTemporaryFile(
-                "wb",
-                delete=False,
-                dir=target.parent,
-                prefix=target.name + ".",
-                suffix=".part",
-            ) as output:
-                temp_path = Path(output.name)
-                total = 0
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > expected_size + 1024:
-                        raise ValueError(
-                            "Downloaded model exceeds the expected size"
-                        )
-                    output.write(chunk)
-        if not verify_file(
-            temp_path,
-            expected_sha256,
-            expected_size,
-        ):
-            raise ValueError(
-                "Downloaded model failed SHA-256 or size verification"
-            )
-        os.replace(temp_path, target)
+    max_attempts = max(1, int(attempts))
+    for attempt in range(max_attempts):
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "BCVision-ANPR/2.2"},
+        )
         temp_path = None
-        return target
-    finally:
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=timeout,
+            ) as response:
+                with tempfile.NamedTemporaryFile(
+                    "wb",
+                    delete=False,
+                    dir=target.parent,
+                    prefix=target.name + ".",
+                    suffix=".part",
+                ) as output:
+                    temp_path = Path(output.name)
+                    total = 0
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > expected_size + 1024:
+                            raise ValueError(
+                                "Downloaded model exceeds the expected size"
+                            )
+                        output.write(chunk)
+            if not verify_file(
+                temp_path,
+                expected_sha256,
+                expected_size,
+            ):
+                raise ValueError(
+                    "Downloaded model failed SHA-256 or size verification"
+                )
+            os.replace(temp_path, target)
+            temp_path = None
+            return target
+        except network_errors:
+            if attempt + 1 >= max_attempts:
+                raise
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+        if retry_delay:
+            time.sleep(float(retry_delay) * (attempt + 1))
 
 
 def ensure_detector_model(download=True) -> Path:
