@@ -225,6 +225,10 @@ def test_video_test_displays_plate_crop_and_text_on_one_row(
     monkeypatch,
 ):
     _as_role(monkeypatch, "operator")
+    db_path = tmp_path / "video-test.db"
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    database.init_db()
     storage = tmp_path / "storage"
     videos = storage / "videos"
     plates = storage / "plates"
@@ -250,8 +254,11 @@ def test_video_test_displays_plate_crop_and_text_on_one_row(
         assert kwargs["frame_step"] == 1
         assert kwargs["include_candidate_shadow"] is True
         Path(plate_dir).mkdir(parents=True)
+        Path(snapshot_dir).mkdir(parents=True)
         crop = Path(plate_dir) / "plate-1.jpg"
         crop.write_bytes(b"jpeg")
+        vehicle = Path(snapshot_dir) / "vehicle-1.jpg"
+        vehicle.write_bytes(b"jpeg")
         return (
             {
                 "frames": 12,
@@ -264,6 +271,8 @@ def test_video_test_displays_plate_crop_and_text_on_one_row(
                 "plate": "31-ط-556-74",
                 "plate_norm": "31ط55674",
                 "plate_path": str(crop),
+                "image_path": str(vehicle),
+                "media_status": "complete",
                 "confidence": 0.91,
                 "video_second": 0.75,
                 "ocr_engine": "fast-plate-ocr-cct",
@@ -275,6 +284,8 @@ def test_video_test_displays_plate_crop_and_text_on_one_row(
                 "raw_guess_norm": "84ب57932",
                 "raw_guess_reason": "position-margin",
                 "plate_path": str(crop),
+                "image_path": str(vehicle),
+                "media_status": "complete",
                 "confidence": 0.43,
                 "video_second": 1.0,
                 "ocr_engine": "fast-plate-ocr-cct",
@@ -304,6 +315,21 @@ def test_video_test_displays_plate_crop_and_text_on_one_row(
     assert "position-margin" in response.text
     assert "fast-plate-ocr-cct" in response.text
     assert "/media?path=" in response.text
+    assert "تصویر خودرو" in response.text
+    with database.connect() as con:
+        archived = con.execute(
+            "SELECT plate_norm,plate_image_path,image_path,video_path,"
+            "source,plate_region FROM plate_events ORDER BY id"
+        ).fetchall()
+    assert len(archived) == 2
+    assert archived[0]["plate_norm"] == "31ط55674"
+    assert archived[0]["plate_region"] == "74"
+    assert Path(archived[0]["plate_image_path"]).is_file()
+    assert Path(archived[0]["plate_image_path"]).is_relative_to(plates)
+    assert Path(archived[0]["image_path"]).is_file()
+    assert Path(archived[0]["image_path"]).is_relative_to(snapshots)
+    assert Path(archived[0]["video_path"]).is_file()
+    assert archived[0]["source"] == "video-test"
 
 
 def test_auto_confirmed_event_requires_operator_action_before_training(
@@ -454,6 +480,87 @@ def test_camera_video_upload_registers_live_source_without_batch_processing(
     assert calls["get"][0][1].startswith("video://")
 
 
+def test_failed_virtual_stream_start_preserves_previous_camera(
+    tmp_path,
+    monkeypatch,
+):
+    _as_role(monkeypatch, "operator")
+    db_path = tmp_path / "upload-failure.db"
+    video_dir = tmp_path / "videos"
+    video_dir.mkdir()
+    old_video = video_dir / "old.avi"
+    old_video.write_bytes(b"old")
+    source_path = tmp_path / "source.avi"
+    writer = cv2.VideoWriter(
+        str(source_path),
+        cv2.VideoWriter_fourcc(*"MJPG"),
+        10.0,
+        (160, 90),
+    )
+    assert writer.isOpened()
+    for value in (20, 80, 140):
+        writer.write(np.full((90, 160, 3), value, dtype=np.uint8))
+    writer.release()
+
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    database.init_db()
+    with database.connect() as con:
+        source_id = int(con.execute(
+            "INSERT INTO cameras("
+            "name,rtsp_url,location,city,enabled,is_demo,lpr_enabled"
+            ") VALUES(?,?,?,?,?,?,?)",
+            ("Gate", "rtsp://gate", "Gate", "تهران", 1, 0, 1),
+        ).lastrowid)
+        old_id = int(con.execute(
+            "INSERT INTO cameras("
+            "name,rtsp_url,location,city,enabled,is_demo,lpr_enabled"
+            ") VALUES(?,?,?,?,?,?,?)",
+            (
+                "Old video", f"video://{old_video}",
+                "old", "تهران", 1, 1, 1,
+            ),
+        ).lastrowid)
+
+    monkeypatch.setattr(
+        main,
+        "_configured_storage_child",
+        lambda setting_key, default: video_dir,
+    )
+    removed = []
+    monkeypatch.setattr(
+        main.manager,
+        "get",
+        lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("stream start failed")
+        ),
+    )
+    monkeypatch.setattr(
+        main.manager,
+        "remove",
+        lambda camera_id: removed.append(camera_id),
+    )
+
+    with TestClient(main.app) as client, source_path.open("rb") as source:
+        response = client.post(
+            "/cameras/video-upload",
+            data={"camera_id": str(source_id)},
+            files={"video": ("traffic.avi", source, "video/x-msvideo")},
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+
+    assert response.status_code == 500
+    with database.connect() as con:
+        virtual_rows = con.execute(
+            "SELECT id,rtsp_url FROM cameras "
+            "WHERE rtsp_url LIKE 'video://%'"
+        ).fetchall()
+    assert [row["id"] for row in virtual_rows] == [old_id]
+    assert virtual_rows[0]["rtsp_url"] == f"video://{old_video}"
+    assert old_id not in removed
+    assert list(video_dir.iterdir()) == [old_video]
+
+
 def test_uploaded_video_flows_through_worker_to_sqlite_and_dashboard(
     tmp_path,
     monkeypatch,
@@ -489,10 +596,13 @@ def test_uploaded_video_flows_through_worker_to_sqlite_and_dashboard(
         )
         source_camera_id = con.execute(
             "INSERT INTO cameras("
-            "name,rtsp_url,location,enabled,is_demo,lpr_enabled,"
+            "name,rtsp_url,location,city,enabled,is_demo,lpr_enabled,"
             "lpr_confidence,frame_step,duplicate_seconds"
-            ") VALUES(?,?,?,?,?,?,?,?,?)",
-            ("Gate", "rtsp://gate", "Gate", 1, 0, 1, 50, 1, 0),
+            ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                "Gate", "rtsp://gate", "Gate", "کرج",
+                1, 0, 1, 50, 1, 0,
+            ),
         ).lastrowid
 
     monkeypatch.setattr(
@@ -562,6 +672,24 @@ def test_uploaded_video_flows_through_worker_to_sqlite_and_dashboard(
 
             assert event is not None
             assert event["plate_norm"] == "12ب34567"
+            assert event["plate_region"] == "67"
+            assert event["city"] == "کرج"
+            assert event["media_status"] == "complete"
+            assert Path(event["plate_image_path"]).is_file()
+            assert Path(event["image_path"]).is_file()
+            assert Path(event["video_path"]).is_file()
+            plate_media = client.get(
+                "/media",
+                params={"path": event["plate_image_path"]},
+            )
+            vehicle_media = client.get(
+                "/media",
+                params={"path": event["image_path"]},
+            )
+            assert plate_media.status_code == 200
+            assert vehicle_media.status_code == 200
+            assert plate_media.content.startswith(b"\xff\xd8")
+            assert vehicle_media.content.startswith(b"\xff\xd8")
             with database.connect() as con:
                 count = con.execute(
                     "SELECT COUNT(*) FROM plate_events WHERE camera_id=?",
@@ -630,15 +758,35 @@ def test_dashboard_recent_events_returns_only_after_new_commit(
         unchanged = client.get(
             f"/api/dashboard/recent-events?after={event_id}"
         )
+        initial_updated = fresh.json()["latest_updated"]
+        with database.connect() as con:
+            con.execute(
+                "UPDATE plate_events SET plate_text=?,updated_at=? "
+                "WHERE id=?",
+                ("12-ب-345-68", "2099-01-01 00:00:00", event_id),
+            )
+        refreshed_same_id = client.get(
+            "/api/dashboard/recent-events",
+            params={
+                "after": event_id,
+                "after_updated": initial_updated,
+            },
+        )
 
     assert fresh.status_code == 200
     assert fresh.json()["latest_id"] == event_id
     assert "Gate" in fresh.json()["rows_html"]
     assert "۱۲" in fresh.json()["rows_html"]
+    assert fresh.json()["latest_updated"]
     assert unchanged.json() == {
         "latest_id": event_id,
         "rows_html": "",
     }
+    assert refreshed_same_id.json()["latest_id"] == event_id
+    assert refreshed_same_id.json()["latest_updated"] == (
+        "2099-01-01 00:00:00"
+    )
+    assert "۶۸" in refreshed_same_id.json()["rows_html"]
 
 
 def test_public_health_does_not_expose_license_or_customer_data():

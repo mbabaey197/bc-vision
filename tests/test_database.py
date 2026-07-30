@@ -59,9 +59,12 @@ def test_old_database_migrates_without_data_loss(
             notes TEXT,
             created_at TEXT
         );
+        INSERT INTO cameras(
+            id,name,rtsp_url,location,enabled,is_demo,sort_order
+        ) VALUES(7,'North Gate','rtsp://north','ورودی شمالی',1,0,0);
         INSERT INTO plate_events(
-            id,plate_text,confidence
-        ) VALUES(1,'۱۲-ب-۳۴۵-۶۷',0.8);
+            id,plate_text,confidence,camera_id
+        ) VALUES(1,'۱۲-ب-۳۴۵-۶۷',0.8,7);
         INSERT INTO users(
             id,username,password_hash,display_name,is_admin
         ) VALUES(1,'existing','x','Existing',1);
@@ -99,6 +102,11 @@ def test_old_database_migrates_without_data_loss(
             "experimental",
             "confirmation_source",
             "operator_reviewed",
+            "city",
+            "plate_region",
+            "media_status",
+            "media_error",
+            "updated_at",
         } <= columns
         feedback_columns = {
             row[1]
@@ -148,6 +156,18 @@ def test_old_database_migrates_without_data_loss(
         ).fetchone()
         assert row["plate_text"] == "۱۲-ب-۳۴۵-۶۷"
         assert row["plate_norm"] == "12ب34567"
+        assert row["plate_region"] == "67"
+        assert row["city"] == ""
+        assert row["media_status"] == "missing"
+        assert row["updated_at"] == row["created_at"]
+        camera_columns = {
+            item[1]
+            for item in con.execute("PRAGMA table_info(cameras)")
+        }
+        assert "city" in camera_columns
+        assert con.execute(
+            "SELECT city FROM cameras WHERE id=7"
+        ).fetchone()[0] == ""
         assert con.execute(
             "SELECT COUNT(*) FROM users "
             "WHERE username='existing'"
@@ -159,6 +179,9 @@ def test_old_database_migrates_without_data_loss(
             )
         }
         assert "idx_plate_events_plate_norm" in indexes
+        assert "idx_plate_events_city_created" in indexes
+        assert "idx_plate_events_region_created" in indexes
+        assert "idx_plate_events_updated_at" in indexes
 
 
 def test_new_database_has_no_automatic_demo_camera(
@@ -180,6 +203,37 @@ def test_new_database_has_no_automatic_demo_camera(
             "SELECT value FROM settings "
             "WHERE key='migration_remove_builtin_demo_camera_v1'"
         ).fetchone()[0] == "1"
+
+
+def test_media_migration_checks_real_files_before_marking_complete(
+    tmp_path,
+    monkeypatch,
+):
+    import app.database
+
+    db_path = tmp_path / "media.db"
+    vehicle = tmp_path / "vehicle.jpg"
+    missing_plate = tmp_path / "missing-plate.jpg"
+    vehicle.write_bytes(b"vehicle")
+    monkeypatch.setattr(app.database, "DB_PATH", db_path)
+    app.database.init_db()
+
+    with sqlite3.connect(db_path) as con:
+        con.execute(
+            "INSERT INTO plate_events("
+            "plate_text,image_path,plate_image_path,media_status"
+            ") VALUES(?,?,?,'pending')",
+            ("ناخوانا", str(vehicle), str(missing_plate)),
+        )
+
+    app.database.init_db()
+    with sqlite3.connect(db_path) as con:
+        row = con.execute(
+            "SELECT media_status,media_error FROM plate_events"
+        ).fetchone()
+
+    assert row[0] == "partial"
+    assert "پیدا نشد" in row[1]
 
 
 def test_builtin_demo_migration_preserves_user_cameras(

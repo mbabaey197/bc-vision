@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 import cv2
 
+from app.media_storage import save_event_images
+
 from .pipeline import (
     PlateConsensusTracker,
     add_vehicle_analysis,
@@ -83,39 +85,40 @@ def _save_event(
 ):
     result = add_vehicle_analysis(result, frame)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    existing_plate_path = (
+        str(existing.get("plate_path") or "") if existing else ""
+    )
+    existing_vehicle_path = (
+        str(existing.get("image_path") or "") if existing else ""
+    )
     plate_file = Path(
-        existing.get("plate_path")
-        if existing
+        existing_plate_path
+        if existing_plate_path
         else plate_dir / f"plate-{stamp}.jpg"
     )
     snap_file = Path(
-        existing.get("image_path")
-        if existing
+        existing_vehicle_path
+        if existing_vehicle_path
         else snapshot_dir / f"vehicle-{stamp}.jpg"
     )
-    crop = result.get("crop")
-    if crop is not None and getattr(crop, "size", 0):
-        cv2.imwrite(str(plate_file), crop, [cv2.IMWRITE_JPEG_QUALITY, 94])
-    vehicle = result.get("vehicle_crop")
-    using_vehicle_crop = bool(
-        vehicle is not None and getattr(vehicle, "size", 0)
+    media = save_event_images(
+        result,
+        frame,
+        plate_target=plate_file,
+        vehicle_target=snap_file,
+        existing_plate_path=existing_plate_path,
+        existing_vehicle_path=existing_vehicle_path,
     )
-    annotated = vehicle.copy() if using_vehicle_crop else frame.copy()
-    x1, y1, x2, y2 = result["bbox"]
-    if using_vehicle_crop and result.get("vehicle_bbox"):
-        vx1, vy1, _, _ = result["vehicle_bbox"]
-        x1, x2 = x1 - vx1, x2 - vx1
-        y1, y2 = y1 - vy1, y2 - vy1
-    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-    cv2.imwrite(str(snap_file), annotated, [cv2.IMWRITE_JPEG_QUALITY, 90])
     event = {
         key: value
         for key, value in result.items()
         if key not in {"crop", "vehicle_crop", "capture_frame"}
     }
     event.update({
-        "plate_path": str(plate_file),
-        "image_path": str(snap_file),
+        "plate_path": media.plate_path,
+        "image_path": media.image_path,
+        "media_status": media.media_status,
+        "media_error": media.media_error,
         "frame": frame_no,
         "video_second": round(frame_no / fps, 2),
         "video_path": str(video_path),

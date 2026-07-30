@@ -5,7 +5,7 @@
 - GitHub repository: `mahdibabaey197/bc-vision`
 - Default branch: `main`
 - Product: BC Vision
-- Current application version in source: `2.2.0-rc16`
+- Current application version in source: `2.2.0-rc17`
 - Windows persistent data root: `C:\ProgramData\BCVision\data`
 
 ## Release contract
@@ -61,6 +61,12 @@ The Iranian plate-recognition subsystem now includes:
 - globally optimized multi-vehicle association with trajectory direction
 - immutable per-run training snapshots and active-checkpoint continuation
 - fail-closed 40-sample/multi-slice Golden Dataset admission contract
+- atomic Unicode-safe plate and vehicle evidence storage
+- event media health/error tracking and historical storage-root access
+- dashboard and event-report pagination with configurable dashboard row count
+- canonical one/two-character partial plate search
+- SQL-side Jalali date, Tehran-local time, camera-city and plate-region filters
+- immutable per-event observation-city snapshots
 
 ## ANPR model execution contract
 
@@ -159,6 +165,17 @@ RC16 engine hardening is recorded in
 full regression result is `209 passed, 1 skipped`; the skipped check is the
 existing opt-in real AI integration runtime gate. No new real-camera accuracy
 claim was made.
+
+RC17 completes the event evidence and report workflow: live and uploaded-video
+events retain verified plate/vehicle images, the dashboard and report pages
+are paginated, and report filtering operates in SQL over partial canonical
+plates, observation city, plate-region code and Tehran-local Jalali time.
+Media writes fail independently and atomically, existing event/database rows
+are preserved by additive migrations, and retired media roots remain readable
+only through validated containment plus an exact event reference.
+The implementation and validation record is
+`agent-results/latest/ANPR_EVENT_ARCHIVE_SEARCH_RC17.md`; its full local
+regression result is `238 passed, 1 skipped`.
 
 ## Security hardening status
 

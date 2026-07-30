@@ -91,6 +91,83 @@ def _backfill_plate_norm(con):
             )
 
 
+def _backfill_event_metadata(con):
+    city_marker = "migration_backfill_event_city_rc17"
+    if con.execute(
+        "SELECT 1 FROM settings WHERE key=?",
+        (city_marker,),
+    ).fetchone() is None:
+        con.execute(
+            "UPDATE plate_events SET city=COALESCE(("
+            "SELECT city FROM cameras c "
+            "WHERE c.id=plate_events.camera_id),'') "
+            "WHERE city IS NULL OR TRIM(city)=''"
+        )
+        con.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?)",
+            (city_marker, "1"),
+        )
+    con.execute(
+        "UPDATE plate_events SET plate_region=SUBSTR("
+        "COALESCE(NULLIF(plate_norm,''),raw_guess_norm),-2) "
+        "WHERE LENGTH(COALESCE(NULLIF(plate_norm,''),raw_guess_norm))=8 "
+        "AND SUBSTR(COALESCE(NULLIF(plate_norm,''),raw_guess_norm),-2) "
+        "GLOB '[0-9][0-9]' "
+        "AND (plate_region IS NULL OR plate_region='')"
+    )
+    media_rows = con.execute(
+        "SELECT id,image_path,plate_image_path,media_error "
+        "FROM plate_events WHERE media_status IS NULL "
+        "OR media_status='' OR media_status='pending'"
+    ).fetchall()
+    for row in media_rows:
+        requested = [
+            str(value)
+            for value in (
+                row["image_path"],
+                row["plate_image_path"],
+            )
+            if value
+        ]
+        present = []
+        for value in requested:
+            try:
+                path = Path(value)
+                present.append(
+                    path.is_file() and path.stat().st_size > 0
+                )
+            except OSError:
+                present.append(False)
+        if not requested:
+            status = "missing"
+        elif all(present):
+            status = "complete"
+        elif any(present):
+            status = "partial"
+        else:
+            status = "missing"
+        error = str(row["media_error"] or "")
+        if requested and not all(present) and not error:
+            error = (
+                "یک یا چند فایل تصویر تاریخی در مسیر ثبت‌شده "
+                "پیدا نشد."
+            )
+        con.execute(
+            "UPDATE plate_events SET media_status=?,media_error=? "
+            "WHERE id=?",
+            (status, error, row["id"]),
+        )
+    con.execute(
+        "UPDATE plate_events SET created_at=CURRENT_TIMESTAMP "
+        "WHERE created_at IS NULL OR created_at=''"
+    )
+    con.execute(
+        "UPDATE plate_events SET updated_at="
+        "COALESCE(created_at,CURRENT_TIMESTAMP) "
+        "WHERE updated_at IS NULL OR updated_at=''"
+    )
+
+
 def init_db():
     with connect() as con:
         con.execute("PRAGMA journal_mode=WAL")
@@ -126,6 +203,7 @@ def init_db():
             name TEXT NOT NULL,
             rtsp_url TEXT NOT NULL DEFAULT '',
             location TEXT NOT NULL DEFAULT '',
+            city TEXT NOT NULL DEFAULT '',
             enabled INTEGER NOT NULL DEFAULT 1,
             is_demo INTEGER NOT NULL DEFAULT 0,
             sort_order INTEGER NOT NULL DEFAULT 0,
@@ -138,8 +216,14 @@ def init_db():
             confidence REAL DEFAULT 0,
             camera_id INTEGER,
             camera_name TEXT,
+            city TEXT DEFAULT '',
+            plate_region TEXT DEFAULT '',
             image_path TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            plate_image_path TEXT,
+            media_status TEXT NOT NULL DEFAULT 'pending',
+            media_error TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS plate_watchlist(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -239,6 +323,11 @@ def init_db():
             "raw_guess_reason": "TEXT NOT NULL DEFAULT ''",
             "model_revision": "TEXT NOT NULL DEFAULT ''",
             "experimental": "INTEGER NOT NULL DEFAULT 0",
+            "city": "TEXT DEFAULT ''",
+            "plate_region": "TEXT DEFAULT ''",
+            "media_status": "TEXT NOT NULL DEFAULT 'pending'",
+            "media_error": "TEXT DEFAULT ''",
+            "updated_at": "TEXT",
         })
         _add_missing_columns(con, "anpr_feedback", {
             "sample_path": "TEXT DEFAULT ''",
@@ -270,6 +359,12 @@ def init_db():
             ON plate_events(plate_norm);
         CREATE INDEX IF NOT EXISTS idx_plate_events_camera_created
             ON plate_events(camera_id,created_at);
+        CREATE INDEX IF NOT EXISTS idx_plate_events_city_created
+            ON plate_events(city,created_at,id);
+        CREATE INDEX IF NOT EXISTS idx_plate_events_region_created
+            ON plate_events(plate_region,created_at,id);
+        CREATE INDEX IF NOT EXISTS idx_plate_events_updated_at
+            ON plate_events(updated_at,id);
         CREATE INDEX IF NOT EXISTS idx_anpr_feedback_observed
             ON anpr_feedback(observed_norm,status);
         CREATE INDEX IF NOT EXISTS idx_anpr_feedback_event
@@ -283,6 +378,7 @@ def init_db():
         """)
 
         _add_missing_columns(con, "cameras", {
+            "city": "TEXT NOT NULL DEFAULT ''",
             "lpr_enabled": "INTEGER NOT NULL DEFAULT 1",
             "lpr_confidence": "INTEGER NOT NULL DEFAULT 60",
             "frame_step": "INTEGER NOT NULL DEFAULT 5",
@@ -293,6 +389,7 @@ def init_db():
             "roi_h": "INTEGER NOT NULL DEFAULT 100",
             "line_y": "INTEGER NOT NULL DEFAULT 50",
         })
+        _backfill_event_metadata(con)
 
         if con.execute(
             "SELECT 1 FROM users WHERE username=?",
@@ -312,6 +409,7 @@ def init_db():
         defaults = {
             "company_name": "گیلاس آبی البرز",
             "dashboard_grid": "2",
+            "dashboard_event_rows": "12",
             "live_fps": "5",
             "stream_width": "640",
             "jpeg_quality": "70",
@@ -320,6 +418,7 @@ def init_db():
             "plate_path": str(DB_PATH.parent / "plates"),
             "video_path": str(DB_PATH.parent / "videos"),
             "backup_path": str(DB_PATH.parent / "backups"),
+            "media_roots_history": "[]",
             "save_snapshots": "1",
             "save_plate_images": "1",
             "save_videos": "0",
