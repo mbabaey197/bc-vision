@@ -29,7 +29,7 @@ concurrency:
 
 jobs:
   regression:
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -52,7 +52,7 @@ jobs:
           python -m pytest -q tests
 
   ai-runtime:
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 45
     env:
       BCVISION_RUN_AI_INTEGRATION: "1"
