@@ -4,6 +4,7 @@ from pathlib import Path
 from PIL import Image
 
 from tools.build_plate_label_review import (
+    _json_for_script,
     build_review_page,
     collect_samples,
 )
@@ -63,17 +64,13 @@ def test_review_page_keeps_shadow_suggestions_unconfirmed(tmp_path):
     assert "bcvision-operator-plate-review" in page
 
 
-def test_review_page_escapes_source_filename_from_script_context(tmp_path):
-    images = tmp_path / "images"
-    images.mkdir()
-    _write_image(images / "unsafe<script>.jpg", (255, 255, 255))
-    output = tmp_path / "review.html"
+def test_review_page_escapes_source_filename_from_script_context():
+    script_json = _json_for_script({
+        "file_name": "unsafe<script>.jpg",
+    })
 
-    build_review_page(images, output)
-
-    page = output.read_text(encoding="utf-8")
-    assert "unsafe<script>" not in page
-    assert "unsafe\\u003Cscript\\u003E.jpg" in page
+    assert "unsafe<script>" not in script_json
+    assert "unsafe\\u003Cscript\\u003E.jpg" in script_json
 
 
 def test_collect_samples_rejects_invalid_quality_bucket_counts(tmp_path):
