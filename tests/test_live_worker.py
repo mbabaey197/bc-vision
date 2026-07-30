@@ -1,10 +1,13 @@
 import time
 import sqlite3
 import threading
+from pathlib import Path
 
+import cv2
 import numpy as np
 
 import app.ai.live_worker as live_worker
+import app.media_storage as media_storage
 
 
 def test_unreadable_vehicle_event_is_upgraded_without_duplicate(
@@ -36,7 +39,9 @@ def test_unreadable_vehicle_event_is_upgraded_without_duplicate(
             quality_score REAL,
             consensus_votes INTEGER,
             source TEXT,
-            processing_ms REAL
+            processing_ms REAL,
+            media_status TEXT,
+            media_error TEXT
         );
         """)
 
@@ -50,8 +55,8 @@ def test_unreadable_vehicle_event_is_upgraded_without_duplicate(
     monkeypatch.setattr(app.database, "connect", connect)
     worker = live_worker.LiveANPRWorker(max_workers=1)
     settings = {
-        "plate_path": str(tmp_path / "plates"),
-        "snapshot_path": str(tmp_path / "vehicles"),
+        "plate_path": str(tmp_path / "تصاویر پلاک"),
+        "snapshot_path": str(tmp_path / "تصاویر خودرو"),
         "save_plate_images": "1",
         "save_snapshots": "1",
     }
@@ -73,7 +78,9 @@ def test_unreadable_vehicle_event_is_upgraded_without_duplicate(
         "ocr_disagreement": False,
         "quality_score": 0.76,
         "bbox": (80, 95, 180, 125),
-        "crop": frame[95:125, 80:180].copy(),
+        # The tracker can emit a best frame without retaining its crop.
+        # Persistence must reconstruct the crop from the detector bbox.
+        "crop": None,
         "method": "test",
         "consensus_votes": 0,
     }
@@ -111,8 +118,329 @@ def test_unreadable_vehicle_event_is_upgraded_without_duplicate(
     assert rows[0]["ocr_engine"] == "crnn-onnx"
     assert rows[0]["ocr_alternative"] == "31-ط-558-74"
     assert rows[0]["ocr_disagreement"] == 1
-    assert (tmp_path / "plates").is_dir()
-    assert (tmp_path / "vehicles").is_dir()
+    assert rows[0]["media_status"] == "complete"
+    assert rows[0]["media_error"] == ""
+    plate_path = Path(rows[0]["plate_image_path"])
+    vehicle_path = Path(rows[0]["image_path"])
+    assert plate_path.parent == tmp_path / "تصاویر پلاک"
+    assert vehicle_path.parent == tmp_path / "تصاویر خودرو"
+    for image_path in (plate_path, vehicle_path):
+        payload = image_path.read_bytes()
+        assert len(payload) > 0
+        decoded = cv2.imdecode(
+            np.frombuffer(payload, dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        assert decoded is not None
+        assert decoded.size > 0
+
+
+def test_confirmed_event_is_not_overwritten_by_different_plate(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "identity-events.db"
+    with sqlite3.connect(db_path) as con:
+        con.executescript("""
+        CREATE TABLE plate_events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plate_text TEXT,
+            plate_norm TEXT,
+            confidence REAL,
+            camera_id INTEGER,
+            camera_name TEXT,
+            image_path TEXT,
+            plate_image_path TEXT,
+            review_status TEXT,
+            source TEXT
+        );
+        """)
+
+    import app.database
+
+    def connect():
+        con = sqlite3.connect(db_path)
+        con.row_factory = sqlite3.Row
+        return con
+
+    monkeypatch.setattr(app.database, "connect", connect)
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    monkeypatch.setattr(
+        worker,
+        "_setting",
+        lambda key, default="": {
+            "plate_path": str(tmp_path / "plates"),
+            "snapshot_path": str(tmp_path / "vehicles"),
+            "save_plate_images": "0",
+            "save_snapshots": "0",
+        }.get(key, default),
+    )
+    frame = np.full((120, 220, 3), 140, dtype=np.uint8)
+    first = {
+        "plate": "12-ب-345-67",
+        "plate_norm": "12ب34567",
+        "valid": True,
+        "confidence": 0.94,
+        "bbox": (60, 70, 160, 100),
+        "crop": frame[70:100, 60:160].copy(),
+    }
+    first_id = worker._persist(8, "Gate", frame, first, 20.0)
+    second = {
+        **first,
+        "plate": "98-م-765-43",
+        "plate_norm": "98م76543",
+    }
+    second_id = worker._persist(
+        8,
+        "Gate",
+        frame,
+        second,
+        20.0,
+        first_id,
+    )
+    worker.shutdown()
+
+    with connect() as con:
+        rows = con.execute(
+            "SELECT id,plate_norm,review_status "
+            "FROM plate_events ORDER BY id"
+        ).fetchall()
+    assert second_id != first_id
+    assert [
+        (row["id"], row["plate_norm"], row["review_status"])
+        for row in rows
+    ] == [
+        (first_id, "12ب34567", "confirmed-ai"),
+        (second_id, "", "suggested"),
+    ]
+
+
+def test_confirmed_event_cannot_be_downgraded_by_reviewable_result(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "immutable-identity-events.db"
+    with sqlite3.connect(db_path) as con:
+        con.executescript("""
+        CREATE TABLE plate_events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plate_text TEXT,
+            plate_norm TEXT,
+            confidence REAL,
+            camera_id INTEGER,
+            camera_name TEXT,
+            image_path TEXT,
+            plate_image_path TEXT,
+            review_status TEXT,
+            source TEXT
+        );
+        """)
+
+    import app.database
+
+    def connect():
+        con = sqlite3.connect(db_path)
+        con.row_factory = sqlite3.Row
+        return con
+
+    monkeypatch.setattr(app.database, "connect", connect)
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    monkeypatch.setattr(
+        worker,
+        "_setting",
+        lambda key, default="": {
+            "plate_path": str(tmp_path / "plates"),
+            "snapshot_path": str(tmp_path / "vehicles"),
+            "save_plate_images": "0",
+            "save_snapshots": "0",
+        }.get(key, default),
+    )
+    frame = np.full((120, 220, 3), 140, dtype=np.uint8)
+    confirmed = {
+        "plate": "12-ب-345-67",
+        "plate_norm": "12ب34567",
+        "valid": True,
+        "confidence": 0.94,
+        "bbox": (60, 70, 160, 100),
+        "crop": frame[70:100, 60:160].copy(),
+    }
+    event_id = worker._persist(
+        8,
+        "Gate",
+        frame,
+        confirmed,
+        20.0,
+    )
+    reviewable = {
+        **confirmed,
+        "plate": "98-م-765-43",
+        "plate_norm": "",
+        "raw_guess_norm": "98م76543",
+        "valid": False,
+        "needs_review": True,
+    }
+    returned_id = worker._persist(
+        8,
+        "Gate",
+        frame,
+        reviewable,
+        20.0,
+        event_id,
+    )
+    worker.shutdown()
+
+    with connect() as con:
+        rows = con.execute(
+            "SELECT id,plate_text,plate_norm,review_status "
+            "FROM plate_events ORDER BY id"
+        ).fetchall()
+    assert returned_id == event_id
+    assert len(rows) == 1
+    assert rows[0]["plate_norm"] == "12ب34567"
+    assert rows[0]["plate_text"] == "12-ب-345-67"
+    assert rows[0]["review_status"] == "confirmed-ai"
+
+
+def test_media_encoder_failure_keeps_text_event_and_records_error(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "events.db"
+    with sqlite3.connect(db_path) as con:
+        con.executescript("""
+        CREATE TABLE plate_events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plate_text TEXT,
+            plate_norm TEXT,
+            confidence REAL,
+            camera_id INTEGER,
+            camera_name TEXT,
+            image_path TEXT,
+            plate_image_path TEXT,
+            media_status TEXT,
+            media_error TEXT
+        );
+        """)
+
+    import app.database
+
+    def connect():
+        con = sqlite3.connect(db_path)
+        con.row_factory = sqlite3.Row
+        return con
+
+    monkeypatch.setattr(app.database, "connect", connect)
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    settings = {
+        "plate_path": str(tmp_path / "plates"),
+        "snapshot_path": str(tmp_path / "vehicles"),
+        "save_plate_images": "1",
+        "save_snapshots": "1",
+    }
+    monkeypatch.setattr(
+        worker,
+        "_setting",
+        lambda key, default="": settings.get(key, default),
+    )
+    monkeypatch.setattr(
+        media_storage.cv2,
+        "imencode",
+        lambda *_args, **_kwargs: (False, None),
+    )
+    frame = np.full((120, 220, 3), 140, dtype=np.uint8)
+    result = {
+        "plate": "12-ب-345-67",
+        "plate_norm": "12ب34567",
+        "valid": True,
+        "confidence": 0.91,
+        "bbox": (60, 70, 160, 100),
+        "crop": frame[70:100, 60:160].copy(),
+    }
+
+    event_id = worker._persist(8, "Gate", frame, result, 20.0)
+    worker.shutdown()
+
+    with connect() as con:
+        row = con.execute(
+            "SELECT * FROM plate_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+    assert row["plate_text"] == "12-ب-345-67"
+    assert row["plate_norm"] == "12ب34567"
+    assert row["plate_image_path"] == ""
+    assert row["image_path"] == ""
+    assert row["media_status"] == "error"
+    assert "plate: JPEG encoder returned no data" in row["media_error"]
+    assert "vehicle: JPEG encoder returned no data" in row["media_error"]
+    assert list(tmp_path.rglob("*.tmp")) == []
+
+
+def test_existing_event_keeps_original_observation_city(
+    tmp_path,
+    monkeypatch,
+):
+    import app.database
+
+    db_path = tmp_path / "city-snapshot.db"
+    monkeypatch.setattr(app.database, "DB_PATH", db_path)
+    app.database.init_db()
+    with app.database.connect() as con:
+        camera_id = int(con.execute(
+            "INSERT INTO cameras(name,rtsp_url,location,city) "
+            "VALUES(?,?,?,?)",
+            ("Gate", "rtsp://gate", "ورودی شمالی", "تهران"),
+        ).lastrowid)
+
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    settings = {
+        "plate_path": str(tmp_path / "plates"),
+        "snapshot_path": str(tmp_path / "vehicles"),
+        "save_plate_images": "1",
+        "save_snapshots": "1",
+    }
+    monkeypatch.setattr(
+        worker,
+        "_setting",
+        lambda key, default="": settings.get(key, default),
+    )
+    frame = np.full((120, 220, 3), 140, dtype=np.uint8)
+    result = {
+        "plate": "12-ب-345-67",
+        "plate_norm": "12ب34567",
+        "valid": True,
+        "confidence": 0.91,
+        "bbox": (60, 70, 160, 100),
+        "crop": frame[70:100, 60:160].copy(),
+    }
+
+    event_id = worker._persist(
+        camera_id,
+        "Gate",
+        frame,
+        result,
+        20.0,
+    )
+    with app.database.connect() as con:
+        con.execute(
+            "UPDATE cameras SET city='شیراز' WHERE id=?",
+            (camera_id,),
+        )
+    worker._persist(
+        camera_id,
+        "Gate",
+        frame,
+        result,
+        20.0,
+        event_id,
+    )
+    worker.shutdown()
+
+    with app.database.connect() as con:
+        city = con.execute(
+            "SELECT city FROM plate_events WHERE id=?",
+            (event_id,),
+        ).fetchone()[0]
+    assert city == "تهران"
 
 
 def test_roi_and_translation():
@@ -138,6 +466,40 @@ def test_roi_and_translation():
     )
     assert row["bbox"] == (21, 22, 31, 32)
     assert row["vehicle_bbox"] == (20, 20, 40, 40)
+
+
+def test_operator_assisted_rows_replaces_only_unreadable_overlap():
+    baseline = [{
+        "bbox": (20, 20, 140, 60),
+        "plate": "ناخوانا",
+        "valid": False,
+        "needs_review": True,
+    }, {
+        "bbox": (180, 20, 300, 60),
+        "plate": "12-ب-345-67",
+        "plate_norm": "12ب34567",
+        "valid": True,
+        "needs_review": False,
+    }]
+    shadow = [{
+        "bbox": (22, 21, 142, 61),
+        "plate": "31-ط-556-74",
+        "raw_guess_norm": "31ط55674",
+        "valid": False,
+    }, {
+        "bbox": (182, 21, 302, 61),
+        "plate": "12-ب-345-76",
+        "raw_guess_norm": "12ب34576",
+        "valid": False,
+    }]
+
+    selected = live_worker.operator_assisted_rows(baseline, shadow)
+
+    assert len(selected) == 2
+    assert selected[0]["raw_guess_norm"] == "31ط55674"
+    assert selected[0]["assisted_candidate"] is True
+    assert selected[0]["needs_review"] is True
+    assert selected[1]["plate_norm"] == "12ب34567"
 
 
 def test_submit_is_non_blocking_and_drops_to_latest(monkeypatch):
@@ -259,7 +621,9 @@ def test_slow_cpu_keeps_three_observations_for_consensus(monkeypatch):
     assert len(recognized) == 1
     assert recognized[0]["plate_norm"] == "12ب34567"
     assert persisted[-1][1] == 41
-    assert state.tracker.max_age_seconds >= 11.0
+    # Slow inference must preserve consecutive observations without leaving a
+    # physical track open long enough to absorb a later vehicle.
+    assert state.tracker.max_age_seconds == 6.0
 
 
 def test_latest_detection_is_available_for_live_overlay(monkeypatch):
@@ -480,6 +844,46 @@ def test_no_plate_backoff_grows_but_recognition_stays_responsive():
     assert delay(0.25, 3) == 1.60
     assert delay(0.25, 4) == 3.20
     assert delay(0.25, 10) == 3.20
+
+
+def test_motion_wakes_camera_during_long_empty_scene_backoff(
+    monkeypatch,
+):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState()
+    state.config = {
+        "id": 27,
+        "enabled": 1,
+        "lpr_enabled": 1,
+        "lpr_confidence": 50,
+        "duplicate_seconds": 0,
+        "roi_x": 0,
+        "roi_y": 0,
+        "roi_w": 100,
+        "roi_h": 100,
+    }
+    state.config_loaded_at = time.monotonic()
+    state.next_inference_at = time.monotonic() + 30.0
+    worker._states[27] = state
+    empty = np.zeros((120, 240, 3), dtype=np.uint8)
+    state.activity.observe(empty)
+    entering = empty.copy()
+    entering[30:100, 70:190] = 220
+    processed = threading.Event()
+
+    def record_process(current_state, payload):
+        assert payload[5].wake_inference is True
+        processed.set()
+        with worker._lock:
+            current_state.busy = False
+
+    monkeypatch.setattr(worker, "_process", record_process)
+
+    worker.submit(27, "entry camera", entering)
+    assert processed.wait(0.5)
+    assert state.motion_wakeups == 1
+    assert state.burst_frames_remaining >= 4
+    worker.shutdown()
 
 
 def test_two_cameras_receive_independent_worker_slots(monkeypatch):

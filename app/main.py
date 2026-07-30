@@ -19,14 +19,22 @@ from app.streams import manager, CV_OK
 from app.license import status as license_status, install_license, activate_online, deactivate_local, machine_id
 from html import escape
 import time, csv, shutil, os, json, secrets
-from datetime import datetime, timedelta
-from urllib.parse import quote
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote, urlencode
 from pathlib import Path
-from app.ai.plate_rules import iran_plate_parts, persian_digits
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from app.ai.plate_rules import (
+    iran_plate_parts,
+    normalize_plate as canonical_normalize_plate,
+    persian_digits,
+    split_iran_plate,
+)
 from app.ai.feedback import invalidate_feedback_cache, validate_correction
+from app.ai.evaluation import character_distance, feedback_quality_summary
 from app.ai.training import (
     apply_candidate,
     capture_feedback_sample,
+    evaluate_candidate_on_golden,
     latest_training_status,
     start_training,
 )
@@ -38,6 +46,13 @@ except Exception:
 
 init_db()
 app = FastAPI(title=f"{APP_NAME} | {COMPANY_NAME}", docs_url="/api/docs", redoc_url=None)
+
+try:
+    APP_LOCAL_TIMEZONE = ZoneInfo("Asia/Tehran")
+except ZoneInfoNotFoundError:
+    # Windows may not expose an IANA timezone database. Iran currently uses a
+    # fixed UTC+03:30 offset, so local time remains correct without tzdata.
+    APP_LOCAL_TIMEZONE = timezone(timedelta(hours=3, minutes=30))
 
 
 @app.middleware("http")
@@ -85,15 +100,40 @@ def _parse_dt(value):
             except Exception: pass
     return None
 
-def jalali_datetime(value, with_seconds=True):
+def _as_local_datetime(value):
     dt=_parse_dt(value)
+    if not dt:return None
+    if dt.tzinfo is None:
+        dt=dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(APP_LOCAL_TIMEZONE)
+
+def _local_to_utc_naive(value):
+    if value is None:return None
+    local=value.replace(tzinfo=APP_LOCAL_TIMEZONE)
+    return local.astimezone(timezone.utc).replace(tzinfo=None)
+
+def _utc_now_text():
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')
+
+def _local_day_utc_bounds(value=None):
+    local_now=value or datetime.now(APP_LOCAL_TIMEZONE)
+    start=local_now.replace(hour=0,minute=0,second=0,microsecond=0)
+    return (
+        start.astimezone(timezone.utc).replace(tzinfo=None),
+        (start+timedelta(days=1)).astimezone(timezone.utc).replace(
+            tzinfo=None
+        ),
+    )
+
+def jalali_datetime(value, with_seconds=True):
+    dt=_as_local_datetime(value)
     if not dt: return '—'
     jy,jm,jd=_gregorian_to_jalali(dt.year,dt.month,dt.day)
     t=dt.strftime('%H:%M:%S' if with_seconds else '%H:%M')
     return persian_digits(f'{jy:04d}/{jm:02d}/{jd:02d} - {t}')
 
 def jalali_date(value):
-    dt=_parse_dt(value)
+    dt=_as_local_datetime(value)
     if not dt:return ''
     jy,jm,jd=_gregorian_to_jalali(dt.year,dt.month,dt.day)
     return persian_digits(f'{jy:04d}/{jm:02d}/{jd:02d}')
@@ -106,9 +146,165 @@ def display_expiration(value):
     return converted or persian_digits(text)
 
 def normalize_plate(text):
-    if not text:return ''
-    trans=str.maketrans('۰۱۲۳۴۵۶۷۸۹','0123456789')
-    return ''.join(ch for ch in str(text).translate(trans).upper() if ch.isalnum() or '\u0600'<=ch<='\u06ff')
+    return canonical_normalize_plate(text)
+
+
+_ALL_DIGITS = str.maketrans(
+    "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+    "01234567890123456789",
+)
+
+
+def _jalali_to_gregorian(jy, jm, jd):
+    jy = int(jy) + 1595
+    jm = int(jm)
+    jd = int(jd)
+    if not 1 <= jm <= 12 or jd < 1:
+        raise ValueError("تاریخ شمسی معتبر نیست.")
+    month_days = 31 if jm <= 6 else 30
+    if jm == 12:
+        month_days = 30
+    if jd > month_days:
+        raise ValueError("تاریخ شمسی معتبر نیست.")
+    days = (
+        -355668
+        + (365 * jy)
+        + ((jy // 33) * 8)
+        + (((jy % 33) + 3) // 4)
+        + jd
+    )
+    days += (jm - 1) * 31 if jm < 7 else ((jm - 7) * 30) + 186
+    gy = 400 * (days // 146097)
+    days %= 146097
+    if days > 36524:
+        days -= 1
+        gy += 100 * (days // 36524)
+        days %= 36524
+        if days >= 365:
+            days += 1
+    gy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        gy += (days - 1) // 365
+        days = (days - 1) % 365
+    gd = days + 1
+    leap = gy % 4 == 0 and (gy % 100 != 0 or gy % 400 == 0)
+    gregorian_month_days = [
+        0, 31, 29 if leap else 28, 31, 30, 31, 30,
+        31, 31, 30, 31, 30, 31,
+    ]
+    gm = 1
+    while gm <= 12 and gd > gregorian_month_days[gm]:
+        gd -= gregorian_month_days[gm]
+        gm += 1
+    if gm > 12:
+        raise ValueError("تاریخ شمسی معتبر نیست.")
+    converted = datetime(gy, gm, gd)
+    if _gregorian_to_jalali(gy, gm, gd) != (
+        int(jy) - 1595,
+        int(jm),
+        int(jd),
+    ):
+        raise ValueError("تاریخ شمسی معتبر نیست.")
+    return converted
+
+
+def _parse_jalali_date(value):
+    text = str(value or "").strip().translate(_ALL_DIGITS)
+    if not text:
+        return None
+    parts = text.replace("-", "/").replace(".", "/").split("/")
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        raise ValueError("تاریخ شمسی را مانند ۱۴۰۵/۰۵/۰۸ وارد کنید.")
+    jy, jm, jd = (int(part) for part in parts)
+    if not 1200 <= jy <= 1600:
+        raise ValueError("سال شمسی معتبر نیست.")
+    return _jalali_to_gregorian(jy, jm, jd)
+
+
+def _parse_time(value):
+    text = str(value or "").strip().translate(_ALL_DIGITS)
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%H:%M").time()
+    except ValueError as exc:
+        raise ValueError("ساعت را مانند ۱۴:۳۰ وارد کنید.") from exc
+
+
+def _plate_region(text):
+    parts = split_iran_plate(text)
+    return parts["region"] if parts else ""
+
+
+def _page_url(path, params, page_key, value):
+    query = {
+        key: str(item)
+        for key, item in params.items()
+        if item not in (None, "")
+    }
+    query[page_key] = str(value)
+    return f"{path}?{urlencode(query)}"
+
+
+def pagination_html(
+    path,
+    current,
+    total_pages,
+    total_items,
+    params,
+    page_key,
+    page_size,
+):
+    total_pages = max(1, int(total_pages))
+    current = max(1, min(total_pages, int(current)))
+    total_items = max(0, int(total_items))
+    if total_items:
+        start = (current - 1) * page_size + 1
+        end = min(total_items, current * page_size)
+        summary = (
+            f"نمایش {persian_digits(start)} تا {persian_digits(end)} "
+            f"از {persian_digits(total_items)} رکورد"
+        )
+    else:
+        summary = "بدون رکورد"
+    visible = {1, total_pages}
+    visible.update(
+        range(max(1, current - 2), min(total_pages, current + 2) + 1)
+    )
+    page_links = []
+    previous = None
+    for number in sorted(visible):
+        if previous is not None and number - previous > 1:
+            page_links.append("<span class='page-gap'>…</span>")
+        cls = "page-number active" if number == current else "page-number"
+        page_links.append(
+            f"<a class='{cls}' href='"
+            f"{escape(_page_url(path, params, page_key, number))}'>"
+            f"{persian_digits(number)}</a>"
+        )
+        previous = number
+    previous_link = (
+        f"<a class='page-nav' href='"
+        f"{escape(_page_url(path, params, page_key, current - 1))}'>"
+        "قبلی</a>"
+        if current > 1
+        else "<span class='page-nav disabled'>قبلی</span>"
+    )
+    next_link = (
+        f"<a class='page-nav' href='"
+        f"{escape(_page_url(path, params, page_key, current + 1))}'>"
+        "بعدی</a>"
+        if current < total_pages
+        else "<span class='page-nav disabled'>بعدی</span>"
+    )
+    return (
+        "<div class='pagination'>"
+        f"<div class='pagination-summary'>{summary} — صفحه "
+        f"{persian_digits(current)} از {persian_digits(total_pages)}</div>"
+        f"<div class='pagination-controls'>{previous_link}"
+        f"{''.join(page_links)}{next_link}</div></div>"
+    )
 
 def event_status_badge(status):
     labels={'allowed':'مجاز','blocked':'غیرمجاز','vip':'VIP','unknown':'ثبت‌نشده'}
@@ -135,6 +331,31 @@ def iran_plate_html(text, compact=False):
     )
 
 
+def anpr_confirmation_badge(status):
+    value = str(status or "confirmed-ai")
+    return {
+        "auto-confirmed": (
+            "<span class='read-badge auto-confirmed'>"
+            "تأیید خودکار مدل؛ قابل اصلاح</span>"
+        ),
+        "suggested": (
+            "<span class='read-badge suggested'>"
+            "خوانش احتمالی؛ اصلاح کنید</span>"
+        ),
+        "unreadable": (
+            "<span class='read-badge unreadable'>واقعاً ناخوانا</span>"
+        ),
+        "confirmed": (
+            "<span class='read-badge confirmed'>"
+            "تأیید اپراتور و ثبت برای آموزش</span>"
+        ),
+        "confirmed-ai": (
+            "<span class='read-badge confirmed-ai'>"
+            "خوانش قطعی چندفریمی</span>"
+        ),
+    }.get(value, "")
+
+
 def dashboard_event_row(row):
     image_path = row["image_path"] or ""
     plate_path = row["plate_image_path"] or ""
@@ -156,11 +377,27 @@ def dashboard_event_row(row):
         if "review_status" in row.keys()
         else "confirmed-ai"
     )
-    review_badge = {
-        "suggested": "<span class='read-badge suggested'>خوانش احتمالی؛ اصلاح کنید</span>",
-        "unreadable": "<span class='read-badge unreadable'>واقعاً ناخوانا</span>",
-        "confirmed": "<span class='read-badge confirmed'>اصلاح و آموزش ثبت شد</span>",
-    }.get(review_status, "")
+    review_badge = anpr_confirmation_badge(review_status)
+    city = (
+        str(row["city"] or "")
+        if "city" in row.keys()
+        else ""
+    )
+    media_status = (
+        str(row["media_status"] or "")
+        if "media_status" in row.keys()
+        else ""
+    )
+    media_warning = (
+        "<span class='read-badge unreadable'>خطای ذخیره تصویر</span>"
+        if media_status in {"error", "partial"}
+        else ""
+    )
+    city_html = (
+        f"<br><small class='muted'>{escape(city)}</small>"
+        if city
+        else ""
+    )
     current_plate = str(row["plate_text"] or "")
     correction_value = (
         f" value='{escape(current_plate)}'"
@@ -171,8 +408,8 @@ def dashboard_event_row(row):
         f"<tr><td>{vehicle}</td>"
         f"<td><div class='recent-plate-result'>{plate_image}"
         f"<div>{iran_plate_html(row['plate_text'], True)}"
-        f"{review_badge}</div></div></td>"
-        f"<td>{escape(row['camera_name'] or '—')}</td>"
+        f"{review_badge}{media_warning}</div></div></td>"
+        f"<td>{escape(row['camera_name'] or '—')}{city_html}</td>"
         f"<td>{persian_digits(int((row['confidence'] or 0) * 100))}٪</td>"
         f"<td>{persian_digits(jalali_datetime(row['created_at'], False))}</td>"
         f"<td><form class='correction-form' method='post' "
@@ -180,7 +417,7 @@ def dashboard_event_row(row):
         f"<input name='corrected_plate' required maxlength='20' "
         f"{correction_value} "
         f"placeholder='مثال: ۱۲ ب ۳۴۵ ایران ۶۷'>"
-        f"<button>ثبت اصلاح</button></form></td></tr>"
+        f"<button>تأیید/اصلاح و آموزش</button></form></td></tr>"
     )
 
 
@@ -192,7 +429,7 @@ CSS = """<style>
 .main{margin-right:var(--sidebar);min-height:100vh;transition:margin-right .22s}.main.collapsed{margin-right:84px}.topbar{height:70px;background:color-mix(in srgb,var(--bc-surface) 92%,transparent);backdrop-filter:blur(12px);border-bottom:1px solid var(--bc-border);display:flex;align-items:center;gap:12px;padding:0 24px;position:sticky;top:0;z-index:900}.top-title{font-size:18px;font-weight:900;color:var(--bc-navy);margin-left:auto}.resource-strip{display:flex;align-items:center;gap:7px;direction:ltr}.resource-chip{display:flex;align-items:center;gap:5px;min-width:66px;padding:5px 8px;border:1px solid var(--bc-border);background:var(--bc-surface);border-radius:10px;font-size:12px;font-weight:800}.resource-dot{width:8px;height:8px;border-radius:50%;background:#22a06b;box-shadow:0 0 0 3px rgba(34,160,107,.12)}.resource-chip.warn .resource-dot{background:#e5a11a}.resource-chip.danger .resource-dot{background:#d64545}.storage-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.drive-card{border:1px solid var(--bc-border);background:var(--bc-surface2);border-radius:13px;padding:14px}.storage-progress{height:10px;background:var(--bc-border);border-radius:8px;overflow:hidden;margin:9px 0}.storage-progress span{display:block;height:100%;background:linear-gradient(90deg,var(--bc-blue),var(--bc-cyan));border-radius:8px}[data-theme=dark] .top-title{color:#eaf2ff}.top-action{width:40px;height:40px;border-radius:11px;border:1px solid var(--bc-border);background:var(--bc-surface);color:var(--bc-text);display:grid;place-items:center;cursor:pointer;box-shadow:none;padding:0}.user-chip{display:flex;align-items:center;gap:9px;border:1px solid var(--bc-border);background:var(--bc-surface);padding:6px 10px;border-radius:12px}.avatar{width:29px;height:29px;border-radius:9px;background:linear-gradient(135deg,var(--bc-blue),var(--bc-cyan));color:#fff;display:grid;place-items:center;font-weight:900}.wrap{max-width:1550px;margin:auto;padding:25px}.page-title{font-weight:900;font-size:28px;margin:0;color:var(--bc-navy)}[data-theme=dark] .page-title,[data-theme=dark] h1{color:#edf4ff}h1{font-size:27px;font-weight:900;color:var(--bc-navy)}h3{font-size:18px;font-weight:800}.page-sub{color:var(--bc-muted);margin:2px 0 0}
 .card{background:var(--bc-surface);border:1px solid var(--bc-border);border-radius:var(--bc-radius);padding:20px;box-shadow:var(--bc-shadow);margin-bottom:17px}.login{max-width:430px;margin:7vh auto;padding:30px}.login .brand{text-align:center;font-size:28px;margin-bottom:3px}.login .muted{text-align:center}.brand{font-size:25px;font-weight:900;color:var(--bc-navy)}.muted{color:var(--bc-muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}.stats-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:15px;margin-bottom:17px}.stat-card{position:relative;overflow:hidden}.stat-card:after{content:"";position:absolute;width:90px;height:90px;border-radius:50%;left:-25px;top:-28px;background:rgba(8,124,240,.07)}.stat-head{display:flex;align-items:center;justify-content:space-between}.stat-icon{width:43px;height:43px;border-radius:13px;background:rgba(8,124,240,.1);color:var(--bc-blue);display:grid;place-items:center;font-size:21px}.stat{font-size:31px;font-weight:900;color:var(--bc-text);margin-top:5px;line-height:1.2}.trend{font-size:12px;color:var(--bc-muted)}
 label{display:block;font-weight:700;color:var(--bc-text);margin-bottom:3px}input,select,textarea,button{font-family:inherit;font-size:14px}input:not([type=checkbox]),select,textarea{width:100%;padding:10px 12px;border:1px solid var(--bc-border);border-radius:10px;margin:5px 0 13px;background:var(--bc-surface);color:var(--bc-text);outline:0;transition:.18s}input:focus,select:focus,textarea:focus{border-color:var(--bc-blue);box-shadow:0 0 0 3px rgba(8,124,240,.13)}button,.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:0;background:linear-gradient(135deg,var(--bc-blue),#075dc5);color:#fff!important;padding:9px 16px;border-radius:9px;text-decoration:none;cursor:pointer;font-weight:700;box-shadow:0 4px 12px rgba(8,124,240,.18);transition:.18s}button:hover,.btn:hover{transform:translateY(-1px);filter:brightness(1.04)}.secondary{background:#65738a!important;box-shadow:none}.danger{background:#c63838!important;box-shadow:none}.ok{color:#168458}.bad{color:#d34747}.replay-layout{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(300px,.8fr);gap:18px}.video-panel video{width:100%;max-height:70vh;background:#05080d;border-radius:14px}.replay-controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:12px}.replay-controls button{padding:8px 12px}.event-meta{display:grid;grid-template-columns:1fr 1fr;gap:10px}.meta-item{padding:10px;border:1px solid var(--bc-border);border-radius:10px;background:var(--bc-surface2)}.meta-item small{display:block;color:var(--bc-muted)}.detail-images{display:grid;grid-template-columns:1fr 1fr;gap:10px}.detail-images img{width:100%;height:165px;object-fit:contain;background:#0b1220;border-radius:11px}.time-badge{font-size:20px;font-weight:900;color:var(--bc-blue)}@media(max-width:900px){.replay-layout{grid-template-columns:1fr}.event-meta{grid-template-columns:1fr}}.alert{padding:12px 15px;border-radius:10px;background:#fff1f2;color:#9b1c2d;border:1px solid #ffd5da;margin-bottom:14px}.toast-box{position:fixed;left:22px;bottom:22px;z-index:2000;min-width:270px;background:var(--bc-surface);border:1px solid var(--bc-border);border-right:4px solid #168458;border-radius:12px;padding:12px 15px;box-shadow:var(--bc-shadow);animation:toastin .3s ease}.toast-box.hide{opacity:0;transform:translateY(12px);transition:.35s}@keyframes toastin{from{opacity:0;transform:translateY(15px)}}
-.table-wrap{overflow:auto}table{width:100%;border-collapse:separate;border-spacing:0;min-width:700px}th,td{padding:12px 11px;border-bottom:1px solid var(--bc-border);text-align:right;vertical-align:middle}th{font-size:13px;color:var(--bc-muted);background:var(--bc-surface2);font-weight:800}tr:last-child td{border-bottom:0}tbody tr:hover td{background:var(--bc-surface2)}.code{direction:ltr;text-align:left;font-family:Consolas,"Courier New",monospace}.live-grid{display:grid;grid-template-columns:repeat(var(--cols),minmax(0,520px));gap:14px;justify-content:start}.camera-tile{background:#101820;border-radius:14px;overflow:hidden;position:relative;min-height:160px;box-shadow:var(--bc-shadow)}.camera-tile img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;background:#101820}.camera-head{display:flex;justify-content:space-between;align-items:center;color:#fff;padding:8px 11px;background:#162631}.badge{font-size:11px;padding:4px 9px;border-radius:20px;background:#657180}.badge.online{background:#168458}.toolbar{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:17px}.toolbar h1{margin-left:auto;margin-bottom:0}.toolbar select{width:auto;margin:0}.two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px}.system-bars{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.meter-label{display:flex;justify-content:space-between;margin-bottom:7px}.meter{height:8px;border-radius:8px;background:var(--bc-border);overflow:hidden}.meter span{display:block;height:100%;background:linear-gradient(90deg,var(--bc-blue),var(--bc-cyan));border-radius:8px;transition:width .4s}.empty-state{text-align:center;padding:38px 20px}.grid-switch{display:flex;background:var(--bc-surface);border:1px solid var(--bc-border);border-radius:10px;padding:3px;gap:3px}.grid-switch button{box-shadow:none;background:transparent;color:var(--bc-muted)!important;padding:6px 10px}.grid-switch button.active{background:var(--bc-blue);color:#fff!important}.mobile-menu{display:none}
+.table-wrap{overflow:auto}table{width:100%;border-collapse:separate;border-spacing:0;min-width:700px}th,td{padding:12px 11px;border-bottom:1px solid var(--bc-border);text-align:right;vertical-align:middle}th{font-size:13px;color:var(--bc-muted);background:var(--bc-surface2);font-weight:800}tr:last-child td{border-bottom:0}tbody tr:hover td{background:var(--bc-surface2)}.pagination{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-top:14px;padding-top:13px;border-top:1px solid var(--bc-border)}.pagination-summary{color:var(--bc-muted);font-weight:700}.pagination-controls{display:flex;align-items:center;gap:5px;direction:rtl}.page-nav,.page-number{min-width:37px;height:37px;padding:5px 10px;border:1px solid var(--bc-border);background:var(--bc-surface);border-radius:9px;text-decoration:none;display:grid;place-items:center;font-weight:800;color:var(--bc-text)}.page-nav{min-width:64px}.page-number.active{background:var(--bc-blue);border-color:var(--bc-blue);color:#fff}.page-nav.disabled{opacity:.42;cursor:not-allowed}.page-gap{padding:0 4px;color:var(--bc-muted)}.new-events-notice{display:none;margin:10px 0;padding:9px 12px;border-radius:10px;background:#e8f4ff;color:#075dc5;font-weight:800}.new-events-notice.show{display:block}.code{direction:ltr;text-align:left;font-family:Consolas,"Courier New",monospace}.live-grid{display:grid;grid-template-columns:repeat(var(--cols),minmax(0,520px));gap:14px;justify-content:start}.camera-tile{background:#101820;border-radius:14px;overflow:hidden;position:relative;min-height:160px;box-shadow:var(--bc-shadow)}.camera-tile img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;background:#101820}.camera-head{display:flex;justify-content:space-between;align-items:center;color:#fff;padding:8px 11px;background:#162631}.badge{font-size:11px;padding:4px 9px;border-radius:20px;background:#657180}.badge.online{background:#168458}.toolbar{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:17px}.toolbar h1{margin-left:auto;margin-bottom:0}.toolbar select{width:auto;margin:0}.two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px}.system-bars{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.meter-label{display:flex;justify-content:space-between;margin-bottom:7px}.meter{height:8px;border-radius:8px;background:var(--bc-border);overflow:hidden}.meter span{display:block;height:100%;background:linear-gradient(90deg,var(--bc-blue),var(--bc-cyan));border-radius:8px;transition:width .4s}.empty-state{text-align:center;padding:38px 20px}.grid-switch{display:flex;background:var(--bc-surface);border:1px solid var(--bc-border);border-radius:10px;padding:3px;gap:3px}.grid-switch button{box-shadow:none;background:transparent;color:var(--bc-muted)!important;padding:6px 10px}.grid-switch button.active{background:var(--bc-blue);color:#fff!important}.mobile-menu{display:none}
 @media(max-width:1150px){.stats-grid{grid-template-columns:repeat(2,1fr)}.system-bars{grid-template-columns:1fr}}
 @media(max-width:900px){.resource-chip span.label{display:none}.resource-chip{min-width:auto}}
 @media(max-width:760px){.sidebar{transform:translateX(110%);width:258px}.sidebar.mobile-open{transform:translateX(0)}.sidebar-toggle{display:none}.main,.main.collapsed{margin-right:0}.mobile-menu{display:grid}.topbar{padding:0 12px}.user-chip span:last-child{display:none}.wrap{padding:17px 12px}.stats-grid{grid-template-columns:1fr 1fr;gap:10px}.card{padding:15px}.live-grid{grid-template-columns:1fr!important}.two-col,.storage-grid{grid-template-columns:1fr}.toolbar h1{width:100%;font-size:23px}.login{margin:4vh 12px}}
@@ -200,7 +437,7 @@ label{display:block;font-weight:700;color:var(--bc-text);margin-bottom:3px}input
 .thumb{width:110px;height:62px;object-fit:cover;border-radius:9px;border:1px solid var(--bc-border);background:#eef2f7;cursor:pointer}.plate-thumb{width:130px;height:48px}.recent-plate-result{display:flex;align-items:center;gap:10px;min-width:275px}.recent-plate-result .plate-thumb{flex:0 0 auto}.recent-vehicle-thumb{width:126px;height:72px;object-fit:cover;border-radius:10px;border:1px solid var(--bc-border);background:#eef2f7}.recent-media-missing{display:inline-flex;width:126px;height:72px;align-items:center;justify-content:center;border:1px dashed var(--bc-border);border-radius:10px;color:var(--bc-muted);font-size:12px}.status-pill{display:inline-block;padding:3px 9px;border-radius:999px;font-size:12px;font-weight:900}.status-pill.ok{background:#e5f7ef;color:#147a50}.status-pill.bad{background:#ffe8e8;color:#b42318}.status-pill.vip{background:#fff3cd;color:#8a6100}.event-blocked{background:rgba(214,69,69,.07)}.event-vip{background:rgba(229,161,26,.08)}.filter-grid{display:grid;grid-template-columns:repeat(5,minmax(140px,1fr));gap:10px;align-items:end}.modal-img{position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:5000;display:none;place-items:center;padding:30px}.modal-img.open{display:grid}.modal-img img{max-width:95vw;max-height:90vh;border-radius:14px}.modal-img button{position:absolute;top:20px;left:20px}@media(max-width:900px){.filter-grid{grid-template-columns:1fr 1fr}}
 .login-page{min-height:100vh;display:grid;grid-template-columns:minmax(320px,520px) 1fr;background:linear-gradient(135deg,#071b3f 0%,#0b2e63 52%,#087cf0 100%);direction:ltr;overflow:hidden}.login-panel{direction:rtl;background:var(--bc-surface);padding:clamp(26px,5vw,68px);display:flex;align-items:center;justify-content:center;box-shadow:20px 0 60px rgba(0,0,0,.18);z-index:2}.login-box{width:100%;max-width:410px}.login-logo{display:flex;align-items:center;gap:13px;margin-bottom:34px}.login-logo .brand-mark{width:58px;height:58px;min-width:58px;font-size:22px}.login-logo h1{margin:0;font-size:28px}.login-logo p{margin:0;color:var(--bc-muted)}.login-title{font-size:25px;font-weight:900;margin:0 0 5px}.login-subtitle{color:var(--bc-muted);margin:0 0 26px}.password-wrap{position:relative}.password-wrap input{padding-left:48px}.password-toggle{position:absolute;left:7px;top:10px;width:36px;height:36px;background:transparent!important;color:var(--bc-muted)!important;box-shadow:none;padding:0}.password-toggle:hover{transform:none;background:var(--bc-surface2)!important}.login-submit{width:100%;height:46px;font-size:15px;margin-top:5px}.login-help{display:flex;justify-content:space-between;gap:12px;margin-top:17px;font-size:12px;color:var(--bc-muted)}.login-visual{direction:rtl;color:#fff;display:flex;align-items:center;justify-content:center;padding:60px;position:relative}.login-visual:before,.login-visual:after{content:'';position:absolute;border-radius:50%;background:rgba(255,255,255,.08)}.login-visual:before{width:420px;height:420px;left:-130px;top:-170px}.login-visual:after{width:300px;height:300px;right:8%;bottom:-140px}.login-hero{max-width:670px;position:relative;z-index:1}.login-hero h2{font-size:clamp(32px,4vw,54px);font-weight:900;line-height:1.35;margin:0 0 16px}.login-hero p{font-size:17px;opacity:.82;max-width:570px}.login-features{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:34px}.login-feature{padding:17px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.08);backdrop-filter:blur(10px);border-radius:15px}.login-feature b{display:block;font-size:15px;margin-bottom:3px}.login-feature span{font-size:12px;opacity:.75}.login-version{position:absolute;bottom:24px;left:30px;opacity:.62;font-size:12px}@media(max-width:900px){.login-page{grid-template-columns:1fr}.login-visual{display:none}.login-panel{min-height:100vh;padding:24px}.login-help{flex-direction:column}}
 .anpr-status{display:block;padding:7px 12px;color:#c8d5df;background:#0c141a;font-size:11px;line-height:1.7;border-top:1px solid #263945}.anpr-status.bad{color:#ffb4ab;background:#301716}.playback-controls{display:flex;gap:7px;padding:8px 11px;background:#0c141a;border-top:1px solid #263945}.playback-controls button{padding:6px 12px;font-size:12px;box-shadow:none}.playback-controls button.active{background:#16a36b}
-.iran-plate{display:inline-flex;direction:ltr;align-items:stretch;height:54px;min-width:250px;border:2px solid #15191f;border-radius:7px;overflow:hidden;background:#fff;color:#111;font-family:Tahoma,"Segoe UI",sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.14)}.iran-plate.compact{height:42px;min-width:205px}.plate-blue{width:32px;background:#0868b7;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:12px;line-height:1}.plate-blue small{font-size:7px;margin-top:3px}.plate-main{display:flex;align-items:center;justify-content:space-evenly;gap:8px;flex:1;padding:0 9px;font-size:21px}.compact .plate-main{font-size:17px;gap:6px;padding:0 7px}.plate-iran{width:54px;border-left:2px solid #15191f;display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1}.plate-iran small{font-size:9px}.plate-iran b{font-size:17px;margin-top:4px}.compact .plate-iran{width:46px}.compact .plate-iran b{font-size:14px}.plate-unreadable{display:inline-block;padding:6px 10px;border-radius:7px;background:#fff1c7;color:#714f00;font-weight:800}.read-badge{display:block;width:max-content;margin-top:5px;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:800}.read-badge.suggested{background:#fff1c7;color:#714f00}.read-badge.unreadable{background:#ffe8e8;color:#a12a2a}.read-badge.confirmed{background:#e5f7ef;color:#147a50}.correction-form{display:flex;gap:7px;align-items:center;min-width:265px}.correction-form input:not([type=checkbox]){margin:0;min-width:170px;padding:7px 9px}.correction-form button{padding:7px 10px;white-space:nowrap}.feedback-note{font-size:12px;color:var(--bc-muted);margin-top:8px}
+.iran-plate{display:inline-flex;direction:ltr;align-items:stretch;height:54px;min-width:250px;border:2px solid #15191f;border-radius:7px;overflow:hidden;background:#fff;color:#111;font-family:Tahoma,"Segoe UI",sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.14)}.iran-plate.compact{height:42px;min-width:205px}.plate-blue{width:32px;background:#0868b7;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:12px;line-height:1}.plate-blue small{font-size:7px;margin-top:3px}.plate-main{display:flex;align-items:center;justify-content:space-evenly;gap:8px;flex:1;padding:0 9px;font-size:21px}.compact .plate-main{font-size:17px;gap:6px;padding:0 7px}.plate-iran{width:54px;border-left:2px solid #15191f;display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1}.plate-iran small{font-size:9px}.plate-iran b{font-size:17px;margin-top:4px}.compact .plate-iran{width:46px}.compact .plate-iran b{font-size:14px}.plate-unreadable{display:inline-block;padding:6px 10px;border-radius:7px;background:#fff1c7;color:#714f00;font-weight:800}.read-badge{display:block;width:max-content;margin-top:5px;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:800}.read-badge.suggested{background:#fff1c7;color:#714f00}.read-badge.unreadable{background:#ffe8e8;color:#a12a2a}.read-badge.confirmed{background:#e5f7ef;color:#147a50}.read-badge.confirmed-ai{background:#e7f5ff;color:#0969a9}.read-badge.auto-confirmed{background:#e9f7ed;color:#226b35;border:1px solid #b9e2c4}.correction-form{display:flex;gap:7px;align-items:center;min-width:265px}.correction-form input:not([type=checkbox]){margin:0;min-width:170px;padding:7px 9px}.correction-form button{padding:7px 10px;white-space:nowrap}.feedback-note{font-size:12px;color:var(--bc-muted);margin-top:8px}
 </style>"""
 
 BOOTSTRAP = "<link href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.rtl.min.css' rel='stylesheet'>"
@@ -337,22 +574,70 @@ def logout(request:Request):
     r=RedirectResponse('/login?logged_out=1',302);r.delete_cookie(COOKIE_NAME,path='/');return r
 
 @app.get('/dashboard')
-def dashboard(request:Request):
+def dashboard(
+    request:Request,
+    events_page:int=1,
+    events_snapshot:int=0,
+):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
     cams=camera_rows(True); cols=max(1,min(4,int(get_setting('dashboard_grid','2'))))
+    event_page_size=max(
+        6,
+        min(50, _safe_int(get_setting('dashboard_event_rows','12'), 12)),
+    )
+    today_start,today_end=_local_day_utc_bounds()
+    today_params=(
+        today_start.strftime('%Y-%m-%d %H:%M:%S'),
+        today_end.strftime('%Y-%m-%d %H:%M:%S'),
+    )
     with connect() as con:
-        today=con.execute("SELECT COUNT(*) c FROM plate_events WHERE date(created_at)=date('now','localtime')").fetchone()['c']
-        alerts=con.execute("SELECT COUNT(*) c FROM plate_events WHERE confidence < 0.70 AND date(created_at)=date('now','localtime')").fetchone()['c']
+        today=con.execute(
+            "SELECT COUNT(*) c FROM plate_events "
+            "WHERE created_at>=? AND created_at<?",
+            today_params,
+        ).fetchone()['c']
+        alerts=con.execute(
+            "SELECT COUNT(*) c FROM plate_events "
+            "WHERE confidence < 0.70 AND created_at>=? AND created_at<?",
+            today_params,
+        ).fetchone()['c']
+        latest_event_id=int(con.execute(
+            "SELECT COALESCE(MAX(id),0) FROM plate_events"
+        ).fetchone()[0])
+        latest_event_updated=str(con.execute(
+            "SELECT COALESCE(MAX(updated_at),'') "
+            "FROM plate_events"
+        ).fetchone()[0] or '')
+        snapshot=max(0,int(events_snapshot or latest_event_id))
+        if snapshot > latest_event_id:
+            snapshot=latest_event_id
+        total_events=int(con.execute(
+            "SELECT COUNT(*) FROM plate_events WHERE id<=?",
+            (snapshot,),
+        ).fetchone()[0])
+        total_event_pages=max(
+            1,
+            (total_events + event_page_size - 1) // event_page_size,
+        )
+        events_page=max(1,min(total_event_pages,int(events_page or 1)))
         recent=con.execute(
             "SELECT id,plate_text,camera_name,confidence,created_at,"
-            "image_path,plate_image_path,review_status "
-            "FROM plate_events ORDER BY id DESC LIMIT 6"
+            "image_path,plate_image_path,review_status,city,media_status "
+            "FROM plate_events WHERE id<=? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (
+                snapshot,
+                event_page_size,
+                (events_page-1)*event_page_size,
+            ),
         ).fetchall()
     lic=license_status()
     def camera_tile(c):
         camera_id=int(c['id'])
         is_video=str(c['rtsp_url']).startswith('video://')
+        camera_place=' / '.join(
+            value for value in (c['city'],c['location']) if value
+        ) or 'بدون موقعیت'
         controls=(
             f"<div class='playback-controls'>"
             f"<button type='button' id='play-{camera_id}' "
@@ -370,7 +655,7 @@ def dashboard(request:Request):
             f"alt='{escape(c['name'])}'><span class='anpr-status' "
             f"id='anpr-{camera_id}'>پلاک‌خوان: در انتظار اولین فریم</span>"
             f"{controls}<div class='camera-head'><small>"
-            f"{escape(c['location'] or 'بدون موقعیت')}</small>"
+            f"{escape(camera_place)}</small>"
             f"<a style='color:#bdefff' href='/cameras/{camera_id}/snapshot'>"
             f"گرفتن عکس</a></div></div>"
         )
@@ -380,24 +665,49 @@ def dashboard(request:Request):
     recent_rows=''.join(
         dashboard_event_row(r) for r in recent
     ) or "<tr><td colspan='6'>هنوز پلاکی ثبت نشده است.</td></tr>"
+    recent_pagination=pagination_html(
+        '/dashboard',
+        events_page,
+        total_event_pages,
+        total_events,
+        {'events_snapshot':snapshot},
+        'events_page',
+        event_page_size,
+    )
     js=f"""<script>
 const ids=[{ids}];
 async function cameraStatus(){{for(const id of ids){{try{{let r=await fetch('/api/cameras/'+id+'/status');let s=await r.json();let e=document.getElementById('st-'+id),a=document.getElementById('anpr-'+id),n=v=>Number(v||0).toLocaleString('fa-IR');e.textContent=s.paused?'متوقف':(s.online?'آنلاین':'آفلاین');e.className='badge '+(s.online?'online':'');const play=document.getElementById('play-'+id),pause=document.getElementById('pause-'+id);if(play)play.classList.toggle('active',!s.paused);if(pause)pause.classList.toggle('active',!!s.paused);const p=s.anpr||{{}},m=p.models||{{}};if(!m.ready){{a.textContent='پلاک‌خوان آماده نیست: مدل تشخیص یا OCR نصب نشده است';a.className='anpr-status bad'}}else if(p.last_error){{a.textContent='خطای پلاک‌خوان: '+p.last_error;a.className='anpr-status bad'}}else{{const idle=p.idle_mode?' | حالت کم‌مصرف':'';a.textContent='پردازش: '+n(p.processed_frames)+' فریم | تشخیص: '+n(p.detected_candidates)+' | ثبت: '+n(p.emitted_events)+idle;a.className='anpr-status'}}}}catch(e){{}}}}}}
 async function videoPlayback(id,action){{try{{const r=await fetch('/api/cameras/'+id+'/playback',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action}})}});if(!r.ok)throw new Error();await cameraStatus()}}catch(e){{alert('تغییر وضعیت پخش انجام نشد.')}}}}
-let latestEventId={recent[0]['id'] if recent else 0};
+let latestEventId={latest_event_id};
+let latestEventUpdated={json.dumps(latest_event_updated)};
+const dashboardEventsPage={events_page};
 async function refreshRecentEvents(){{
  try{{
-  const r=await fetch('/api/dashboard/recent-events?after='+latestEventId,{{cache:'no-store'}});
+  const url='/api/dashboard/recent-events?after='+latestEventId+'&after_updated='+encodeURIComponent(latestEventUpdated);
+  const r=await fetch(url,{{cache:'no-store'}});
   if(!r.ok)return;
   const data=await r.json();
-  if(data.latest_id>latestEventId){{
-   document.getElementById('recentEventsBody').innerHTML=data.rows_html;
+  if(data.rows_html&&(
+    data.latest_id>latestEventId||
+    (data.latest_updated&&data.latest_updated>latestEventUpdated)
+  )){{
+   const focused=document.activeElement?.closest?.('#recentEventsBody');
+   if(dashboardEventsPage!==1){{
+    document.getElementById('newEventsNotice').classList.add('show');
+   }}else if(focused){{
+    document.getElementById('newEventsNotice').classList.add('show');
+    return;
+   }}else{{
+    document.getElementById('recentEventsBody').innerHTML=data.rows_html;
+    if(data.pagination_html)document.getElementById('recentEventsPagination').innerHTML=data.pagination_html;
+   }}
    latestEventId=data.latest_id;
+   latestEventUpdated=data.latest_updated||latestEventUpdated;
   }}
  }}catch(e){{}}
 }}
 function setGrid(n){{document.getElementById('liveGrid').style.setProperty('--cols',n);document.querySelectorAll('.grid-switch button').forEach(b=>b.classList.toggle('active',Number(b.dataset.n)===n));localStorage.setItem('bc-grid',n)}}
-const savedGrid=Number(localStorage.getItem('bc-grid')||{cols});setGrid(savedGrid);cameraStatus();setInterval(cameraStatus,4000);setInterval(refreshRecentEvents,750);
+const savedGrid=Number(localStorage.getItem('bc-grid')||{cols});setGrid(savedGrid);cameraStatus();setInterval(cameraStatus,4000);setInterval(refreshRecentEvents,1500);
 </script>"""
     valid_class='ok' if lic['valid'] else 'bad'
     body=f"""<div class='wrap'><div class='toolbar'><div style='margin-left:auto'><h1 class='page-title'>داشبورد</h1><p class='page-sub'>نمای کلی وضعیت سامانه و تصاویر زنده</p></div><a class='btn' href='/cameras/new'>＋ افزودن دوربین</a></div>
@@ -408,26 +718,69 @@ const savedGrid=Number(localStorage.getItem('bc-grid')||{cols});setGrid(savedGri
       <div class='card stat-card'><div class='stat-head'><span class='muted'>وضعیت لایسنس</span><span class='stat-icon'>◆</span></div><div class='{valid_class}' style='font-size:20px;font-weight:900;margin-top:10px'>{escape(lic['plan'])}</div><div class='trend'>{escape(lic['message'])}</div></div>
     </div>
     <div class='card'><div class='toolbar'><div style='margin-left:auto'><h3 style='margin:0'>نمایش زنده</h3><span class='muted'>تصاویر دوربین‌های فعال</span></div><div class='grid-switch'><button data-n='1' onclick='setGrid(1)'>۱</button><button data-n='2' onclick='setGrid(2)'>۴</button><button data-n='3' onclick='setGrid(3)'>۹</button><button data-n='4' onclick='setGrid(4)'>۱۶</button></div><button class='secondary' onclick='document.documentElement.requestFullscreen?.()'>تمام‌صفحه</button></div><div class='live-grid' id='liveGrid' style='--cols:{cols}'>{tiles}</div></div>
-    <div class='card'><h3>آخرین تشخیص‌های پلاک و خودرو</h3><p class='feedback-note'>در نسخه آزمایشی، پلاک صحیح را کنار هر نتیجه وارد کنید. اصلاح ثبت‌شده همان رویداد را تصحیح می‌کند، خوانش مشابه را به حافظه محلی می‌سپارد و تصویر آن را برای بازآموزی کنترل‌شده نگه می‌دارد.</p><div class='table-wrap'><table><thead><tr><th>تصویر خودرو</th><th>تصویر پلاک / پلاک خوانده‌شده</th><th>دوربین</th><th>اطمینان</th><th>زمان</th><th>اصلاح و آموزش</th></tr></thead><tbody id='recentEventsBody'>{recent_rows}</tbody></table></div><div style='margin-top:12px'><a class='btn secondary' href='/events'>مشاهده همه گزارش‌ها</a> <a class='btn secondary' href='/settings'>وضعیت فنی سامانه</a></div></div>{js}</div>"""
+    <div class='card'><h3>آخرین تشخیص‌های پلاک و خودرو</h3><p class='feedback-note'>حدس کاملِ چندفریمی با نشان «تأیید خودکار مدل» در ترددها ثبت می‌شود. با زدن دکمهٔ تأیید/اصلاح، نتیجهٔ انسانی قطعی می‌شود، همان رویداد تصحیح می‌گردد و تصویر پلاک برای آموزش کنترل‌شده نگه‌داری می‌شود.</p><a id='newEventsNotice' class='new-events-notice' href='/dashboard'>رویداد جدید ثبت شد — نمایش صفحهٔ اول</a><div class='table-wrap'><table><thead><tr><th>تصویر خودرو</th><th>تصویر پلاک / پلاک خوانده‌شده</th><th>دوربین / شهر</th><th>اطمینان</th><th>زمان</th><th>تأیید، اصلاح و آموزش</th></tr></thead><tbody id='recentEventsBody'>{recent_rows}</tbody></table></div><div id='recentEventsPagination'>{recent_pagination}</div><div style='margin-top:12px'><a class='btn secondary' href='/events'>مشاهده همه گزارش‌ها</a> <a class='btn secondary' href='/settings'>وضعیت فنی سامانه</a></div></div>{js}</div>"""
     return page('داشبورد',body,u,request)
 
 @app.get('/api/dashboard/recent-events')
-def dashboard_recent_events(request:Request,after:int=0):
+def dashboard_recent_events(
+    request:Request,
+    after:int=0,
+    after_updated:str='',
+):
     if not auth(request):
         return JSONResponse({'error':'unauthorized'},401)
+    event_page_size=max(
+        6,
+        min(50, _safe_int(get_setting('dashboard_event_rows','12'), 12)),
+    )
     with connect() as con:
+        latest_id=int(con.execute(
+            "SELECT COALESCE(MAX(id),0) FROM plate_events"
+        ).fetchone()[0])
+        latest_updated=str(con.execute(
+            "SELECT COALESCE(MAX(updated_at),'') "
+            "FROM plate_events"
+        ).fetchone()[0] or '')
+        unchanged=(
+            latest_id <= max(0,int(after))
+            and (
+                not after_updated
+                or latest_updated <= str(after_updated)
+            )
+        )
+        if unchanged:
+            return JSONResponse({'latest_id':latest_id,'rows_html':''})
+        total_events=int(con.execute(
+            "SELECT COUNT(*) FROM plate_events"
+        ).fetchone()[0])
         recent=con.execute(
             "SELECT id,plate_text,camera_name,confidence,created_at,"
-            "image_path,plate_image_path,review_status "
-            "FROM plate_events ORDER BY id DESC LIMIT 6"
+            "image_path,plate_image_path,review_status,city,media_status "
+            "FROM plate_events ORDER BY id DESC LIMIT ?",
+            (event_page_size,),
         ).fetchall()
-    latest_id=int(recent[0]['id']) if recent else 0
-    if latest_id <= max(0,int(after)):
-        return JSONResponse({'latest_id':latest_id,'rows_html':''})
     rows=''.join(
         dashboard_event_row(r) for r in recent
     ) or "<tr><td colspan='6'>هنوز پلاکی ثبت نشده است.</td></tr>"
-    return JSONResponse({'latest_id':latest_id,'rows_html':rows})
+    total_pages=max(
+        1,
+        (total_events+event_page_size-1)//event_page_size,
+    )
+    pager=pagination_html(
+        '/dashboard',
+        1,
+        total_pages,
+        total_events,
+        {'events_snapshot':latest_id},
+        'events_page',
+        event_page_size,
+    )
+    return JSONResponse({
+        'latest_id':latest_id,
+        'latest_updated':latest_updated,
+        'rows_html':rows,
+        'pagination_html':pager,
+    })
 
 @app.get('/live/{camera_id}')
 def live(camera_id:int,request:Request):
@@ -466,9 +819,9 @@ def cameras(request:Request,msg:str=''):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
     if not has_permission(request,'camera.manage'):return access_denied()
-    rows=camera_rows(); trs=''.join(f"<tr><td>{c['id']}</td><td>{escape(c['name'])}</td><td>{escape(c['location'])}</td><td>{'فعال' if c['enabled'] else 'غیرفعال'}</td><td>{'ویدئوی آپلودی' if str(c['rtsp_url']).startswith('video://') else ('آزمایشی' if c['is_demo'] else 'RTSP')}</td><td><a class='btn' href='/cameras/{c['id']}/edit'>ویرایش</a> <form style='display:inline' method='post' action='/cameras/{c['id']}/delete' onsubmit=\"return confirm('حذف شود؟')\"><button class='danger'>حذف</button></form></td></tr>" for c in rows) or "<tr><td colspan='6'>دوربینی ثبت نشده است.</td></tr>"
+    rows=camera_rows(); trs=''.join(f"<tr><td>{c['id']}</td><td>{escape(c['name'])}</td><td>{escape(c['city'] or '—')}</td><td>{escape(c['location'])}</td><td>{'فعال' if c['enabled'] else 'غیرفعال'}</td><td>{'ویدئوی آپلودی' if str(c['rtsp_url']).startswith('video://') else ('آزمایشی' if c['is_demo'] else 'RTSP')}</td><td><a class='btn' href='/cameras/{c['id']}/edit'>ویرایش</a> <form style='display:inline' method='post' action='/cameras/{c['id']}/delete' onsubmit=\"return confirm('حذف شود؟')\"><button class='danger'>حذف</button></form></td></tr>" for c in rows) or "<tr><td colspan='7'>دوربینی ثبت نشده است.</td></tr>"
     notice="<div class='card ok'>عملیات انجام شد.</div>" if msg else ''
-    return page('دوربین‌ها',f"""<div class='wrap'><div class='toolbar'><h1 style='margin-left:auto'>مدیریت دوربین‌ها</h1><a class='btn' href='/cameras/new'>افزودن دوربین</a></div>{notice}<div class='card'><div class='table-wrap'><table><tr><th>ID</th><th>نام</th><th>موقعیت</th><th>وضعیت</th><th>نوع</th><th>عملیات</th></tr>{trs}</table></div></div><div class='card'><h2>🎞️ نمایش ویدئو به‌صورت دوربین زنده</h2><p class='muted'>پس از پایان آپلود، ویدئو به‌عنوان یک دوربین مجازی در داشبورد پخش می‌شود و پلاک‌خوان در پس‌زمینه روی آن کار می‌کند.</p><form id='videoUploadForm' action='/cameras/video-upload' method='post' enctype='multipart/form-data'><label>تنظیمات کدام دوربین استفاده شود؟</label><select name='camera_id'>{''.join(f"<option value='{c['id']}'>{escape(c['name'])}</option>" for c in rows if not str(c['rtsp_url']).startswith('video://'))}</select><br><label>فایل ویدئو</label><input type='file' name='video' accept='.mp4,.avi,.mkv,.mov' required><div id='uploadState' class='muted' style='display:none;margin:10px 0'>در حال آپلود: <b id='uploadPercent'>۰٪</b><progress id='uploadProgress' value='0' max='100' style='width:100%'></progress></div><br><button id='uploadButton'>آپلود و نمایش در پخش زنده</button></form></div></div>
+    return page('دوربین‌ها',f"""<div class='wrap'><div class='toolbar'><h1 style='margin-left:auto'>مدیریت دوربین‌ها</h1><a class='btn' href='/cameras/new'>افزودن دوربین</a></div>{notice}<div class='card'><div class='table-wrap'><table><tr><th>ID</th><th>نام</th><th>شهر</th><th>موقعیت</th><th>وضعیت</th><th>نوع</th><th>عملیات</th></tr>{trs}</table></div></div><div class='card'><h2>🎞️ نمایش ویدئو به‌صورت دوربین زنده</h2><p class='muted'>پس از پایان آپلود، ویدئو به‌عنوان یک دوربین مجازی در داشبورد پخش می‌شود و پلاک‌خوان در پس‌زمینه روی آن کار می‌کند.</p><form id='videoUploadForm' action='/cameras/video-upload' method='post' enctype='multipart/form-data'><label>تنظیمات کدام دوربین استفاده شود؟</label><select name='camera_id'>{''.join(f"<option value='{c['id']}'>{escape(c['name'])}</option>" for c in rows if not str(c['rtsp_url']).startswith('video://'))}</select><br><label>فایل ویدئو</label><input type='file' name='video' accept='.mp4,.avi,.mkv,.mov' required><div id='uploadState' class='muted' style='display:none;margin:10px 0'>در حال آپلود: <b id='uploadPercent'>۰٪</b><progress id='uploadProgress' value='0' max='100' style='width:100%'></progress></div><br><button id='uploadButton'>آپلود و نمایش در پخش زنده</button></form></div></div>
 <script>
 const uploadForm=document.getElementById('videoUploadForm');
 uploadForm?.addEventListener('submit',event=>{{
@@ -484,9 +837,9 @@ uploadForm?.addEventListener('submit',event=>{{
 </script>""",u,request)
 
 def cam_form(c=None):
-    c=dict(c) if c else {'id':'','name':'','rtsp_url':'','location':'','enabled':1,'is_demo':0,'sort_order':0,'lpr_enabled':1,'lpr_confidence':60,'frame_step':5,'duplicate_seconds':30,'roi_x':0,'roi_y':0,'roi_w':100,'roi_h':100,'line_y':50}
+    c=dict(c) if c else {'id':'','name':'','rtsp_url':'','location':'','city':'','enabled':1,'is_demo':0,'sort_order':0,'lpr_enabled':1,'lpr_confidence':60,'frame_step':5,'duplicate_seconds':30,'roi_x':0,'roi_y':0,'roi_w':100,'roi_h':100,'line_y':50}
     action=f"/cameras/{c['id']}/edit" if c['id'] else '/cameras/new'
-    return f"""<div class='wrap'><h1>{'ویرایش' if c['id'] else 'افزودن'} دوربین</h1><div class='card'><form method='post' action='{action}'><div class='two-col'><div><label>نام دوربین</label><input name='name' value='{escape(str(c['name']))}' required></div><div><label>موقعیت</label><input name='location' value='{escape(str(c['location']))}'></div></div><label>آدرس RTSP</label><input class='code' name='rtsp_url' value='{escape(str(c['rtsp_url']))}' placeholder='rtsp://user:pass@192.168.1.10:554/...'><div class='two-col'><div><label>ترتیب نمایش</label><input type='number' name='sort_order' value='{c['sort_order']}'></div><div><label>نوع تصویر</label><select name='is_demo'><option value='0' {'selected' if not c['is_demo'] else ''}>دوربین RTSP</option><option value='1' {'selected' if c['is_demo'] else ''}>دوربین آزمایشی</option></select></div></div><label><input style='width:auto' type='checkbox' name='enabled' value='1' {'checked' if c['enabled'] else ''}> فعال باشد</label><hr><h3>تنظیمات پلاک‌خوان این دوربین</h3><label><input style='width:auto' type='checkbox' name='lpr_enabled' value='1' {'checked' if c.get('lpr_enabled',1) else ''}> پلاک‌خوان فعال باشد</label><div class='two-col'><div><label>حداقل اطمینان تشخیص (درصد)</label><input type='number' min='1' max='99' name='lpr_confidence' value='{c.get('lpr_confidence',60)}'></div><div><label>پردازش هر چند فریم</label><input type='number' min='1' max='60' name='frame_step' value='{c.get('frame_step',5)}'></div><div><label>زمان حذف پلاک تکراری (ثانیه)</label><input type='number' min='0' max='3600' step='0.5' name='duplicate_seconds' value='{c.get('duplicate_seconds',30)}'></div><div><label>خط عبور عمودی (درصد ارتفاع تصویر)</label><input type='number' min='0' max='100' name='line_y' value='{c.get('line_y',50)}'></div></div><h3>منطقه تشخیص ROI برحسب درصد تصویر</h3><p class='muted'>برای بررسی کل تصویر: X=0، Y=0، عرض=100 و ارتفاع=100 قرار دهید.</p><div class='storage-grid'><div><label>X شروع</label><input type='number' min='0' max='99' name='roi_x' value='{c.get('roi_x',0)}'></div><div><label>Y شروع</label><input type='number' min='0' max='99' name='roi_y' value='{c.get('roi_y',0)}'></div><div><label>عرض ROI</label><input type='number' min='1' max='100' name='roi_w' value='{c.get('roi_w',100)}'></div><div><label>ارتفاع ROI</label><input type='number' min='1' max='100' name='roi_h' value='{c.get('roi_h',100)}'></div></div><button>ذخیره</button> <a class='btn secondary' href='/cameras'>انصراف</a></form></div></div>"""
+    return f"""<div class='wrap'><h1>{'ویرایش' if c['id'] else 'افزودن'} دوربین</h1><div class='card'><form method='post' action='{action}'><div class='two-col'><div><label>نام دوربین</label><input name='name' value='{escape(str(c['name']))}' required></div><div><label>شهر</label><input name='city' value='{escape(str(c.get('city','')))}' placeholder='مثال: کرج'></div><div><label>موقعیت دقیق</label><input name='location' value='{escape(str(c['location']))}' placeholder='مثال: ورودی پارکینگ'></div></div><label>آدرس RTSP</label><input class='code' name='rtsp_url' value='{escape(str(c['rtsp_url']))}' placeholder='rtsp://user:pass@192.168.1.10:554/...'><div class='two-col'><div><label>ترتیب نمایش</label><input type='number' name='sort_order' value='{c['sort_order']}'></div><div><label>نوع تصویر</label><select name='is_demo'><option value='0' {'selected' if not c['is_demo'] else ''}>دوربین RTSP</option><option value='1' {'selected' if c['is_demo'] else ''}>دوربین آزمایشی</option></select></div></div><label><input style='width:auto' type='checkbox' name='enabled' value='1' {'checked' if c['enabled'] else ''}> فعال باشد</label><hr><h3>تنظیمات پلاک‌خوان این دوربین</h3><label><input style='width:auto' type='checkbox' name='lpr_enabled' value='1' {'checked' if c.get('lpr_enabled',1) else ''}> پلاک‌خوان فعال باشد</label><div class='two-col'><div><label>حداقل اطمینان تشخیص (درصد)</label><input type='number' min='1' max='99' name='lpr_confidence' value='{c.get('lpr_confidence',60)}'></div><div><label>پردازش هر چند فریم</label><input type='number' min='1' max='60' name='frame_step' value='{c.get('frame_step',5)}'></div><div><label>زمان حذف پلاک تکراری (ثانیه)</label><input type='number' min='0' max='3600' step='0.5' name='duplicate_seconds' value='{c.get('duplicate_seconds',30)}'></div><div><label>خط عبور عمودی (درصد ارتفاع تصویر)</label><input type='number' min='0' max='100' name='line_y' value='{c.get('line_y',50)}'></div></div><h3>منطقه تشخیص ROI برحسب درصد تصویر</h3><p class='muted'>برای بررسی کل تصویر: X=0، Y=0، عرض=100 و ارتفاع=100 قرار دهید.</p><div class='storage-grid'><div><label>X شروع</label><input type='number' min='0' max='99' name='roi_x' value='{c.get('roi_x',0)}'></div><div><label>Y شروع</label><input type='number' min='0' max='99' name='roi_y' value='{c.get('roi_y',0)}'></div><div><label>عرض ROI</label><input type='number' min='1' max='100' name='roi_w' value='{c.get('roi_w',100)}'></div><div><label>ارتفاع ROI</label><input type='number' min='1' max='100' name='roi_h' value='{c.get('roi_h',100)}'></div></div><button>ذخیره</button> <a class='btn secondary' href='/cameras'>انصراف</a></form></div></div>"""
 @app.get('/cameras/new')
 def new_cam_form(request:Request):
     u=auth(request)
@@ -494,7 +847,7 @@ def new_cam_form(request:Request):
     if not has_permission(request,'camera.manage'):return access_denied()
     return page('افزودن دوربین',cam_form(),u,request)
 @app.post('/cameras/new')
-def new_cam(request:Request,name:str=Form(...),rtsp_url:str=Form(''),location:str=Form(''),enabled:str|None=Form(None),is_demo:int=Form(0),sort_order:int=Form(0),lpr_enabled:str|None=Form(None),lpr_confidence:int=Form(60),frame_step:int=Form(5),duplicate_seconds:float=Form(30),roi_x:int=Form(0),roi_y:int=Form(0),roi_w:int=Form(100),roi_h:int=Form(100),line_y:int=Form(50)):
+def new_cam(request:Request,name:str=Form(...),rtsp_url:str=Form(''),location:str=Form(''),city:str=Form(''),enabled:str|None=Form(None),is_demo:int=Form(0),sort_order:int=Form(0),lpr_enabled:str|None=Form(None),lpr_confidence:int=Form(60),frame_step:int=Form(5),duplicate_seconds:float=Form(30),roi_x:int=Form(0),roi_y:int=Form(0),roi_w:int=Form(100),roi_h:int=Form(100),line_y:int=Form(50)):
     if not auth(request):return RedirectResponse('/login',302)
     if not has_permission(request,'camera.manage'):return access_denied()
     lic=license_status()
@@ -503,7 +856,7 @@ def new_cam(request:Request,name:str=Form(...),rtsp_url:str=Form(''),location:st
     if count >= lic['camera_limit']:
         return page('محدودیت لایسنس',f"<div class='wrap'><div class='card alert'>حداکثر تعداد دوربین در پلن {escape(lic['plan'])} برابر {lic['camera_limit']} است. برای افزایش ظرفیت، لایسنس را ارتقا دهید.</div><a class='btn' href='/license'>مدیریت لایسنس</a></div>",auth(request),request)
     url='demo://camera' if is_demo else rtsp_url.strip()
-    with connect() as con:con.execute('INSERT INTO cameras(name,rtsp_url,location,enabled,is_demo,sort_order,lpr_enabled,lpr_confidence,frame_step,duplicate_seconds,roi_x,roi_y,roi_w,roi_h,line_y) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(name.strip(),url,location.strip(),1 if enabled else 0,is_demo,sort_order,1 if lpr_enabled else 0,max(1,min(99,lpr_confidence)),max(1,min(60,frame_step)),max(0,min(3600,duplicate_seconds)),max(0,min(99,roi_x)),max(0,min(99,roi_y)),max(1,min(100-roi_x,roi_w)),max(1,min(100-roi_y,roi_h)),max(0,min(100,line_y))))
+    with connect() as con:con.execute('INSERT INTO cameras(name,rtsp_url,location,city,enabled,is_demo,sort_order,lpr_enabled,lpr_confidence,frame_step,duplicate_seconds,roi_x,roi_y,roi_w,roi_h,line_y) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(name.strip(),url,location.strip(),city.strip(),1 if enabled else 0,is_demo,sort_order,1 if lpr_enabled else 0,max(1,min(99,lpr_confidence)),max(1,min(60,frame_step)),max(0,min(3600,duplicate_seconds)),max(0,min(99,roi_x)),max(0,min(99,roi_y)),max(1,min(100-roi_x,roi_w)),max(1,min(100-roi_y,roi_h)),max(0,min(100,line_y))))
     return RedirectResponse('/cameras?msg=1',303)
 @app.get('/cameras/{camera_id}/edit')
 def edit_cam_form(camera_id:int,request:Request):
@@ -514,11 +867,11 @@ def edit_cam_form(camera_id:int,request:Request):
     if not c:return RedirectResponse('/cameras',302)
     return page('ویرایش دوربین',cam_form(c),u,request)
 @app.post('/cameras/{camera_id}/edit')
-def edit_cam(camera_id:int,request:Request,name:str=Form(...),rtsp_url:str=Form(''),location:str=Form(''),enabled:str|None=Form(None),is_demo:int=Form(0),sort_order:int=Form(0),lpr_enabled:str|None=Form(None),lpr_confidence:int=Form(60),frame_step:int=Form(5),duplicate_seconds:float=Form(30),roi_x:int=Form(0),roi_y:int=Form(0),roi_w:int=Form(100),roi_h:int=Form(100),line_y:int=Form(50)):
+def edit_cam(camera_id:int,request:Request,name:str=Form(...),rtsp_url:str=Form(''),location:str=Form(''),city:str=Form(''),enabled:str|None=Form(None),is_demo:int=Form(0),sort_order:int=Form(0),lpr_enabled:str|None=Form(None),lpr_confidence:int=Form(60),frame_step:int=Form(5),duplicate_seconds:float=Form(30),roi_x:int=Form(0),roi_y:int=Form(0),roi_w:int=Form(100),roi_h:int=Form(100),line_y:int=Form(50)):
     if not auth(request):return RedirectResponse('/login',302)
     if not has_permission(request,'camera.manage'):return access_denied()
     url='demo://camera' if is_demo else rtsp_url.strip()
-    with connect() as con:con.execute('UPDATE cameras SET name=?,rtsp_url=?,location=?,enabled=?,is_demo=?,sort_order=?,lpr_enabled=?,lpr_confidence=?,frame_step=?,duplicate_seconds=?,roi_x=?,roi_y=?,roi_w=?,roi_h=?,line_y=? WHERE id=?',(name.strip(),url,location.strip(),1 if enabled else 0,is_demo,sort_order,1 if lpr_enabled else 0,max(1,min(99,lpr_confidence)),max(1,min(60,frame_step)),max(0,min(3600,duplicate_seconds)),max(0,min(99,roi_x)),max(0,min(99,roi_y)),max(1,min(100-roi_x,roi_w)),max(1,min(100-roi_y,roi_h)),max(0,min(100,line_y)),camera_id))
+    with connect() as con:con.execute('UPDATE cameras SET name=?,rtsp_url=?,location=?,city=?,enabled=?,is_demo=?,sort_order=?,lpr_enabled=?,lpr_confidence=?,frame_step=?,duplicate_seconds=?,roi_x=?,roi_y=?,roi_w=?,roi_h=?,line_y=? WHERE id=?',(name.strip(),url,location.strip(),city.strip(),1 if enabled else 0,is_demo,sort_order,1 if lpr_enabled else 0,max(1,min(99,lpr_confidence)),max(1,min(60,frame_step)),max(0,min(3600,duplicate_seconds)),max(0,min(99,roi_x)),max(0,min(99,roi_y)),max(1,min(100-roi_x,roi_w)),max(1,min(100-roi_y,roi_h)),max(0,min(100,line_y)),camera_id))
     manager.remove(camera_id);return RedirectResponse('/cameras?msg=1',303)
 @app.post('/cameras/{camera_id}/delete')
 def delete_cam(camera_id:int,request:Request):
@@ -531,52 +884,235 @@ def delete_cam(camera_id:int,request:Request):
 def media(request:Request,path:str=''):
     if not auth(request): return RedirectResponse('/login',302)
     try:
-        target=Path(path).resolve()
-        allowed=[Path(get_setting('snapshot_path',str(SNAPSHOT_DIR))).resolve(),Path(get_setting('plate_path',str(PLATE_DIR))).resolve(),Path(get_setting('video_path',str(VIDEO_DIR))).resolve()]
-        if not target.is_file() or not any(target.is_relative_to(root) for root in allowed): return JSONResponse({'error':'not found'},404)
+        raw_path=str(path or '')
+        target=Path(raw_path).resolve()
+        if (
+            target.suffix.lower() not in MEDIA_FILE_EXTENSIONS
+            or not target.is_file()
+        ):
+            return JSONResponse({'error':'not found'},404)
+        current_roots=[
+            Path(get_setting('snapshot_path',str(SNAPSHOT_DIR))).resolve(),
+            Path(get_setting('plate_path',str(PLATE_DIR))).resolve(),
+            Path(get_setting('video_path',str(VIDEO_DIR))).resolve(),
+        ]
+        in_current_root=any(
+            target.is_relative_to(root) for root in current_roots
+        )
+        in_historical_root=any(
+            target.is_relative_to(root)
+            for root in _media_roots_history()
+        )
+        historically_referenced=False
+        if in_historical_root:
+            with connect() as con:
+                historically_referenced=con.execute(
+                    "SELECT 1 FROM plate_events WHERE "
+                    "image_path IN (?,?) OR plate_image_path IN (?,?) "
+                    "OR video_path IN (?,?) LIMIT 1",
+                    (
+                        raw_path,str(target),raw_path,str(target),
+                        raw_path,str(target),
+                    ),
+                ).fetchone() is not None
+        if not (
+            in_current_root or historically_referenced
+        ):
+            return JSONResponse({'error':'not found'},404)
         return FileResponse(target)
     except Exception:return JSONResponse({'error':'not found'},404)
 
 @app.get('/events')
-def events(request:Request,q:str='',camera:str='',status:str='',vehicle_type:str='',vehicle_color:str='',date_from:str='',date_to:str=''):
+def events(
+    request:Request,
+    q:str='',
+    camera:str='',
+    city:str='',
+    region:str='',
+    status:str='',
+    vehicle_type:str='',
+    vehicle_color:str='',
+    date_from:str='',
+    time_from:str='',
+    date_to:str='',
+    time_to:str='',
+    events_page:int=1,
+    per_page:int=25,
+):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
-    date_from=persian_digits(date_from.strip())
-    date_to=persian_digits(date_to.strip())
-    where=[];params=[]
-    if q: where.append('e.plate_text LIKE ?');params.append(f'%{q}%')
-    if camera: where.append('e.camera_name=?');params.append(camera)
-    if status: where.append("COALESCE(w.status,'unknown')=?");params.append(status)
-    if vehicle_type: where.append('e.vehicle_type=?');params.append(vehicle_type)
-    if vehicle_color: where.append('e.vehicle_color=?');params.append(vehicle_color)
-    sql="""SELECT e.*,COALESCE(w.status,'unknown') watch_status,w.owner_name,w.vehicle_model,w.vehicle_color
-             FROM plate_events e LEFT JOIN plate_watchlist w ON w.plate_norm=REPLACE(REPLACE(UPPER(e.plate_text),'-',''),' ','')"""
-    if where: sql+=' WHERE '+' AND '.join(where)
-    sql+=' ORDER BY e.id DESC LIMIT 500'
+    q=q.strip();camera=camera.strip();city=city.strip();region=region.strip()
+    date_from=date_from.strip();date_to=date_to.strip()
+    time_from=time_from.strip();time_to=time_to.strip()
+    per_page=per_page if per_page in {25,50,100} else 25
+    where=[];params=[];filter_error=''
+    normalized_query=normalize_plate(q)
+    if q:
+        if normalized_query:
+            where.append(
+                "INSTR(COALESCE(NULLIF(e.plate_norm,''),"
+                "e.raw_guess_norm,''),?)>0"
+            )
+            params.append(normalized_query)
+        else:
+            filter_error='عبارت واردشده برای جست‌وجوی پلاک معتبر نیست.'
+            where.append('1=0')
+    if camera:
+        where.append('e.camera_name=?');params.append(camera)
+    city_expression="COALESCE(NULLIF(e.city,''),NULLIF(c.city,''),'')"
+    if city:
+        where.append(f'INSTR({city_expression},?)>0');params.append(city)
+    normalized_region=''.join(
+        char for char in normalize_plate(region) if char.isdigit()
+    )
+    if region:
+        if 1 <= len(normalized_region) <= 2:
+            where.append('e.plate_region=?')
+            params.append(normalized_region.zfill(2))
+        else:
+            filter_error=filter_error or 'کد ناحیه پلاک باید یک یا دو رقم باشد.'
+            where.append('1=0')
+    if status:
+        where.append("COALESCE(w.status,'unknown')=?");params.append(status)
+    if vehicle_type:
+        where.append('e.vehicle_type=?');params.append(vehicle_type)
+    if vehicle_color:
+        where.append('e.vehicle_color=?');params.append(vehicle_color)
+    try:
+        start_date=_parse_jalali_date(date_from)
+        end_date=_parse_jalali_date(date_to)
+        start_time=_parse_time(time_from)
+        end_time=_parse_time(time_to)
+        start_bound=(
+            start_date.replace(
+                hour=start_time.hour if start_time else 0,
+                minute=start_time.minute if start_time else 0,
+                second=0,
+                microsecond=0,
+            )
+            if start_date else None
+        )
+        end_bound=(
+            end_date.replace(
+                hour=end_time.hour if end_time else 0,
+                minute=end_time.minute if end_time else 0,
+                second=0,
+                microsecond=0,
+            )
+            + (timedelta(minutes=1) if end_time else timedelta(days=1))
+            if end_date else None
+        )
+        if start_bound and end_bound and start_bound >= end_bound:
+            raise ValueError('ابتدای بازه زمانی باید قبل از انتهای آن باشد.')
+        if start_bound:
+            where.append('e.created_at>=?')
+            params.append(
+                _local_to_utc_naive(start_bound).strftime(
+                    '%Y-%m-%d %H:%M:%S'
+                )
+            )
+        if end_bound:
+            where.append('e.created_at<?')
+            params.append(
+                _local_to_utc_naive(end_bound).strftime(
+                    '%Y-%m-%d %H:%M:%S'
+                )
+            )
+        current_offset=APP_LOCAL_TIMEZONE.utcoffset(
+            datetime.now(APP_LOCAL_TIMEZONE)
+        ) or timedelta()
+        offset_minutes=int(current_offset.total_seconds()//60)
+        local_time_sql="TIME(datetime(e.created_at,?))"
+        offset_modifier=f"{offset_minutes:+d} minutes"
+        if start_time and not start_date:
+            where.append(f"{local_time_sql}>=?")
+            params.extend([
+                offset_modifier,
+                start_time.strftime('%H:%M:%S'),
+            ])
+        if end_time and not end_date:
+            end_minutes=end_time.hour*60+end_time.minute+1
+            if start_time and (
+                start_time.hour*60+start_time.minute >= end_minutes
+            ):
+                raise ValueError('ابتدای بازه ساعت باید قبل از انتهای آن باشد.')
+            where.append(f"{local_time_sql}<?")
+            params.extend([
+                offset_modifier,
+                '24:00:00'
+                if end_minutes >= 24*60
+                else f'{end_minutes//60:02d}:{end_minutes%60:02d}:00'
+            ])
+    except ValueError as exc:
+        filter_error=filter_error or str(exc)
+        where.append('1=0')
+    source_sql=""" FROM plate_events e
+        LEFT JOIN plate_watchlist w ON w.plate_norm=e.plate_norm
+        LEFT JOIN cameras c ON c.id=e.camera_id"""
+    where_sql=(' WHERE '+' AND '.join(where)) if where else ''
     with connect() as con:
-        rows=con.execute(sql,params).fetchall()
+        total_rows=int(con.execute(
+            'SELECT COUNT(*)'+source_sql+where_sql,
+            params,
+        ).fetchone()[0])
+        total_pages=max(1,(total_rows+per_page-1)//per_page)
+        events_page=max(1,min(total_pages,int(events_page or 1)))
+        sql=(
+            "SELECT e.*,COALESCE(w.status,'unknown') watch_status,"
+            "w.owner_name,w.vehicle_model,"
+            "w.vehicle_color watch_vehicle_color,"
+            f"{city_expression} event_city"
+            +source_sql+where_sql+
+            " ORDER BY e.created_at DESC,e.id DESC LIMIT ? OFFSET ?"
+        )
+        rows=con.execute(
+            sql,
+            params+[per_page,(events_page-1)*per_page],
+        ).fetchall()
         cameras=[r['camera_name'] for r in con.execute("SELECT DISTINCT camera_name FROM plate_events WHERE camera_name IS NOT NULL AND camera_name<>'' ORDER BY camera_name").fetchall()]
         vehicle_types=[r['vehicle_type'] for r in con.execute("SELECT DISTINCT vehicle_type FROM plate_events WHERE vehicle_type IS NOT NULL AND vehicle_type<>'' ORDER BY vehicle_type").fetchall()]
         vehicle_colors=[r['vehicle_color'] for r in con.execute("SELECT DISTINCT vehicle_color FROM plate_events WHERE vehicle_color IS NOT NULL AND vehicle_color<>'' ORDER BY vehicle_color").fetchall()]
-    def in_jdate(row):
-        jd=jalali_date(row['created_at'])
-        return (not date_from or jd>=date_from) and (not date_to or jd<=date_to)
-    rows=[r for r in rows if in_jdate(r)]
+        cities=sorted({
+            str(r[0]).strip()
+            for r in con.execute(
+                "SELECT city FROM plate_events WHERE city<>'' "
+                "UNION SELECT city FROM cameras WHERE city<>''"
+            ).fetchall()
+            if str(r[0]).strip()
+        })
     trs=[]
     for r in rows:
         st=r['watch_status'] or 'unknown'; cls='event-blocked' if st=='blocked' else ('event-vip' if st=='vip' else '')
         vehicle=(f"<img class='thumb' onclick=\"showImage(this.src)\" src='/media?path={quote(r['image_path'])}'>" if r['image_path'] and Path(r['image_path']).exists() else '—')
         plateimg=(f"<img class='thumb plate-thumb' onclick=\"showImage(this.src)\" src='/media?path={quote(r['plate_image_path'])}'>" if r['plate_image_path'] and Path(r['plate_image_path']).exists() else '—')
-        owner=escape(' / '.join(x for x in [r['owner_name'],r['vehicle_model'],r['vehicle_color']] if x) or '—')
-        trs.append(f"<tr class='{cls}'><td>{persian_digits(r['id'])}</td><td>{vehicle}</td><td>{plateimg}</td><td>{iran_plate_html(r['plate_text'],True)}<br>{event_status_badge(st)}</td><td>{owner}</td><td>{escape(r['vehicle_type'] or 'نامشخص')}<br><span class='muted'>{escape(r['vehicle_color'] or 'نامشخص')}</span></td><td>{persian_digits(int((r['confidence'] or 0)*100))}٪</td><td>{escape(r['camera_name'] or '—')}</td><td>{persian_digits(jalali_datetime(r['created_at']))}</td><td><a class='btn' href='/events/{r['id']}'>جزئیات و پخش</a></td></tr>")
-    trs=''.join(trs) or "<tr><td colspan='10'>رکوردی با این فیلتر پیدا نشد.</td></tr>"
+        owner=escape(' / '.join(x for x in [r['owner_name'],r['vehicle_model'],r['watch_vehicle_color']] if x) or '—')
+        confirmation=anpr_confirmation_badge(r['review_status'] if 'review_status' in r.keys() else 'confirmed-ai')
+        city_label=escape(r['event_city'] or '—')
+        region_label=persian_digits(r['plate_region'] or '—')
+        trs.append(f"<tr class='{cls}'><td>{persian_digits(r['id'])}</td><td>{vehicle}</td><td>{plateimg}</td><td>{iran_plate_html(r['plate_text'],True)}{confirmation}<br>{event_status_badge(st)}</td><td>{owner}</td><td>{escape(r['vehicle_type'] or 'نامشخص')}<br><span class='muted'>{escape(r['vehicle_color'] or 'نامشخص')}</span></td><td>{persian_digits(int((r['confidence'] or 0)*100))}٪</td><td>{escape(r['camera_name'] or '—')}</td><td>{city_label}<br><span class='muted'>کد پلاک: {region_label}</span></td><td>{persian_digits(jalali_datetime(r['created_at']))}</td><td><a class='btn' href='/events/{r['id']}'>جزئیات و پخش</a></td></tr>")
+    trs=''.join(trs) or "<tr><td colspan='11'>رکوردی با این فیلتر پیدا نشد.</td></tr>"
     cam_opts=''.join(f"<option {'selected' if camera==c else ''}>{escape(c)}</option>" for c in cameras)
     type_opts=''.join(f"<option {'selected' if vehicle_type==v else ''}>{escape(v)}</option>" for v in vehicle_types)
     color_opts=''.join(f"<option {'selected' if vehicle_color==v else ''}>{escape(v)}</option>" for v in vehicle_colors)
+    city_opts=''.join(f"<option value='{escape(value)}'></option>" for value in cities)
     status_opts=''.join(f"<option value='{v}' {'selected' if status==v else ''}>{l}</option>" for v,l in [('allowed','مجاز'),('blocked','غیرمجاز'),('vip','VIP'),('unknown','ثبت‌نشده')])
+    filter_params={
+        'q':q,'camera':camera,'city':city,'region':region,'status':status,
+        'vehicle_type':vehicle_type,'vehicle_color':vehicle_color,
+        'date_from':date_from,'time_from':time_from,
+        'date_to':date_to,'time_to':time_to,'per_page':per_page,
+    }
+    pager=pagination_html(
+        '/events',events_page,total_pages,total_rows,filter_params,
+        'events_page',per_page,
+    )
+    error_html=(
+        f"<div class='alert'>{escape(filter_error)}</div>"
+        if filter_error else ''
+    )
     body=f"""<div class='wrap'><div class='toolbar'><h1 style='margin-left:auto'>گزارش ترددها</h1><a class='btn' href='/watchlist'>مدیریت پلاک‌ها</a><a class='btn secondary' href='/events/export.csv'>خروجی CSV</a></div>
-    <div class='card'><form class='filter-grid'><div><label>پلاک</label><input name='q' value='{escape(q)}'></div><div><label>دوربین</label><select name='camera'><option value=''>همه</option>{cam_opts}</select></div><div><label>وضعیت</label><select name='status'><option value=''>همه</option>{status_opts}</select></div><div><label>نوع خودرو</label><select name='vehicle_type'><option value=''>همه</option>{type_opts}</select></div><div><label>رنگ خودرو</label><select name='vehicle_color'><option value=''>همه</option>{color_opts}</select></div><div><label>از تاریخ شمسی</label><input name='date_from' value='{escape(date_from)}' placeholder='۱۴۰۵/۰۵/۰۲'></div><div><label>تا تاریخ شمسی</label><input name='date_to' value='{escape(date_to)}' placeholder='۱۴۰۵/۰۵/۰۳'></div><div><button>اعمال فیلتر</button></div></form></div>
-    <div class='card'><div class='table-wrap'><table><tr><th>ردیف</th><th>تصویر خودرو</th><th>تصویر پلاک</th><th>پلاک/وضعیت</th><th>مالک/خودرو</th><th>تشخیص خودرو</th><th>اطمینان</th><th>دوربین</th><th>تاریخ و ساعت شمسی</th><th>عملیات</th></tr>{trs}</table></div></div></div>
+    {error_html}<div class='card'><form class='filter-grid'><div><label>پلاک؛ حتی یک یا دو رقم</label><input name='q' value='{escape(q)}' placeholder='مثال: ۱۲ یا ۳۴۵'></div><div><label>دوربین</label><select name='camera'><option value=''>همه</option>{cam_opts}</select></div><div><label>شهر محل ثبت</label><input name='city' list='eventCities' value='{escape(city)}' placeholder='مثال: تهران'><datalist id='eventCities'>{city_opts}</datalist></div><div><label>کد ناحیه پلاک</label><input name='region' inputmode='numeric' maxlength='2' value='{escape(region)}' placeholder='مثال: ۷۴'></div><div><label>وضعیت</label><select name='status'><option value=''>همه</option>{status_opts}</select></div><div><label>نوع خودرو</label><select name='vehicle_type'><option value=''>همه</option>{type_opts}</select></div><div><label>رنگ خودرو</label><select name='vehicle_color'><option value=''>همه</option>{color_opts}</select></div><div><label>از تاریخ شمسی</label><input name='date_from' value='{escape(date_from)}' placeholder='۱۴۰۵/۰۵/۰۸'></div><div><label>از ساعت</label><input type='time' name='time_from' value='{escape(time_from.translate(_ALL_DIGITS))}'></div><div><label>تا تاریخ شمسی</label><input name='date_to' value='{escape(date_to)}' placeholder='۱۴۰۵/۰۵/۰۸'></div><div><label>تا ساعت</label><input type='time' name='time_to' value='{escape(time_to.translate(_ALL_DIGITS))}'></div><div><label>تعداد در هر صفحه</label><select name='per_page'>{''.join(f"<option value='{size}' {'selected' if per_page==size else ''}>{persian_digits(size)}</option>" for size in (25,50,100))}</select></div><div><button>اعمال فیلتر</button> <a class='btn secondary' href='/events'>پاک‌کردن</a></div></form></div>
+    <div class='card'><div class='table-wrap'><table><tr><th>ردیف</th><th>تصویر خودرو</th><th>تصویر پلاک</th><th>پلاک/وضعیت</th><th>مالک/خودرو</th><th>تشخیص خودرو</th><th>اطمینان</th><th>دوربین</th><th>شهر / کد ناحیه</th><th>تاریخ و ساعت شمسی</th><th>عملیات</th></tr>{trs}</table></div>{pager}</div></div>
     <div id='imgModal' class='modal-img' onclick='this.classList.remove("open")'><button>بستن</button><img id='modalImage'></div><script>function showImage(src){{document.getElementById('modalImage').src=src;document.getElementById('imgModal').classList.add('open')}}</script>"""
     return page('ترددها',body,u,request)
 
@@ -614,17 +1150,44 @@ def correct_event_plate(
         if not row:
             return JSONResponse({'error': 'event not found'}, 404)
         observed_text = row['plate_text'] or ''
+        observed_norm = (
+            row['raw_guess_norm']
+            if 'raw_guess_norm' in row.keys()
+            and row['raw_guess_norm']
+            else normalize_plate(observed_text)
+        )
+        distance = character_distance(observed_norm, corrected_norm)
         feedback_cursor = con.execute(
             "INSERT INTO anpr_feedback("
-            "event_id,observed_text,observed_norm,corrected_text,"
-            "corrected_norm,plate_image_path,image_path,submitted_by"
-            ") VALUES(?,?,?,?,?,?,?,?)",
+            "event_id,observed_text,observed_norm,observed_engine,"
+            "observed_confidence,observed_model_revision,corrected_text,"
+            "corrected_norm,character_distance,exact_match,"
+            "plate_image_path,image_path,submitted_by"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 event_id,
                 observed_text,
-                normalize_plate(observed_text),
+                observed_norm,
+                (
+                    row['raw_guess_engine']
+                    if 'raw_guess_engine' in row.keys()
+                    and row['raw_guess_engine']
+                    else row['ocr_engine'] or ''
+                ),
+                float(
+                    row['raw_guess_confidence']
+                    if 'raw_guess_confidence' in row.keys()
+                    else row['ocr_confidence'] or 0
+                ),
+                (
+                    row['model_revision']
+                    if 'model_revision' in row.keys()
+                    else row['ocr_engine'] or ''
+                ),
                 corrected_text,
                 corrected_norm,
+                distance,
+                int(bool(observed_norm == corrected_norm)),
                 row['plate_image_path'] or '',
                 row['image_path'] or '',
                 username,
@@ -640,8 +1203,17 @@ def correct_event_plate(
         if "review_status" in columns:
             con.execute(
                 "UPDATE plate_events SET plate_text=?,plate_norm=?,"
-                "review_status='confirmed' WHERE id=?",
-                (corrected_text, corrected_norm, event_id),
+                "plate_region=?,"
+                "review_status='confirmed',"
+                "confirmation_source='operator',operator_reviewed=1,"
+                "experimental=0,updated_at=? WHERE id=?",
+                (
+                    corrected_text,
+                    corrected_norm,
+                    _plate_region(corrected_norm),
+                    _utc_now_text(),
+                    event_id,
+                ),
             )
         else:
             con.execute(
@@ -664,7 +1236,7 @@ def event_detail(event_id:int, request:Request):
     if not u:return RedirectResponse('/login',302)
     with connect() as con:
         r=con.execute("""SELECT e.*,COALESCE(w.status,'unknown') watch_status,w.owner_name,w.phone,w.vehicle_model,w.vehicle_color,w.notes
-            FROM plate_events e LEFT JOIN plate_watchlist w ON w.plate_norm=REPLACE(REPLACE(UPPER(e.plate_text),'-',''),' ','') WHERE e.id=?""",(event_id,)).fetchone()
+            FROM plate_events e LEFT JOIN plate_watchlist w ON w.plate_norm=e.plate_norm WHERE e.id=?""",(event_id,)).fetchone()
     if not r:return page('تردد پیدا نشد',"<div class='wrap'><div class='card'><h1>تردد پیدا نشد</h1><a class='btn' href='/events'>بازگشت</a></div></div>",u,request)
     st=r['watch_status'] or 'unknown'
     second=float(r['video_second'] or 0)
@@ -675,9 +1247,19 @@ def event_detail(event_id:int, request:Request):
     vehicle=(f"<img onclick='showImage(this.src)' src='/media?path={quote(r['image_path'])}'>" if image_ok else "<div class='muted'>تصویر خودرو موجود نیست</div>")
     plate=(f"<img onclick='showImage(this.src)' src='/media?path={quote(r['plate_image_path'])}'>" if plate_ok else "<div class='muted'>تصویر پلاک موجود نیست</div>")
     owner=' / '.join(x for x in [r['owner_name'],r['vehicle_model'],r['vehicle_color']] if x) or 'ثبت نشده'
+    confirmation=anpr_confirmation_badge(r['review_status'] if 'review_status' in r.keys() else 'confirmed-ai')
+    media_notice=(
+        f"<div class='alert'>ذخیره بعضی تصاویر این رخداد کامل نشده است: "
+        f"{escape(r['media_error'] or 'خطای نامشخص')}</div>"
+        if 'media_status' in r.keys()
+        and r['media_status'] in {'partial','error'}
+        else ''
+    )
+    correction_value=escape(str(r['plate_text'] or ''))
+    correction_form=f"""<form class='correction-form' method='post' action='/events/{r['id']}/correct'><input name='corrected_plate' required maxlength='20' value='{correction_value}' placeholder='مثال: ۱۲ ب ۳۴۵ ایران ۶۷'><button>تأیید/اصلاح و آموزش</button></form>"""
     body=f"""<div class='wrap'><div class='toolbar'><h1 style='margin-left:auto'>جزئیات تردد شماره {r['id']}</h1><a class='btn secondary' href='/events'>بازگشت به ترددها</a></div>
     <div class='replay-layout'><div class='card video-panel'><h3>پخش ویدئو از لحظه عبور</h3><div class='time-badge'>زمان ثبت در ویدئو: {persian_digits(f"{second:.2f}").replace(".", "٫")} ثانیه</div>{video}</div>
-    <div><div class='card'><h3>اطلاعات تردد</h3><div class='event-meta'><div class='meta-item' style='grid-column:1/-1'><small>پلاک</small>{iran_plate_html(r['plate_text'])}</div><div class='meta-item'><small>وضعیت</small>{event_status_badge(st)}</div><div class='meta-item'><small>دوربین</small>{escape(r['camera_name'] or '—')}</div><div class='meta-item'><small>اطمینان</small>{persian_digits(f"{(r['confidence'] or 0)*100:.1f}")}٪</div><div class='meta-item'><small>تاریخ و ساعت شمسی</small>{persian_digits(jalali_datetime(r['created_at']))}</div><div class='meta-item'><small>روش تشخیص</small>{escape(r['detector_method'] or '—')}</div><div class='meta-item'><small>نوع خودرو</small>{escape(r['vehicle_type'] or 'نامشخص')}</div><div class='meta-item'><small>رنگ خودرو</small>{escape(r['vehicle_color'] or 'نامشخص')}</div><div class='meta-item'><small>اطمینان تشخیص خودرو</small>{persian_digits(f"{(r['vehicle_confidence'] or 0)*100:.1f}")}٪</div><div class='meta-item'><small>مالک / خودرو</small>{escape(owner)}</div><div class='meta-item'><small>شماره تماس</small>{persian_digits(r['phone'] or '—')}</div></div></div>
+    <div>{media_notice}<div class='card'><h3>اطلاعات تردد</h3><div class='event-meta'><div class='meta-item' style='grid-column:1/-1'><small>پلاک</small>{iran_plate_html(r['plate_text'])}{confirmation}</div><div class='meta-item' style='grid-column:1/-1'><small>تأیید یا اصلاح اپراتور</small>{correction_form}</div><div class='meta-item'><small>وضعیت</small>{event_status_badge(st)}</div><div class='meta-item'><small>دوربین</small>{escape(r['camera_name'] or '—')}</div><div class='meta-item'><small>شهر محل ثبت</small>{escape(r['city'] or '—')}</div><div class='meta-item'><small>کد ناحیه پلاک</small>{persian_digits(r['plate_region'] or '—')}</div><div class='meta-item'><small>اطمینان</small>{persian_digits(f"{(r['confidence'] or 0)*100:.1f}")}٪</div><div class='meta-item'><small>تاریخ و ساعت شمسی</small>{persian_digits(jalali_datetime(r['created_at']))}</div><div class='meta-item'><small>روش تشخیص</small>{escape(r['detector_method'] or '—')}</div><div class='meta-item'><small>نوع خودرو</small>{escape(r['vehicle_type'] or 'نامشخص')}</div><div class='meta-item'><small>رنگ خودرو</small>{escape(r['vehicle_color'] or 'نامشخص')}</div><div class='meta-item'><small>اطمینان تشخیص خودرو</small>{persian_digits(f"{(r['vehicle_confidence'] or 0)*100:.1f}")}٪</div><div class='meta-item'><small>مالک / خودرو</small>{escape(owner)}</div><div class='meta-item'><small>شماره تماس</small>{persian_digits(r['phone'] or '—')}</div></div></div>
     <div class='card'><h3>تصاویر ثبت‌شده</h3><div class='detail-images'><div>{vehicle}<small>تصویر خودرو</small></div><div>{plate}<small>تصویر پلاک</small></div></div></div></div></div></div>
     <div id='imgModal' class='modal-img' onclick='this.classList.remove("open")'><button>بستن</button><img id='modalImage'></div>
     <script>const eventSecond={second:.3f};const v=document.getElementById('eventVideo');function jumpToEvent(){{if(!v)return;v.currentTime=Math.max(0,eventSecond-.5);v.play().catch(()=>{{}})}}function stepFrame(dir){{if(!v)return;v.pause();v.currentTime=Math.max(0,v.currentTime+dir/25)}}function setSpeed(rate){{if(!v)return;v.playbackRate=rate;document.getElementById('speedLabel').textContent='سرعت: '+window.faDigits(rate)+'×'}}function showImage(src){{document.getElementById('modalImage').src=src;document.getElementById('imgModal').classList.add('open')}}if(v){{v.addEventListener('loadedmetadata',jumpToEvent,{{once:true}})}}</script>"""
@@ -735,6 +1317,26 @@ def _csv_cell(value):
     if text.startswith(('=', '+', '-', '@', '\t', '\r')):
         return "'" + text
     return text
+
+MEDIA_FILE_EXTENSIONS={
+    '.jpg','.jpeg','.png','.webp','.bmp',
+    '.mp4','.avi','.mkv','.mov','.m4v',
+}
+
+def _media_roots_history():
+    try:
+        raw=json.loads(get_setting('media_roots_history','[]'))
+    except (TypeError,ValueError,json.JSONDecodeError):
+        return []
+    roots=[]
+    for value in raw if isinstance(raw,list) else []:
+        try:
+            root=Path(str(value)).expanduser().resolve()
+            if root != Path(root.anchor) and root not in roots:
+                roots.append(root)
+        except (OSError,RuntimeError,ValueError):
+            continue
+    return roots
 
 def _storage_paths(storage_root, snapshot_path, plate_path, video_path, backup_path):
     raw=[storage_root,snapshot_path,plate_path,video_path,backup_path]
@@ -906,8 +1508,11 @@ def settings(request:Request,saved:int=0,restart:int=0,error:str=''):
     checked=lambda k: 'checked' if get_setting(k,'0')=='1' else ''
     selected=lambda k,v: 'selected' if get_setting(k,'')==v else ''
     training=latest_training_status(); training_run=training.get('run')
+    with connect() as con:
+        quality=feedback_quality_summary(con)
     training_labels={
         'queued':'در صف','running':'در حال آموزش',
+        'awaiting-golden':'در انتظار ارزیابی Golden',
         'candidate-ready':'مدل نامزد آماده اعمال',
         'rejected':'ردشده به‌دلیل افت دقت',
         'applied':'اعمال‌شده','error':'خطای آموزش',
@@ -937,16 +1542,34 @@ def settings(request:Request,saved:int=0,restart:int=0,error:str=''):
         "<button>اعمال مدل نامزد تأییدشده</button></form>"
         if training_run and training_run['status']=='candidate-ready'
         else (
+            f"<form method='post' action='/settings/ai/training/evaluate'>"
+            f"<input type='hidden' name='run_id' value='{training_run['id']}'>"
+            "<button>اجرای ارزیابی مستقل Golden</button></form>"
+            if training_run and training_run['status']=='awaiting-golden'
+            else (
             "<form method='post' action='/settings/ai/training/start'>"
             "<label>دوره آموزش</label><input type='number' name='epochs' "
             "min='4' max='40' value='12'><button>شروع آموزش کنترل‌شده</button>"
             "</form>"
             if training['ready']
             else "<span class='muted'>با افزایش اصلاحات تأییدشده، آموزش فعال می‌شود.</span>"
+            )
         )
     )
+    quality_models=''.join(
+        "<tr><td>"
+        + escape(str(row['model_revision']))
+        + "</td><td>"
+        + persian_digits(row['guessed'])
+        + "</td><td>"
+        + persian_digits(f"{row['exact_accuracy']*100:.1f}")
+        + "٪</td><td>"
+        + persian_digits(row['mean_character_error'])
+        + "</td></tr>"
+        for row in quality['by_model'][-6:]
+    ) or "<tr><td colspan='4'>هنوز حدسی توسط اپراتور بررسی نشده است.</td></tr>"
     body=f"""<div class='wrap'><h1>تنظیمات</h1>{msg}
-    <div class='card'><h3>نمایش زنده</h3><form method='post' action='/settings/display'><div class='two-col'><div><label>تعداد ستون نمایش زنده</label><select name='dashboard_grid'>{''.join(f'<option value={x} '+('selected' if get_setting('dashboard_grid','2')==str(x) else '')+f'>{x} ستون</option>' for x in [1,2,3,4])}</select></div><div><label>تعداد فریم نمایش در ثانیه</label><input type='number' min='1' max='15' name='live_fps' value='{get_setting('live_fps','5')}'></div><div><label>عرض تصویر لایو</label><select name='stream_width'>{''.join(f'<option value={x} '+('selected' if get_setting('stream_width','640')==str(x) else '')+f'>{x}px</option>' for x in [480,640,960,1280])}</select></div><div><label>کیفیت JPEG</label><input type='number' min='30' max='95' name='jpeg_quality' value='{get_setting('jpeg_quality','70')}'></div></div><label>رمز جدید مدیر (اختیاری)</label><input type='password' name='new_password'><button>ذخیره تنظیمات نمایش</button></form></div>
+    <div class='card'><h3>نمایش زنده</h3><form method='post' action='/settings/display'><div class='two-col'><div><label>تعداد ستون نمایش زنده</label><select name='dashboard_grid'>{''.join(f'<option value={x} '+('selected' if get_setting('dashboard_grid','2')==str(x) else '')+f'>{x} ستون</option>' for x in [1,2,3,4])}</select></div><div><label>تعداد سطرهای پلاک در داشبورد</label><input type='number' min='6' max='50' name='dashboard_event_rows' value='{get_setting('dashboard_event_rows','12')}'></div><div><label>تعداد فریم نمایش در ثانیه</label><input type='number' min='1' max='15' name='live_fps' value='{get_setting('live_fps','5')}'></div><div><label>عرض تصویر لایو</label><select name='stream_width'>{''.join(f'<option value={x} '+('selected' if get_setting('stream_width','640')==str(x) else '')+f'>{x}px</option>' for x in [480,640,960,1280])}</select></div><div><label>کیفیت JPEG</label><input type='number' min='30' max='95' name='jpeg_quality' value='{get_setting('jpeg_quality','70')}'></div></div><label>رمز جدید مدیر (اختیاری)</label><input type='password' name='new_password'><button>ذخیره تنظیمات نمایش</button></form></div>
     <div class='card' id='storage'><h3>ذخیره‌سازی</h3><p class='muted'>درایو یا پوشه اصلی و مسیر جداگانه هر نوع اطلاعات را انتخاب کنید.</p>{usage_html}<form method='post' action='/settings/storage' style='margin-top:18px'><label>مسیر اصلی ذخیره‌سازی</label><input class='code' name='storage_root' value='{escape(root)}' placeholder='D:\\BCVisionData'><div class='storage-grid'><div><label>تصاویر خودرو</label><input class='code' name='snapshot_path' value='{escape(snap)}'></div><div><label>تصاویر پلاک</label><input class='code' name='plate_path' value='{escape(plates)}'></div><div><label>ویدئوها</label><input class='code' name='video_path' value='{escape(videos)}'></div><div><label>نسخه‌های پشتیبان</label><input class='code' name='backup_path' value='{escape(backups)}'></div></div>
     <div class='two-col'><label><input style='width:auto' type='checkbox' name='save_snapshots' value='1' {checked('save_snapshots')}> ذخیره تصویر خودرو</label><label><input style='width:auto' type='checkbox' name='save_plate_images' value='1' {checked('save_plate_images')}> ذخیره تصویر پلاک</label><label><input style='width:auto' type='checkbox' name='save_videos' value='1' {checked('save_videos')}> ذخیره ویدئو</label><div><label>حداکثر فضای مجاز (GB؛ صفر یعنی نامحدود)</label><input type='number' min='0' name='max_storage_gb' value='{get_setting('max_storage_gb','0')}'></div></div>
     <label>وقتی فضا پر شد</label><select name='storage_full_action'><option value='delete_oldest' {selected('storage_full_action','delete_oldest')}>حذف قدیمی‌ترین اطلاعات</option><option value='stop' {selected('storage_full_action','stop')}>توقف ذخیره‌سازی</option><option value='alert' {selected('storage_full_action','alert')}>فقط نمایش هشدار</option></select>
@@ -969,6 +1592,12 @@ def settings(request:Request,saved:int=0,restart:int=0,error:str=''):
 <input type='number' min='1' max='99' name='ai_confidence' value='{get_setting("ai_confidence","85")}'>
 <label>تعداد فریم تأیید</label>
 <input type='number' min='1' max='20' name='ai_frames' value='{get_setting("ai_frames","5")}'>
+<label><input style='width:auto' type='checkbox'
+name='anpr_auto_confirm_guesses' value='1'
+{checked('anpr_auto_confirm_guesses')}>
+ثبت حدس‌های کامل چندفریمی به‌عنوان «تأیید خودکار مدل»</label>
+<p class='muted'>این نتایج وارد گزارش تردد می‌شوند، اما تا تأیید یا اصلاح
+اپراتور به دیتاست آموزشی اضافه نخواهند شد.</p>
 <button>ذخیره تنظیمات AI</button>
 </form>
 </div>
@@ -981,15 +1610,26 @@ def settings(request:Request,saved:int=0,restart:int=0,error:str=''):
 <div class='stat-card'><span class='muted'>پلاک یکتا</span><div class='stat'>{persian_digits(training['unique_plates'])}</div></div>
 <div class='stat-card'><span class='muted'>وضعیت</span><div style='font-weight:900;margin-top:12px'>{escape(str(training_state))}</div></div>
 </div>{training_metrics}{training_action}</div>
+<div class='card' id='ai-quality'><h3>اندازه‌گیری خطای حدس‌های پلاک</h3>
+<p class='muted'>حدس کامل مدل به‌صورت تأیید خودکار قابل استفاده است، اما
+فقط تأیید یا اصلاح اپراتور حقیقت ارزیابی و نمونهٔ آموزشی محسوب می‌شود.</p>
+<div class='stats-grid'>
+<div class='stat-card'><span class='muted'>حدس بررسی‌شده</span><div class='stat'>{persian_digits(quality['guessed'])}</div></div>
+<div class='stat-card'><span class='muted'>کاملاً صحیح</span><div class='stat'>{persian_digits(quality['exact'])}</div></div>
+<div class='stat-card'><span class='muted'>دقت کامل</span><div class='stat'>{persian_digits(f"{quality['exact_accuracy']*100:.1f}")}٪</div></div>
+<div class='stat-card'><span class='muted'>میانگین کاراکتر اشتباه</span><div class='stat'>{persian_digits(quality['mean_character_error'])}</div></div>
+</div>
+<div class='table-wrap'><table><tr><th>نسخه مدل</th><th>حدس بررسی‌شده</th><th>دقت کامل</th><th>خطای میانگین</th></tr>{quality_models}</table></div>
+</div>
 <div class='card'><form method='post' action='/backup'><button class='secondary'>دریافت نسخه پشتیبان دیتابیس</button></form></div><div class='card'><b>وضعیت موتور تصویر:</b> {'آماده' if CV_OK else 'OpenCV بارگذاری نشده است'}</div></div>"""
     return page('تنظیمات',body,u,request)
 
 @app.post('/settings/display')
-def save_display_settings(request:Request,dashboard_grid:int=Form(2),live_fps:int=Form(5),stream_width:int=Form(640),jpeg_quality:int=Form(70),new_password:str=Form('')):
+def save_display_settings(request:Request,dashboard_grid:int=Form(2),dashboard_event_rows:int=Form(12),live_fps:int=Form(5),stream_width:int=Form(640),jpeg_quality:int=Form(70),new_password:str=Form('')):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
     if not has_permission(request,'system.manage'):return access_denied()
-    set_setting('dashboard_grid',max(1,min(4,dashboard_grid)));set_setting('live_fps',max(1,min(15,live_fps)));set_setting('stream_width',stream_width);set_setting('jpeg_quality',max(30,min(95,jpeg_quality)))
+    set_setting('dashboard_grid',max(1,min(4,dashboard_grid)));set_setting('dashboard_event_rows',max(6,min(50,dashboard_event_rows)));set_setting('live_fps',max(1,min(15,live_fps)));set_setting('stream_width',stream_width);set_setting('jpeg_quality',max(30,min(95,jpeg_quality)))
     if new_password.strip():
         with connect() as con:con.execute('UPDATE users SET password_hash=? WHERE username=?',(hash_password(new_password.strip()),u))
     for cid in list(manager.streams): manager.remove(cid)
@@ -1003,7 +1643,20 @@ def save_storage_settings(request:Request,storage_root:str=Form(...),snapshot_pa
         paths=_storage_paths(storage_root,snapshot_path,plate_path,video_path,backup_path)
         for x in paths: x.mkdir(parents=True,exist_ok=True)
         old_root=Path(get_setting('storage_root',str(DATA_DIR))).resolve(); new_root=paths[0]; restart=old_root!=new_root
-        values={'storage_root':new_root,'snapshot_path':paths[1],'plate_path':paths[2],'video_path':paths[3],'backup_path':paths[4],'save_snapshots':'1' if save_snapshots else '0','save_plate_images':'1' if save_plate_images else '0','save_videos':'1' if save_videos else '0','max_storage_gb':max(0,max_storage_gb),'storage_full_action':storage_full_action if storage_full_action in {'delete_oldest','stop','alert'} else 'delete_oldest','retention_snapshots_days':max(0,retention_snapshots_days),'retention_plates_days':max(0,retention_plates_days),'retention_videos_days':max(0,retention_videos_days),'retention_events_days':max(0,retention_events_days)}
+        old_media=[
+            Path(get_setting('snapshot_path',str(SNAPSHOT_DIR))).resolve(),
+            Path(get_setting('plate_path',str(PLATE_DIR))).resolve(),
+            Path(get_setting('video_path',str(VIDEO_DIR))).resolve(),
+        ]
+        history=_media_roots_history()
+        for old_path,new_path in zip(old_media,paths[1:4]):
+            if (
+                old_path != new_path
+                and old_path != Path(old_path.anchor)
+                and old_path not in history
+            ):
+                history.append(old_path)
+        values={'storage_root':new_root,'snapshot_path':paths[1],'plate_path':paths[2],'video_path':paths[3],'backup_path':paths[4],'media_roots_history':json.dumps([str(root) for root in history[-24:]],ensure_ascii=False),'save_snapshots':'1' if save_snapshots else '0','save_plate_images':'1' if save_plate_images else '0','save_videos':'1' if save_videos else '0','max_storage_gb':max(0,max_storage_gb),'storage_full_action':storage_full_action if storage_full_action in {'delete_oldest','stop','alert'} else 'delete_oldest','retention_snapshots_days':max(0,retention_snapshots_days),'retention_plates_days':max(0,retention_plates_days),'retention_videos_days':max(0,retention_videos_days),'retention_events_days':max(0,retention_events_days)}
         if restart:
             database_target=new_root/'bcvision.db'
             persistent_names=['bcvision.db','.secret','license.json','.trial.json']
@@ -1104,14 +1757,16 @@ def export_events(request:Request):
     if not auth(request):return RedirectResponse('/login',302)
     out=Path(get_setting('backup_path',str(BACKUP_DIR)));out.mkdir(parents=True,exist_ok=True);out=out / f"events-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
     with connect() as con, out.open('w',newline='',encoding='utf-8-sig') as f:
-        rows=con.execute('SELECT id,plate_text,confidence,camera_name,vehicle_type,vehicle_color,vehicle_confidence,created_at FROM plate_events ORDER BY id DESC').fetchall()
-        w=csv.writer(f);w.writerow(['ردیف','پلاک','اطمینان پلاک','دوربین','نوع خودرو','رنگ خودرو','اطمینان خودرو','تاریخ و ساعت شمسی'])
+        rows=con.execute('SELECT id,plate_text,confidence,camera_name,city,plate_region,vehicle_type,vehicle_color,vehicle_confidence,created_at FROM plate_events ORDER BY id DESC').fetchall()
+        w=csv.writer(f);w.writerow(['ردیف','پلاک','اطمینان پلاک','دوربین','شهر محل ثبت','کد ناحیه پلاک','نوع خودرو','رنگ خودرو','اطمینان خودرو','تاریخ و ساعت شمسی'])
         w.writerows([
             (
                 r['id'],
                 _csv_cell(r['plate_text']),
                 r['confidence'],
                 _csv_cell(r['camera_name']),
+                _csv_cell(r['city']),
+                _csv_cell(r['plate_region']),
                 _csv_cell(r['vehicle_type']),
                 _csv_cell(r['vehicle_color']),
                 r['vehicle_confidence'],
@@ -1122,7 +1777,7 @@ def export_events(request:Request):
     return FileResponse(out,media_type='text/csv',filename=out.name)
 
 @app.post('/settings/ai')
-def save_ai_settings(request:Request, ai_accelerator:str=Form('auto'), ai_quality:str=Form('balanced'), ai_confidence:int=Form(85), ai_frames:int=Form(5)):
+def save_ai_settings(request:Request, ai_accelerator:str=Form('auto'), ai_quality:str=Form('balanced'), ai_confidence:int=Form(85), ai_frames:int=Form(5), anpr_auto_confirm_guesses:str|None=Form(None)):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
     if not has_permission(request,'system.manage'):return access_denied()
@@ -1130,6 +1785,10 @@ def save_ai_settings(request:Request, ai_accelerator:str=Form('auto'), ai_qualit
     set_setting('ai_quality', ai_quality)
     set_setting('ai_confidence', max(1,min(99,ai_confidence)))
     set_setting('ai_frames', max(1,min(20,ai_frames)))
+    set_setting(
+        'anpr_auto_confirm_guesses',
+        '1' if anpr_auto_confirm_guesses else '0',
+    )
     return RedirectResponse('/settings?saved=1',302)
 
 
@@ -1186,6 +1845,31 @@ def apply_ai_training(
         )
 
 
+@app.post('/settings/ai/training/evaluate')
+def evaluate_ai_training(
+    request: Request,
+    run_id: int = Form(...),
+):
+    username = auth(request)
+    if not username:
+        return RedirectResponse('/login', 302)
+    if not has_permission(request, 'system.manage'):
+        return access_denied()
+    try:
+        result = evaluate_candidate_on_golden(run_id)
+        audit(
+            request,
+            'anpr_training_golden_evaluate',
+            f"run={run_id}; status={result['status']}",
+        )
+        return RedirectResponse('/settings?saved=1#ai-training', 303)
+    except ValueError as exc:
+        return RedirectResponse(
+            '/settings?error=' + quote(str(exc)) + '#ai-training',
+            303,
+        )
+
+
 @app.post('/backup')
 def backup_database(request:Request):
     if not auth(request):return RedirectResponse('/login',302)
@@ -1224,30 +1908,32 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(...), vid
     except ValueError as e:
         return upload_error(e)
 
+    virtual_camera_id=None
     try:
         from app.ai.video_test import VideoTester
         tester=VideoTester(target)
-        info=tester.info()
-        tester.close()
-        old_stream_ids=[]
+        try:
+            info=tester.info()
+        finally:
+            tester.close()
+        display_name=(Path(video.filename or target.name).stem or 'ویدئو')[:80]
         with connect() as con:
             old_stream_ids=[
                 int(row['id']) for row in con.execute(
                     "SELECT id FROM cameras WHERE rtsp_url LIKE 'video://%'"
                 ).fetchall()
             ]
-            con.execute("DELETE FROM cameras WHERE rtsp_url LIKE 'video://%'")
-            display_name=(Path(video.filename or target.name).stem or 'ویدئو')[:80]
             cursor=con.execute(
                 "INSERT INTO cameras("
-                "name,rtsp_url,location,enabled,is_demo,sort_order,"
+                "name,rtsp_url,location,city,enabled,is_demo,sort_order,"
                 "lpr_enabled,lpr_confidence,frame_step,duplicate_seconds,"
                 "roi_x,roi_y,roi_w,roi_h,line_y"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     f"ویدئو: {display_name}",
                     f"video://{target}",
                     f"فایل آپلودی با تنظیمات {source_camera['name']}",
+                    source_camera['city'] or '',
                     1,
                     1,
                     -1,
@@ -1263,8 +1949,6 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(...), vid
                 ),
             )
             virtual_camera_id=int(cursor.lastrowid)
-        for old_id in old_stream_ids:
-            manager.remove(old_id)
         manager.get(
             virtual_camera_id,
             f"video://{target}",
@@ -1273,6 +1957,17 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(...), vid
             int(get_setting('live_fps','5')),
             int(get_setting('jpeg_quality','70')),
         )
+        with connect() as con:
+            con.execute(
+                "DELETE FROM cameras WHERE rtsp_url LIKE 'video://%' "
+                "AND id<>?",
+                (virtual_camera_id,),
+            )
+        for old_id in old_stream_ids:
+            try:
+                manager.remove(old_id)
+            except Exception:
+                pass
         if wants_json:
             return JSONResponse({
                 'ok':True,
@@ -1286,10 +1981,270 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(...), vid
             })
         return RedirectResponse('/dashboard?video=1',303)
     except Exception as e:
+        if virtual_camera_id is not None:
+            try:
+                manager.remove(virtual_camera_id)
+            except Exception:
+                pass
+            try:
+                with connect() as con:
+                    con.execute(
+                        "DELETE FROM cameras WHERE id=?",
+                        (virtual_camera_id,),
+                    )
+            except Exception:
+                # Keep the file if a surviving database row may reference it.
+                return upload_error(
+                    f'خطا در آماده‌سازی ویدئو: {e}',500
+                )
         target.unlink(missing_ok=True)
         return upload_error(f'خطا در آماده‌سازی ویدئو: {e}',500)
 
 # ---------- Video AI Test Upload ----------
+def _archive_video_test_events(events, video_path, display_name):
+    archived=[]
+    with connect() as con:
+        columns={
+            row[1]
+            for row in con.execute(
+                "PRAGMA table_info(plate_events)"
+            ).fetchall()
+        }
+        for raw in events:
+            event=dict(raw)
+            candidate_norm=(
+                normalize_plate(event.get('plate_norm'))
+                or normalize_plate(event.get('plate'))
+            )
+            candidate_parts=split_iran_plate(candidate_norm)
+            recognized=bool(
+                candidate_parts and (
+                    event.get('valid')
+                    or event.get('auto_confirmed')
+                )
+                and not event.get('unreadable_final')
+            )
+            suggested=bool(event.get('needs_review'))
+            if recognized:
+                plate_text=str(event.get('plate') or candidate_norm)
+                normalized=candidate_norm
+            elif suggested:
+                plate_text=str(
+                    event.get('raw_guess_text')
+                    or event.get('plate')
+                    or 'ناخوانا'
+                )
+                normalized=normalize_plate(
+                    event.get('raw_guess_norm') or plate_text
+                )
+            else:
+                plate_text='ناخوانا'
+                normalized=''
+            parts=split_iran_plate(normalized)
+            plate_norm=normalized if recognized else ''
+            review_status=(
+                'auto-confirmed'
+                if recognized and event.get('auto_confirmed')
+                else (
+                    'confirmed-ai'
+                    if recognized
+                    else ('suggested' if suggested else 'unreadable')
+                )
+            )
+            values={
+                'plate_text':plate_text,
+                'plate_norm':plate_norm,
+                'plate_region':parts['region'] if parts else '',
+                'confidence':max(
+                    0.0,min(1.0,float(event.get('confidence') or 0.0))
+                ),
+                'camera_id':None,
+                'camera_name':f"تست ویدئو: {display_name}"[:120],
+                'city':'',
+                'image_path':str(event.get('image_path') or ''),
+                'plate_image_path':str(event.get('plate_path') or ''),
+                'media_status':str(event.get('media_status') or 'missing'),
+                'media_error':str(event.get('media_error') or '')[:1000],
+                'video_path':str(video_path),
+                'video_second':max(
+                    0.0,float(event.get('video_second') or 0.0)
+                ),
+                'detector_method':str(event.get('method') or 'video-test'),
+                'ocr_confidence':max(
+                    0.0,min(1.0,float(event.get('ocr_confidence') or 0.0))
+                ),
+                'ocr_engine':str(event.get('ocr_engine') or ''),
+                'ocr_alternative':str(event.get('ocr_alternative') or ''),
+                'ocr_disagreement':int(bool(event.get('ocr_disagreement'))),
+                'vehicle_type':str(event.get('vehicle_type') or 'نامشخص'),
+                'vehicle_color':str(event.get('vehicle_color') or 'نامشخص'),
+                'vehicle_brand':str(event.get('vehicle_brand') or 'نامشخص'),
+                'vehicle_confidence':max(
+                    0.0,min(
+                        1.0,float(event.get('vehicle_confidence') or 0.0)
+                    )
+                ),
+                'direction':str(event.get('direction') or 'stationary'),
+                'quality_score':max(
+                    0.0,min(1.0,float(event.get('quality_score') or 0.0))
+                ),
+                'consensus_votes':max(
+                    0,int(event.get('consensus_votes') or 0)
+                ),
+                'source':'video-test',
+                'processing_ms':max(
+                    0.0,float(event.get('processing_ms') or 0.0)
+                ),
+                'review_status':review_status,
+                'confirmation_source':str(
+                    event.get('confirmation_source') or 'video-test'
+                ),
+                'operator_reviewed':0,
+                'raw_guess_text':str(
+                    event.get('raw_guess_text') or plate_text
+                ),
+                'raw_guess_norm':normalize_plate(
+                    event.get('raw_guess_norm')
+                    or event.get('raw_guess_text')
+                    or plate_norm
+                ),
+                'raw_guess_confidence':max(
+                    0.0,min(
+                        1.0,
+                        float(
+                            event.get('raw_guess_confidence')
+                            or event.get('ocr_confidence')
+                            or 0.0
+                        ),
+                    )
+                ),
+                'raw_guess_engine':str(
+                    event.get('raw_guess_engine')
+                    or event.get('ocr_engine')
+                    or ''
+                ),
+                'raw_guess_reason':str(
+                    event.get('raw_guess_reason') or ''
+                ),
+                'model_revision':str(
+                    event.get('model_revision')
+                    or event.get('ocr_engine')
+                    or ''
+                ),
+                'experimental':int(bool(
+                    event.get('experimental')
+                    or event.get('needs_review')
+                )),
+            }
+            selected=[key for key in values if key in columns]
+            placeholders=','.join('?' for _ in selected)
+            cursor=con.execute(
+                f"INSERT INTO plate_events({','.join(selected)}) "
+                f"VALUES({placeholders})",
+                tuple(values[key] for key in selected),
+            )
+            event['event_id']=int(cursor.lastrowid)
+            archived.append(event)
+    return archived
+
+
+def _video_test_result_row(event, index):
+    image_path = str(event.get('image_path') or '')
+    vehicle_image = (
+        f"<a href='/events/{int(event['event_id'])}'>"
+        f"<img class='recent-vehicle-thumb' "
+        f"src='/media?path={quote(image_path)}' "
+        f"alt='تصویر خودرو ردیف {index}'></a>"
+        if image_path and Path(image_path).is_file()
+        and event.get('event_id')
+        else "<span class='recent-media-missing'>بدون تصویر خودرو</span>"
+    )
+    plate_path = str(event.get('plate_path') or '')
+    plate_href=(
+        f"/events/{int(event['event_id'])}"
+        if event.get('event_id')
+        else f"/media?path={quote(plate_path)}"
+    )
+    plate_image = (
+        f"<a href='{plate_href}'>"
+        f"<img class='thumb plate-thumb' "
+        f"src='/media?path={quote(plate_path)}' "
+        f"alt='تصویر پلاک ردیف {index}'></a>"
+        if plate_path and Path(plate_path).is_file()
+        else "<span class='recent-media-missing' "
+        "style='width:130px;height:48px'>بدون تصویر پلاک</span>"
+    )
+    recognized = bool(
+        split_iran_plate(
+            normalize_plate(
+                event.get('plate_norm') or event.get('plate')
+            )
+        )
+        and (event.get('valid') or event.get('auto_confirmed'))
+        and not event.get('unreadable_final')
+    )
+    plate_text = str(
+        (event.get('plate') if recognized else event.get('raw_guess_text'))
+        or event.get('plate')
+        or 'ناخوانا'
+    )
+    confidence = max(0.0, min(1.0, float(event.get('confidence') or 0.0)))
+    video_second = max(0.0, float(event.get('video_second') or 0.0))
+    engine = str(event.get('ocr_engine') or event.get('method') or '—')
+    lane = str(event.get('engine_lane') or 'baseline')
+    experimental = bool(
+        event.get('experimental')
+        or lane == 'candidate-shadow'
+    )
+    if event.get('auto_confirmed'):
+        status = (
+            "<span class='read-badge auto-confirmed'>"
+            "تأیید خودکار مدل؛ قابل اصلاح</span>"
+        )
+    elif experimental:
+        status = (
+            "<span class='read-badge suggested'>"
+            "حدس خام مدل آزمایشی؛ قطعی نیست</span>"
+        )
+    elif event.get('needs_review') and plate_text not in {
+        '', 'ناخوانا', 'در حال بررسی'
+    }:
+        status = (
+            "<span class='read-badge suggested'>"
+            "حدس آزمایشی؛ نیازمند اصلاح</span>"
+        )
+    elif event.get('valid'):
+        status = "<span class='read-badge confirmed'>خوانش قطعی</span>"
+    else:
+        status = (
+            "<span class='read-badge unreadable'>"
+            "ناخوانا / بدون حدس معتبر</span>"
+        )
+    reason = str(event.get('raw_guess_reason') or '')
+    diagnostics = (
+        f"<small class='muted code'>{escape(reason)}</small>"
+        if reason
+        else ""
+    )
+    lane_label = (
+        "مدل جدید / Shadow"
+        if lane == 'candidate-shadow'
+        else "Baseline فعال"
+    )
+    return (
+        f"<tr><td>{persian_digits(index)}</td>"
+        f"<td>{vehicle_image}</td>"
+        f"<td><div class='recent-plate-result'>{plate_image}"
+        f"<div data-recognized-text='{escape(plate_text)}'>"
+        f"{iran_plate_html(plate_text, True)}{status}{diagnostics}"
+        f"</div></div></td>"
+        f"<td>{persian_digits(round(confidence * 100, 1))}٪</td>"
+        f"<td>{persian_digits(round(video_second, 2))} ثانیه</td>"
+        f"<td><b>{escape(lane_label)}</b><br>"
+        f"<span class='code'>{escape(engine)}</span></td></tr>"
+    )
+
+
 @app.get('/ai/video-test', response_class=HTMLResponse)
 def ai_video_test_page(request: Request):
     u=auth(request)
@@ -1297,12 +2252,22 @@ def ai_video_test_page(request: Request):
         return RedirectResponse('/login',302)
     if not has_permission(request,'video.process'):return access_denied()
     return page('تست ویدئو',"""
-    <div style="direction:rtl;font-family:Tahoma;padding:30px">
-    <h2>🧠 تست پلاک‌خوان با فایل ویدئو</h2>
-    <form action="/ai/video-test/upload" method="post" enctype="multipart/form-data">
-      <input type="file" name="video" accept=".mp4,.avi,.mkv,.mov" />
-      <button type="submit">شروع تست AI</button>
-    </form>
+    <div class="wrap">
+      <div class="toolbar"><h1>تست واقعی پلاک‌خوان با ویدئو</h1></div>
+      <div class="card">
+        <p class="muted">تمام فریم‌ها پردازش می‌شوند. از هر تردد، بهترین
+        تصویر پلاک و متن تشخیص‌داده‌شده در یک ردیف نمایش داده می‌شود.
+        حدس کاملِ چندفریمی با نشان «تأیید خودکار مدل» وارد نتیجه می‌شود؛
+        حدس ناقص همچنان آزمایشی می‌ماند. هیچ‌کدام تا تأیید یا اصلاح
+        اپراتور، حقیقت آموزشی محسوب نمی‌شوند.</p>
+        <form action="/ai/video-test/upload" method="post"
+              enctype="multipart/form-data">
+          <label>فایل ویدئو</label>
+          <input type="file" name="video"
+                 accept=".mp4,.avi,.mkv,.mov,.m4v" required>
+          <button type="submit">شروع پردازش کامل</button>
+        </form>
+      </div>
     </div>
     """,u,request)
 
@@ -1320,18 +2285,115 @@ async def ai_video_test_upload(request: Request, video: UploadFile = File(...)):
     except ValueError as e:
         return page('خطای ویدئو',f"<div class='wrap'><div class='alert'>{escape(str(e))}</div></div>",u,request)
     try:
-        from app.ai.video_test import VideoTester
-        tester = VideoTester(target)
-        info = tester.info()
-        tester.close()
-        return page('نتیجه آماده‌سازی ویدئو',f"""
-        <div style="direction:rtl;font-family:Tahoma;padding:30px">
-        <h2>نتیجه آماده‌سازی ویدئو</h2>
-        <p>فایل: {escape(video.filename or '')}</p>
-        <p>فریم: {info['frames']}</p>
-        <p>FPS: {info['fps']}</p>
-        <p>رزولوشن: {info['width']}x{info['height']}</p>
-        <p>مرحله بعد: اتصال همین ورودی به موتور تشخیص پلاک</p>
+        from app.ai.video_test import process_video
+        run_name = target.stem
+        plate_dir = (
+            _configured_storage_child('plate_path', PLATE_DIR)
+            / 'video-tests'
+            / run_name
+        )
+        snapshot_dir = (
+            _configured_storage_child('snapshot_path', SNAPSHOT_DIR)
+            / 'video-tests'
+            / run_name
+        )
+        started = time.perf_counter()
+        info, events = process_video(
+            target,
+            plate_dir,
+            snapshot_dir,
+            frame_step=1,
+            max_events=10000,
+            min_confidence=0.20,
+            duplicate_seconds=2.5,
+            include_candidate_shadow=True,
+        )
+        events = _archive_video_test_events(
+            events,
+            target,
+            Path(video.filename or target.name).stem or 'ویدئو',
+        )
+        elapsed = time.perf_counter() - started
+        readable = sum(
+            1
+            for event in events
+            if event.get('valid') and not event.get('needs_review')
+        )
+        auto_confirmed = sum(
+            1
+            for event in events
+            if event.get('auto_confirmed')
+        )
+        guesses = sum(
+            1
+            for event in events
+            if (
+                event.get('experimental')
+                or event.get('needs_review')
+            )
+            and not event.get('auto_confirmed')
+            and str(
+                event.get('raw_guess_text')
+                or event.get('plate')
+                or ''
+            ) not in {'', 'ناخوانا', 'در حال بررسی'}
+        )
+        shadow_events = sum(
+            1
+            for event in events
+            if event.get('engine_lane') == 'candidate-shadow'
+        )
+        rows = ''.join(
+            _video_test_result_row(event, index)
+            for index, event in enumerate(events, start=1)
+        ) or (
+            "<tr><td colspan='6'>هیچ پلاکی در این ویدئو تشخیص داده نشد."
+            "</td></tr>"
+        )
+        return page('نتیجه تست پلاک‌خوان',f"""
+        <div class="wrap">
+          <div class="toolbar">
+            <h1>نتیجه تست پلاک‌خوان</h1>
+            <a class="btn secondary" href="/ai/video-test">تست ویدئوی دیگر</a>
+          </div>
+          <div class="card">
+            <div class="stat-grid">
+              <div class="stat"><small>فریم</small>
+                <b>{persian_digits(info['frames'])}</b></div>
+              <div class="stat"><small>تردد تشخیص‌داده‌شده</small>
+                <b>{persian_digits(len(events))}</b></div>
+              <div class="stat"><small>خوانش قطعی</small>
+                <b>{persian_digits(readable)}</b></div>
+              <div class="stat"><small>تأیید خودکار مدل</small>
+                <b>{persian_digits(auto_confirmed)}</b></div>
+              <div class="stat"><small>حدس آزمایشی</small>
+                <b>{persian_digits(guesses)}</b></div>
+              <div class="stat"><small>خروجی Shadow</small>
+                <b>{persian_digits(shadow_events)}</b></div>
+              <div class="stat"><small>زمان پردازش</small>
+                <b>{persian_digits(round(elapsed, 2))} ثانیه</b></div>
+            </div>
+            <p class="muted">فایل: {escape(video.filename or '')} —
+            {persian_digits(info['width'])}×{persian_digits(info['height'])}
+            در {persian_digits(info['fps'])} FPS</p>
+            {(
+                "<div class='alert'>موتور Shadow اجرا نشد: "
+                + escape(str(info.get('candidate_shadow_error') or ''))
+                + "</div>"
+                if info.get('candidate_shadow_error')
+                else ""
+            )}
+          </div>
+          <div class="card">
+            <div class="table-wrap"><table>
+              <thead><tr><th>ردیف</th>
+                <th>تصویر خودرو</th>
+                <th>تصویر پلاک / متن تشخیص‌داده‌شده</th>
+                <th>اطمینان</th><th>زمان ویدئو</th><th>موتور / مسیر</th>
+              </tr></thead>
+              <tbody>{rows}</tbody>
+            </table></div>
+          </div>
         </div>
         """,u,request)
     except Exception as e:

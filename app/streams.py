@@ -424,12 +424,21 @@ class CameraStream:
             for result in self._live_overlays(frame):
                 x1, y1, x2, y2 = result["bbox"]
                 # The rectangle represents a physical plate detection, not OCR
-                # confidence.  Keep it green and let the label/confidence show
-                # that the text may still need operator review.
-                color = (36, 220, 96)
+                # confidence. Confirmed reads stay green; experimental raw
+                # guesses are amber and explicitly labelled GUESS.
+                experimental = bool(result.get("experimental"))
+                color = (
+                    (24, 178, 255)
+                    if experimental
+                    else (36, 220, 96)
+                )
                 cv2.rectangle(display, (x1, y1), (x2, y2), color, 3)
                 confidence = int(float(result.get("confidence", 0)) * 100)
-                label = f"PLATE {confidence}%"
+                label = (
+                    f"GUESS {confidence}%"
+                    if experimental
+                    else f"PLATE {confidence}%"
+                )
                 top = max(24, y1)
                 cv2.rectangle(
                     display,

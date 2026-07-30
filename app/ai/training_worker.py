@@ -22,7 +22,9 @@ from .onnx_crnn import (
     ctc_greedy_decode,
     prepare_crnn_input,
 )
-from .plate_rules import normalize_plate
+from .evaluation import character_distance
+from .plate_rules import normalize_plate, plausible_plate
+from .training_manifest import operator_dataset_fingerprint
 
 
 def _sha256(path: Path) -> str:
@@ -33,17 +35,107 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest().upper()
 
 
-def _load_manifest(path: Path) -> tuple[list[dict], list[dict]]:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+def _load_manifest(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+) -> tuple[list[dict], list[dict]]:
+    path = Path(path).resolve()
+    manifest_bytes = path.read_bytes()
+    if expected_sha256 is not None:
+        expected = str(expected_sha256).strip().upper()
+        if (
+            len(expected) != 64
+            or any(
+                character not in "0123456789ABCDEF"
+                for character in expected
+            )
+            or hashlib.sha256(manifest_bytes).hexdigest().upper()
+            != expected
+        ):
+            raise ValueError("Training manifest SHA-256 mismatch")
+    payload = json.loads(manifest_bytes.decode("utf-8"))
+    if (
+        int(payload.get("schema", 0)) != 2
+        or payload.get("training_source") != "operator-confirmed-only"
+        or payload.get("golden_benchmark_data") is not False
+    ):
+        raise ValueError(
+            "Training manifest must be a non-Golden schema-2 "
+            "operator-confirmed snapshot"
+        )
+    samples = payload.get("samples", [])
+    expected_fingerprint = str(
+        payload.get("dataset_fingerprint", "")
+    ).strip().upper()
+    if (
+        not isinstance(samples, list)
+        or len(expected_fingerprint) != 64
+        or operator_dataset_fingerprint(samples)
+        != expected_fingerprint
+    ):
+        raise ValueError("Training dataset fingerprint mismatch")
+    snapshot_root = (
+        path.parent.parent
+        if path.parent.name == "manifests"
+        else path.parent
+    ).resolve()
     train = []
     validation = []
-    for row in payload.get("samples", []):
+    seen_feedback_ids = set()
+    seen_digests = set()
+    labels_by_group = {}
+    splits_by_plate = {}
+    for number, row in enumerate(samples, 1):
+        feedback_id = int(row.get("feedback_id", 0))
+        if feedback_id <= 0 or feedback_id in seen_feedback_ids:
+            raise ValueError(
+                f"Invalid or duplicate feedback id at sample {number}"
+            )
+        seen_feedback_ids.add(feedback_id)
         image = Path(row.get("image_path", ""))
+        if not image.is_absolute():
+            image = (path.parent / image).resolve()
+        else:
+            image = image.resolve()
+        try:
+            image.relative_to(snapshot_root)
+        except ValueError as exc:
+            raise ValueError(
+                f"Training image escapes snapshot root at sample {number}"
+            ) from exc
         label = normalize_plate(row.get("plate", ""))
-        if not image.is_file() or len(label) != 8:
-            continue
-        target = validation if row.get("split") == "validation" else train
+        group = str(row.get("group_id", "")).strip()
+        digest = str(row.get("sha256", "")).strip().upper()
+        split = str(row.get("split", "")).strip().lower()
+        if split not in {"train", "validation"}:
+            raise ValueError("Invalid training dataset split")
+        if not group:
+            raise ValueError(
+                f"Missing training group at sample {number}"
+            )
+        if (
+            not image.is_file()
+            or not plausible_plate(label)
+            or len(digest) != 64
+            or _sha256(image) != digest
+        ):
+            raise ValueError(
+                f"Invalid or changed training sample at item {number}"
+            )
+        if digest in seen_digests:
+            raise ValueError("Duplicate crop in training snapshot")
+        seen_digests.add(digest)
+        labels_by_group.setdefault(group, set()).add(label)
+        splits_by_plate.setdefault(label, set()).add(split)
+        target = validation if split == "validation" else train
         target.append({"image": image, "label": label})
+    if any(len(labels) != 1 for labels in labels_by_group.values()):
+        raise ValueError("Training group has conflicting plate labels")
+    if any(len(splits) != 1 for splits in splits_by_plate.values()):
+        raise ValueError(
+            "One plate identity crosses train and validation"
+        )
     if not train or not validation:
         raise ValueError("Training and validation samples are required")
     return train, validation
@@ -81,8 +173,9 @@ def _augment(tensor: np.ndarray, rng) -> np.ndarray:
     return gray.astype(np.float32)[None] / 255.0
 
 
-def _evaluate(session, rows: list[dict]) -> float:
-    correct = 0
+def _evaluate(session, rows: list[dict]) -> dict:
+    predictions = []
+    distances = []
     for row in rows:
         tensor = _load_tensor(row["image"])[None]
         input_name = session.get_inputs()[0].name
@@ -90,8 +183,21 @@ def _evaluate(session, rows: list[dict]) -> float:
             session.run(None, {input_name: tensor})[0]
         )[0]
         text, _confidence = ctc_greedy_decode(logits)
-        correct += normalize_plate(text) == row["label"]
-    return correct / max(len(rows), 1)
+        predicted = normalize_plate(text)
+        predictions.append(predicted)
+        distances.append(character_distance(predicted, row["label"]))
+    correct = sum(
+        predicted == row["label"]
+        for predicted, row in zip(predictions, rows)
+    )
+    return {
+        "accuracy": correct / max(len(rows), 1),
+        "mean_character_error": (
+            sum(distances) / max(len(distances), 1)
+        ),
+        "predictions": predictions,
+        "distances": distances,
+    }
 
 
 def train_candidate(
@@ -99,13 +205,18 @@ def train_candidate(
     output_dir: Path,
     device="auto",
     epochs=12,
+    manifest_sha256=None,
 ) -> dict:
     import onnxruntime as ort
     import torch
     from torch import nn
     from torch.utils.data import DataLoader, Dataset
 
-    from .model_manager import active_crnn_model
+    from .model_manager import (
+        active_crnn_model,
+        active_crnn_training_checkpoint,
+        verify_file,
+    )
 
     thread_limit = threads_per_camera()
     torch.set_num_threads(thread_limit)
@@ -114,13 +225,18 @@ def train_candidate(
     except RuntimeError:
         pass
 
-    train_rows, validation_rows = _load_manifest(Path(manifest))
-    base_path, _base_sha, _base_size = active_crnn_model()
+    train_rows, validation_rows = _load_manifest(
+        Path(manifest),
+        expected_sha256=manifest_sha256,
+    )
+    base_path, base_sha, base_size = active_crnn_model()
+    if not verify_file(base_path, base_sha, base_size):
+        raise ValueError("Active CRNN baseline integrity verification failed")
     base_session = ort.InferenceSession(
         str(base_path),
         providers=["CPUExecutionProvider"],
     )
-    baseline_accuracy = _evaluate(base_session, validation_rows)
+    baseline_metrics = _evaluate(base_session, validation_rows)
 
     label_to_index = {
         label: index for index, label in enumerate(CRNN_LABELS)
@@ -138,11 +254,6 @@ def train_candidate(
         base_session.run(None, {teacher_input: train_x})[0],
         dtype=np.float32,
     )
-    validation_x = np.stack([
-        _load_tensor(row["image"]) for row in validation_rows
-    ])
-    validation_y = [row["label"] for row in validation_rows]
-
     rng = np.random.default_rng(20260728)
 
     class TrainingDataset(Dataset):
@@ -225,6 +336,21 @@ def train_candidate(
         selected_device = "cuda"
     runtime_device = torch.device(selected_device)
     model = CRNN().to(runtime_device)
+    initialization_mode = "active-model-distillation"
+    active_checkpoint = active_crnn_training_checkpoint()
+    if active_checkpoint is not None:
+        checkpoint_path, _checkpoint_sha, _checkpoint_size = (
+            active_checkpoint
+        )
+        state_dict = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+        if not isinstance(state_dict, dict):
+            raise ValueError("Active CRNN checkpoint is not a state dict")
+        model.load_state_dict(state_dict, strict=True)
+        initialization_mode = "active-checkpoint"
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=8e-4,
@@ -272,6 +398,17 @@ def train_candidate(
     model.eval()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    candidate_checkpoint = output_dir / "ocr_crnn-state.pt"
+    torch.save(
+        {
+            name: tensor.detach().cpu()
+            for name, tensor in model.state_dict().items()
+        },
+        candidate_checkpoint,
+    )
+    candidate_checkpoint_sha256 = _sha256(
+        candidate_checkpoint
+    )
     candidate = output_dir / "ocr_crnn.onnx"
     torch.onnx.export(
         model.cpu(),
@@ -290,21 +427,54 @@ def train_candidate(
         str(candidate),
         providers=["CPUExecutionProvider"],
     )
-    candidate_accuracy = 0.0
-    input_name = candidate_session.get_inputs()[0].name
-    outputs = candidate_session.run(
-        None,
-        {input_name: validation_x},
-    )[0]
-    for logits, expected in zip(outputs, validation_y):
-        text, _confidence = ctc_greedy_decode(logits)
-        candidate_accuracy += normalize_plate(text) == expected
-    candidate_accuracy /= max(len(validation_y), 1)
+    candidate_metrics = _evaluate(
+        candidate_session,
+        validation_rows,
+    )
+    validation_regressions = sum(
+        candidate_distance > baseline_distance
+        for candidate_distance, baseline_distance in zip(
+            candidate_metrics["distances"],
+            baseline_metrics["distances"],
+        )
+    )
+    validation_improvements = sum(
+        candidate_distance < baseline_distance
+        for candidate_distance, baseline_distance in zip(
+            candidate_metrics["distances"],
+            baseline_metrics["distances"],
+        )
+    )
     digest = _sha256(candidate)
     return {
-        "baseline_accuracy": round(float(baseline_accuracy), 6),
-        "candidate_accuracy": round(float(candidate_accuracy), 6),
+        "baseline_accuracy": round(
+            float(baseline_metrics["accuracy"]),
+            6,
+        ),
+        "candidate_accuracy": round(
+            float(candidate_metrics["accuracy"]),
+            6,
+        ),
+        "baseline_mean_character_error": round(
+            float(baseline_metrics["mean_character_error"]),
+            6,
+        ),
+        "candidate_mean_character_error": round(
+            float(candidate_metrics["mean_character_error"]),
+            6,
+        ),
+        "validation_samples": len(validation_rows),
+        "validation_regressions": validation_regressions,
+        "validation_improvements": validation_improvements,
+        "baseline_sha256": str(base_sha).upper(),
+        "initialization_mode": initialization_mode,
         "candidate_path": str(candidate),
         "candidate_sha256": digest,
+        "candidate_checkpoint_path": str(
+            candidate_checkpoint
+        ),
+        "candidate_checkpoint_sha256": (
+            candidate_checkpoint_sha256
+        ),
         "device": selected_device,
     }

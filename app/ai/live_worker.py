@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import threading
 import time
@@ -15,14 +15,51 @@ import time
 import cv2
 
 from app.cpu_budget import parallel_camera_limit, threads_per_camera
+from app.media_storage import save_event_images
 
+from .activity import FrameActivityAnalyzer
 from .pipeline import (
     PlateConsensusTracker,
     add_vehicle_analysis,
+    bbox_iou,
     process_frame,
 )
-from .plate_rules import normalize_plate
+from .plate_rules import normalize_plate, split_iran_plate
 from .feedback import apply_learned_correction
+from .next_engine import engine_router
+from .review_policy import (
+    auto_confirm_guess,
+    tag_assisted_candidate,
+)
+
+
+def operator_assisted_rows(primary: list, shadow: list) -> list:
+    """Prefer a complete Shadow guess over an overlapping unreadable row.
+
+    Strict baseline reads retain priority. Candidate output stays tagged as
+    experimental until the tracker has enough temporal evidence to emit one
+    automatically confirmed, operator-reviewable event.
+    """
+
+    selected = [dict(row) for row in primary]
+    for raw_candidate in shadow:
+        candidate = tag_assisted_candidate(raw_candidate)
+        if candidate is None or not candidate.get("bbox"):
+            continue
+        overlaps = [
+            (bbox_iou(row.get("bbox"), candidate["bbox"]), index)
+            for index, row in enumerate(selected)
+            if row.get("bbox")
+        ]
+        overlap, index = max(overlaps, default=(0.0, -1))
+        if overlap >= 0.28:
+            baseline = selected[index]
+            if baseline.get("valid") and not baseline.get("needs_review"):
+                continue
+            selected[index] = candidate
+        else:
+            selected.append(candidate)
+    return selected
 
 
 @dataclass
@@ -62,6 +99,17 @@ class _CameraState:
     latest_detection_frame: object | None = None
     detection_revision: int = 0
     last_submitted_at: float = 0.0
+    burst_frames_remaining: int = 0
+    plate_visible: bool = False
+    shadow_frames: int = 0
+    shadow_candidates: int = 0
+    shadow_errors: int = 0
+    activity: FrameActivityAnalyzer = field(
+        default_factory=FrameActivityAnalyzer
+    )
+    motion_score: float = 0.0
+    motion_wakeups: int = 0
+    overlay_mask_pixels: int = 0
 
 
 class LiveANPRWorker:
@@ -173,12 +221,25 @@ class LiveANPRWorker:
                 vx2 + offset_x,
                 vy2 + offset_y,
             )
+        if row.get("quadrilateral"):
+            row["quadrilateral"] = [
+                [
+                    float(point[0]) + offset_x,
+                    float(point[1]) + offset_y,
+                ]
+                for point in row["quadrilateral"]
+            ]
         return row
 
     @staticmethod
     def _setting(key, default=""):
-        from app.database import get_setting
-        return get_setting(key, default)
+        try:
+            from app.database import get_setting
+            return get_setting(key, default)
+        except Exception:
+            # Inference must retain safe defaults during first-run database
+            # creation or a transient settings migration.
+            return default
 
     def _persist(
         self,
@@ -197,92 +258,192 @@ class LiveANPRWorker:
         snapshot_dir = Path(
             self._setting("snapshot_path", str(SNAPSHOT_DIR))
         )
-        plate_dir.mkdir(parents=True, exist_ok=True)
-        snapshot_dir.mkdir(parents=True, exist_ok=True)
 
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         plate_path = ""
         image_path = ""
         with connect() as con:
-            existing = (
-                con.execute(
-                    "SELECT image_path,plate_image_path "
-                    "FROM plate_events WHERE id=?",
-                    (int(event_id),),
+            try:
+                camera_row = con.execute(
+                    "SELECT city,location,rtsp_url "
+                    "FROM cameras WHERE id=?",
+                    (int(camera_id),),
                 ).fetchone()
-                if event_id
-                else None
+            except Exception:
+                # Compatibility with pre-migration/minimal recovery schemas.
+                camera_row = None
+            if event_id:
+                try:
+                    existing = con.execute(
+                        "SELECT image_path,plate_image_path,city,plate_norm "
+                        "FROM plate_events WHERE id=?",
+                        (int(event_id),),
+                    ).fetchone()
+                except Exception:
+                    try:
+                        existing = con.execute(
+                            "SELECT image_path,plate_image_path,plate_norm "
+                            "FROM plate_events WHERE id=?",
+                            (int(event_id),),
+                        ).fetchone()
+                    except Exception:
+                        existing = con.execute(
+                            "SELECT image_path,plate_image_path "
+                            "FROM plate_events WHERE id=?",
+                            (int(event_id),),
+                        ).fetchone()
+            else:
+                existing = None
+        incoming_identity = normalize_plate(
+            result.get("plate_norm", "")
+        )
+        existing_identity = (
+            normalize_plate(existing["plate_norm"])
+            if (
+                existing
+                and "plate_norm" in existing.keys()
             )
+            else ""
+        )
+        if existing_identity and incoming_identity != existing_identity:
+            if (
+                incoming_identity
+                and (
+                    result.get("valid")
+                    or result.get("auto_confirmed")
+                )
+            ):
+                # A different identity must never overwrite the confirmed
+                # event. Preserve it as a separate reviewable observation:
+                # the stale event_id itself is evidence of an association
+                # conflict, so automatic confirmation is unsafe.
+                result = {
+                    **result,
+                    "valid": False,
+                    "auto_confirmed": False,
+                    "needs_review": True,
+                    "read_status": "identity-conflict",
+                    "raw_guess_norm": incoming_identity,
+                    "raw_guess_text": result.get("plate", ""),
+                    "raw_guess_reason": "tracker-identity-conflict",
+                }
+                existing = None
+                event_id = None
+            else:
+                # A reviewable, unreadable, or capture-only row may never
+                # erase/downgrade an already identified event.
+                return int(event_id)
         if existing:
             plate_path = existing["plate_image_path"] or ""
             image_path = existing["image_path"] or ""
-        crop = result.get("crop")
+        plate_root = plate_dir.expanduser().resolve()
+        snapshot_root = snapshot_dir.expanduser().resolve()
 
-        if (
-            self._setting("save_plate_images", "1") == "1"
-            and crop is not None
-            and getattr(crop, "size", 0)
-        ):
-            target = (
-                Path(plate_path)
-                if plate_path
-                else plate_dir / f"plate-live-{stamp}.jpg"
-            )
-            if cv2.imwrite(
-                str(target),
-                crop,
-                [cv2.IMWRITE_JPEG_QUALITY, 94],
-            ):
-                plate_path = str(target)
+        def media_target(existing_path, root, filename):
+            if existing_path:
+                try:
+                    current = Path(existing_path).expanduser().resolve()
+                    if current.is_file() and current.is_relative_to(root):
+                        return current
+                except OSError:
+                    pass
+            return root / filename
 
-        if self._setting("save_snapshots", "1") == "1":
-            vehicle = result.get("vehicle_crop")
-            using_vehicle_crop = bool(
-                vehicle is not None and getattr(vehicle, "size", 0)
+        media = save_event_images(
+            result,
+            frame,
+            plate_target=(
+                media_target(
+                    plate_path,
+                    plate_root,
+                    f"plate-live-{stamp}.jpg",
+                )
+            ),
+            vehicle_target=(
+                media_target(
+                    image_path,
+                    snapshot_root,
+                    f"vehicle-live-{stamp}.jpg",
+                )
+            ),
+            save_plate=(
+                self._setting("save_plate_images", "1") == "1"
+            ),
+            save_vehicle=(
+                self._setting("save_snapshots", "1") == "1"
+            ),
+            existing_plate_path=plate_path,
+            existing_vehicle_path=image_path,
+        )
+        plate_path = media.plate_path
+        image_path = media.image_path
+        plate_identity_norm = (
+            normalize_plate(result.get("plate_norm"))
+            or normalize_plate(result.get("raw_guess_norm"))
+            or normalize_plate(result.get("plate"))
+        )
+        plate_parts = split_iran_plate(plate_identity_norm)
+        recognized = bool(
+            plate_parts
+            and (result.get("valid") or result.get("auto_confirmed"))
+            and not result.get("unreadable_final")
+        )
+        plate_norm = plate_identity_norm if recognized else ""
+        plate_text = (
+            result.get("plate")
+            if recognized
+            else (
+                result.get("raw_guess_text") or result.get("plate")
+                if result.get("needs_review")
+                else "ناخوانا"
             )
-            annotated = (
-                vehicle.copy()
-                if using_vehicle_crop
-                else frame.copy()
+        ) or "ناخوانا"
+        review_status = (
+            "auto-confirmed"
+            if recognized and result.get("auto_confirmed")
+            else (
+                "confirmed-ai"
+                if recognized
+                else (
+                    "suggested"
+                    if result.get("needs_review")
+                    else "unreadable"
+                )
             )
-            x1, y1, x2, y2 = result["bbox"]
-            if result.get("vehicle_bbox") and using_vehicle_crop:
-                vx1, vy1, _, _ = result["vehicle_bbox"]
-                x1, x2 = x1 - vx1, x2 - vx1
-                y1, y2 = y1 - vy1, y2 - vy1
-            cv2.rectangle(
-                annotated,
-                (x1, y1),
-                (x2, y2),
-                (0, 255, 0),
-                2,
-            )
-            target = (
-                Path(image_path)
-                if image_path
-                else snapshot_dir / f"vehicle-live-{stamp}.jpg"
-            )
-            if cv2.imwrite(
-                str(target),
-                annotated,
-                [cv2.IMWRITE_JPEG_QUALITY, 90],
-            ):
-                image_path = str(target)
+        )
+        camera_city = (
+            str(camera_row["city"] or "")
+            if camera_row else ""
+        )
+        event_city = (
+            str(existing["city"] or "")
+            if existing and "city" in existing.keys()
+            else str(result.get("city") or camera_city)
+        )
+        camera_url = str(camera_row["rtsp_url"] or "") if camera_row else ""
 
         values = {
-            "plate_text": result.get("plate") or "ناخوانا",
-            "plate_norm": (
-                result.get("plate_norm")
-                or normalize_plate(result.get("plate"))
-                if result.get("valid")
-                else ""
+            "plate_text": plate_text,
+            "plate_norm": plate_norm,
+            "plate_region": (
+                plate_parts["region"] if plate_parts else ""
             ),
             "confidence": float(result["confidence"]),
             "camera_id": camera_id,
             "camera_name": camera_name,
+            "city": event_city,
             "image_path": image_path,
             "plate_image_path": plate_path,
-            "video_path": "",
+            "media_status": media.media_status,
+            "media_error": media.media_error,
+            "updated_at": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S.%f"
+            ),
+            "video_path": (
+                camera_url[len("video://"):]
+                if camera_url.startswith("video://")
+                else ""
+            ),
             "video_second": 0.0,
             "detector_method": result.get("method", "live"),
             "ocr_confidence": float(
@@ -320,15 +481,49 @@ class LiveANPRWorker:
             ),
             "source": "live",
             "processing_ms": float(processing_ms),
-            "review_status": (
-                "unreadable"
-                if result.get("unreadable_final")
-                else (
-                    "suggested"
-                    if result.get("needs_review")
-                    else "confirmed-ai"
+            "review_status": review_status,
+            "confirmation_source": result.get(
+                "confirmation_source",
+                (
+                    "operator-learned"
+                    if result.get("operator_learned")
+                    else "ai-strict"
+                ),
+            ),
+            "operator_reviewed": int(bool(
+                result.get("operator_reviewed")
+            )),
+            "raw_guess_text": result.get(
+                "raw_guess_text",
+                result.get("plate", ""),
+            ),
+            "raw_guess_norm": normalize_plate(
+                result.get("raw_guess_norm")
+                or result.get("raw_guess_text")
+                or result.get("plate")
+            ),
+            "raw_guess_confidence": float(
+                result.get(
+                    "raw_guess_confidence",
+                    result.get("ocr_confidence", 0.0),
                 )
             ),
+            "raw_guess_engine": result.get(
+                "raw_guess_engine",
+                result.get("ocr_engine", ""),
+            ),
+            "raw_guess_reason": result.get(
+                "raw_guess_reason",
+                "",
+            ),
+            "model_revision": result.get(
+                "model_revision",
+                result.get("ocr_engine", ""),
+            ),
+            "experimental": int(bool(
+                result.get("experimental")
+                or result.get("needs_review")
+            )),
         }
         with connect() as con:
             columns = {
@@ -418,12 +613,35 @@ class LiveANPRWorker:
             ):
                 return
             selection_score = self._selection_score(frame, config)
+            activity_source, _, _ = self._roi_frame(frame, config)
+            activity = state.activity.observe(activity_source)
+            state.motion_score = float(activity.motion_score)
+            state.overlay_mask_pixels = (
+                int(cv2.countNonZero(activity.exclusion_mask))
+                if activity.exclusion_mask is not None
+                else 0
+            )
+            if activity.wake_inference:
+                state.motion_wakeups += 1
+                state.burst_frames_remaining = max(
+                    state.burst_frames_remaining,
+                    4,
+                )
+                state.next_inference_at = min(
+                    state.next_inference_at,
+                    now,
+                )
+                selection_score += min(
+                    0.40,
+                    0.18 + float(activity.motion_score),
+                )
             payload = (
                 int(camera_id),
                 str(camera_name),
                 frame.copy(),
                 now,
                 selection_score,
+                activity,
             )
             if state.busy:
                 pending_score = (
@@ -448,19 +666,33 @@ class LiveANPRWorker:
             # adaptively; this reduces load without lowering image quality.
             minimum_interval = max(
                 0.0,
-                state.next_inference_at - now,
                 (
-                max(
-                    0.20,
-                    min(1.25, state.processing_seconds_ema * 0.45),
-                )
-                if state.processing_seconds_ema
-                else 0.0
+                    0.0
+                    if activity.wake_inference
+                    else state.next_inference_at - now
+                ),
+                (
+                    0.0
+                    if state.burst_frames_remaining
+                    else (
+                        max(
+                            0.20,
+                            min(
+                                1.25,
+                                state.processing_seconds_ema * 0.45,
+                            ),
+                        )
+                        if state.processing_seconds_ema
+                        else 0.0
+                    )
                 ),
             )
             if (
                 now - state.last_submitted_at < minimum_interval
-                or now < state.next_inference_at
+                or (
+                    now < state.next_inference_at
+                    and not activity.wake_inference
+                )
             ):
                 pending_score = (
                     float(state.pending[4])
@@ -488,6 +720,7 @@ class LiveANPRWorker:
 
     def _process(self, state: _CameraState, payload):
         camera_id, camera_name, frame, timestamp = payload[:4]
+        activity = payload[5] if len(payload) > 5 else None
         started = time.perf_counter()
         try:
             config = state.config or {}
@@ -502,16 +735,63 @@ class LiveANPRWorker:
                     float(config.get("lpr_confidence", 60)) / 100.0,
                 ),
             )
-            rows = [
+            exclusion_mask = (
+                activity.exclusion_mask
+                if activity is not None
+                else None
+            )
+
+            def baseline_process():
+                kwargs = {"engine_key": camera_id}
+                if exclusion_mask is not None:
+                    kwargs["exclusion_mask"] = exclusion_mask
+                return process_frame(
+                    source,
+                    min_confidence * 0.45,
+                    **kwargs,
+                )
+
+            outcome = engine_router.process(
+                source,
+                baseline=baseline_process,
+                min_detection_confidence=min_confidence * 0.45,
+                engine_key=camera_id,
+                exclusion_mask=exclusion_mask,
+            )
+            primary_rows = [
                 apply_learned_correction(
                     self._translate(row, offset_x, offset_y)
                 )
-                for row in process_frame(
-                    source,
-                    min_confidence * 0.45,
-                    engine_key=camera_id,
-                )
+                for row in outcome.primary
             ]
+            shadow_rows = [
+                {
+                    **self._translate(row, offset_x, offset_y),
+                    "engine_lane": "candidate-shadow",
+                    "experimental": True,
+                    "needs_review": True,
+                }
+                for row in outcome.shadow
+            ]
+            assisted_enabled = (
+                self._setting("anpr_auto_confirm_guesses", "1") == "1"
+            )
+            rows = (
+                operator_assisted_rows(primary_rows, shadow_rows)
+                if outcome.mode == "shadow"
+                and assisted_enabled
+                and shadow_rows
+                else primary_rows
+            )
+            display_rows = (
+                rows
+                if outcome.mode == "shadow" and assisted_enabled
+                else rows + shadow_rows
+            )
+            if outcome.mode == "shadow":
+                state.shadow_frames += 1
+                state.shadow_candidates += len(outcome.shadow)
+                state.shadow_errors += int(bool(outcome.error))
             processing_seconds = time.perf_counter() - started
             if state.processing_seconds_ema:
                 state.processing_seconds_ema = (
@@ -522,7 +802,7 @@ class LiveANPRWorker:
                 state.processing_seconds_ema = processing_seconds
             state.tracker.max_age_seconds = max(
                 2.4,
-                min(45.0, state.processing_seconds_ema * 3.5 + 1.0),
+                min(6.0, state.processing_seconds_ema * 2.0 + 1.0),
             )
             state.processed_frames += 1
             state.detected_candidates += len(rows)
@@ -548,17 +828,37 @@ class LiveANPRWorker:
                     }
                 )
             if rows:
+                if not state.plate_visible:
+                    state.burst_frames_remaining = 3
+                elif state.burst_frames_remaining:
+                    state.burst_frames_remaining -= 1
+                state.plate_visible = True
                 state.no_plate_streak = 0
             else:
-                state.no_plate_streak = min(
-                    12,
-                    state.no_plate_streak + 1,
-                )
+                state.plate_visible = False
+                if state.burst_frames_remaining:
+                    state.burst_frames_remaining -= 1
+                if activity is not None and activity.wake_inference:
+                    state.no_plate_streak = 0
+                else:
+                    state.no_plate_streak = min(
+                        12,
+                        state.no_plate_streak + 1,
+                    )
             stable = state.tracker.update(
                 rows,
                 timestamp=timestamp,
                 frame=frame,
             )
+            stable = [
+                auto_confirm_guess(row)
+                if (
+                    row.get("assisted_candidate")
+                    and not row.get("capture_only")
+                )
+                else row
+                for row in stable
+            ]
             state.latest_detections = [
                     {
                         "bbox": tuple(
@@ -590,8 +890,33 @@ class LiveANPRWorker:
                         "ocr_disagreement": bool(
                             row.get("ocr_disagreement")
                         ),
+                        "raw_guess_text": row.get(
+                            "raw_guess_text",
+                            row.get("plate", ""),
+                        ),
+                        "raw_guess_confidence": float(
+                            row.get(
+                                "raw_guess_confidence",
+                                row.get("ocr_confidence", 0.0),
+                            )
+                        ),
+                        "raw_guess_reason": row.get(
+                            "raw_guess_reason",
+                            "",
+                        ),
+                        "model_revision": row.get(
+                            "model_revision",
+                            row.get("ocr_engine", ""),
+                        ),
+                        "engine_lane": row.get(
+                            "engine_lane",
+                            "baseline",
+                        ),
+                        "experimental": bool(
+                            row.get("experimental")
+                        ),
                     }
-                    for row in rows
+                    for row in display_rows
                 ]
             state.latest_detection_frame = frame.copy()
             state.latest_detections_at = time.time()
@@ -679,10 +1004,18 @@ class LiveANPRWorker:
                 # which kept detector/OCR threads continuously busy even when
                 # every inference returned no plate.
                 state.next_inference_at = time.monotonic() + (
-                    self._post_inference_delay(
-                        state.processing_seconds_ema,
-                        state.no_plate_streak,
+                    0.04
+                    if (
+                        state.burst_frames_remaining
+                        or (
+                            activity is not None
+                            and activity.wake_inference
+                        )
                     )
+                    else self._post_inference_delay(
+                            state.processing_seconds_ema,
+                            state.no_plate_streak,
+                        )
                 )
                 state.busy = False
 
@@ -726,6 +1059,16 @@ class LiveANPRWorker:
                     max(0.0, state.next_inference_at - time.monotonic()),
                     2,
                 ),
+                "burst_frames_remaining": state.burst_frames_remaining,
+                "motion_score": round(state.motion_score, 5),
+                "motion_wakeups": state.motion_wakeups,
+                "overlay_mask_pixels": state.overlay_mask_pixels,
+                "anpr_engine": engine_router.status(camera_id),
+                "shadow": {
+                    "frames": state.shadow_frames,
+                    "candidates": state.shadow_candidates,
+                    "errors": state.shadow_errors,
+                },
                 "consensus_window_seconds": round(
                     state.tracker.max_age_seconds,
                     2,

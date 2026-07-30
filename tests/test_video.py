@@ -1,10 +1,13 @@
 from pathlib import Path
 import time
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
+import pytest
 
 import app.ai.video_test as video_test
+import app.media_storage as media_storage
 import app.streams as streams
 from app.streams import CameraStream
 
@@ -52,7 +55,7 @@ def test_video_emits_one_consensus_event(tmp_path, monkeypatch):
             "ocr_confidence": 0.7,
             "quality_score": 0.8,
             "bbox": (80, 80, 240, 120),
-            "crop": frame[80:120, 80:240].copy(),
+            "crop": None,
             "method": "test",
             "vehicle_type": "سواری",
             "vehicle_color": "سفید",
@@ -68,8 +71,8 @@ def test_video_emits_one_consensus_event(tmp_path, monkeypatch):
     )
     info, events = video_test.process_video(
         video_path,
-        tmp_path / "plates",
-        tmp_path / "snapshots",
+        tmp_path / "پلاک‌ها",
+        tmp_path / "خودروها",
         frame_step=1,
         duplicate_seconds=20,
         min_confidence=0.5,
@@ -78,8 +81,155 @@ def test_video_emits_one_consensus_event(tmp_path, monkeypatch):
     assert len(events) == 1
     assert events[0]["plate"] == "12-ب-345-67"
     assert events[0]["consensus_votes"] >= 2
-    assert Path(events[0]["plate_path"]).is_file()
-    assert Path(events[0]["image_path"]).is_file()
+    assert events[0]["media_status"] == "complete"
+    assert events[0]["media_error"] == ""
+    for key in ("plate_path", "image_path"):
+        image_path = Path(events[0][key])
+        payload = image_path.read_bytes()
+        assert len(payload) > 0
+        decoded = cv2.imdecode(
+            np.frombuffer(payload, dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        assert decoded is not None
+        assert decoded.size > 0
+
+
+def test_video_media_failure_keeps_result_and_reports_error(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        media_storage.cv2,
+        "imencode",
+        lambda *_args, **_kwargs: (False, None),
+    )
+    frame = np.full((100, 180, 3), 120, dtype=np.uint8)
+    result = {
+        "plate": "12-ب-345-67",
+        "plate_norm": "12ب34567",
+        "valid": True,
+        "confidence": 0.9,
+        "bbox": (40, 50, 140, 82),
+        "crop": frame[50:82, 40:140].copy(),
+    }
+
+    event = video_test._save_event(
+        result,
+        frame,
+        frame_no=10,
+        fps=10.0,
+        plate_dir=tmp_path / "plates",
+        snapshot_dir=tmp_path / "snapshots",
+        video_path=tmp_path / "source.mp4",
+    )
+
+    assert event["plate"] == "12-ب-345-67"
+    assert event["plate_path"] == ""
+    assert event["image_path"] == ""
+    assert event["media_status"] == "error"
+    assert "plate: JPEG encoder returned no data" in event["media_error"]
+    assert "vehicle: JPEG encoder returned no data" in event["media_error"]
+
+
+def test_video_shadow_fails_closed_once_when_bundle_is_missing(
+    tmp_path,
+    monkeypatch,
+):
+    video_path = tmp_path / "sample.avi"
+    _write_video(video_path, frames=3)
+    monkeypatch.setattr(
+        video_test,
+        "next_models_status",
+        lambda: {
+            "ready": False,
+            "error": "signed candidate bundle is missing",
+        },
+    )
+    monkeypatch.setattr(
+        video_test.engine_router,
+        "process",
+        lambda *_args, **_kwargs: pytest.fail(
+            "router must not run without a verified bundle"
+        ),
+    )
+    monkeypatch.setattr(
+        video_test,
+        "process_frame",
+        lambda *_args, **_kwargs: [],
+    )
+
+    info, events = video_test.process_video(
+        video_path,
+        tmp_path / "plates",
+        tmp_path / "snapshots",
+        frame_step=1,
+        include_candidate_shadow=True,
+    )
+
+    assert events == []
+    assert info["candidate_shadow_requested"] is True
+    assert "signed candidate bundle is missing" in (
+        info["candidate_shadow_error"]
+    )
+
+
+def test_video_shadow_complete_consensus_is_auto_confirmed(
+    tmp_path,
+    monkeypatch,
+):
+    video_path = tmp_path / "sample.avi"
+    _write_video(video_path, frames=6)
+    monkeypatch.setattr(
+        video_test,
+        "next_models_status",
+        lambda: {"ready": True, "error": ""},
+    )
+
+    def candidate(frame):
+        return {
+            "plate": "31-ط-556-74",
+            "plate_norm": "31ط55674",
+            "raw_guess_text": "31-ط-556-74",
+            "raw_guess_norm": "31ط55674",
+            "valid": True,
+            "confidence": 0.88,
+            "detector_confidence": 0.90,
+            "ocr_confidence": 0.86,
+            "quality_score": 0.80,
+            "bbox": (80, 80, 240, 120),
+            "crop": frame[80:120, 80:240].copy(),
+            "method": "candidate-test",
+            "ocr_engine": "fast-plate-ocr-cct",
+        }
+
+    monkeypatch.setattr(
+        video_test.engine_router,
+        "process",
+        lambda frame, **_kwargs: SimpleNamespace(
+            primary=[],
+            shadow=[candidate(frame)],
+            error="",
+        ),
+    )
+
+    _, events = video_test.process_video(
+        video_path,
+        tmp_path / "plates",
+        tmp_path / "snapshots",
+        frame_step=1,
+        include_candidate_shadow=True,
+    )
+
+    confirmed = [
+        event for event in events
+        if event.get("auto_confirmed")
+    ]
+    assert len(confirmed) == 1
+    assert confirmed[0]["plate_norm"] == "31ط55674"
+    assert confirmed[0]["read_status"] == "auto-confirmed"
+    assert confirmed[0]["needs_review"] is True
+    assert confirmed[0]["experimental"] is True
 
 
 def test_uploaded_video_stream_loops_without_becoming_offline(tmp_path, monkeypatch):

@@ -13,7 +13,11 @@ on:
       - "requirements-lock.txt"
       - "requirements-ai-lock.txt"
       - "requirements-test.txt"
+      - "requirements-cct-training.txt"
       - "tests/**"
+      - "tools/**"
+      - "training/**"
+      - "docs/ANPR_MODELS.md"
       - ".github/workflows/**"
 
 permissions:

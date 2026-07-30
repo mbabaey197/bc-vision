@@ -1,10 +1,11 @@
 """BC Vision ANPR pipeline with quality scoring and strict multi-frame consensus."""
 from __future__ import annotations
 
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from copy import deepcopy
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from functools import lru_cache
 import math
 import time
 
@@ -14,6 +15,7 @@ import numpy as np
 from .detector import detect_plates
 from .ocr import read_plate_candidate
 from .plate_rules import format_iran_plate, normalize_plate, plausible_plate
+from .review_policy import auto_confirm_guess
 from .vehicle_intelligence import analyze_vehicle
 
 
@@ -86,10 +88,12 @@ def process_frame(
     frame,
     min_detection_confidence=0.25,
     engine_key=None,
+    exclusion_mask=None,
 ):
     results = []
     detector_kwargs = {
         "min_confidence": min_detection_confidence,
+        "exclusion_mask": exclusion_mask,
     }
     if engine_key is not None:
         detector_kwargs["engine_key"] = engine_key
@@ -315,6 +319,11 @@ def process_frame(
         valid = plausible_plate(text)
         best_effort = False
         needs_review = ocr_disagreement
+        raw_guess_text = ""
+        raw_guess_norm = ""
+        raw_guess_confidence = 0.0
+        raw_guess_engine = ""
+        raw_guess_reason = ""
         if ocr_disagreement:
             best_effort = True
         if valid and all(
@@ -329,10 +338,9 @@ def process_frame(
                 "score": float(ocr_confidence),
             })
         elif not valid and plate_hypotheses:
-            # The character detector often has a complete second hypothesis
-            # even when its strict decoder rejects the primary read.  Surface
-            # that real hypothesis as a reviewable suggestion instead of
-            # throwing it away as "ناخوانا".
+            # Preserve the actual best hypothesis for operator review, but do
+            # not turn a rejected single-frame hypothesis into accepted truth.
+            # It is displayed and measured as an experimental guess only.
             suggestion = max(
                 plate_hypotheses,
                 key=lambda row: (
@@ -346,9 +354,13 @@ def process_frame(
                 float(ocr_confidence),
                 float(suggestion["confidence"]),
             )
-            valid = True
             best_effort = True
             needs_review = True
+            raw_guess_text = suggestion["plate"]
+            raw_guess_norm = suggestion["plate_norm"]
+            raw_guess_confidence = float(suggestion["confidence"])
+            raw_guess_engine = str(suggestion["engine"])
+            raw_guess_reason = "strict-decoder-rejected"
         elif not valid and position_hypotheses:
             # Preserve 5–7 observed positions.  Question marks explicitly mean
             # "not seen"; they are not guessed characters and remain easy for
@@ -371,6 +383,15 @@ def process_frame(
             )
             best_effort = True
             needs_review = True
+            raw_guess_text = text
+            raw_guess_confidence = float(partial["score"])
+            raw_guess_engine = ocr_engine
+            raw_guess_reason = "partial-character-evidence"
+        if valid:
+            raw_guess_norm = normalize_plate(text)
+            raw_guess_text = format_iran_plate(raw_guess_norm)
+            raw_guess_confidence = float(ocr_confidence)
+            raw_guess_engine = ocr_engine
         combined = _combined_confidence(
             item["confidence"],
             ocr_confidence,
@@ -396,6 +417,14 @@ def process_frame(
             "bbox": item["bbox"],
             "crop": crop,
             "method": item["method"],
+            "quadrilateral": item.get("quadrilateral"),
+            "crop_geometry": item.get(
+                "crop_geometry",
+                "axis-aligned",
+            ),
+            "static_overlay_overlap": float(
+                item.get("static_overlay_overlap", 0.0)
+            ),
             "ocr_engine": ocr_engine,
             "ocr_alternative": ocr_alternative,
             "ocr_disagreement": ocr_disagreement,
@@ -422,6 +451,27 @@ def process_frame(
             "valid": valid,
             "best_effort": best_effort,
             "needs_review": needs_review,
+            "read_status": (
+                "experimental-guess"
+                if best_effort and needs_review
+                else "confirmed-ai"
+                if valid
+                else "unreadable"
+            ),
+            "raw_guess_text": raw_guess_text,
+            "raw_guess_norm": raw_guess_norm,
+            "raw_guess_confidence": raw_guess_confidence,
+            "raw_guess_engine": raw_guess_engine,
+            "raw_guess_reason": raw_guess_reason,
+            "model_revision": raw_guess_engine or ocr_engine,
+            "experimental": bool(best_effort and needs_review),
+            "hypotheses_accepted_for_consensus": bool(
+                (valid and not needs_review)
+                or (
+                    not plate_hypotheses
+                    and bool(position_hypotheses)
+                )
+            ),
             "vehicle_type": "نامشخص",
             "vehicle_color": "نامشخص",
             "vehicle_brand": "نامشخص",
@@ -570,6 +620,7 @@ class _Track:
     last_prediction: float = 0.0
     hits: int = 1
     misses: int = 0
+    centers: deque = field(default_factory=lambda: deque(maxlen=6))
 
 
 class PlateConsensusTracker:
@@ -585,6 +636,7 @@ class PlateConsensusTracker:
         emit_unreadable=False,
         min_unreadable_observations=3,
         min_unreadable_seconds=0.8,
+        min_confirmation_span_seconds=0.12,
     ):
         # One or two frames are never enough for a definitive CCTV read.
         self.min_votes = max(3, int(min_votes))
@@ -600,6 +652,10 @@ class PlateConsensusTracker:
         self.min_unreadable_seconds = max(
             0.2,
             float(min_unreadable_seconds),
+        )
+        self.min_confirmation_span_seconds = max(
+            0.05,
+            float(min_confirmation_span_seconds),
         )
         self._tracks: dict[int, _Track] = {}
         self._next_track_id = 1
@@ -631,8 +687,8 @@ class PlateConsensusTracker:
         track.best_frame = frame.copy()
         return True
 
-    @staticmethod
     def _capture_result(
+        self,
         track: _Track,
         refresh=False,
         final_unreadable=False,
@@ -640,32 +696,71 @@ class PlateConsensusTracker:
         if track.best_capture_result is None or track.best_frame is None:
             return None
         result = deepcopy(track.best_capture_result)
+        raw_guess_norm = normalize_plate(
+            result.get("raw_guess_norm")
+            or result.get("raw_guess_text")
+            or (
+                result.get("plate")
+                if result.get("best_effort")
+                else ""
+            )
+        )
+        has_raw_guess = plausible_plate(raw_guess_norm)
+        raw_guess_text = (
+            format_iran_plate(raw_guess_norm)
+            if has_raw_guess
+            else str(result.get("raw_guess_text") or "")
+        )
         result.update({
             "plate": (
-                "ناخوانا"
-                if final_unreadable
-                else "در حال بررسی"
+                raw_guess_text
+                if raw_guess_text
+                else (
+                    "ناخوانا"
+                    if final_unreadable
+                    else "در حال بررسی"
+                )
             ),
             "plate_norm": "",
             "valid": False,
-            "ocr_confidence": 0.0,
+            "ocr_confidence": float(
+                result.get("raw_guess_confidence")
+                or result.get("ocr_confidence", 0.0)
+            ),
             "track_id": track.track_id,
             "first_seen": track.first_seen,
             "last_seen": track.last_seen,
             "capture_only": True,
             "capture_refresh": bool(refresh),
             "provisional": not bool(final_unreadable),
-            "unreadable_final": bool(final_unreadable),
-            "best_effort": False,
+            "unreadable_final": bool(
+                final_unreadable and not raw_guess_text
+            ),
+            "best_effort": bool(raw_guess_text),
             "needs_review": True,
             "read_status": (
-                "unreadable"
-                if final_unreadable
-                else "processing"
+                "experimental-guess"
+                if raw_guess_text
+                else (
+                    "unreadable"
+                    if final_unreadable
+                    else "processing"
+                )
             ),
+            "raw_guess_text": raw_guess_text,
+            "raw_guess_norm": raw_guess_norm if has_raw_guess else "",
+            "experimental": bool(raw_guess_text),
             "capture_frame": track.best_frame.copy(),
             "consensus_votes": 0,
+            "guess_supporting_frames": 0,
+            "consensus_span_seconds": 0.0,
+            "auto_confirm_min_frames": self.min_votes,
+            "auto_confirm_min_span_seconds": (
+                self.min_confirmation_span_seconds
+            ),
         })
+        if final_unreadable and has_raw_guess:
+            return auto_confirm_guess(result)
         return result
 
     def _unreadable_ready(
@@ -703,20 +798,13 @@ class PlateConsensusTracker:
         for track in self._tracks.values():
             if timestamp - track.last_seen > self.max_age_seconds:
                 continue
-            overlap = bbox_iou(
-                track.predicted_bbox or track.bbox,
-                result["bbox"],
+            score, overlap, proximity, size_ratio, _direction = (
+                self._association_score(track, result)
             )
-            text_score = 0.0
-            if result.get("valid"):
-                for observation in track.observations:
-                    if observation.get("valid"):
-                        text_score = max(
-                            text_score,
-                            plate_similarity(result["plate"], observation["plate"]),
-                        )
-            score = max(overlap, text_score * 0.88)
-            if score > best_score and (overlap >= 0.18 or text_score >= 0.74):
+            if score > best_score and (
+                overlap >= 0.18
+                or (proximity >= 0.62 and size_ratio >= 0.55)
+            ):
                 best, best_score = track, score
         return best
 
@@ -736,24 +824,156 @@ class PlateConsensusTracker:
         )
 
     @staticmethod
-    def _association_score(track: _Track, result: dict) -> tuple:
-        overlap = bbox_iou(
-            track.predicted_bbox or track.bbox,
-            result["bbox"],
+    def _strong_plate_identity(result: dict) -> str:
+        explicit = normalize_plate(
+            result.get("association_plate_norm", "")
         )
-        text_score = 0.0
-        if result.get("valid"):
-            for observation in track.observations:
-                if observation.get("valid"):
-                    text_score = max(
-                        text_score,
-                        plate_similarity(
-                            result.get("plate", ""),
-                            observation.get("plate", ""),
-                        ),
-                    )
-        score = max(overlap, text_score * 0.88)
-        return score, overlap, text_score
+        if (
+            result.get("association_plate_strong")
+            and plausible_plate(explicit)
+        ):
+            return explicit
+        accepted = normalize_plate(result.get("plate_norm", ""))
+        confidence = float(
+            result.get(
+                "ocr_confidence",
+                result.get("confidence", 0.0),
+            )
+        )
+        if (
+            result.get("valid")
+            and confidence >= 0.78
+            and plausible_plate(accepted)
+        ):
+            return accepted
+        return ""
+
+    @classmethod
+    def _track_plate_identity(cls, track: _Track) -> str:
+        emitted = normalize_plate(track.emitted_plate)
+        if plausible_plate(emitted):
+            return emitted
+        identities = [
+            cls._strong_plate_identity(row)
+            for row in track.observations
+        ]
+        counts = Counter(value for value in identities if value)
+        if not counts:
+            return ""
+        identity, count = counts.most_common(1)[0]
+        return identity if count >= 2 else ""
+
+    @classmethod
+    def _identity_conflict(
+        cls,
+        track: _Track,
+        result: dict,
+    ) -> bool:
+        anchored = cls._track_plate_identity(track)
+        observed = cls._strong_plate_identity(result)
+        if not anchored or not observed or anchored == observed:
+            return False
+        distance = sum(
+            left != right
+            for left, right in zip(anchored, observed)
+        )
+        # Once an event has been emitted, its identity is immutable. A later
+        # strong full-plate read with even one changed slot must start a new
+        # physical track instead of being swallowed by the one-shot emitter.
+        if plausible_plate(track.emitted_plate):
+            return True
+        # A short detection gap is also a vehicle-boundary signal. It lets two
+        # very similar plates use the same lane without treating ordinary
+        # one-frame OCR noise as a new vehicle.
+        if track.misses >= 2:
+            return True
+        return bool(
+            distance >= 3
+            or (anchored[2] != observed[2] and distance >= 2)
+        )
+
+    @staticmethod
+    def _association_score(track: _Track, result: dict) -> tuple:
+        predicted = track.predicted_bbox or track.bbox
+        if len(track.centers) >= 2:
+            previous_x, previous_y = track.centers[-2]
+            current_x, current_y = track.centers[-1]
+            velocity_x = current_x - previous_x
+            velocity_y = current_y - previous_y
+            if math.hypot(velocity_x, velocity_y) >= 2.0:
+                width = max(2.0, predicted[2] - predicted[0])
+                height = max(2.0, predicted[3] - predicted[1])
+                projected_x = current_x + velocity_x
+                projected_y = current_y + velocity_y
+                predicted = (
+                    projected_x - width / 2.0,
+                    projected_y - height / 2.0,
+                    projected_x + width / 2.0,
+                    projected_y + height / 2.0,
+                )
+        detected = result["bbox"]
+        overlap = bbox_iou(predicted, detected)
+        px1, py1, px2, py2 = (
+            float(value) for value in predicted
+        )
+        dx1, dy1, dx2, dy2 = (
+            float(value) for value in detected
+        )
+        predicted_width = max(2.0, px2 - px1)
+        predicted_height = max(2.0, py2 - py1)
+        detected_width = max(2.0, dx2 - dx1)
+        detected_height = max(2.0, dy2 - dy1)
+        center_distance = math.hypot(
+            (px1 + px2 - dx1 - dx2) / 2.0,
+            (py1 + py2 - dy1 - dy2) / 2.0,
+        )
+        scale = max(
+            predicted_width,
+            predicted_height,
+            detected_width,
+            detected_height,
+        )
+        proximity = max(0.0, 1.0 - center_distance / (scale * 1.6))
+        predicted_area = predicted_width * predicted_height
+        detected_area = detected_width * detected_height
+        size_ratio = min(predicted_area, detected_area) / max(
+            predicted_area,
+            detected_area,
+        )
+        direction_consistency = 0.5
+        if len(track.centers) >= 2:
+            previous_x, previous_y = track.centers[-2]
+            current_x, current_y = track.centers[-1]
+            candidate_x = (dx1 + dx2) / 2.0
+            candidate_y = (dy1 + dy2) / 2.0
+            velocity_x = current_x - previous_x
+            velocity_y = current_y - previous_y
+            observed_x = candidate_x - current_x
+            observed_y = candidate_y - current_y
+            velocity_length = math.hypot(velocity_x, velocity_y)
+            observed_length = math.hypot(observed_x, observed_y)
+            if velocity_length >= 1.0 and observed_length >= 1.0:
+                cosine = (
+                    velocity_x * observed_x
+                    + velocity_y * observed_y
+                ) / (velocity_length * observed_length)
+                direction_consistency = min(
+                    1.0,
+                    max(0.0, (cosine + 1.0) / 2.0),
+                )
+        score = (
+            0.55 * overlap
+            + 0.20 * proximity
+            + 0.10 * size_ratio
+            + 0.15 * direction_consistency
+        )
+        return (
+            score,
+            overlap,
+            proximity,
+            size_ratio,
+            direction_consistency,
+        )
 
     def _associate(self, results, timestamp: float) -> dict[int, _Track]:
         """ByteTrack-style two-pass association over high/low detections."""
@@ -786,41 +1006,115 @@ class PlateConsensusTracker:
         available = {track.track_id: track for track in active}
 
         def match(indices, second_pass=False):
-            pairs = []
+            candidates = {}
             for index in indices:
                 for track in available.values():
-                    score, overlap, text_score = (
+                    (
+                        score,
+                        overlap,
+                        proximity,
+                        size_ratio,
+                        direction_consistency,
+                    ) = (
                         self._association_score(track, results[index])
                     )
                     accepted = (
                         overlap >= (0.08 if second_pass else 0.12)
                         or (
-                            not second_pass
-                            and text_score >= 0.74
+                            proximity
+                            >= (0.52 if second_pass else 0.62)
+                            and size_ratio >= 0.55
                         )
                     )
+                    if (
+                        len(track.centers) >= 2
+                        and direction_consistency < 0.10
+                        and overlap < 0.28
+                    ):
+                        accepted = False
+                    if self._identity_conflict(
+                        track,
+                        results[index],
+                    ):
+                        accepted = False
                     if accepted:
-                        pairs.append(
-                            (
-                                score,
-                                overlap,
-                                text_score,
-                                -track.misses,
-                                index,
-                                track.track_id,
-                            )
+                        candidates.setdefault(index, []).append(
+                            (track.track_id, float(score))
                         )
+
+            ordered_indices = tuple(
+                index for index in indices if index in candidates
+            )
+            track_ids = tuple(sorted(available))
+            track_bits = {
+                track_id: 1 << position
+                for position, track_id in enumerate(track_ids)
+            }
+
+            if len(track_ids) > 12 or len(ordered_indices) > 10:
+                ranked = sorted(
+                    (
+                        (score, index, track_id)
+                        for index, options in candidates.items()
+                        for track_id, score in options
+                    ),
+                    reverse=True,
+                )
+                selected_pairs = []
+                used_detections = set()
+                used_tracks = set()
+                for _score, index, track_id in ranked:
+                    if (
+                        index in used_detections
+                        or track_id in used_tracks
+                    ):
+                        continue
+                    selected_pairs.append((index, track_id))
+                    used_detections.add(index)
+                    used_tracks.add(track_id)
+            else:
+
+                @lru_cache(maxsize=None)
+                def solve(position, used_mask):
+                    if position >= len(ordered_indices):
+                        return 0.0, ()
+                    index = ordered_indices[position]
+                    best_score, best_pairs = solve(
+                        position + 1,
+                        used_mask,
+                    )
+                    for track_id, score in candidates[index]:
+                        bit = track_bits[track_id]
+                        if used_mask & bit:
+                            continue
+                        tail_score, tail_pairs = solve(
+                            position + 1,
+                            used_mask | bit,
+                        )
+                        candidate_score = score + tail_score
+                        candidate_pairs = (
+                            (index, track_id),
+                            *tail_pairs,
+                        )
+                        if (
+                            candidate_score > best_score + 1e-9
+                            or (
+                                abs(candidate_score - best_score) <= 1e-9
+                                and (
+                                    not best_pairs
+                                    or candidate_pairs < best_pairs
+                                )
+                            )
+                        ):
+                            best_score = candidate_score
+                            best_pairs = candidate_pairs
+                    return best_score, best_pairs
+
+                _score, selected_pairs = solve(0, 0)
             used_detections = set()
             used_tracks = set()
-            for *_rank, index, track_id in sorted(
-                pairs,
-                reverse=True,
-            ):
-                if (
-                    index in used_detections
-                    or track_id in used_tracks
-                    or track_id not in available
-                ):
+            for index, track_id in selected_pairs:
+                if track_id not in available:
                     continue
                 assigned[index] = available[track_id]
                 used_detections.add(index)
@@ -867,15 +1161,45 @@ class PlateConsensusTracker:
 
     @staticmethod
     def _observation_weight(row: dict) -> float:
-        confidence = min(1.0, max(0.0, float(row.get("confidence", 0.0))))
+        confidence = min(
+            1.0,
+            max(
+                0.0,
+                float(
+                    row.get("ocr_confidence")
+                    or row.get("raw_guess_confidence")
+                    or row.get("confidence", 0.0)
+                ),
+            ),
+        )
         quality = min(1.0, max(0.0, float(row.get("quality_score", 0.0))))
         return confidence * max(0.25, quality)
 
     @staticmethod
-    def _position_probabilities(row: dict) -> list[dict[str, float]]:
+    def _position_probabilities(
+        row: dict,
+        include_rejected=False,
+    ) -> list[dict[str, float]]:
         candidates = {}
         primary = normalize_plate(row.get("plate", ""))
-        if row.get("valid") and plausible_plate(primary):
+        consensus_allowed = bool(
+            row.get(
+                "hypotheses_accepted_for_consensus",
+                (
+                    row.get("valid")
+                    and not row.get("needs_review")
+                )
+                or (
+                    bool(row.get("position_hypotheses"))
+                    and not bool(row.get("plate_hypotheses"))
+                ),
+            )
+        )
+        if (
+            row.get("valid")
+            and (include_rejected or consensus_allowed)
+            and plausible_plate(primary)
+        ):
             candidates[primary] = max(
                 0.05,
                 float(
@@ -883,7 +1207,11 @@ class PlateConsensusTracker:
                     or row.get("confidence", 0.0)
                 ),
             )
-        for hypothesis in row.get("plate_hypotheses", []):
+        for hypothesis in (
+            row.get("plate_hypotheses", [])
+            if include_rejected or consensus_allowed
+            else []
+        ):
             normalized = normalize_plate(
                 hypothesis.get("plate_norm")
                 or hypothesis.get("plate")
@@ -913,7 +1241,11 @@ class PlateConsensusTracker:
             }
             for plate, weight in candidates.items()
         ]
-        for hypothesis in row.get("position_hypotheses", []):
+        for hypothesis in (
+            row.get("position_hypotheses", [])
+            if include_rejected or consensus_allowed
+            else []
+        ):
             positions = {}
             for raw_position, raw_value in hypothesis.get(
                 "positions",
@@ -965,7 +1297,10 @@ class PlateConsensusTracker:
     def _consensus(self, track: _Track) -> dict | None:
         evidence = []
         for row in track.observations:
-            probabilities = self._position_probabilities(row)
+            probabilities = self._position_probabilities(
+                row,
+                include_rejected=False,
+            )
             if probabilities:
                 copied = deepcopy(row)
                 copied["_position_probabilities"] = probabilities
@@ -973,6 +1308,18 @@ class PlateConsensusTracker:
 
         if len(evidence) < self.min_votes:
             return None
+        # Keep only the five clearest plate crops. Long tracks otherwise let
+        # many blurred frames overwhelm the few frames that contain the actual
+        # character detail.
+        evidence = sorted(
+            evidence,
+            key=lambda row: (
+                self._observation_weight(row),
+                float(row.get("quality_score", 0.0)),
+                float(row.get("detector_confidence", 0.0)),
+            ),
+            reverse=True,
+        )[:5]
 
         winner_chars = []
         winner_counts = []
@@ -1038,6 +1385,35 @@ class PlateConsensusTracker:
         if not plausible_plate(winner_norm):
             return None
 
+        # Positional voting may only resolve characters after the same complete
+        # plate has appeared as the top full-plate observation in independent
+        # frames. This prevents a synthetic hybrid that never existed.
+        whole_plate_support = []
+        for row in evidence:
+            candidates = {
+                normalize_plate(row.get("plate_norm")),
+                normalize_plate(row.get("plate")),
+                normalize_plate(row.get("raw_guess_norm")),
+                normalize_plate(row.get("raw_guess_text")),
+            }
+            if winner_norm in candidates:
+                whole_plate_support.append(row)
+        support_times = [
+            float(row.get("_observed_at", track.last_seen))
+            for row in whole_plate_support
+        ]
+        support_span = (
+            max(support_times) - min(support_times)
+            if len(support_times) >= 2
+            else 0.0
+        )
+        if (
+            len(whole_plate_support) < self.min_votes
+            or support_span + 1e-9
+            < self.min_confirmation_span_seconds
+        ):
+            return None
+
         matching_scores = []
         for row in evidence:
             support = sum(
@@ -1083,6 +1459,26 @@ class PlateConsensusTracker:
         result["best_effort"] = False
         result["needs_review"] = False
         result["read_status"] = "confirmed-ai"
+        result["experimental"] = False
+        result["raw_guess_text"] = result["plate"]
+        result["raw_guess_norm"] = winner_norm
+        result["raw_guess_confidence"] = float(
+            result.get("ocr_confidence", result["confidence"])
+        )
+        result["raw_guess_engine"] = str(
+            result.get("ocr_engine", "")
+        )
+        result["guess_supporting_frames"] = len(
+            whole_plate_support
+        )
+        result["consensus_span_seconds"] = round(
+            support_span,
+            4,
+        )
+        result["auto_confirm_min_frames"] = self.min_votes
+        result["auto_confirm_min_span_seconds"] = (
+            self.min_confirmation_span_seconds
+        )
 
         engine_support = defaultdict(float)
         alternative_support = defaultdict(float)
@@ -1205,7 +1601,10 @@ class PlateConsensusTracker:
 
         evidence = []
         for row in track.observations:
-            probabilities = self._position_probabilities(row)
+            probabilities = self._position_probabilities(
+                row,
+                include_rejected=True,
+            )
             if any(probabilities):
                 evidence.append((row, probabilities))
         if not evidence:
@@ -1284,11 +1683,15 @@ class PlateConsensusTracker:
                 if complete
                 else _partial_plate_text(winners)
             ),
-            "plate_norm": normalized if complete else "",
-            "valid": complete,
+            "plate_norm": "",
+            "valid": False,
             "best_effort": True,
             "needs_review": True,
-            "read_status": "probable" if complete else "partial",
+            "read_status": (
+                "experimental-guess"
+                if complete
+                else "partial"
+            ),
             "confidence": round(confidence, 4),
             "track_id": track.track_id,
             "first_seen": track.first_seen,
@@ -1298,9 +1701,62 @@ class PlateConsensusTracker:
             "provisional": False,
             "unreadable_final": False,
             "partial_final": not complete,
+            "raw_guess_text": (
+                format_iran_plate(normalized)
+                if complete
+                else _partial_plate_text(winners)
+            ),
+            "raw_guess_norm": normalized if complete else "",
+            "raw_guess_confidence": round(confidence, 4),
+            "raw_guess_reason": (
+                "multi-frame-rejected-hypotheses"
+                if complete
+                else "partial-character-evidence"
+            ),
+            "experimental": True,
+            "hypotheses_accepted_for_consensus": False,
             "consensus_votes": min(vote_counts.values()),
             "consensus_observations": len(evidence),
         })
+        full_support = []
+        if complete:
+            for row, _probabilities in evidence:
+                candidates = {
+                    normalize_plate(row.get("plate")),
+                    normalize_plate(row.get("raw_guess_norm")),
+                    normalize_plate(row.get("raw_guess_text")),
+                }
+                candidates.update(
+                    normalize_plate(
+                        hypothesis.get("plate_norm")
+                        or hypothesis.get("plate")
+                    )
+                    for hypothesis in row.get(
+                        "plate_hypotheses",
+                        [],
+                    )
+                )
+                if normalized in candidates:
+                    full_support.append(row)
+        support_times = [
+            float(row.get("_observed_at", track.last_seen))
+            for row in full_support
+        ]
+        basis["guess_supporting_frames"] = len(full_support)
+        basis["consensus_span_seconds"] = round(
+            (
+                max(support_times) - min(support_times)
+                if len(support_times) >= 2
+                else 0.0
+            ),
+            4,
+        )
+        basis["auto_confirm_min_frames"] = self.min_votes
+        basis["auto_confirm_min_span_seconds"] = (
+            self.min_confirmation_span_seconds
+        )
+        if complete:
+            basis = auto_confirm_guess(basis)
         if track.best_frame is not None:
             basis["capture_frame"] = track.best_frame.copy()
         if track.best_capture_result is not None:
@@ -1325,6 +1781,11 @@ class PlateConsensusTracker:
             track.last_prediction = timestamp
             track.hits += 1
             track.misses = 0
+            observed_bbox = result["bbox"]
+            track.centers.append((
+                (observed_bbox[0] + observed_bbox[2]) / 2.0,
+                (observed_bbox[1] + observed_bbox[3]) / 2.0,
+            ))
             result["track_id"] = track.track_id
             result["tracking_engine"] = (
                 "bytetrack-kalman+optical-flow"
@@ -1334,6 +1795,7 @@ class PlateConsensusTracker:
                 for value in filtered_bbox
             )
             observation = deepcopy(result)
+            observation["_observed_at"] = timestamp
             track.observations.append(observation)
             capture_improved = self._consider_capture(track, result, frame)
             consensus = self._consensus(track)
@@ -1375,11 +1837,22 @@ class PlateConsensusTracker:
                         emitted.append(final_read)
                 continue
 
-            changed = consensus["plate_norm"] != track.emitted_plate
-            cooled_down = timestamp - track.emitted_at >= self.emit_cooldown
-            if changed or cooled_down:
+            # One physical track owns one immutable identity. A clearer frame
+            # for that same identity may refresh its media, but it must reuse
+            # the event_id in LiveANPRWorker rather than create a duplicate.
+            if not track.emitted_plate:
                 track.emitted_plate = consensus["plate_norm"]
                 track.emitted_at = timestamp
+                track.capture_event_score = track.best_capture_score
+                emitted.append(consensus)
+            elif (
+                consensus["plate_norm"] == track.emitted_plate
+                and capture_improved
+                and track.best_capture_score
+                > track.capture_event_score + 0.04
+            ):
+                consensus["capture_refresh"] = True
+                track.capture_event_score = track.best_capture_score
                 emitted.append(consensus)
 
         return emitted
@@ -1390,6 +1863,8 @@ class PlateConsensusTracker:
     def flush(self):
         rows = []
         for track in list(self._tracks.values()):
+            if track.emitted_plate:
+                continue
             consensus = self._consensus(track)
             if consensus is not None:
                 rows.append(consensus)

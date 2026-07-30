@@ -308,6 +308,7 @@ def _run(
             "bbox": (ix1, iy1, ix2, iy2),
             "confidence": float(scores[index]),
             "method": method,
+            "crop_geometry": "axis-aligned",
             "direct_ocr_attempted": False,
         })
     return detections
