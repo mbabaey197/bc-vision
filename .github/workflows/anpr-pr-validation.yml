@@ -31,6 +31,8 @@ jobs:
   regression:
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 20
+    env:
+      BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\regression
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
@@ -62,6 +64,7 @@ jobs:
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 45
     env:
+      BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\ai-runtime
       BCVISION_RUN_AI_INTEGRATION: "1"
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
