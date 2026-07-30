@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import threading
 import time
@@ -15,6 +15,7 @@ import time
 import cv2
 
 from app.cpu_budget import parallel_camera_limit, threads_per_camera
+from app.media_storage import save_event_images
 
 from .activity import FrameActivityAnalyzer
 from .pipeline import (
@@ -23,7 +24,7 @@ from .pipeline import (
     bbox_iou,
     process_frame,
 )
-from .plate_rules import normalize_plate
+from .plate_rules import normalize_plate, split_iran_plate
 from .feedback import apply_learned_correction
 from .next_engine import engine_router
 from .review_policy import (
@@ -257,92 +258,146 @@ class LiveANPRWorker:
         snapshot_dir = Path(
             self._setting("snapshot_path", str(SNAPSHOT_DIR))
         )
-        plate_dir.mkdir(parents=True, exist_ok=True)
-        snapshot_dir.mkdir(parents=True, exist_ok=True)
 
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         plate_path = ""
         image_path = ""
         with connect() as con:
-            existing = (
-                con.execute(
-                    "SELECT image_path,plate_image_path "
-                    "FROM plate_events WHERE id=?",
-                    (int(event_id),),
+            try:
+                camera_row = con.execute(
+                    "SELECT city,location,rtsp_url "
+                    "FROM cameras WHERE id=?",
+                    (int(camera_id),),
                 ).fetchone()
-                if event_id
-                else None
-            )
+            except Exception:
+                # Compatibility with pre-migration/minimal recovery schemas.
+                camera_row = None
+            if event_id:
+                try:
+                    existing = con.execute(
+                        "SELECT image_path,plate_image_path,city "
+                        "FROM plate_events WHERE id=?",
+                        (int(event_id),),
+                    ).fetchone()
+                except Exception:
+                    existing = con.execute(
+                        "SELECT image_path,plate_image_path "
+                        "FROM plate_events WHERE id=?",
+                        (int(event_id),),
+                    ).fetchone()
+            else:
+                existing = None
         if existing:
             plate_path = existing["plate_image_path"] or ""
             image_path = existing["image_path"] or ""
-        crop = result.get("crop")
+        plate_root = plate_dir.expanduser().resolve()
+        snapshot_root = snapshot_dir.expanduser().resolve()
 
-        if (
-            self._setting("save_plate_images", "1") == "1"
-            and crop is not None
-            and getattr(crop, "size", 0)
-        ):
-            target = (
-                Path(plate_path)
-                if plate_path
-                else plate_dir / f"plate-live-{stamp}.jpg"
-            )
-            if cv2.imwrite(
-                str(target),
-                crop,
-                [cv2.IMWRITE_JPEG_QUALITY, 94],
-            ):
-                plate_path = str(target)
+        def media_target(existing_path, root, filename):
+            if existing_path:
+                try:
+                    current = Path(existing_path).expanduser().resolve()
+                    if current.is_file() and current.is_relative_to(root):
+                        return current
+                except OSError:
+                    pass
+            return root / filename
 
-        if self._setting("save_snapshots", "1") == "1":
-            vehicle = result.get("vehicle_crop")
-            using_vehicle_crop = bool(
-                vehicle is not None and getattr(vehicle, "size", 0)
+        media = save_event_images(
+            result,
+            frame,
+            plate_target=(
+                media_target(
+                    plate_path,
+                    plate_root,
+                    f"plate-live-{stamp}.jpg",
+                )
+            ),
+            vehicle_target=(
+                media_target(
+                    image_path,
+                    snapshot_root,
+                    f"vehicle-live-{stamp}.jpg",
+                )
+            ),
+            save_plate=(
+                self._setting("save_plate_images", "1") == "1"
+            ),
+            save_vehicle=(
+                self._setting("save_snapshots", "1") == "1"
+            ),
+            existing_plate_path=plate_path,
+            existing_vehicle_path=image_path,
+        )
+        plate_path = media.plate_path
+        image_path = media.image_path
+        plate_identity_norm = (
+            normalize_plate(result.get("plate_norm"))
+            or normalize_plate(result.get("raw_guess_norm"))
+            or normalize_plate(result.get("plate"))
+        )
+        plate_parts = split_iran_plate(plate_identity_norm)
+        recognized = bool(
+            plate_parts
+            and (result.get("valid") or result.get("auto_confirmed"))
+            and not result.get("unreadable_final")
+        )
+        plate_norm = plate_identity_norm if recognized else ""
+        plate_text = (
+            result.get("plate")
+            if recognized
+            else (
+                result.get("raw_guess_text") or result.get("plate")
+                if result.get("needs_review")
+                else "ناخوانا"
             )
-            annotated = (
-                vehicle.copy()
-                if using_vehicle_crop
-                else frame.copy()
+        ) or "ناخوانا"
+        review_status = (
+            "auto-confirmed"
+            if recognized and result.get("auto_confirmed")
+            else (
+                "confirmed-ai"
+                if recognized
+                else (
+                    "suggested"
+                    if result.get("needs_review")
+                    else "unreadable"
+                )
             )
-            x1, y1, x2, y2 = result["bbox"]
-            if result.get("vehicle_bbox") and using_vehicle_crop:
-                vx1, vy1, _, _ = result["vehicle_bbox"]
-                x1, x2 = x1 - vx1, x2 - vx1
-                y1, y2 = y1 - vy1, y2 - vy1
-            cv2.rectangle(
-                annotated,
-                (x1, y1),
-                (x2, y2),
-                (0, 255, 0),
-                2,
-            )
-            target = (
-                Path(image_path)
-                if image_path
-                else snapshot_dir / f"vehicle-live-{stamp}.jpg"
-            )
-            if cv2.imwrite(
-                str(target),
-                annotated,
-                [cv2.IMWRITE_JPEG_QUALITY, 90],
-            ):
-                image_path = str(target)
+        )
+        camera_city = (
+            str(camera_row["city"] or "")
+            if camera_row else ""
+        )
+        event_city = (
+            str(existing["city"] or "")
+            if existing and "city" in existing.keys()
+            else str(result.get("city") or camera_city)
+        )
+        camera_url = str(camera_row["rtsp_url"] or "") if camera_row else ""
 
         values = {
-            "plate_text": result.get("plate") or "ناخوانا",
-            "plate_norm": (
-                result.get("plate_norm")
-                or normalize_plate(result.get("plate"))
-                if result.get("valid")
-                else ""
+            "plate_text": plate_text,
+            "plate_norm": plate_norm,
+            "plate_region": (
+                plate_parts["region"] if plate_parts else ""
             ),
             "confidence": float(result["confidence"]),
             "camera_id": camera_id,
             "camera_name": camera_name,
+            "city": event_city,
             "image_path": image_path,
             "plate_image_path": plate_path,
-            "video_path": "",
+            "media_status": media.media_status,
+            "media_error": media.media_error,
+            "updated_at": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S.%f"
+            ),
+            "video_path": (
+                camera_url[len("video://"):]
+                if camera_url.startswith("video://")
+                else ""
+            ),
             "video_second": 0.0,
             "detector_method": result.get("method", "live"),
             "ocr_confidence": float(
@@ -380,19 +435,7 @@ class LiveANPRWorker:
             ),
             "source": "live",
             "processing_ms": float(processing_ms),
-            "review_status": (
-                "unreadable"
-                if result.get("unreadable_final")
-                else (
-                    "auto-confirmed"
-                    if result.get("auto_confirmed")
-                    else (
-                        "suggested"
-                        if result.get("needs_review")
-                        else "confirmed-ai"
-                    )
-                )
-            ),
+            "review_status": review_status,
             "confirmation_source": result.get(
                 "confirmation_source",
                 (
@@ -408,9 +451,10 @@ class LiveANPRWorker:
                 "raw_guess_text",
                 result.get("plate", ""),
             ),
-            "raw_guess_norm": result.get(
-                "raw_guess_norm",
-                normalize_plate(result.get("plate")),
+            "raw_guess_norm": normalize_plate(
+                result.get("raw_guess_norm")
+                or result.get("raw_guess_text")
+                or result.get("plate")
             ),
             "raw_guess_confidence": float(
                 result.get(

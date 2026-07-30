@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 import app.ai.video_test as video_test
+import app.media_storage as media_storage
 import app.streams as streams
 from app.streams import CameraStream
 
@@ -54,7 +55,7 @@ def test_video_emits_one_consensus_event(tmp_path, monkeypatch):
             "ocr_confidence": 0.7,
             "quality_score": 0.8,
             "bbox": (80, 80, 240, 120),
-            "crop": frame[80:120, 80:240].copy(),
+            "crop": None,
             "method": "test",
             "vehicle_type": "سواری",
             "vehicle_color": "سفید",
@@ -70,8 +71,8 @@ def test_video_emits_one_consensus_event(tmp_path, monkeypatch):
     )
     info, events = video_test.process_video(
         video_path,
-        tmp_path / "plates",
-        tmp_path / "snapshots",
+        tmp_path / "پلاک‌ها",
+        tmp_path / "خودروها",
         frame_step=1,
         duplicate_seconds=20,
         min_confidence=0.5,
@@ -80,8 +81,55 @@ def test_video_emits_one_consensus_event(tmp_path, monkeypatch):
     assert len(events) == 1
     assert events[0]["plate"] == "12-ب-345-67"
     assert events[0]["consensus_votes"] >= 2
-    assert Path(events[0]["plate_path"]).is_file()
-    assert Path(events[0]["image_path"]).is_file()
+    assert events[0]["media_status"] == "complete"
+    assert events[0]["media_error"] == ""
+    for key in ("plate_path", "image_path"):
+        image_path = Path(events[0][key])
+        payload = image_path.read_bytes()
+        assert len(payload) > 0
+        decoded = cv2.imdecode(
+            np.frombuffer(payload, dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        assert decoded is not None
+        assert decoded.size > 0
+
+
+def test_video_media_failure_keeps_result_and_reports_error(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        media_storage.cv2,
+        "imencode",
+        lambda *_args, **_kwargs: (False, None),
+    )
+    frame = np.full((100, 180, 3), 120, dtype=np.uint8)
+    result = {
+        "plate": "12-ب-345-67",
+        "plate_norm": "12ب34567",
+        "valid": True,
+        "confidence": 0.9,
+        "bbox": (40, 50, 140, 82),
+        "crop": frame[50:82, 40:140].copy(),
+    }
+
+    event = video_test._save_event(
+        result,
+        frame,
+        frame_no=10,
+        fps=10.0,
+        plate_dir=tmp_path / "plates",
+        snapshot_dir=tmp_path / "snapshots",
+        video_path=tmp_path / "source.mp4",
+    )
+
+    assert event["plate"] == "12-ب-345-67"
+    assert event["plate_path"] == ""
+    assert event["image_path"] == ""
+    assert event["media_status"] == "error"
+    assert "plate: JPEG encoder returned no data" in event["media_error"]
+    assert "vehicle: JPEG encoder returned no data" in event["media_error"]
 
 
 def test_video_shadow_fails_closed_once_when_bundle_is_missing(
