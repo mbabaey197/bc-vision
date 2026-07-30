@@ -31,10 +31,17 @@ jobs:
   regression:
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 20
-    env:
-      PSExecutionPolicyPreference: Bypass
     steps:
       - uses: actions/checkout@v4
+      - name: Discover system Python
+        shell: cmd
+        continue-on-error: true
+        run: |
+          whoami
+          where.exe python
+          python --version
+          where.exe py
+          py -0p
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -58,10 +65,18 @@ jobs:
     timeout-minutes: 45
     env:
       BCVISION_RUN_AI_INTEGRATION: "1"
-      PSExecutionPolicyPreference: Bypass
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: Discover system Python
+        shell: cmd
+        continue-on-error: true
+        run: |
+          whoami
+          where.exe python
+          python --version
+          where.exe py
+          py -0p
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
