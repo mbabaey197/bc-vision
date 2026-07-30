@@ -41,6 +41,7 @@ jobs:
         with:
           version: "0.12.0"
           enable-cache: true
+          cache-python: true
           cache-dependency-glob: requirements-test.txt
       - name: Set up portable Python
         shell: cmd
@@ -75,6 +76,7 @@ jobs:
         with:
           version: "0.12.0"
           enable-cache: true
+          cache-python: true
           cache-dependency-glob: requirements-ai-lock.txt
       - name: Set up portable Python
         shell: cmd
