@@ -14,6 +14,7 @@ from app.ai.detector import (
     _iou,
     _nms,
     _plate_class_ids,
+    _rectified_crop,
     _select_partial_position_hypotheses,
     _select_plate_hypotheses,
     _select_plate_sequence,
@@ -82,6 +83,45 @@ def test_fallback_handles_dark_rotated_blurred(monkeypatch):
     ]:
         rows = detect_plates(scene, min_confidence=0.08)
         assert rows
+
+
+def test_perspective_crop_keeps_expanded_rotated_plate_border():
+    image = make_plate_scene()
+    contour = cv2.boxPoints(
+        ((400.0, 247.0), (340.0, 84.0), 11.0)
+    ).astype(np.int32).reshape(-1, 1, 2)
+
+    crop, quadrilateral = _rectified_crop(
+        image,
+        contour,
+        return_box=True,
+    )
+
+    assert crop is not None
+    assert crop.shape[1] > crop.shape[0] * 3
+    assert quadrilateral.shape == (4, 2)
+    assert np.ptp(quadrilateral[:, 0]) > 340
+    assert np.ptp(quadrilateral[:, 1]) > 84
+
+
+def test_verified_detector_result_inside_static_overlay_is_rejected(
+    monkeypatch,
+):
+    frame = np.zeros((180, 320, 3), dtype=np.uint8)
+    candidate = {
+        "crop": np.zeros((24, 150, 3), dtype=np.uint8),
+        "bbox": (5, 2, 190, 34),
+        "confidence": 0.91,
+        "method": "yolov8-onnx-light",
+    }
+    monkeypatch.setattr(
+        "app.ai.detector.detect_plates_onnx",
+        lambda *_args, **_kwargs: [candidate],
+    )
+    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    mask[2:34, 5:190] = 255
+
+    assert detect_plates(frame, exclusion_mask=mask) == []
 
 
 def test_nms_removes_overlaps():

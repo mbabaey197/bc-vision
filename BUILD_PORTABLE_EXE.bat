@@ -79,6 +79,8 @@ rem RC15 operator-assisted ANPR modules are packaged explicitly.
     --hidden-import app.ai.video_test ^
     --hidden-import app.ai.live_worker ^
     --hidden-import app.ai.evaluation ^
+    --hidden-import app.ai.activity ^
+    --hidden-import app.ai.golden ^
     --hidden-import app.ai.next_engine ^
     --hidden-import app.ai.next_models ^
     --hidden-import app.ai.onnx_cct ^

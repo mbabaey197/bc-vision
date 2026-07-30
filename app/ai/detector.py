@@ -17,6 +17,7 @@ configure_process_cpu_budget()
 import cv2
 import numpy as np
 
+from .activity import masked_bbox_ratio
 from .plate_recovery import recover_mild_blur, should_attempt_recovery
 from .onnx_detector import (
     detect_plates_onnx,
@@ -189,6 +190,23 @@ def _nms(candidates: list[dict], threshold: float = 0.38) -> list[dict]:
         if all(_iou(candidate["bbox"], row["bbox"]) < threshold for row in kept):
             kept.append(candidate)
     return kept
+
+
+def _exclude_static_overlays(
+    candidates: list[dict],
+    exclusion_mask,
+    maximum_overlap=0.22,
+) -> list[dict]:
+    selected = []
+    for candidate in candidates:
+        overlap = masked_bbox_ratio(
+            exclusion_mask,
+            candidate.get("bbox"),
+        )
+        candidate["static_overlay_overlap"] = round(overlap, 5)
+        if overlap < float(maximum_overlap):
+            selected.append(candidate)
+    return selected
 
 
 def _plate_class_ids(model) -> list[int] | None:
@@ -708,9 +726,22 @@ def _order_points(points: np.ndarray) -> np.ndarray:
     return ordered
 
 
-def _rectified_crop(image: np.ndarray, contour: np.ndarray) -> np.ndarray | None:
+def _rectified_crop(
+    image: np.ndarray,
+    contour: np.ndarray,
+    return_box=False,
+):
     rectangle = cv2.minAreaRect(contour)
     box = _order_points(cv2.boxPoints(rectangle))
+    center = box.mean(axis=0)
+    # Preserve the full physical plate border. Tight contour warps used to
+    # shave the outer region digits on angled views.
+    box = center + (box - center) * np.array(
+        [1.08, 1.20],
+        dtype=np.float32,
+    )
+    box[:, 0] = np.clip(box[:, 0], 0, image.shape[1] - 1)
+    box[:, 1] = np.clip(box[:, 1], 0, image.shape[0] - 1)
     tl, tr, br, bl = box
     width = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
     height = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
@@ -725,7 +756,9 @@ def _rectified_crop(image: np.ndarray, contour: np.ndarray) -> np.ndarray | None
     )
     matrix = cv2.getPerspectiveTransform(box, destination)
     crop = cv2.warpPerspective(image, matrix, (width, height), flags=cv2.INTER_CUBIC)
-    return crop if crop.size else None
+    if not crop.size:
+        return (None, None) if return_box else None
+    return (crop, box) if return_box else crop
 
 
 def _character_likelihood(gray: np.ndarray) -> float:
@@ -783,11 +816,25 @@ def _fallback_masks(gray: np.ndarray) -> Iterable[np.ndarray]:
         yield cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 3)))
 
 
-def _opencv_candidates(frame: np.ndarray, max_results: int) -> list[dict]:
+def _opencv_candidates(
+    frame: np.ndarray,
+    max_results: int,
+    exclusion_mask=None,
+) -> list[dict]:
     height, width = frame.shape[:2]
     scale = min(2.0, 1280.0 / max(width, 1)) if width < 640 else min(1.0, 1280.0 / max(width, 1))
     work = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA) if scale != 1 else frame
     gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY) if work.ndim == 3 else work
+    work_exclusion = None
+    if exclusion_mask is not None and getattr(exclusion_mask, "size", 0):
+        work_exclusion = cv2.resize(
+            exclusion_mask,
+            (gray.shape[1], gray.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        if np.any(work_exclusion):
+            gray = gray.copy()
+            gray[work_exclusion > 0] = int(np.median(gray))
     work_h, work_w = gray.shape[:2]
     frame_area = float(work_h * work_w)
     candidates = []
@@ -810,7 +857,11 @@ def _opencv_candidates(frame: np.ndarray, max_results: int) -> list[dict]:
             wx1, wy1, wx2, wy2 = _clip_box((x - pad_x, y - pad_y, x + box_w + pad_x, y + box_h + pad_y), work_w, work_h)
             ox1, oy1, ox2, oy2 = _clip_box((wx1 / scale, wy1 / scale, wx2 / scale, wy2 / scale), width, height)
             axis_crop = frame[oy1:oy2, ox1:ox2].copy()
-            rectified = _rectified_crop(work, contour)
+            rectified, quadrilateral = _rectified_crop(
+                work,
+                contour,
+                return_box=True,
+            )
             if rectified is not None and rectified.shape[1] / max(rectified.shape[0], 1) >= 1.7:
                 crop = rectified
                 method = "opencv-perspective"
@@ -819,13 +870,26 @@ def _opencv_candidates(frame: np.ndarray, max_results: int) -> list[dict]:
                 method = "opencv"
             if crop is None or crop.size == 0:
                 continue
-            candidates.append({
+            candidate = {
                 "crop": crop,
                 "bbox": (ox1, oy1, ox2, oy2),
                 "confidence": float(score),
                 "method": method,
-            })
-    return _nms(candidates)[:max_results]
+            }
+            if quadrilateral is not None:
+                candidate["quadrilateral"] = [
+                    [
+                        round(float(point[0]) / scale, 3),
+                        round(float(point[1]) / scale, 3),
+                    ]
+                    for point in quadrilateral
+                ]
+                candidate["crop_geometry"] = "perspective"
+            candidates.append(candidate)
+    return _exclude_static_overlays(
+        _nms(candidates),
+        exclusion_mask,
+    )[:max_results]
 
 
 def detect_plates(
@@ -833,6 +897,7 @@ def detect_plates(
     min_confidence: float = 0.25,
     max_results: int = 8,
     engine_key=None,
+    exclusion_mask=None,
 ):
     if frame is None or getattr(frame, "size", 0) == 0:
         return []
@@ -843,13 +908,17 @@ def detect_plates(
         engine_key=engine_key,
     )
     if light_rows:
-        return light_rows
+        return _exclude_static_overlays(
+            light_rows,
+            exclusion_mask,
+        )[:max_results]
 
     light_status = onnx_detector_status()
     if light_status.get("model_loaded"):
         fallback = _opencv_candidates(
             frame,
             max_results=min(max_results, 3),
+            exclusion_mask=exclusion_mask,
         )
         return [
             row
@@ -860,7 +929,11 @@ def detect_plates(
             )
         ][:max_results]
 
-    fallback = _opencv_candidates(frame, max_results=max_results)
+    fallback = _opencv_candidates(
+        frame,
+        max_results=max_results,
+        exclusion_mask=exclusion_mask,
+    )
     return [row for row in fallback if row["confidence"] >= min(0.45, max(0.08, float(min_confidence) * 0.65))][:max_results]
 
 

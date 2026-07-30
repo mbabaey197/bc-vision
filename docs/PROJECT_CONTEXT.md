@@ -5,7 +5,7 @@
 - GitHub repository: `mahdibabaey197/bc-vision`
 - Default branch: `main`
 - Product: BC Vision
-- Current application version in source: `2.2.0-rc15`
+- Current application version in source: `2.2.0-rc16`
 - Windows persistent data root: `C:\ProgramData\BCVision\data`
 
 ## Release contract
@@ -54,6 +54,13 @@ The Iranian plate-recognition subsystem now includes:
 - five-best-frame probability voting and strict ambiguity rejection
 - geometric-only track association; OCR text never links vehicle tracks
 - Golden Dataset promotion gate and atomic runtime rollback
+- temporal proof for operator-assisted confirmation: at least three
+  independent full-plate frames over a non-zero confirmation span
+- low-cost motion wake-up that bypasses idle backoff for entering vehicles
+- temporal fixed-overlay suppression for NVR clock/name/date text
+- globally optimized multi-vehicle association with trajectory direction
+- immutable per-run training snapshots and active-checkpoint continuation
+- fail-closed 40-sample/multi-slice Golden Dataset admission contract
 
 ## ANPR model execution contract
 
@@ -146,6 +153,12 @@ The latest full-suite and system optimization result is recorded in
 `agent-results/latest/PROJECT_OPTIMIZATION_PHASE_1.md`: `64 passed, 1 skipped`,
 plus a successful headless runtime smoke and a 1,000-write SQLite concurrency
 and integrity check.
+
+RC16 engine hardening is recorded in
+`agent-results/latest/ANPR_ENGINE_HARDENING_RC16.md`. Its locally executable
+full regression result is `209 passed, 1 skipped`; the skipped check is the
+existing opt-in real AI integration runtime gate. No new real-camera accuracy
+claim was made.
 
 ## Security hardening status
 

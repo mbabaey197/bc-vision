@@ -1,4 +1,5 @@
 import hashlib
+import json
 from pathlib import Path
 
 import cv2
@@ -76,12 +77,42 @@ def test_only_verified_candidate_can_be_promoted(tmp_path, monkeypatch):
     candidate = tmp_path / "candidate.onnx"
     candidate.write_bytes(b"candidate-crnn")
     digest = hashlib.sha256(candidate.read_bytes()).hexdigest().upper()
+    _active_path, active_digest, _active_size = (
+        model_manager.active_crnn_model()
+    )
+    manifest = (
+        data_dir
+        / "anpr-training"
+        / "manifests"
+        / "run-1.json"
+    )
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        json.dumps({"schema": 2, "samples": []}),
+        encoding="utf-8",
+    )
+    manifest_digest = hashlib.sha256(
+        manifest.read_bytes()
+    ).hexdigest().upper()
+    promotion_report = json.dumps({
+        "schema": 1,
+        "promote": True,
+        "baseline_sha256": active_digest,
+    })
     with database.connect() as con:
         run_id = con.execute(
             "INSERT INTO anpr_training_runs("
-            "status,candidate_path,candidate_sha256"
-            ") VALUES('candidate-ready',?,?)",
-            (str(candidate), digest),
+            "status,candidate_path,candidate_sha256,"
+            "promotion_report,dataset_manifest_path,"
+            "dataset_manifest_sha256"
+            ") VALUES('candidate-ready',?,?,?,?,?)",
+            (
+                str(candidate),
+                digest,
+                promotion_report,
+                str(manifest),
+                manifest_digest,
+            ),
         ).lastrowid
 
     promoted = training.apply_candidate(run_id, "admin")
@@ -103,3 +134,27 @@ def test_only_verified_candidate_can_be_promoted(tmp_path, monkeypatch):
         ).fetchone()
     assert row["status"] == "applied"
     assert row["applied_by"] == "admin"
+
+
+def test_candidate_without_promotion_evidence_is_rejected(
+    tmp_path,
+    monkeypatch,
+):
+    database, _data_dir = _isolated_database(tmp_path, monkeypatch)
+    candidate = tmp_path / "candidate.onnx"
+    candidate.write_bytes(b"candidate-crnn")
+    digest = hashlib.sha256(candidate.read_bytes()).hexdigest().upper()
+    with database.connect() as con:
+        run_id = con.execute(
+            "INSERT INTO anpr_training_runs("
+            "status,candidate_path,candidate_sha256"
+            ") VALUES('candidate-ready',?,?)",
+            (str(candidate), digest),
+        ).lastrowid
+
+    try:
+        training.apply_candidate(run_id, "admin")
+    except ValueError as exc:
+        assert "گزارش ارتقای مدل" in str(exc)
+    else:
+        raise AssertionError("promotion evidence was bypassed")

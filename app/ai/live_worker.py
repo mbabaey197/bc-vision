@@ -16,6 +16,7 @@ import cv2
 
 from app.cpu_budget import parallel_camera_limit, threads_per_camera
 
+from .activity import FrameActivityAnalyzer
 from .pipeline import (
     PlateConsensusTracker,
     add_vehicle_analysis,
@@ -102,6 +103,12 @@ class _CameraState:
     shadow_frames: int = 0
     shadow_candidates: int = 0
     shadow_errors: int = 0
+    activity: FrameActivityAnalyzer = field(
+        default_factory=FrameActivityAnalyzer
+    )
+    motion_score: float = 0.0
+    motion_wakeups: int = 0
+    overlay_mask_pixels: int = 0
 
 
 class LiveANPRWorker:
@@ -213,12 +220,25 @@ class LiveANPRWorker:
                 vx2 + offset_x,
                 vy2 + offset_y,
             )
+        if row.get("quadrilateral"):
+            row["quadrilateral"] = [
+                [
+                    float(point[0]) + offset_x,
+                    float(point[1]) + offset_y,
+                ]
+                for point in row["quadrilateral"]
+            ]
         return row
 
     @staticmethod
     def _setting(key, default=""):
-        from app.database import get_setting
-        return get_setting(key, default)
+        try:
+            from app.database import get_setting
+            return get_setting(key, default)
+        except Exception:
+            # Inference must retain safe defaults during first-run database
+            # creation or a transient settings migration.
+            return default
 
     def _persist(
         self,
@@ -503,12 +523,35 @@ class LiveANPRWorker:
             ):
                 return
             selection_score = self._selection_score(frame, config)
+            activity_source, _, _ = self._roi_frame(frame, config)
+            activity = state.activity.observe(activity_source)
+            state.motion_score = float(activity.motion_score)
+            state.overlay_mask_pixels = (
+                int(cv2.countNonZero(activity.exclusion_mask))
+                if activity.exclusion_mask is not None
+                else 0
+            )
+            if activity.wake_inference:
+                state.motion_wakeups += 1
+                state.burst_frames_remaining = max(
+                    state.burst_frames_remaining,
+                    4,
+                )
+                state.next_inference_at = min(
+                    state.next_inference_at,
+                    now,
+                )
+                selection_score += min(
+                    0.40,
+                    0.18 + float(activity.motion_score),
+                )
             payload = (
                 int(camera_id),
                 str(camera_name),
                 frame.copy(),
                 now,
                 selection_score,
+                activity,
             )
             if state.busy:
                 pending_score = (
@@ -533,7 +576,11 @@ class LiveANPRWorker:
             # adaptively; this reduces load without lowering image quality.
             minimum_interval = max(
                 0.0,
-                state.next_inference_at - now,
+                (
+                    0.0
+                    if activity.wake_inference
+                    else state.next_inference_at - now
+                ),
                 (
                     0.0
                     if state.burst_frames_remaining
@@ -552,7 +599,10 @@ class LiveANPRWorker:
             )
             if (
                 now - state.last_submitted_at < minimum_interval
-                or now < state.next_inference_at
+                or (
+                    now < state.next_inference_at
+                    and not activity.wake_inference
+                )
             ):
                 pending_score = (
                     float(state.pending[4])
@@ -580,6 +630,7 @@ class LiveANPRWorker:
 
     def _process(self, state: _CameraState, payload):
         camera_id, camera_name, frame, timestamp = payload[:4]
+        activity = payload[5] if len(payload) > 5 else None
         started = time.perf_counter()
         try:
             config = state.config or {}
@@ -594,15 +645,28 @@ class LiveANPRWorker:
                     float(config.get("lpr_confidence", 60)) / 100.0,
                 ),
             )
-            outcome = engine_router.process(
-                source,
-                baseline=lambda: process_frame(
+            exclusion_mask = (
+                activity.exclusion_mask
+                if activity is not None
+                else None
+            )
+
+            def baseline_process():
+                kwargs = {"engine_key": camera_id}
+                if exclusion_mask is not None:
+                    kwargs["exclusion_mask"] = exclusion_mask
+                return process_frame(
                     source,
                     min_confidence * 0.45,
-                    engine_key=camera_id,
-                ),
+                    **kwargs,
+                )
+
+            outcome = engine_router.process(
+                source,
+                baseline=baseline_process,
                 min_detection_confidence=min_confidence * 0.45,
                 engine_key=camera_id,
+                exclusion_mask=exclusion_mask,
             )
             primary_rows = [
                 apply_learned_correction(
@@ -684,10 +748,13 @@ class LiveANPRWorker:
                 state.plate_visible = False
                 if state.burst_frames_remaining:
                     state.burst_frames_remaining -= 1
-                state.no_plate_streak = min(
-                    12,
-                    state.no_plate_streak + 1,
-                )
+                if activity is not None and activity.wake_inference:
+                    state.no_plate_streak = 0
+                else:
+                    state.no_plate_streak = min(
+                        12,
+                        state.no_plate_streak + 1,
+                    )
             stable = state.tracker.update(
                 rows,
                 timestamp=timestamp,
@@ -848,7 +915,13 @@ class LiveANPRWorker:
                 # every inference returned no plate.
                 state.next_inference_at = time.monotonic() + (
                     0.04
-                    if state.burst_frames_remaining
+                    if (
+                        state.burst_frames_remaining
+                        or (
+                            activity is not None
+                            and activity.wake_inference
+                        )
+                    )
                     else self._post_inference_delay(
                             state.processing_seconds_ema,
                             state.no_plate_streak,
@@ -897,6 +970,9 @@ class LiveANPRWorker:
                     2,
                 ),
                 "burst_frames_remaining": state.burst_frames_remaining,
+                "motion_score": round(state.motion_score, 5),
+                "motion_wakeups": state.motion_wakeups,
+                "overlay_mask_pixels": state.overlay_mask_pixels,
                 "anpr_engine": engine_router.status(camera_id),
                 "shadow": {
                     "frames": state.shadow_frames,

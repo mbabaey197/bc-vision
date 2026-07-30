@@ -102,3 +102,35 @@ def test_cnn_is_bootstrapped_from_packaged_seed(tmp_path, monkeypatch):
 
     assert model_manager.ensure_cnn_model(download=False) == target
     assert target.read_bytes() == payload
+
+
+def test_promoted_crnn_keeps_verified_training_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    data = tmp_path / "data"
+    monkeypatch.setattr(model_manager, "_data_dir", lambda: data)
+    candidate = tmp_path / "candidate.onnx"
+    checkpoint = tmp_path / "candidate.pt"
+    candidate.write_bytes(b"candidate-onnx")
+    checkpoint.write_bytes(b"weights-only-state-dict")
+    candidate_digest = sha256_file(candidate)
+    checkpoint_digest = sha256_file(checkpoint)
+
+    promoted = model_manager.promote_crnn_candidate(
+        candidate,
+        candidate_digest,
+        source_run_id=7,
+        training_checkpoint=checkpoint,
+        training_checkpoint_sha256=checkpoint_digest,
+    )
+    active_checkpoint = (
+        model_manager.active_crnn_training_checkpoint()
+    )
+
+    assert promoted["sha256"] == candidate_digest
+    assert active_checkpoint is not None
+    assert active_checkpoint[1] == checkpoint_digest
+    assert active_checkpoint[0].read_bytes() == (
+        b"weights-only-state-dict"
+    )

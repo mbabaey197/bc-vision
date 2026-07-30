@@ -516,6 +516,46 @@ def test_no_plate_backoff_grows_but_recognition_stays_responsive():
     assert delay(0.25, 10) == 3.20
 
 
+def test_motion_wakes_camera_during_long_empty_scene_backoff(
+    monkeypatch,
+):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState()
+    state.config = {
+        "id": 27,
+        "enabled": 1,
+        "lpr_enabled": 1,
+        "lpr_confidence": 50,
+        "duplicate_seconds": 0,
+        "roi_x": 0,
+        "roi_y": 0,
+        "roi_w": 100,
+        "roi_h": 100,
+    }
+    state.config_loaded_at = time.monotonic()
+    state.next_inference_at = time.monotonic() + 30.0
+    worker._states[27] = state
+    empty = np.zeros((120, 240, 3), dtype=np.uint8)
+    state.activity.observe(empty)
+    entering = empty.copy()
+    entering[30:100, 70:190] = 220
+    processed = threading.Event()
+
+    def record_process(current_state, payload):
+        assert payload[5].wake_inference is True
+        processed.set()
+        with worker._lock:
+            current_state.busy = False
+
+    monkeypatch.setattr(worker, "_process", record_process)
+
+    worker.submit(27, "entry camera", entering)
+    assert processed.wait(0.5)
+    assert state.motion_wakeups == 1
+    assert state.burst_frames_remaining >= 4
+    worker.shutdown()
+
+
 def test_two_cameras_receive_independent_worker_slots(monkeypatch):
     monkeypatch.setattr(
         live_worker,

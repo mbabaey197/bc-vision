@@ -22,6 +22,7 @@ from .onnx_crnn import (
     ctc_greedy_decode,
     prepare_crnn_input,
 )
+from .evaluation import character_distance
 from .plate_rules import normalize_plate
 
 
@@ -81,8 +82,9 @@ def _augment(tensor: np.ndarray, rng) -> np.ndarray:
     return gray.astype(np.float32)[None] / 255.0
 
 
-def _evaluate(session, rows: list[dict]) -> float:
-    correct = 0
+def _evaluate(session, rows: list[dict]) -> dict:
+    predictions = []
+    distances = []
     for row in rows:
         tensor = _load_tensor(row["image"])[None]
         input_name = session.get_inputs()[0].name
@@ -90,8 +92,21 @@ def _evaluate(session, rows: list[dict]) -> float:
             session.run(None, {input_name: tensor})[0]
         )[0]
         text, _confidence = ctc_greedy_decode(logits)
-        correct += normalize_plate(text) == row["label"]
-    return correct / max(len(rows), 1)
+        predicted = normalize_plate(text)
+        predictions.append(predicted)
+        distances.append(character_distance(predicted, row["label"]))
+    correct = sum(
+        predicted == row["label"]
+        for predicted, row in zip(predictions, rows)
+    )
+    return {
+        "accuracy": correct / max(len(rows), 1),
+        "mean_character_error": (
+            sum(distances) / max(len(distances), 1)
+        ),
+        "predictions": predictions,
+        "distances": distances,
+    }
 
 
 def train_candidate(
@@ -105,7 +120,10 @@ def train_candidate(
     from torch import nn
     from torch.utils.data import DataLoader, Dataset
 
-    from .model_manager import active_crnn_model
+    from .model_manager import (
+        active_crnn_model,
+        active_crnn_training_checkpoint,
+    )
 
     thread_limit = threads_per_camera()
     torch.set_num_threads(thread_limit)
@@ -115,12 +133,12 @@ def train_candidate(
         pass
 
     train_rows, validation_rows = _load_manifest(Path(manifest))
-    base_path, _base_sha, _base_size = active_crnn_model()
+    base_path, base_sha, _base_size = active_crnn_model()
     base_session = ort.InferenceSession(
         str(base_path),
         providers=["CPUExecutionProvider"],
     )
-    baseline_accuracy = _evaluate(base_session, validation_rows)
+    baseline_metrics = _evaluate(base_session, validation_rows)
 
     label_to_index = {
         label: index for index, label in enumerate(CRNN_LABELS)
@@ -138,11 +156,6 @@ def train_candidate(
         base_session.run(None, {teacher_input: train_x})[0],
         dtype=np.float32,
     )
-    validation_x = np.stack([
-        _load_tensor(row["image"]) for row in validation_rows
-    ])
-    validation_y = [row["label"] for row in validation_rows]
-
     rng = np.random.default_rng(20260728)
 
     class TrainingDataset(Dataset):
@@ -225,6 +238,21 @@ def train_candidate(
         selected_device = "cuda"
     runtime_device = torch.device(selected_device)
     model = CRNN().to(runtime_device)
+    initialization_mode = "active-model-distillation"
+    active_checkpoint = active_crnn_training_checkpoint()
+    if active_checkpoint is not None:
+        checkpoint_path, _checkpoint_sha, _checkpoint_size = (
+            active_checkpoint
+        )
+        state_dict = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+        if not isinstance(state_dict, dict):
+            raise ValueError("Active CRNN checkpoint is not a state dict")
+        model.load_state_dict(state_dict, strict=True)
+        initialization_mode = "active-checkpoint"
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=8e-4,
@@ -272,6 +300,17 @@ def train_candidate(
     model.eval()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    candidate_checkpoint = output_dir / "ocr_crnn-state.pt"
+    torch.save(
+        {
+            name: tensor.detach().cpu()
+            for name, tensor in model.state_dict().items()
+        },
+        candidate_checkpoint,
+    )
+    candidate_checkpoint_sha256 = _sha256(
+        candidate_checkpoint
+    )
     candidate = output_dir / "ocr_crnn.onnx"
     torch.onnx.export(
         model.cpu(),
@@ -290,21 +329,54 @@ def train_candidate(
         str(candidate),
         providers=["CPUExecutionProvider"],
     )
-    candidate_accuracy = 0.0
-    input_name = candidate_session.get_inputs()[0].name
-    outputs = candidate_session.run(
-        None,
-        {input_name: validation_x},
-    )[0]
-    for logits, expected in zip(outputs, validation_y):
-        text, _confidence = ctc_greedy_decode(logits)
-        candidate_accuracy += normalize_plate(text) == expected
-    candidate_accuracy /= max(len(validation_y), 1)
+    candidate_metrics = _evaluate(
+        candidate_session,
+        validation_rows,
+    )
+    validation_regressions = sum(
+        candidate_distance > baseline_distance
+        for candidate_distance, baseline_distance in zip(
+            candidate_metrics["distances"],
+            baseline_metrics["distances"],
+        )
+    )
+    validation_improvements = sum(
+        candidate_distance < baseline_distance
+        for candidate_distance, baseline_distance in zip(
+            candidate_metrics["distances"],
+            baseline_metrics["distances"],
+        )
+    )
     digest = _sha256(candidate)
     return {
-        "baseline_accuracy": round(float(baseline_accuracy), 6),
-        "candidate_accuracy": round(float(candidate_accuracy), 6),
+        "baseline_accuracy": round(
+            float(baseline_metrics["accuracy"]),
+            6,
+        ),
+        "candidate_accuracy": round(
+            float(candidate_metrics["accuracy"]),
+            6,
+        ),
+        "baseline_mean_character_error": round(
+            float(baseline_metrics["mean_character_error"]),
+            6,
+        ),
+        "candidate_mean_character_error": round(
+            float(candidate_metrics["mean_character_error"]),
+            6,
+        ),
+        "validation_samples": len(validation_rows),
+        "validation_regressions": validation_regressions,
+        "validation_improvements": validation_improvements,
+        "baseline_sha256": str(base_sha).upper(),
+        "initialization_mode": initialization_mode,
         "candidate_path": str(candidate),
         "candidate_sha256": digest,
+        "candidate_checkpoint_path": str(
+            candidate_checkpoint
+        ),
+        "candidate_checkpoint_sha256": (
+            candidate_checkpoint_sha256
+        ),
         "device": selected_device,
     }

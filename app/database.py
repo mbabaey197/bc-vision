@@ -252,6 +252,16 @@ def init_db():
             "character_distance": "INTEGER NOT NULL DEFAULT 0",
             "exact_match": "INTEGER NOT NULL DEFAULT 0",
         })
+        _add_missing_columns(con, "anpr_training_runs", {
+            "baseline_mean_character_error": "REAL DEFAULT 0",
+            "candidate_mean_character_error": "REAL DEFAULT 0",
+            "baseline_sha256": "TEXT DEFAULT ''",
+            "candidate_checkpoint_path": "TEXT DEFAULT ''",
+            "candidate_checkpoint_sha256": "TEXT DEFAULT ''",
+            "promotion_report": "TEXT DEFAULT ''",
+            "dataset_manifest_path": "TEXT DEFAULT ''",
+            "dataset_manifest_sha256": "TEXT DEFAULT ''",
+        })
         _backfill_plate_norm(con)
         con.executescript("""
         CREATE INDEX IF NOT EXISTS idx_plate_events_created_at
