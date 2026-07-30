@@ -1,4 +1,4 @@
-# Manual CI trigger
+# Manual CI trigger 2
 # Trusted, isolated validation for BC Vision ANPR pull requests.
 # Per-job temporary storage keeps installed BC Vision data out of CI.
 name: ANPR PR validation
