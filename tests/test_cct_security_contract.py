@@ -168,7 +168,12 @@ def test_dataset_preflight_rejects_symlinked_image(tmp_path):
     replacement = image.with_name("replacement.png")
     replacement.write_bytes(image.read_bytes())
     image.unlink()
-    image.symlink_to(replacement.name)
+    try:
+        image.symlink_to(replacement.name)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows runner cannot create symbolic links")
+        raise
 
     with pytest.raises(ValueError, match="symlink"):
         _dataset_contract(dataset)
