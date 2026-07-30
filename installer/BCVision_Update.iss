@@ -1,3 +1,4 @@
+; RC17 verified updater build trigger
 #define MyAppName "BC Vision"
 #define MyAppVersion "2.2.0-rc17"
 #define MyAppPublisher "Gilas Abi Alborz"
