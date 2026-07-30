@@ -5,6 +5,7 @@ from collections import defaultdict, deque
 from copy import deepcopy
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from functools import lru_cache
 import math
 import time
 
@@ -87,10 +88,12 @@ def process_frame(
     frame,
     min_detection_confidence=0.25,
     engine_key=None,
+    exclusion_mask=None,
 ):
     results = []
     detector_kwargs = {
         "min_confidence": min_detection_confidence,
+        "exclusion_mask": exclusion_mask,
     }
     if engine_key is not None:
         detector_kwargs["engine_key"] = engine_key
@@ -414,6 +417,14 @@ def process_frame(
             "bbox": item["bbox"],
             "crop": crop,
             "method": item["method"],
+            "quadrilateral": item.get("quadrilateral"),
+            "crop_geometry": item.get(
+                "crop_geometry",
+                "axis-aligned",
+            ),
+            "static_overlay_overlap": float(
+                item.get("static_overlay_overlap", 0.0)
+            ),
             "ocr_engine": ocr_engine,
             "ocr_alternative": ocr_alternative,
             "ocr_disagreement": ocr_disagreement,
@@ -609,6 +620,7 @@ class _Track:
     last_prediction: float = 0.0
     hits: int = 1
     misses: int = 0
+    centers: deque = field(default_factory=lambda: deque(maxlen=6))
 
 
 class PlateConsensusTracker:
@@ -624,6 +636,7 @@ class PlateConsensusTracker:
         emit_unreadable=False,
         min_unreadable_observations=3,
         min_unreadable_seconds=0.8,
+        min_confirmation_span_seconds=0.12,
     ):
         # One or two frames are never enough for a definitive CCTV read.
         self.min_votes = max(3, int(min_votes))
@@ -639,6 +652,10 @@ class PlateConsensusTracker:
         self.min_unreadable_seconds = max(
             0.2,
             float(min_unreadable_seconds),
+        )
+        self.min_confirmation_span_seconds = max(
+            0.05,
+            float(min_confirmation_span_seconds),
         )
         self._tracks: dict[int, _Track] = {}
         self._next_track_id = 1
@@ -670,8 +687,8 @@ class PlateConsensusTracker:
         track.best_frame = frame.copy()
         return True
 
-    @staticmethod
     def _capture_result(
+        self,
         track: _Track,
         refresh=False,
         final_unreadable=False,
@@ -735,6 +752,12 @@ class PlateConsensusTracker:
             "experimental": bool(raw_guess_text),
             "capture_frame": track.best_frame.copy(),
             "consensus_votes": 0,
+            "guess_supporting_frames": 0,
+            "consensus_span_seconds": 0.0,
+            "auto_confirm_min_frames": self.min_votes,
+            "auto_confirm_min_span_seconds": (
+                self.min_confirmation_span_seconds
+            ),
         })
         if final_unreadable and has_raw_guess:
             return auto_confirm_guess(result)
@@ -775,7 +798,7 @@ class PlateConsensusTracker:
         for track in self._tracks.values():
             if timestamp - track.last_seen > self.max_age_seconds:
                 continue
-            score, overlap, proximity, size_ratio = (
+            score, overlap, proximity, size_ratio, _direction = (
                 self._association_score(track, result)
             )
             if score > best_score and (
@@ -803,6 +826,22 @@ class PlateConsensusTracker:
     @staticmethod
     def _association_score(track: _Track, result: dict) -> tuple:
         predicted = track.predicted_bbox or track.bbox
+        if len(track.centers) >= 2:
+            previous_x, previous_y = track.centers[-2]
+            current_x, current_y = track.centers[-1]
+            velocity_x = current_x - previous_x
+            velocity_y = current_y - previous_y
+            if math.hypot(velocity_x, velocity_y) >= 2.0:
+                width = max(2.0, predicted[2] - predicted[0])
+                height = max(2.0, predicted[3] - predicted[1])
+                projected_x = current_x + velocity_x
+                projected_y = current_y + velocity_y
+                predicted = (
+                    projected_x - width / 2.0,
+                    projected_y - height / 2.0,
+                    projected_x + width / 2.0,
+                    projected_y + height / 2.0,
+                )
         detected = result["bbox"]
         overlap = bbox_iou(predicted, detected)
         px1, py1, px2, py2 = (
@@ -832,12 +871,40 @@ class PlateConsensusTracker:
             predicted_area,
             detected_area,
         )
+        direction_consistency = 0.5
+        if len(track.centers) >= 2:
+            previous_x, previous_y = track.centers[-2]
+            current_x, current_y = track.centers[-1]
+            candidate_x = (dx1 + dx2) / 2.0
+            candidate_y = (dy1 + dy2) / 2.0
+            velocity_x = current_x - previous_x
+            velocity_y = current_y - previous_y
+            observed_x = candidate_x - current_x
+            observed_y = candidate_y - current_y
+            velocity_length = math.hypot(velocity_x, velocity_y)
+            observed_length = math.hypot(observed_x, observed_y)
+            if velocity_length >= 1.0 and observed_length >= 1.0:
+                cosine = (
+                    velocity_x * observed_x
+                    + velocity_y * observed_y
+                ) / (velocity_length * observed_length)
+                direction_consistency = min(
+                    1.0,
+                    max(0.0, (cosine + 1.0) / 2.0),
+                )
         score = (
-            0.65 * overlap
-            + 0.25 * proximity
+            0.55 * overlap
+            + 0.20 * proximity
             + 0.10 * size_ratio
+            + 0.15 * direction_consistency
         )
-        return score, overlap, proximity, size_ratio
+        return (
+            score,
+            overlap,
+            proximity,
+            size_ratio,
+            direction_consistency,
+        )
 
     def _associate(self, results, timestamp: float) -> dict[int, _Track]:
         """ByteTrack-style two-pass association over high/low detections."""
@@ -870,10 +937,16 @@ class PlateConsensusTracker:
         available = {track.track_id: track for track in active}
 
         def match(indices, second_pass=False):
-            pairs = []
+            candidates = {}
             for index in indices:
                 for track in available.values():
-                    score, overlap, proximity, size_ratio = (
+                    (
+                        score,
+                        overlap,
+                        proximity,
+                        size_ratio,
+                        direction_consistency,
+                    ) = (
                         self._association_score(track, results[index])
                     )
                     accepted = (
@@ -884,29 +957,90 @@ class PlateConsensusTracker:
                             and size_ratio >= 0.55
                         )
                     )
+                    if (
+                        len(track.centers) >= 2
+                        and direction_consistency < 0.10
+                        and overlap < 0.28
+                    ):
+                        accepted = False
                     if accepted:
-                        pairs.append(
-                            (
-                                score,
-                                overlap,
-                                proximity,
-                                size_ratio,
-                                -track.misses,
-                                index,
-                                track.track_id,
-                            )
+                        candidates.setdefault(index, []).append(
+                            (track.track_id, float(score))
                         )
+
+            ordered_indices = tuple(
+                index for index in indices if index in candidates
+            )
+            track_ids = tuple(sorted(available))
+            track_bits = {
+                track_id: 1 << position
+                for position, track_id in enumerate(track_ids)
+            }
+
+            if len(track_ids) > 12 or len(ordered_indices) > 10:
+                ranked = sorted(
+                    (
+                        (score, index, track_id)
+                        for index, options in candidates.items()
+                        for track_id, score in options
+                    ),
+                    reverse=True,
+                )
+                selected_pairs = []
+                used_detections = set()
+                used_tracks = set()
+                for _score, index, track_id in ranked:
+                    if (
+                        index in used_detections
+                        or track_id in used_tracks
+                    ):
+                        continue
+                    selected_pairs.append((index, track_id))
+                    used_detections.add(index)
+                    used_tracks.add(track_id)
+            else:
+
+                @lru_cache(maxsize=None)
+                def solve(position, used_mask):
+                    if position >= len(ordered_indices):
+                        return 0.0, ()
+                    index = ordered_indices[position]
+                    best_score, best_pairs = solve(
+                        position + 1,
+                        used_mask,
+                    )
+                    for track_id, score in candidates[index]:
+                        bit = track_bits[track_id]
+                        if used_mask & bit:
+                            continue
+                        tail_score, tail_pairs = solve(
+                            position + 1,
+                            used_mask | bit,
+                        )
+                        candidate_score = score + tail_score
+                        candidate_pairs = (
+                            (index, track_id),
+                            *tail_pairs,
+                        )
+                        if (
+                            candidate_score > best_score + 1e-9
+                            or (
+                                abs(candidate_score - best_score) <= 1e-9
+                                and (
+                                    not best_pairs
+                                    or candidate_pairs < best_pairs
+                                )
+                            )
+                        ):
+                            best_score = candidate_score
+                            best_pairs = candidate_pairs
+                    return best_score, best_pairs
+
+                _score, selected_pairs = solve(0, 0)
             used_detections = set()
             used_tracks = set()
-            for *_rank, index, track_id in sorted(
-                pairs,
-                reverse=True,
-            ):
-                if (
-                    index in used_detections
-                    or track_id in used_tracks
-                    or track_id not in available
-                ):
+            for index, track_id in selected_pairs:
+                if track_id not in available:
                     continue
                 assigned[index] = available[track_id]
                 used_detections.add(index)
@@ -1221,6 +1355,41 @@ class PlateConsensusTracker:
         result["raw_guess_engine"] = str(
             result.get("ocr_engine", "")
         )
+        whole_plate_support = []
+        for row in evidence:
+            candidates = {
+                normalize_plate(row.get("plate")),
+                normalize_plate(row.get("raw_guess_norm")),
+                normalize_plate(row.get("raw_guess_text")),
+            }
+            candidates.update(
+                normalize_plate(
+                    hypothesis.get("plate_norm")
+                    or hypothesis.get("plate")
+                )
+                for hypothesis in row.get("plate_hypotheses", [])
+            )
+            if winner_norm in candidates:
+                whole_plate_support.append(row)
+        support_times = [
+            float(row.get("_observed_at", track.last_seen))
+            for row in whole_plate_support
+        ]
+        result["guess_supporting_frames"] = len(
+            whole_plate_support
+        )
+        result["consensus_span_seconds"] = round(
+            (
+                max(support_times) - min(support_times)
+                if len(support_times) >= 2
+                else 0.0
+            ),
+            4,
+        )
+        result["auto_confirm_min_frames"] = self.min_votes
+        result["auto_confirm_min_span_seconds"] = (
+            self.min_confirmation_span_seconds
+        )
 
         engine_support = defaultdict(float)
         alternative_support = defaultdict(float)
@@ -1460,6 +1629,43 @@ class PlateConsensusTracker:
             "consensus_votes": min(vote_counts.values()),
             "consensus_observations": len(evidence),
         })
+        full_support = []
+        if complete:
+            for row, _probabilities in evidence:
+                candidates = {
+                    normalize_plate(row.get("plate")),
+                    normalize_plate(row.get("raw_guess_norm")),
+                    normalize_plate(row.get("raw_guess_text")),
+                }
+                candidates.update(
+                    normalize_plate(
+                        hypothesis.get("plate_norm")
+                        or hypothesis.get("plate")
+                    )
+                    for hypothesis in row.get(
+                        "plate_hypotheses",
+                        [],
+                    )
+                )
+                if normalized in candidates:
+                    full_support.append(row)
+        support_times = [
+            float(row.get("_observed_at", track.last_seen))
+            for row in full_support
+        ]
+        basis["guess_supporting_frames"] = len(full_support)
+        basis["consensus_span_seconds"] = round(
+            (
+                max(support_times) - min(support_times)
+                if len(support_times) >= 2
+                else 0.0
+            ),
+            4,
+        )
+        basis["auto_confirm_min_frames"] = self.min_votes
+        basis["auto_confirm_min_span_seconds"] = (
+            self.min_confirmation_span_seconds
+        )
         if complete:
             basis = auto_confirm_guess(basis)
         if track.best_frame is not None:
@@ -1486,6 +1692,11 @@ class PlateConsensusTracker:
             track.last_prediction = timestamp
             track.hits += 1
             track.misses = 0
+            observed_bbox = result["bbox"]
+            track.centers.append((
+                (observed_bbox[0] + observed_bbox[2]) / 2.0,
+                (observed_bbox[1] + observed_bbox[3]) / 2.0,
+            ))
             result["track_id"] = track.track_id
             result["tracking_engine"] = (
                 "bytetrack-kalman+optical-flow"
@@ -1495,6 +1706,7 @@ class PlateConsensusTracker:
                 for value in filtered_bbox
             )
             observation = deepcopy(result)
+            observation["_observed_at"] = timestamp
             track.observations.append(observation)
             capture_improved = self._consider_capture(track, result, frame)
             consensus = self._consensus(track)

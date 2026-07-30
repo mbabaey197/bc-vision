@@ -127,6 +127,22 @@ def test_old_database_migrates_without_data_loss(
             "SELECT COUNT(*) FROM sqlite_master "
             "WHERE type='table' AND name='anpr_training_runs'"
         ).fetchone()[0] == 1
+        training_columns = {
+            row[1]
+            for row in con.execute(
+                "PRAGMA table_info(anpr_training_runs)"
+            )
+        }
+        assert {
+            "baseline_mean_character_error",
+            "candidate_mean_character_error",
+            "baseline_sha256",
+            "candidate_checkpoint_path",
+            "candidate_checkpoint_sha256",
+            "promotion_report",
+            "dataset_manifest_path",
+            "dataset_manifest_sha256",
+        } <= training_columns
         row = con.execute(
             "SELECT * FROM plate_events WHERE id=1"
         ).fetchone()

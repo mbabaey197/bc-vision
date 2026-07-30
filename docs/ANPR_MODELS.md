@@ -253,10 +253,30 @@ local dataset with a SHA-256 digest and deterministic group-aware
 train/validation split. Frames with the same confirmed plate never cross the
 split boundary.
 Training runs outside live inference and create a candidate CRNN. The candidate
-is evaluated against the currently active model on the isolated validation
-split. It cannot be applied when it regresses or scores below the promotion
-threshold. Applying a verified candidate copies it into persistent storage,
-records its digest and run ID, and atomically changes the active manifest.
+is evaluated against the currently active model on an immutable per-run
+validation snapshot. RC16 stores a hash-verified PyTorch state dictionary next
+to every promoted ONNX model, so later runs start from the active checkpoint;
+the vendor-only first run remains explicitly identified as active-model
+distillation.
+
+Promotion now fails closed unless all of these conditions hold:
+
+- at least 12 independent validation samples;
+- no exact-plate, mean-character-error or per-sample regression;
+- immutable identity of the active baseline and candidate SHA-256;
+- a complete Golden comparison with more exact reads, no slice regression,
+  no false-accept regression and bounded CPU latency;
+- a Golden manifest containing at least 40 operator-labelled samples,
+  20 unique readable plates and at least three samples in every required
+  slice: day, night, fast, angle, blur, glare, unreadable and multi-vehicle.
+
+`tools/prepare_golden_dataset.py` copies operator-labelled media into a
+hash-verified, training-forbidden Golden directory and reports missing
+coverage. The three labels from `01.mp4` remain trusted regression truth, but
+do not satisfy this larger admission contract by themselves. Until real media
+fills every slice and the same end-to-end pipeline passes the comparison, a
+trained candidate remains `awaiting-golden` or `rejected` and cannot be
+applied.
 
 ## Operational limitation
 

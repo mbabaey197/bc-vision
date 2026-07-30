@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import threading
 import time
 
+from .activity import suppress_static_overlay_rows
 from .next_models import (
     engine_mode,
     rollback_to_baseline,
@@ -55,6 +56,7 @@ def process_frame_next(
     min_detection_confidence=0.25,
     engine_key=None,
     detections=None,
+    exclusion_mask=None,
 ) -> list[dict]:
     from .pipeline import image_quality
 
@@ -86,6 +88,10 @@ def process_frame_next(
             engine_key=engine_key,
         )
         detector_state = obb_status()
+    detections = suppress_static_overlay_rows(
+        detections,
+        exclusion_mask,
+    )
     if (
         detector_state.get("attempted")
         and not detector_state.get("model_loaded")
@@ -233,6 +239,7 @@ class EngineRouter:
         min_detection_confidence=0.25,
         engine_key=None,
         mode=None,
+        exclusion_mask=None,
     ) -> EngineFrameResult:
         selected = str(mode or engine_mode())
         baseline_started = time.monotonic()
@@ -242,6 +249,7 @@ class EngineRouter:
                     frame,
                     min_detection_confidence,
                     engine_key,
+                    exclusion_mask=exclusion_mask,
                 )
                 elapsed = (time.monotonic() - baseline_started) * 1000
                 result = EngineFrameResult(
@@ -281,6 +289,7 @@ class EngineRouter:
                         min_detection_confidence,
                         engine_key,
                         detections=primary,
+                        exclusion_mask=exclusion_mask,
                     )
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"

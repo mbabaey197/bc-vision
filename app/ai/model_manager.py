@@ -145,10 +145,45 @@ def active_crnn_model() -> tuple[Path, str, int]:
     return crnn_path(), CRNN_SHA256, CRNN_SIZE
 
 
+def active_crnn_training_checkpoint() -> tuple[Path, str, int] | None:
+    """Return the hash-verified state dict paired with a promoted CRNN."""
+
+    manifest = _active_crnn_manifest_path()
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        filename = str(
+            payload.get("training_checkpoint_filename", "")
+        ).strip()
+        digest = str(
+            payload.get("training_checkpoint_sha256", "")
+        ).strip().upper()
+        size = int(payload.get("training_checkpoint_size", 0))
+        custom_root = (
+            _data_dir()
+            / "models"
+            / "crnn"
+            / "custom"
+        ).resolve()
+        checkpoint = (custom_root / filename).resolve()
+        checkpoint.relative_to(custom_root)
+        if (
+            filename
+            and digest
+            and size > 0
+            and verify_file(checkpoint, digest, size)
+        ):
+            return checkpoint, digest, size
+    except Exception:
+        pass
+    return None
+
+
 def promote_crnn_candidate(
     candidate: Path,
     expected_sha256: str,
     source_run_id: int,
+    training_checkpoint: Path | None = None,
+    training_checkpoint_sha256: str = "",
 ) -> dict:
     candidate = Path(candidate)
     digest = str(expected_sha256).upper()
@@ -171,6 +206,53 @@ def promote_crnn_candidate(
             temporary.unlink(missing_ok=True)
             raise ValueError("Promoted CRNN copy verification failed")
         os.replace(temporary, target)
+    checkpoint_target = None
+    checkpoint_digest = ""
+    checkpoint_size = 0
+    if training_checkpoint is not None:
+        training_checkpoint = Path(training_checkpoint)
+        checkpoint_digest = str(
+            training_checkpoint_sha256
+        ).upper()
+        checkpoint_size = (
+            training_checkpoint.stat().st_size
+            if training_checkpoint.is_file()
+            else 0
+        )
+        if (
+            checkpoint_size <= 0
+            or not verify_file(
+                training_checkpoint,
+                checkpoint_digest,
+                checkpoint_size,
+            )
+        ):
+            raise ValueError(
+                "Candidate CRNN training checkpoint verification failed"
+            )
+        checkpoint_target = custom_root / (
+            f"run-{int(source_run_id)}-{checkpoint_digest[:16]}.pt"
+        )
+        if not verify_file(
+            checkpoint_target,
+            checkpoint_digest,
+            checkpoint_size,
+        ):
+            temporary_checkpoint = checkpoint_target.with_suffix(".tmp")
+            shutil.copy2(
+                training_checkpoint,
+                temporary_checkpoint,
+            )
+            if not verify_file(
+                temporary_checkpoint,
+                checkpoint_digest,
+                checkpoint_size,
+            ):
+                temporary_checkpoint.unlink(missing_ok=True)
+                raise ValueError(
+                    "Promoted CRNN checkpoint copy verification failed"
+                )
+            os.replace(temporary_checkpoint, checkpoint_target)
     manifest = _active_crnn_manifest_path()
     manifest.parent.mkdir(parents=True, exist_ok=True)
     temporary_manifest = manifest.with_suffix(".tmp")
@@ -182,6 +264,13 @@ def promote_crnn_candidate(
                 "sha256": digest,
                 "size": size,
                 "source_run_id": int(source_run_id),
+                "training_checkpoint_filename": (
+                    checkpoint_target.name
+                    if checkpoint_target is not None
+                    else ""
+                ),
+                "training_checkpoint_sha256": checkpoint_digest,
+                "training_checkpoint_size": checkpoint_size,
             },
             ensure_ascii=False,
             indent=2,
@@ -200,6 +289,12 @@ def promote_crnn_candidate(
         "sha256": digest,
         "size": size,
         "source_run_id": int(source_run_id),
+        "training_checkpoint_path": (
+            str(checkpoint_target)
+            if checkpoint_target is not None
+            else ""
+        ),
+        "training_checkpoint_sha256": checkpoint_digest,
     }
 
 

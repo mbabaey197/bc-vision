@@ -140,6 +140,7 @@ def _verified_samples() -> list[dict]:
             "image_path": str(path),
             "sha256": str(row["sample_sha256"]).upper(),
             "plate": label,
+            "group_id": label,
             "split": stable_split_for_group(label),
         })
     return samples
@@ -165,18 +166,44 @@ def dataset_status() -> dict:
         "minimum_train": MIN_TRAIN_SAMPLES,
         "minimum_validation": MIN_VALIDATION_SAMPLES,
         "minimum_unique_plates": MIN_UNIQUE_PLATES,
+        "identity_overlap": 0,
         "ready": ready,
     }
 
 
-def export_manifest() -> Path:
+def export_manifest(run_id: int | None = None) -> Path:
     samples = _verified_samples()
     root = _training_root()
-    manifest = root / "dataset.json"
+    if run_id is None:
+        manifest = root / "dataset.json"
+    else:
+        manifest = root / "manifests" / f"run-{int(run_id)}.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
     temporary = manifest.with_suffix(".tmp")
+    sample_fingerprint = hashlib.sha256(
+        json.dumps(
+            [
+                {
+                    "feedback_id": row["feedback_id"],
+                    "sha256": row["sha256"],
+                    "plate": row["plate"],
+                    "group_id": row["group_id"],
+                    "split": row["split"],
+                }
+                for row in samples
+            ],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest().upper()
     payload = {
-        "schema": 1,
+        "schema": 2,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "training_source": "operator-confirmed-only",
+        "golden_benchmark_data": False,
+        "group_key": "group_id",
+        "dataset_fingerprint": sample_fingerprint,
         "samples": samples,
     }
     temporary.write_text(
@@ -221,28 +248,62 @@ def _run_training(
             device=device,
             epochs=epochs,
         )
+        from .benchmark import assess_training_candidate
+        from .golden import golden_status
+
+        golden = golden_status()
+        report = assess_training_candidate(result, golden)
+        golden_only = all(
+            reason == "golden-not-ready"
+            or reason == "golden-comparison-missing"
+            or reason.startswith("golden:")
+            for reason in report["reasons"]
+        )
         status = (
             "candidate-ready"
-            if result["candidate_accuracy"]
-            >= result["baseline_accuracy"]
-            and result["candidate_accuracy"] >= 0.70
+            if report["promote"]
+            else "awaiting-golden"
+            if golden_only
             else "rejected"
         )
         message = (
-            "مدل نامزد آزمون را بدون افت پشت سر گذاشت."
+            "مدل نامزد همه دروازه‌های Validation و Golden را گذراند."
             if status == "candidate-ready"
-            else "مدل نامزد از موتور فعال بهتر نبود و اعمال نشد."
+            else (
+                "مدل آموزش دید، اما تا تکمیل و قبولی Golden فعال نمی‌شود."
+                if status == "awaiting-golden"
+                else "مدل نامزد یک یا چند دروازه ارتقا را رد کرد."
+            )
         )
         with connect() as con:
             con.execute(
                 "UPDATE anpr_training_runs SET status=?,"
                 "baseline_accuracy=?,candidate_accuracy=?,"
+                "baseline_mean_character_error=?,"
+                "candidate_mean_character_error=?,"
+                "baseline_sha256=?,promotion_report=?,"
+                "candidate_checkpoint_path=?,"
+                "candidate_checkpoint_sha256=?,"
                 "candidate_path=?,candidate_sha256=?,message=?,"
                 "finished_at=CURRENT_TIMESTAMP WHERE id=?",
                 (
                     status,
                     float(result["baseline_accuracy"]),
                     float(result["candidate_accuracy"]),
+                    float(
+                        result["baseline_mean_character_error"]
+                    ),
+                    float(
+                        result["candidate_mean_character_error"]
+                    ),
+                    str(result["baseline_sha256"]).upper(),
+                    json.dumps(
+                        report,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    result["candidate_checkpoint_path"],
+                    result["candidate_checkpoint_sha256"],
                     result["candidate_path"],
                     result["candidate_sha256"],
                     message,
@@ -299,7 +360,15 @@ def start_training(device="auto", epochs=12) -> dict:
                 ),
             )
             run_id = int(cursor.lastrowid)
-        manifest = export_manifest()
+        manifest = export_manifest(run_id)
+        manifest_sha256 = _sha256(manifest)
+        with connect() as con:
+            con.execute(
+                "UPDATE anpr_training_runs SET "
+                "dataset_manifest_path=?,dataset_manifest_sha256=? "
+                "WHERE id=?",
+                (str(manifest), manifest_sha256, run_id),
+            )
         _TRAINING_THREAD = threading.Thread(
             target=_run_training,
             args=(run_id, manifest, device, epochs),
@@ -312,7 +381,7 @@ def start_training(device="auto", epochs=12) -> dict:
 
 def apply_candidate(run_id: int, username: str) -> dict:
     from app.database import connect
-    from .model_manager import promote_crnn_candidate
+    from .model_manager import active_crnn_model, promote_crnn_candidate
 
     with connect() as con:
         row = con.execute(
@@ -321,14 +390,52 @@ def apply_candidate(run_id: int, username: str) -> dict:
         ).fetchone()
     if not row or row["status"] != "candidate-ready":
         raise ValueError("مدل نامزد آماده و تأییدشده‌ای وجود ندارد.")
+    try:
+        report = json.loads(row["promotion_report"] or "")
+    except Exception as exc:
+        raise ValueError("گزارش ارتقای مدل معتبر نیست.") from exc
+    if not report.get("promote"):
+        raise ValueError("دروازه ارتقای مدل نامزد تأیید نشده است.")
+    _active_path, active_sha256, _active_size = active_crnn_model()
+    if str(active_sha256).upper() != str(
+        report.get("baseline_sha256", "")
+    ).upper():
+        raise ValueError(
+            "مدل پایه پس از آموزش تغییر کرده است؛ ارزیابی باید تکرار شود."
+        )
     candidate = Path(row["candidate_path"] or "")
     expected = str(row["candidate_sha256"] or "").upper()
     if not candidate.is_file() or _sha256(candidate) != expected:
         raise ValueError("فایل مدل نامزد یا SHA-256 آن معتبر نیست.")
+    manifest = Path(row["dataset_manifest_path"] or "")
+    manifest_digest = str(
+        row["dataset_manifest_sha256"] or ""
+    ).upper()
+    if (
+        not manifest.is_file()
+        or _sha256(manifest) != manifest_digest
+    ):
+        raise ValueError("Snapshot دیتاست آموزش معتبر نیست.")
+    manifest_payload = json.loads(
+        manifest.read_text(encoding="utf-8")
+    )
+    trained_feedback_ids = sorted({
+        int(sample["feedback_id"])
+        for sample in manifest_payload.get("samples", [])
+        if int(sample.get("feedback_id", 0)) > 0
+    })
     promoted = promote_crnn_candidate(
         candidate,
         expected,
         source_run_id=int(run_id),
+        training_checkpoint=(
+            Path(row["candidate_checkpoint_path"])
+            if row["candidate_checkpoint_path"]
+            else None
+        ),
+        training_checkpoint_sha256=str(
+            row["candidate_checkpoint_sha256"] or ""
+        ),
     )
     with connect() as con:
         con.execute(
@@ -336,9 +443,14 @@ def apply_candidate(run_id: int, username: str) -> dict:
             "applied_at=CURRENT_TIMESTAMP,applied_by=? WHERE id=?",
             (username, int(run_id)),
         )
-        con.execute(
-            "UPDATE anpr_feedback SET training_status='trained',"
-            "trained_run_id=? WHERE training_status='ready'",
-            (int(run_id),),
-        )
+        if trained_feedback_ids:
+            placeholders = ",".join(
+                "?" for _ in trained_feedback_ids
+            )
+            con.execute(
+                "UPDATE anpr_feedback SET training_status='trained',"
+                f"trained_run_id=? WHERE id IN ({placeholders}) "
+                "AND training_status='ready'",
+                (int(run_id), *trained_feedback_ids),
+            )
     return promoted
