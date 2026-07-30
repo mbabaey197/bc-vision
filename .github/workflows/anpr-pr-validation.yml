@@ -1,4 +1,4 @@
-# Trusted base-branch validation for BC Vision ANPR pull requests.
+# Trusted, isolated validation for BC Vision ANPR pull requests.
 name: ANPR PR validation
 
 on:
