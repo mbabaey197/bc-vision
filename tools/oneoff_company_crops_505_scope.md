@@ -1,0 +1,1 @@
+Temporary one-off benchmark only. It reads the verified 505-image company review HTML and optional operator review export from the BC Vision Windows runner, runs current production OCR plus the available signed/hash-pinned Shadow candidate, writes visual HTML/CSV/JSON outputs, and does not modify installed models, database, settings, or main.
