@@ -67,6 +67,7 @@ def test_release_version_metadata_stays_consistent():
         assert f'#define MyAppVersion "{version}"' in source
         assert f"OutputBaseFilename={prefix}{version}" in source
         assert "VersionInfoVersion=2.2.0.17" in source
+        assert "PrivilegesRequiredOverridesAllowed=commandline" in source
 
 
 def test_windows_build_and_source_launch_are_windowless():
@@ -135,3 +136,61 @@ def test_windows_gate_runs_detector_and_ocr_inside_installed_executable():
     assert workflow.count('"--verify-anpr"') == 2
     assert "firstJson.anpr_ready" in workflow
     assert "updatedJson.anpr_ready" in workflow
+
+
+def test_fast_updater_reuses_build_cache_and_skips_full_installer():
+    root = Path(__file__).resolve().parents[1]
+    build = (root / "BUILD_PORTABLE_EXE.bat").read_text(
+        encoding="utf-8",
+    )
+    workflow = (
+        root / ".github" / "workflows" / "windows-fast-updater.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "BCVISION_INCREMENTAL_BUILD" in build
+    assert "build_dependency_stamp.py check" in build
+    assert 'set "BCVISION_PYINSTALLER_CLEAN=--clean"' in build
+    assert 'set "BCVISION_PYINSTALLER_CLEAN="' in build
+    assert "clean: false" in workflow
+    assert 'BCVISION_INCREMENTAL_BUILD: "1"' in workflow
+    assert "Build only the one-click updater" in workflow
+    assert "installer\\BCVision_Update.iss" in workflow
+    assert "installer\\BCVision.iss" not in workflow
+    assert "BCVision_Setup_v" not in workflow
+    assert "compression-level: 0" in workflow
+
+
+def test_full_windows_release_is_manual_and_non_cancelling():
+    root = Path(__file__).resolve().parents[1]
+    workflow = (
+        root / ".github" / "workflows" / "windows-release-candidate.yml"
+    ).read_text(encoding="utf-8")
+
+    trigger_block = workflow.split("permissions:", 1)[0]
+    assert "workflow_dispatch:" in trigger_block
+    assert "push:" not in trigger_block
+    assert "pull_request:" not in trigger_block
+    assert "cancel-in-progress: false" in workflow
+    assert "ensure_inno_setup.ps1" in workflow
+
+
+def test_fast_update_uses_reusable_verified_packaging_tools():
+    root = Path(__file__).resolve().parents[1]
+    inno = (root / "scripts" / "ensure_inno_setup.ps1").read_text(
+        encoding="utf-8",
+    )
+    verifier = (root / "scripts" / "verify_fast_update.ps1").read_text(
+        encoding="utf-8",
+    )
+    updater = (
+        root / "installer" / "BCVision_Update.iss"
+    ).read_text(encoding="utf-8")
+
+    assert "RUNNER_TOOL_CACHE" in inno
+    assert "Get-AuthenticodeSignature" in inno
+    assert 'Status -ne "Valid"' in inno
+    assert '"--verify-anpr"' in verifier
+    assert "Database marker was not preserved" in verifier
+    assert "AI model marker was not preserved" in verifier
+    assert "Compression=lzma2/fast" in updater
+    assert "SolidCompression=no" in updater

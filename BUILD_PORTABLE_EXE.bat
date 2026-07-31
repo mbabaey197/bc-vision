@@ -4,6 +4,14 @@ chcp 65001 >nul
 cd /d "%~dp0"
 set "PYTHONUTF8=1"
 
+rem Normal release builds stay reproducible and clean.  The dedicated fast
+rem updater workflow opts into PyInstaller's incremental cache explicitly.
+set "BCVISION_PYINSTALLER_CLEAN=--clean"
+if /I "%BCVISION_INCREMENTAL_BUILD%"=="1" (
+    set "BCVISION_PYINSTALLER_CLEAN="
+    echo Incremental Windows build cache is enabled.
+)
+
 set "PY="
 py -3.13 --version >nul 2>&1 && set "PY=py -3.13"
 
@@ -38,26 +46,41 @@ if not exist ".buildvenv\Scripts\python.exe" (
 
 set "BUILD_PY=%CD%\.buildvenv\Scripts\python.exe"
 
-"%BUILD_PY%" -m pip install ^
-    --disable-pip-version-check ^
-    -r requirements-lock.txt ^
-    -r requirements-ai-lock.txt
-if errorlevel 1 goto :error
+"%BUILD_PY%" scripts\build_dependency_stamp.py check ^
+    ".buildvenv\.bcvision-dependencies.sha256" ^
+    requirements-lock.txt requirements-ai-lock.txt
+if errorlevel 1 (
+    "%BUILD_PY%" -m pip install ^
+        --disable-pip-version-check ^
+        -r requirements-lock.txt ^
+        -r requirements-ai-lock.txt
+    if errorlevel 1 goto :error
+    "%BUILD_PY%" scripts\build_dependency_stamp.py write ^
+        ".buildvenv\.bcvision-dependencies.sha256" ^
+        requirements-lock.txt requirements-ai-lock.txt
+    if errorlevel 1 goto :error
+) else (
+    echo Reusing verified pinned build dependencies.
+)
 
 "%BUILD_PY%" -m pip check
 if errorlevel 1 goto :error
 
-rmdir /s /q .model-seed 2>nul
+if /I not "%BCVISION_INCREMENTAL_BUILD%"=="1" (
+    rmdir /s /q .model-seed 2>nul
+)
 "%BUILD_PY%" -m app.ai.model_manager --seed-dir ".model-seed"
 if errorlevel 1 goto :error
 
-rmdir /s /q build 2>nul
-rmdir /s /q dist 2>nul
+if /I not "%BCVISION_INCREMENTAL_BUILD%"=="1" (
+    rmdir /s /q build 2>nul
+    rmdir /s /q dist 2>nul
+)
 
 rem RC15 operator-assisted ANPR modules are packaged explicitly.
 "%BUILD_PY%" -m PyInstaller ^
     --noconfirm ^
-    --clean ^
+    %BCVISION_PYINSTALLER_CLEAN% ^
     --windowed ^
     --onedir ^
     --name BCVision ^

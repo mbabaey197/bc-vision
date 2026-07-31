@@ -1,0 +1,143 @@
+name: Windows fast updater
+
+# Daily agent-branch updates reuse the self-hosted runner's local PyInstaller
+# cache and publish only the one-click updater.  The complete clean release
+# workflow remains a separate, manually triggered final gate.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "app/**"
+      - "installer/**"
+      - "scripts/build_dependency_stamp.py"
+      - "scripts/ensure_inno_setup.ps1"
+      - "scripts/verify_fast_update.ps1"
+      - "tests/**"
+      - "launcher.py"
+      - "VERSION"
+      - "BUILD_PORTABLE_EXE.bat"
+      - "requirements-lock.txt"
+      - "requirements-ai-lock.txt"
+      - "requirements-test.txt"
+      - ".github/workflows/windows-fast-updater.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-fast-updater-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build-test-update:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 60
+    env:
+      BCVISION_INCREMENTAL_BUILD: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Checkout candidate without deleting local build caches
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Read candidate version
+        id: version
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $value = (Get-Content VERSION -Raw).Trim()
+          "value=$value" >> $env:GITHUB_OUTPUT
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.0"
+          enable-cache: true
+          cache-python: true
+          cache-dependency-glob: requirements-test.txt
+
+      - name: Reuse Python 3.13 test environment
+        shell: cmd
+        run: |
+          if not exist .venv\Scripts\python.exe uv python install 3.13
+          if not exist .venv\Scripts\python.exe uv venv --python 3.13 --seed .venv
+          echo %CD%\.venv\Scripts>>"%GITHUB_PATH%"
+
+      - name: Run source regression
+        shell: cmd
+        env:
+          BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\fast-regression
+        run: |
+          python scripts\build_dependency_stamp.py check .venv\.bcvision-test-dependencies.sha256 requirements-test.txt
+          if errorlevel 1 python -m pip install --disable-pip-version-check -r requirements-test.txt --quiet
+          if errorlevel 1 exit /b 1
+          python scripts\build_dependency_stamp.py write .venv\.bcvision-test-dependencies.sha256 requirements-test.txt
+          python -m compileall -q app launcher.py
+          python -m pytest -q tests
+
+      - name: Build Windows application with the warm local cache
+        shell: cmd
+        run: BUILD_PORTABLE_EXE.bat
+
+      - name: Verify windowless Windows service host
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          python scripts\verify_windows_gui_subsystem.py `
+            dist\BCVision\BCVision.exe
+
+      - name: Reuse verified Inno Setup
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $iscc = & .\scripts\ensure_inno_setup.ps1
+          if (-not $iscc -or -not (Test-Path $iscc)) {
+            throw "ISCC.exe was not prepared"
+          }
+          "INNO_ISCC=$iscc" >> $env:GITHUB_ENV
+
+      - name: Build only the one-click updater
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          & $env:INNO_ISCC installer\BCVision_Update.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify updater, ANPR and persistent data
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          & .\scripts\verify_fast_update.ps1 `
+            -UpdatePath "setup_output\BCVision_Update_v$version.exe" `
+            -DistPath "dist\BCVision" `
+            -Version $version `
+            -WorkRoot $env:RUNNER_TEMP
+
+      - name: Create updater checksum
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          $releaseDir = Join-Path $PWD "fast-update"
+          if (Test-Path $releaseDir) {
+            Remove-Item $releaseDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $releaseDir | Out-Null
+          $update = "setup_output\BCVision_Update_v$version.exe"
+          Copy-Item $update $releaseDir
+          $target = Join-Path $releaseDir (Split-Path $update -Leaf)
+          $hash = (Get-FileHash $target -Algorithm SHA256).Hash
+          Set-Content `
+            -Path "$target.sha256" `
+            -Value "$hash  $(Split-Path $target -Leaf)" `
+            -Encoding ascii
+
+      - name: Upload verified fast updater
+        uses: actions/upload-artifact@v4
+        with:
+          name: BCVision-${{ steps.version.outputs.value }}-fast-updater-${{ github.run_number }}
+          path: fast-update/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
