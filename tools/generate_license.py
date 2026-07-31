@@ -5,14 +5,18 @@ import base64
 import json
 import os
 import secrets
+import sys
 from datetime import date, timedelta
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from cryptography.hazmat.primitives import serialization
 
 from app.license_format import canonical, encode_document
 
-ROOT = Path(__file__).resolve().parent.parent
 KEY_DIR = Path(__file__).resolve().parent / "keys"
 DEFAULT_PRIVATE = KEY_DIR / "license_private_key.pem"
 DEFAULT_PUBLIC = ROOT / "license_public_key.pem"
