@@ -1,2 +1,2 @@
 Run the one-off IR-LPR old-vs-new visual regression benchmark on the exact validation and test archives.
-Trigger attempt 6 with the minimal ONNX/OpenCV runtime.
+Trigger attempt 7 using Windows PowerShell available on the runner.
