@@ -2,16 +2,16 @@
 name: BC Vision 505 company crops one-off
 
 on:
-  pull_request:
+  push:
     branches:
       - main
     paths:
-      - "tools/oneoff_company_crops_505_trigger.txt"
-      - "tools/oneoff_company_crops_test.py.b64.part*"
-      - ".github/workflows/**"
+      - "oneoff-runs/company-crops-505-20260731.txt"
 
 permissions:
   contents: read
+  issues: write
+  pull-requests: write
 
 concurrency:
   group: bcvision-company-crops-505-oneoff
@@ -82,3 +82,53 @@ jobs:
             ${{ runner.temp }}\bcvision-company-crops-505\BCVision_505_Company_Crops_Test_Report.zip
           if-no-files-found: error
           retention-days: 7
+
+      - name: Publish sanitized run summary to temporary PR
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          REPORT_PATH: ${{ env.BCVISION_TEST_OUTPUT }}\BCVision_505_Summary.json
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- bcvision-company-crops-505-run -->';
+            let result = {
+              run_id: context.runId,
+              run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+              artifact_name: 'bcvision-company-crops-505-full-report',
+              status: 'failed-before-summary'
+            };
+            if (fs.existsSync(process.env.REPORT_PATH)) {
+              const s = JSON.parse(fs.readFileSync(process.env.REPORT_PATH, 'utf8'));
+              const clean = (m) => ({
+                samples: m?.samples ?? 0,
+                exact_matches: m?.exact_matches ?? 0,
+                full_plate_accuracy: m?.full_plate_accuracy ?? 0,
+                character_accuracy: m?.character_accuracy ?? 0,
+                accepted_samples: m?.accepted_samples ?? 0,
+                accepted_precision: m?.accepted_precision ?? 0,
+                rejection_rate: m?.rejection_rate ?? 0
+              });
+              result = {
+                run_id: context.runId,
+                run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+                artifact_name: 'bcvision-company-crops-505-full-report',
+                status: 'summary-ready',
+                image_count: s.source?.image_count ?? 0,
+                review: s.review ?? {},
+                old: clean(s.engines?.old?.confirmed_metrics),
+                production: clean(s.engines?.production?.confirmed_metrics),
+                shadow: clean(s.engines?.shadow?.confirmed_metrics),
+                production_mean_latency_ms: s.engines?.production?.mean_latency_ms ?? 0,
+                shadow_mean_latency_ms: s.engines?.shadow?.mean_latency_ms ?? 0,
+                shadow_sha256: s.engines?.shadow?.sha256 ?? '',
+                verdict: s.verdict ?? ''
+              };
+            }
+            const body = `${marker}\n\`\`\`json\n${JSON.stringify(result, null, 2)}\n\`\`\``;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 39,
+              body
+            });
