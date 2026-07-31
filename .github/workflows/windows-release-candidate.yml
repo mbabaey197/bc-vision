@@ -1,6 +1,7 @@
 name: Windows release candidate
 
 # Candidate builds run on each relevant agent-branch update.
+# Candidate build for merged RC17 update test: 2c33537
 
 on:
   workflow_dispatch:
