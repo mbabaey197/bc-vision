@@ -821,6 +821,19 @@ records are
 `agent-results/latest/ANPR_COMPANY_CROPS_01_REVIEW.md` and
 `agent-results/latest/ANPR_COMPANY_CROPS_01_FINE_TUNE.md`.
 
+## Fast Windows updater pipeline
+
+Windows packaging is split into two gates.  Agent-branch pushes use the
+incremental `windows-fast-updater.yml` path, which retains the local
+PyInstaller/Python/model caches on the self-hosted runner, reuses a verified
+Inno Setup installation, builds only the one-click updater and publishes only
+that executable plus its SHA-256.  The complete clean Setup/update/install/
+uninstall gate remains manually triggered in
+`windows-release-candidate.yml` and cannot be cancelled by a later commit.
+Incremental behavior is opt-in; `BUILD_PORTABLE_EXE.bat` remains clean by
+default.  Details and the safety boundary are recorded in
+`agent-results/latest/WINDOWS_FAST_UPDATE_PIPELINE_RC17.md`.
+
 ## OCR geometry and temporal-safety correction
 
 The earlier `2/16` metric described exact OCR reconstruction, not human
