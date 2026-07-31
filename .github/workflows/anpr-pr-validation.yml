@@ -137,6 +137,7 @@ jobs:
       - name: Run exact old-vs-new visual benchmark
         shell: cmd
         run: |
+          set PYTHONPATH=%CD%
           python tools\oneoff_ir_lpr_retest.py --ci --output "%RUNNER_TEMP%\bcvision-ir-lpr-retest" --source-commit "${{ github.event.pull_request.base.sha }}"
       - name: Upload visual retest report
         if: always()
