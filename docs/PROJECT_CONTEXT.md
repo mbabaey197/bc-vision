@@ -823,7 +823,7 @@ records are
 
 ## Fast Windows updater pipeline
 
-Windows packaging is split into two gates.  Agent-branch pushes use the
+Windows packaging is split into two gates.  Pull-request updates use the
 incremental `windows-fast-updater.yml` path, which retains the local
 PyInstaller/Python/model caches on the self-hosted runner, reuses a verified
 Inno Setup installation, builds only the one-click updater and publishes only
