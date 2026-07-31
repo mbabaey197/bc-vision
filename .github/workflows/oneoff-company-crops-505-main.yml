@@ -1,0 +1,82 @@
+# Temporary one-off runner entrypoint; remove after artifact collection.
+name: BC Vision 505 company crops one-off
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "oneoff-runs/company-crops-505-20260731.txt"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bcvision-company-crops-505-oneoff
+  cancel-in-progress: true
+
+jobs:
+  company-crops-505-test:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 60
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      BCVISION_CPU_THREADS: "2"
+      BCVISION_TEST_OUTPUT: ${{ runner.temp }}\bcvision-company-crops-505\report
+    steps:
+      - name: Checkout isolated test branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/company-crops-505-test-20260731
+          clean: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          version: "0.12.0"
+          enable-cache: true
+          cache-python: true
+          cache-dependency-glob: requirements-ai-lock.txt
+
+      - name: Set up portable Python
+        shell: cmd
+        run: |
+          uv python install 3.13
+          uv venv --python 3.13 --seed .venv
+          echo %CD%\.venv\Scripts>>"%GITHUB_PATH%"
+
+      - name: Install OCR benchmark dependencies
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip --quiet
+          python -m pip install -r requirements-ai-lock.txt --quiet
+          python -m pip check
+
+      - name: Reconstruct and verify isolated benchmark script
+        shell: pwsh
+        run: |
+          $parts = Get-ChildItem tools\oneoff_company_crops_test.py.b64.part* | Sort-Object Name
+          $encoded = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ""
+          [IO.File]::WriteAllBytes("tools\oneoff_company_crops_test.py", [Convert]::FromBase64String($encoded))
+          $actual = (Get-FileHash tools\oneoff_company_crops_test.py -Algorithm SHA256).Hash
+          if ($actual -ne "1935B6CEBEDC74A13AE3F802D74B4D16633015271B0EDA68F7576CC735367267") { throw "Benchmark script digest mismatch" }
+          python -m py_compile tools\oneoff_company_crops_test.py
+
+      - name: Run full 505-image company-crop benchmark
+        shell: cmd
+        run: |
+          python tools\oneoff_company_crops_test.py --output "%BCVISION_TEST_OUTPUT%"
+
+      - name: Upload full visual report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bcvision-company-crops-505-full-report
+          path: |
+            ${{ env.BCVISION_TEST_OUTPUT }}\BCVision_505_Full_Test_Report.html
+            ${{ env.BCVISION_TEST_OUTPUT }}\BCVision_505_Detailed_Results.csv
+            ${{ env.BCVISION_TEST_OUTPUT }}\BCVision_505_Summary.json
+            ${{ env.BCVISION_TEST_OUTPUT }}\README_FA.md
+            ${{ runner.temp }}\bcvision-company-crops-505\BCVision_505_Company_Crops_Test_Report.zip
+          if-no-files-found: error
+          retention-days: 7
