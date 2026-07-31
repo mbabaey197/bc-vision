@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   company-crops-505-test:
-    if: github.head_ref == 'agent/company-crops-505-test-20260731'
+    if: startsWith(github.head_ref, 'agent/company-crops-505-')
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 60
     env:
