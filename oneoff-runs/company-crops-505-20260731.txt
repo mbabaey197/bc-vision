@@ -1,1 +1,2 @@
 Run full verified 505-image company-owned crop benchmark from agent/company-crops-505-test-20260731.
+Final visible run with sanitized summary callback to PR 39.
