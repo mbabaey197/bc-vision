@@ -1,6 +1,7 @@
 name: Offline license validation
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - agent/harden-license-enforcement
