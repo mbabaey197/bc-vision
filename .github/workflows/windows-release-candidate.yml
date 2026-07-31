@@ -149,14 +149,19 @@ jobs:
           $update = Resolve-Path "setup_output\BCVision_Update_v$version.exe"
           $firstResult = Join-Path $env:RUNNER_TEMP "self-test-install.json"
           $updatedResult = Join-Path $env:RUNNER_TEMP "self-test-update.json"
+          $setupLog = Join-Path $env:RUNNER_TEMP "bcvision-setup.log"
+          $updateLog = Join-Path $env:RUNNER_TEMP "bcvision-update.log"
 
           $install = Start-Process -FilePath $setup -ArgumentList @(
             "/VERYSILENT",
             "/SUPPRESSMSGBOXES",
             "/NORESTART",
+            "/CURRENTUSER",
+            "/LOG=$setupLog",
             "/DIR=$installDir"
           ) -Wait -PassThru
           if ($install.ExitCode -ne 0) {
+            if (Test-Path $setupLog) { Get-Content $setupLog }
             throw "Installer exited with $($install.ExitCode)"
           }
 
@@ -186,9 +191,12 @@ jobs:
             "/VERYSILENT",
             "/SUPPRESSMSGBOXES",
             "/NORESTART",
+            "/CURRENTUSER",
+            "/LOG=$updateLog",
             "/DIR=$installDir"
           ) -Wait -PassThru
           if ($upgrade.ExitCode -ne 0) {
+            if (Test-Path $updateLog) { Get-Content $updateLog }
             throw "Updater exited with $($upgrade.ExitCode)"
           }
 
