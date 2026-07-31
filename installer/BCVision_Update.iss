@@ -15,10 +15,13 @@ DisableProgramGroupPage=yes
 UsePreviousAppDir=yes
 OutputDir=..\setup_output
 OutputBaseFilename=BCVision_Update_v2.2.0-rc17
-Compression=lzma2
-SolidCompression=yes
+; Updaters favor build/deployment latency over the smallest possible archive.
+; The full installer keeps maximum solid compression in BCVision.iss.
+Compression=lzma2/fast
+SolidCompression=no
 WizardStyle=modern
 PrivilegesRequired=admin
+PrivilegesRequiredOverridesAllowed=commandline
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 CloseApplications=yes
