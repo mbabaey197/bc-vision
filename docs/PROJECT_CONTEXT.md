@@ -897,6 +897,7 @@ from both the dashboard and event archive.
 Database, users, camera settings and historical event rows are preserved. No
 historical media is deleted by this migration. The implementation record is
 `agent-results/latest/ANPR_VISUAL_ROI_STILL_EVIDENCE_RC18.md`.
+
 # RC19 — plate-shaped search and conditional rescue OCR (2026-07-31)
 
 - RC19 is based on the verified RC18 commit `eecc7b9` from Draft PR #32.
@@ -913,4 +914,3 @@ historical media is deleted by this migration. The implementation record is
 - Existing operator-confirmed feedback, images, settings, users and historical
   events are preserved. IR-LPR-derived candidate weights remain research/shadow
   only until a written commercial license is obtained.
-

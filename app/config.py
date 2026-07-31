@@ -3,7 +3,7 @@ import json, os, sys
 
 COMPANY_NAME = "گیلاس آبی البرز"
 APP_NAME = "BC Vision"
-APP_VERSION = "2.2.0-rc18"
+APP_VERSION = "2.2.0-rc19"
 HOST = "127.0.0.1"
 PORT = 8000
 

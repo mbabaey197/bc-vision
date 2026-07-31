@@ -66,7 +66,7 @@ def test_release_version_metadata_stays_consistent():
         ).read_text(encoding="utf-8")
         assert f'#define MyAppVersion "{version}"' in source
         assert f"OutputBaseFilename={prefix}{version}" in source
-        assert "VersionInfoVersion=2.2.0.18" in source
+        assert "VersionInfoVersion=2.2.0.19" in source
         assert "PrivilegesRequiredOverridesAllowed=commandline" in source
 
 

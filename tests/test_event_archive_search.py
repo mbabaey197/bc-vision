@@ -531,10 +531,8 @@ def test_html_like_plate_filter_is_escaped_and_does_not_match_all(
 
     assert response.status_code == 200
     assert _report_event_ids(response.text) == []
-    assert (
-        "value='&lt;script&gt;alert(1)&lt;/script&gt;'"
-        in response.text
-    )
+    assert payload not in response.text
+    assert "عبارت واردشده برای جست‌وجوی پلاک معتبر نیست" in response.text
 
 
 def test_archive_video_events_persists_vehicle_plate_and_video_paths(
