@@ -1,2 +1,2 @@
-Run isolated 505-image company-owned crop benchmark.
-Attempt 4 through the tracked main PR-validation workflow.
+Run the verified 505-image company-owned crop benchmark.
+Final-run branch with a fresh head commit and no workflow conflict.
