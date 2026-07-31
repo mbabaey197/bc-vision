@@ -11,6 +11,7 @@ from app.license_format import encode_document
 
 
 def _configure_paths(monkeypatch, tmp_path):
+    original_write_state = license._write_state
     monkeypatch.setattr(license, "LICENSE_PATH", tmp_path / "license.dat")
     monkeypatch.setattr(
         license,
@@ -29,6 +30,14 @@ def _configure_paths(monkeypatch, tmp_path):
         "_STATE_KEY_PATH",
         tmp_path / ".license-state.key",
     )
+
+    def write_state(data, path=None):
+        return original_write_state(
+            data,
+            license._STATE_PATH if path is None else path,
+        )
+
+    monkeypatch.setattr(license, "_write_state", write_state)
 
 
 def _signed_document(tmp_path, payload):
