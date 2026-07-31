@@ -24,6 +24,9 @@ application change into a multi-hour wait.
   cancelled by a later commit.
 - `BUILD_PORTABLE_EXE.bat` remains clean by default.  Incremental behavior is
   opt-in and cannot weaken the final release workflow accidentally.
+- ANPR regression and AI-runtime validation keep separate reusable virtual
+  environments and a persistent verified model cache; their checkout no
+  longer deletes the warm PyInstaller state needed by the updater job.
 - `scripts/ensure_inno_setup.ps1` caches the signed Inno Setup tool under the
   runner tool cache and verifies the Pyrsys B.V. Authenticode signature before
   first use.

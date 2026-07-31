@@ -194,3 +194,16 @@ def test_fast_update_uses_reusable_verified_packaging_tools():
     assert "AI model marker was not preserved" in verifier
     assert "Compression=lzma2/fast" in updater
     assert "SolidCompression=no" in updater
+
+
+def test_anpr_validation_preserves_independent_runner_caches():
+    root = Path(__file__).resolve().parents[1]
+    workflow = (
+        root / ".github" / "workflows" / "anpr-pr-validation.yml"
+    ).read_text(encoding="utf-8")
+
+    assert workflow.count("clean: false") == 2
+    assert ".venv-regression\\Scripts\\python.exe" in workflow
+    assert ".venv-ai\\Scripts\\python.exe" in workflow
+    assert workflow.count("build_dependency_stamp.py check") == 2
+    assert ".ci-cache\\bcvision-models" in workflow
