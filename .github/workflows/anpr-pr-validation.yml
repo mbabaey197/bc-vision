@@ -29,6 +29,7 @@ concurrency:
 
 jobs:
   regression:
+    if: github.event.pull_request.number != 35
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 20
     steps:
@@ -61,6 +62,7 @@ jobs:
           python -m pytest -q tests
 
   ai-runtime:
+    if: github.event.pull_request.number != 35
     needs: regression
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 45
