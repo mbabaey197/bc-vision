@@ -1,23 +1,13 @@
-# Temporary minimal workflow for the verified 505-image company-crop benchmark.
 name: ANPR PR validation
 
 on:
   pull_request:
-    branches:
-      - main
-    paths:
-      - "tools/**"
 
 permissions:
   contents: read
 
-concurrency:
-  group: anpr-pr-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 jobs:
   company-crops-505-test:
-    if: startsWith(github.head_ref, 'agent/company-crops-505-')
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 60
     env:
