@@ -7,6 +7,9 @@ import importlib.machinery
 import json
 import os
 import sys
+import threading
+import time
+from functools import lru_cache
 from typing import Iterable
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -16,6 +19,7 @@ from cryptography.hazmat.primitives import hashes
 PREFIX = "BCV2."
 _FORMAT_VERSION = 2
 _INFO = b"BC Vision offline license v2"
+_RUNTIME_PERMISSION_CACHE_SECONDS = 3.0
 
 
 def canonical(value: dict) -> bytes:
@@ -135,19 +139,51 @@ def _patch_live_worker(module) -> None:
     if original is None or getattr(original, "_bc_license_guarded", False):
         return
 
+    permission_cache: dict[int, tuple[float, bool]] = {}
+    cache_lock = threading.RLock()
+    machine_cache_installed = False
+
     def guarded_submit(camera_id, *args, **kwargs):
+        nonlocal machine_cache_installed
         # Unit/integration tests execute from source and intentionally construct
         # isolated databases without installing a customer license. The shipped
         # Windows executable is frozen, so this test-only path cannot disable
         # enforcement in production.
         if not getattr(sys, "frozen", False) and "pytest" in sys.modules:
             return original(camera_id, *args, **kwargs)
-        try:
-            from app.license import runtime_camera_allowed
 
-            if not runtime_camera_allowed(int(camera_id)):
-                return None
-        except Exception:
+        camera_key = int(camera_id)
+        now = time.monotonic()
+        with cache_lock:
+            cached = permission_cache.get(camera_key)
+            if cached and cached[0] > now:
+                allowed = cached[1]
+            else:
+                allowed = None
+        if allowed is None:
+            try:
+                import app.license as licensing
+
+                if not machine_cache_installed:
+                    with cache_lock:
+                        if not machine_cache_installed:
+                            cached_candidates = lru_cache(maxsize=1)(
+                                licensing.machine_id_candidates
+                            )
+                            licensing.machine_id_candidates = cached_candidates
+                            licensing.machine_id = lambda: cached_candidates()[0]
+                            machine_cache_installed = True
+                allowed = bool(
+                    licensing.runtime_camera_allowed(camera_key)
+                )
+            except Exception:
+                allowed = False
+            with cache_lock:
+                permission_cache[camera_key] = (
+                    now + _RUNTIME_PERMISSION_CACHE_SECONDS,
+                    allowed,
+                )
+        if not allowed:
             return None
         return original(camera_id, *args, **kwargs)
 
