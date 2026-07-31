@@ -10,21 +10,6 @@ on:
       - main
     paths:
       - ".github/workflows/windows-release-candidate.yml"
-  push:
-    branches:
-      - "agent/**"
-    paths:
-      - "app/**"
-      - "installer/**"
-      - "tests/**"
-      - "launcher.py"
-      - "VERSION"
-      - "BUILD_PORTABLE_EXE.bat"
-      - "requirements-lock.txt"
-      - "requirements-ai-lock.txt"
-      - "requirements-test.txt"
-      - ".github/workflows/windows-release-candidate.yml"
-
 permissions:
   contents: read
 
