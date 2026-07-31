@@ -1,4 +1,5 @@
-# Trusted base-branch validation for BC Vision ANPR pull requests.
+# Trusted, isolated validation for BC Vision ANPR pull requests.
+# Per-job temporary storage keeps installed BC Vision data out of CI.
 name: ANPR PR validation
 
 on:
@@ -13,7 +14,11 @@ on:
       - "requirements-lock.txt"
       - "requirements-ai-lock.txt"
       - "requirements-test.txt"
+      - "requirements-cct-training.txt"
       - "tests/**"
+      - "tools/**"
+      - "training/**"
+      - "docs/ANPR_MODELS.md"
       - ".github/workflows/**"
 
 permissions:
@@ -25,55 +30,73 @@ concurrency:
 
 jobs:
   regression:
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
-          python-version: "3.13"
-          cache: pip
-          cache-dependency-path: requirements-test.txt
+          version: "0.12.0"
+          enable-cache: true
+          cache-python: true
+          cache-dependency-glob: requirements-test.txt
+      - name: Set up portable Python
+        shell: cmd
+        run: |
+          uv python install 3.13
+          uv venv --python 3.13 --seed .venv
+          echo %CD%\.venv\Scripts>>"%GITHUB_PATH%"
       - name: Install test dependencies
-        shell: pwsh
+        shell: cmd
         run: |
           python -m pip install --disable-pip-version-check --upgrade pip --quiet
           python -m pip install -r requirements-test.txt --quiet
       - name: Compile and test
-        shell: pwsh
+        shell: cmd
         env:
+          BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\regression
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
           python -m compileall -q app/ai app/database.py app/streams.py
           python -m pytest -q tests
 
   ai-runtime:
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 45
     env:
       BCVISION_RUN_AI_INTEGRATION: "1"
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
-          python-version: "3.13"
-          cache: pip
-          cache-dependency-path: requirements-ai-lock.txt
+          version: "0.12.0"
+          enable-cache: true
+          cache-python: true
+          cache-dependency-glob: requirements-ai-lock.txt
+      - name: Set up portable Python
+        shell: cmd
+        run: |
+          uv python install 3.13
+          uv venv --python 3.13 --seed .venv
+          echo %CD%\.venv\Scripts>>"%GITHUB_PATH%"
       - uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}\bcvision-models
           key: bcvision-anpr-models-v2-onnx
       - name: Install AI runtime
-        shell: pwsh
+        shell: cmd
         run: |
           python -m pip install --disable-pip-version-check --upgrade pip --quiet
           python -m pip install -r requirements-ai-lock.txt --quiet
           python -m pip install pytest==9.0.2 --quiet
           python -m pip check
       - name: Verify real engines and models
-        shell: pwsh
+        shell: cmd
         env:
+          BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\ai-runtime
           BCVISION_PLATE_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo.onnx
           BCVISION_PLATE_FALLBACK_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo_fallback.onnx
           BCVISION_CRNN_MODEL: ${{ runner.temp }}\bcvision-models\crnn\ocr_crnn.onnx

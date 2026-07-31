@@ -69,6 +69,7 @@ def test_verified_models_and_real_engines_load(tmp_path):
     assert get_cnn_status()["model_loaded"] is True
 
     from app.ai.training_worker import train_candidate
+    from app.ai.training_manifest import operator_dataset_fingerprint
 
     samples = []
     for index, (label, split) in enumerate((
@@ -81,13 +82,24 @@ def test_verified_models_and_real_engines_load(tmp_path):
         cv2.rectangle(image, (2, 2), (177, 45), (25, 25, 25), 2)
         assert cv2.imwrite(str(image_path), image)
         samples.append({
+            "feedback_id": index + 1,
             "image_path": str(image_path),
             "plate": label,
+            "group_id": label,
+            "sha256": hashlib.sha256(
+                image_path.read_bytes()
+            ).hexdigest().upper(),
             "split": split,
         })
     manifest = tmp_path / "dataset.json"
     manifest.write_text(
-        json.dumps({"schema": 1, "samples": samples}, ensure_ascii=False),
+        json.dumps({
+            "schema": 2,
+            "training_source": "operator-confirmed-only",
+            "golden_benchmark_data": False,
+            "dataset_fingerprint": operator_dataset_fingerprint(samples),
+            "samples": samples,
+        }, ensure_ascii=False),
         encoding="utf-8",
     )
     trained = train_candidate(

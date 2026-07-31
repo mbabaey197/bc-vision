@@ -12,7 +12,8 @@ def test_all_visible_date_and_time_digits_are_persian():
         character.isascii() and character.isdigit()
         for character in datetime_text
     )
-    assert "۱۴:۰۵:۰۹" in datetime_text
+    # SQLite timestamps are UTC; the Persian UI displays Tehran local time.
+    assert "۱۷:۳۵:۰۹" in datetime_text
 
 
 def test_license_expiration_is_jalali_with_persian_digits():

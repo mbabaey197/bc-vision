@@ -5,7 +5,7 @@
 - GitHub repository: `mahdibabaey197/bc-vision`
 - Default branch: `main`
 - Product: BC Vision
-- Current application version in source: `2.2.0-rc12`
+- Current application version in source: `2.2.0-rc17`
 - Windows persistent data root: `C:\ProgramData\BCVision\data`
 
 ## Release contract
@@ -49,6 +49,26 @@ The Iranian plate-recognition subsystem now includes:
 - per-camera ONNX sessions with a hard two-thread ceiling
 - persistent feedback datasets and gated CRNN candidate promotion
 - Jalali visible dates and Persian digits for all visible dates and times
+- dormant signed RC14 OBB/CCT engine with baseline, shadow and next modes
+- photo-calibrated private-plate renderer with fixed glyph cells, versioned
+  geometry and renderer/font SHA-256 provenance
+- mandatory OBB perspective rectification before candidate OCR
+- five-best-frame probability voting and strict ambiguity rejection
+- geometric-only track association; OCR text never links vehicle tracks
+- Golden Dataset promotion gate and atomic runtime rollback
+- temporal proof for operator-assisted confirmation: at least three
+  independent full-plate frames over a non-zero confirmation span
+- low-cost motion wake-up that bypasses idle backoff for entering vehicles
+- temporal fixed-overlay suppression for NVR clock/name/date text
+- globally optimized multi-vehicle association with trajectory direction
+- immutable per-run training snapshots and active-checkpoint continuation
+- fail-closed 40-sample/multi-slice Golden Dataset admission contract
+- atomic Unicode-safe plate and vehicle evidence storage
+- event media health/error tracking and historical storage-root access
+- dashboard and event-report pagination with configurable dashboard row count
+- canonical one/two-character partial plate search
+- SQL-side Jalali date, Tehran-local time, camera-city and plate-region filters
+- immutable per-event observation-city snapshots
 
 ## ANPR model execution contract
 
@@ -132,11 +152,48 @@ The current regression suite covers:
 - immutable operator sample capture and SHA-256 verification
 - additive training-run database migration and gated candidate promotion
 - Persian digits for all visible date/time fields
+- traditional and end-to-end YOLO26-OBB output contracts
+- signed candidate manifest verification and tamper rejection
+- candidate shadow isolation and runtime rollback
+- group-aware dataset splitting without track/plate leakage
 
 The latest full-suite and system optimization result is recorded in
 `agent-results/latest/PROJECT_OPTIMIZATION_PHASE_1.md`: `64 passed, 1 skipped`,
 plus a successful headless runtime smoke and a 1,000-write SQLite concurrency
 and integrity check.
+
+RC16 engine hardening is recorded in
+`agent-results/latest/ANPR_ENGINE_HARDENING_RC16.md`. Its locally executable
+full regression result is `209 passed, 1 skipped`; the skipped check is the
+existing opt-in real AI integration runtime gate. No new real-camera accuracy
+claim was made.
+
+RC17 completes the event evidence and report workflow: live and uploaded-video
+events retain verified plate/vehicle images, the dashboard and report pages
+are paginated, and report filtering operates in SQL over partial canonical
+plates, observation city, plate-region code and Tehran-local Jalali time.
+Media writes fail independently and atomically, existing event/database rows
+are preserved by additive migrations, and retired media roots remain readable
+only through validated containment plus an exact event reference.
+The implementation and validation record is
+`agent-results/latest/ANPR_EVENT_ARCHIVE_SEARCH_RC17.md`; its full local
+regression result is `238 passed, 1 skipped`.
+
+The latest synthetic private-plate fidelity work is recorded in
+`agent-results/latest/ANPR_PLATE_REFERENCE_FIDELITY_V3.md`. Real reference
+photos are measurement-only and never enter a dataset. Manifest schema 3 binds
+each corpus to the exact renderer and separately licensed font stack. The
+focused renderer/provenance/security result is `60 passed`, and the complete
+local regression result is `329 passed, 1 skipped`; no real-camera accuracy or
+activation claim is made.
+
+A later severely overexposed and defocused rear-plate photograph was rejected
+as a glyph/label reference and used only to calibrate the anonymous
+`rear-plate-overexposed-defocus-v1` synthetic condition. The source image and
+its identity remain outside Git and every dataset split. The bounded profile,
+quality gate and scope are recorded in
+`agent-results/latest/ANPR_REFERENCE_DEGRADATION_V4.md`; it affects only future
+dataset builds and does not change or retrain the completed 30K model.
 
 ## Security hardening status
 
@@ -448,8 +505,361 @@ The verified regression result for this combined branch is
 reported `16 passed`. Compile and whitespace checks also passed. Windows
 packaging and installed-build acceptance are still required before release.
 
-## Repository security observation
+## RC13 next ANPR engine scaffold
 
-GitHub reported the repository visibility as public on 2026-07-27, while the
-recorded project requirement is private. This external setting must be
-corrected separately with explicit visibility-change authority.
+Version `2.2.0-rc13` adds the complete runtime boundary needed for the new
+detector/OCR pair while preserving RC12 as the default customer path. The
+candidate detector accepts both traditional YOLO OBB tensors and the
+end-to-end `N x 7` contract, maps the rotated corners back through letterbox
+geometry, and applies a perspective warp before OCR. The candidate OCR keeps
+multiple constrained CTC hypotheses, calculates per-position margins and
+returns `ناخوانا` when confidence or any character margin is insufficient.
+
+Engine mode is `baseline`, `shadow` or `next`. Shadow executes the candidate
+without changing persisted or displayed customer results. A runtime exception
+in `next` atomically selects baseline. The candidate bundle requires a signed
+Ed25519 manifest plus exact SHA-256 and size verification for both ONNX files.
+No untrained or placeholder model file is included.
+
+Track association no longer uses OCR text. It relies on predicted overlap,
+normalized center distance and size consistency, preventing the same wrong OCR
+string from joining two separate vehicles. Consensus uses the five
+highest-quality observations and votes by character probability. A short
+three-frame burst follows first plate visibility; exponential idle backoff
+continues only while no plate is visible.
+
+The Golden Dataset gate compares exact full-plate accuracy, false accepts,
+latency and scenario slices. Related frames are grouped during
+train/validation splitting so one vehicle or confirmed plate cannot leak
+across both sets. Final promotion remains blocked until signed trained weights
+and labelled real-camera videos are available.
+
+Local RC13 regression is `143 passed, 1 skipped`. The skip is the existing real
+ONNX integration test that requires the Windows model bundle. Windows
+installer/update validation and real-video accuracy remain pending release
+gates and are not claimed by this local test.
+
+The real Hezar v2 preprocessing/decoder contract was subsequently completed:
+blank index zero, full id-to-label mapping, mirrored `32x384` input,
+reverse-time constrained decoding and normalized character margins. The
+official checkpoint was exported locally to ONNX with maximum PyTorch parity
+error `0.0000057220458984375` and tested on all 546 frames of `01.mp4`.
+Baseline and the Hezar hybrid each matched 1 of 3 known truth plates; candidate
+elapsed time was 92.751 seconds versus 67.542 seconds. The candidate therefore
+failed promotion and RC12 remains the active customer engine. No model weight
+was committed. RC13 regression after the decoder/export additions is
+`145 passed, 1 skipped`.
+
+## RC14 FastPlateOCR CCT candidate
+
+Version `2.2.0-rc14` replaces Hezar as the intended next OCR architecture with
+custom FastPlateOCR CCT-XS-v2 and CCT-S-v2 candidates. Hezar remains available
+only for reproducing its failed benchmark. The CCT production reader uses
+NumPy, OpenCV and ONNX Runtime only; Keras and Torch are confined to the
+offline training environment.
+
+The signed model manifest selects the OCR runtime. A CCT manifest entry must
+also bind the alphabet, eight fixed output positions, input dimensions,
+fixed NHWC layout, uint8 dtype, RGB conversion, resize policy and strict
+ambiguity thresholds. The ONNX graph must expose the exact signed
+`1x64x128x3 -> 1x8x37` contract. Unsupported runtimes, legacy engine IDs used
+with CCT, and incomplete contracts fail closed to baseline.
+
+Training data must carry a machine-readable provenance manifest. The
+commercial path accepts explicitly attested company-owned or CC0 crops,
+keeps complete vehicle/plate groups in one split, and rejects rows marked as
+Golden, benchmark or test data. CC-BY is rejected until attribution can be
+preserved end to end. Operator confirmation proves the label, not image
+ownership: un-attested operator exports are therefore non-distributable
+Shadow data until a separate rights attestation is supplied. The GPL-3.0
+IR-LPR repository is
+still excluded from the proprietary production model path, but the owner
+requested an isolated research comparison on 2026-07-29. The dedicated
+`prepare_ir_lpr_dataset.py` adapter therefore marks all IR-LPR derivatives
+non-distributable and Shadow-only, preserves its official test split and
+removes cross-split image/plate-identity leakage. A signed research bundle is
+blocked from activating `next`. A reproducible synthetic Iranian plate
+generator remains available to bootstrap commercial training without
+importing a third-party plate dataset. Transfer learning copies only
+shape-compatible feature backbone tensors from released FastPlateOCR models;
+OCR/region heads and incompatible slot-query tensors are deliberately
+reinitialized for the Iranian eight-position alphabet. Python 3.12 and
+TensorFlow CPU form the validated offline training environment.
+
+Promotion still requires both CCT variants to run on the exact same
+operator-labelled Golden Dataset. The winner must improve exact full-plate
+accuracy over RC12, avoid a false-accept or scenario-slice regression, and
+remain faster than the recorded `67.542` second all-frame baseline on
+`01.mp4`. A synthetic validation result alone can never activate `next`.
+
+The exact fixed video was supplied again and verified by SHA-256 on
+2026-07-28. Both Stage-2 candidates processed all 546 frames but matched
+`0/3` known truth plates. CCT-XS emitted 214 rows containing 99 unverified
+unique strings in `82.165` seconds; CCT-S emitted 204 rows containing 113
+unverified unique strings in `153.530` seconds. Both are rejected and RC12
+remains active. Inspection of the saved OCR crops showed that the source is a
+four-camera composite and the fallback detector repeatedly selects OSD date,
+clock and camera-name text. The next iteration needs a dedicated plate
+detector plus labelled real company footage; synthetic OCR accuracy is not a
+substitute.
+
+The legacy `/ai/video-test` preparation-only page now runs actual full-frame
+ANPR. It displays one row per tracked passage with the exact saved plate crop,
+recognized text or `ناخوانا`, confidence, video time and OCR engine. The
+standalone Golden benchmark can also persist every crop and render a
+self-contained RTL HTML report with the crop and its recognized text on the
+same row. Golden/test crops remain prohibited from entering training.
+
+## RC15 PP-YOLOE-R and observable raw guesses
+
+Version `2.2.0-rc15` implements the selected next detector runtime instead of
+renaming the RC14 YOLO scaffold. A signed `bcvision-rc15` bundle can declare
+`ppyoloe-r-onnx`; preprocessing supplies the three official PaddleDetection
+inputs and the decoder consumes the official rotated boxes/scores tensors.
+The contract, preprocessing thresholds and every model file remain covered by
+the signed manifest and SHA-256 verification.
+
+The detector data preparation tool accepts only company-owned/operator
+confirmed, CC0 or CC-BY-4.0 images. It writes rotated COCO annotations for
+PP-YOLOE-R and includes unlabelled hard-negative images so timestamp, camera
+name, signs and headlights can be taught as background. Golden data and
+train/validation source leakage fail closed.
+
+Raw OCR hypotheses are now first-class diagnostic data. A rejected full-plate
+hypothesis is shown together with confidence, engine, signed model revision
+and rejection reason. In the owner-approved operator-assisted policy, a
+complete multi-frame guess can become an operational
+`review_status=auto-confirmed` event with a canonical plate value. This status
+is distinct from strict multi-frame consensus and human confirmation:
+`confirmation_source=ai-auto-guess`, `operator_reviewed=0` and
+`experimental=1` remain set until an authorized operator confirms or corrects
+the complete Iranian plate. AI-only guesses never become training labels.
+
+Baseline and candidate Shadow results run through separate trackers on the
+video-test page and are labelled by lane. In live operator-assisted mode, an
+overlapping strict Baseline read always wins; a complete Shadow guess may
+replace only an unreadable Baseline row. The resulting event is visibly
+AI-confirmed and remains operator-reviewable. This does not activate the
+research model as `next`, does not include it in an installer and does not
+turn its output into ground truth. Operator feedback records exact-match and
+Levenshtein character distance; Settings reports exact full-plate accuracy
+and mean character error overall and per immutable model revision.
+
+## Repository visibility authorization
+
+The repository is private as of the 2026-07-30 GitHub audit. On 2026-07-28
+the owner explicitly authorized publishing the RC13 branch and Draft PR;
+that historical authorization does not make model weights, Golden evidence
+or operator data suitable for public distribution.
+
+## RC15 IR-LPR research result
+
+The three official IR-LPR plate-crop archives were uploaded on 2026-07-29 and
+passed ZIP integrity and SHA-256 checks. The importer produced 17,371 train,
+2,007 validation and 3,903 test OCR crops with zero cross-split image or plate
+identity overlap. Golden video data was not imported.
+
+CCT-XS-v2 was fine-tuned in four two-epoch CPU stages from only the compatible
+feature layers of the official FastPlateOCR global checkpoint. The final
+Stage-4 ONNX achieved 87.45% raw exact accuracy and 97.61% character accuracy
+on the untouched 3,903-image IR-LPR test split. Its SHA-256 is
+`AD8D77D69CD0C914CB0CB3E0AC4E18709C446F78625A440D8F2D7AD2FB669482`.
+
+The verified fixed Golden video then produced 807 detector candidates across
+all 546 frames. Strict Tracker output matched `1/3`, equal to RC12; observable
+raw OCR matched `2/3`. `55-ط-639-74` was exact in 19 observations and
+confirmed. `84-ب-571-33` was exact in only one observation and correctly
+failed the three-vote gate. The closest read for `31-ط-556-74` was
+`31-ط-566-74`, one character away. There were 39 unverified emitted unique
+strings, so promotion failed.
+
+The derived model remains `research-shadow-only`, non-distributable and
+excluded from installers because IR-LPR is GPL-3.0 research data. RC12 remains
+active. The detailed record is
+`agent-results/latest/ANPR_IR_LPR_RESEARCH_RC15.md`.
+
+After reviewing the visual guesses, the owner approved using complete guesses
+as operator-assisted events on 2026-07-29. The strict Golden result remains
+`1/3`; the new label describes workflow state, not measured truth. Operators
+can confirm an unchanged guess or correct it from the dashboard/event detail.
+Only that human action creates `anpr_feedback`, captures the immutable crop and
+allows later controlled training. The implementation record is
+`agent-results/latest/ANPR_OPERATOR_ASSISTED_RC15.md`.
+
+For private internal evaluation, RC15 also supports a signed
+`baseline-yolov8-onnx` detector-reuse contract. Shadow CCT OCR runs on the
+already verified Baseline detector crops, exactly matching the detector/OCR
+pairing used for the Golden result and avoiding an untrained candidate
+detector. `tools/build_internal_cct_model_installer.py` creates a private
+one-click model pack outside Git; it verifies the embedded detector and OCR,
+installs under the configured persistent data root and selects Shadow mode.
+The public Setup, Updater, source archive and GitHub repository still exclude
+the IR-LPR-derived weight.
+
+## Commercial-clean synthetic plate generator v2
+
+On 2026-07-30 the owner selected synthetic Iranian plate generation as the
+first step toward replacing the GPL-derived research model. The procedural
+generator now writes the exact CCT `128x64 RGB` / eight-slot contract and
+records deterministic per-sample provenance without copying or transforming
+any third-party plate image.
+
+Ten balanced profiles cover clean, daylight, night, directional motion blur,
+perspective, headlight glare, rain, dirt, simulated 68–155 pixel source width
+and mixed hard conditions. Special plate colour families are represented and
+known weak or missing classes `ژ، ث، ا، ف، ک، گ، D، S` receive extra sampling
+only after all configured letters receive baseline coverage. Train and
+validation plate identities are disjoint.
+
+The same seed and inputs produce byte-identical annotations and JPEGs. The
+manifest binds the font SHA-256 and approved license; a missing or unapproved
+license fails closed. DejaVu Sans is only the permissively licensed bootstrap
+font and is not claimed to be an exact production plate font.
+
+A local 60-train/20-validation visual pilot covered all ten profiles with zero
+identity overlap and no unusable-quality rescues. Focused regression is
+`17 passed`. The implementation record is
+`agent-results/latest/ANPR_SYNTHETIC_PLATE_GENERATOR_V2.md`.
+
+The completed pilot contains 24,000 train, 3,000 validation and 3,000 held-out
+test images from 3,000 unique plate identities. All ten profiles are balanced,
+every image has the exact CCT shape and Train/Validation/Test plate identities
+have zero overlap. CCT-XS-v2 was trained from random initialization for 30
+epochs; epoch 24 produced the selected checkpoint. The ONNX SHA-256 is
+`DE47B20DE2CF545276977E230EF07BD88657D1DFB9C7956C62873A7C731A966F`.
+
+The synthetic Test split reached 99.57% raw exact-plate accuracy, 99.94%
+character accuracy, 99.73% accepted precision and 0.20% rejection. Nine
+profiles reached 100% raw exact accuracy; mixed-hard reached 95.67% and remains
+the principal synthetic weakness.
+
+The exact fixed `01.mp4` Golden video was recovered and verified by SHA-256.
+An initial diagnostic run without the verified detector used the explicit
+OpenCV fallback and correctly remained a rejection. The production primary
+and secondary ONNX detectors were then restored from the pinned model
+contract and independently verified by size and SHA-256. A strict rerun,
+with OpenCV disabled, produced 807 candidates across all 546 frames in
+62.163 seconds. The synthetic model matched `0/3` trusted plates through the
+Tracker and only `1/3` as a one-frame raw exact guess; it emitted 23 rows with
+21 unmatched unique strings. It therefore still fails activation. Metadata remains
+`production-candidate` and distributable, but `activation_allowed=false` with
+the `independent-real-camera-pass` gate. Runtime mode selection now enforces
+that explicit activation flag. The benchmark also fails closed unless both
+ONNX detector files pass their pinned size/hash contract; an OpenCV diagnostic
+run or model preparation now requires an explicit command-line flag. A
+tiny-contour fallback-detector crash found by the first benchmark has a
+regression test.
+
+RC12 remains active. The local application database contains no confirmed
+operator samples, so no real-camera fine-tune was fabricated from Golden
+truth or AI guesses. The operator-feedback schema-2 export can now be consumed
+directly by the CCT dataset preparer, duplicate crops and conflicting labels
+fail closed, and its default rights state is non-distributable/unverified.
+Only a separate explicit ownership attestation can enter the commercial path;
+all real-data candidates remain activation-locked until independent Golden
+and real-camera gates pass. The internal start gate is aligned with promotion
+at 24 Train samples, 12 Validation samples and eight unique plate identities.
+
+The final 100,000–300,000 synthetic corpus remains blocked until
+plate-faithful licensed glyphs are available and operator-labelled
+real-camera transfer improves. The detailed record is
+`agent-results/latest/ANPR_SYNTHETIC_30K_TRAINING_V1.md`.
+
+## Company-owned crop batch 01 review
+
+On 2026-07-30 the owner explicitly attested that the 505 plate-crop images in
+private source archive `01.zip` were collected by the company. The archive
+SHA-256 is
+`83307A71EF3428739C20C286FB62DF0759C0572F803B77361D0CDCC95FFC5628`.
+The source remains outside Git and is classified as
+`operator-confirmed-company-owned`; the attestation evidence identifier is
+`user-attestation-chat-2026-07-30-company-owned-01`.
+
+The archive contains OCR crops rather than full vehicle frames, so it can
+support OCR fine-tuning and hard-condition evaluation but cannot train the
+plate detector or tracker. The established triage contains 204 good crops,
+217 crops requiring careful review and 84 hard/test candidates.
+
+`tools/build_plate_label_review.py` now creates a self-contained offline RTL
+review page. Source images are embedded locally, browser progress can be
+exported/imported, and the operator must explicitly choose Confirmed,
+Unreadable or Excluded. Shadow OCR output is stored only as a visibly
+untrusted draft suggestion and can never become a training label by itself.
+The generated private review artifact is not committed.
+
+A first partial operator export has now been validated: 82 Confirmed,
+20 Unreadable, two Excluded and 401 Pending. The confirmed subset represents
+79 unique plate identities. `tools/prepare_plate_review_dataset.py` binds the
+CSV to the exact source archive and review-page provenance, verifies every
+image digest, excludes all non-confirmed rows, and groups repeated plate
+identities before creating the private 66-Train/16-Validation split. Plate and
+digest overlap are both zero. Source crops and labels remain outside Git.
+
+Two CCT-XS fine-tunes resumed the company-owned 30K synthetic checkpoint. The
+stronger `5e-5` candidate improved development-crop character accuracy from
+57.03% to 71.88% and full-plate exact accuracy from `1/16` to `2/16`.
+Synthetic Test exact accuracy moved from 99.57% to 99.47%. The fixed 546-frame
+real video still produced `0/3` Tracker matches and `1/3` raw exact truth, the
+same as the synthetic base, while unmatched emitted unique strings rose from
+21 to 23. Because the confirmed subset is tiny and 79 of 82 samples use one
+letter class, no general OCR claim is made. The candidate remains private
+Shadow-only and is not copied into the runtime, installer or `next` slot.
+RC12 remains active.
+
+The stronger candidate was then repeated with the exact same dataset
+fingerprint, 66/16 split, source checkpoint, seed `20260730`, 30 epochs,
+batch size 8 and learning rate `5e-5`. The development-crop result reproduced
+exactly at `2/16` full plates and 71.88% character accuracy. The random
+augmentation stream produced a different ONNX artifact; Synthetic Test exact
+was slightly lower at `2982/3000` (99.40%), the fixed video again returned
+`0/3` Tracker and `1/3` raw exact, and unmatched emitted strings increased
+from the first candidate's 23 to 27. The repeat is therefore not promoted and
+remains private Shadow-only.
+
+The focused importer/review/security/dataset suite passes `64` tests. Detailed
+records are
+`agent-results/latest/ANPR_COMPANY_CROPS_01_REVIEW.md` and
+`agent-results/latest/ANPR_COMPANY_CROPS_01_FINE_TUNE.md`.
+
+## OCR geometry and temporal-safety correction
+
+The earlier `2/16` metric described exact OCR reconstruction, not human
+readability. Conservative review found at least 14 of the 16 development crops
+human-readable, confirming an engine/domain problem.
+
+The CCT runtime now supports a signed
+`stretch-letterbox-geomean-v1` profile. It runs a stretched and an
+aspect-preserving view, deduplicates identical tensors, fuses normalized
+probabilities in log space, and requires both view strings plus agreement of
+at least `0.75`. Rejected strings are review-only and cannot re-enter strict
+temporal consensus or strong identity association.
+
+With the first `5e-5` candidate, the company development split improves from
+`2/16` to `8/16` exact and from 71.88% to 82.03% character accuracy. Four
+reads pass the strict gate and all four are correct. The 3,000-image synthetic
+raw exact count remains `2984/3000`. This is a tuning result, not an
+independent test: the split has already been reused for checkpoint,
+learning-rate and preprocessing selection.
+
+Tracker confirmation now requires the same complete plate in at least three
+independent observations over the minimum time span. Positional hybrids cannot
+confirm, emitted identities are immutable, similar later vehicles can start a
+new track, confirmed database events cannot be downgraded or overwritten, and
+a clearer frame of the same identity refreshes the existing event. Live track
+age is capped at six seconds.
+
+On the fixed 546-frame / 807-detection video, the corrected path remains `0/3`
+Tracker exact and `1/3` raw exact, but unmatched emitted unique strings fall
+from the previously recorded 23 to one. This is a major false-emission
+reduction but still fails activation.
+
+A separate 30-epoch aspect-preserving Fine-tune used the same private 66/16
+split and produced ONNX SHA-256
+`61C9A8426D04EA4E2FCEE4E547364F60AEB038FE4D08D999A15CCBE26E07412D`.
+It reached only `5/16` development exact, `2976/3000` synthetic exact and
+`0/3` video Tracker exact with two unmatched strings, so it was rejected.
+
+RC12 remains active; both candidates are Shadow-only and
+`activation_allowed=false`. Full verification is `360 passed, 1 skipped`
+(AI integration runtime disabled). The detailed record is
+`agent-results/latest/ANPR_OCR_ENGINE_GEOMETRY_V1.md`.

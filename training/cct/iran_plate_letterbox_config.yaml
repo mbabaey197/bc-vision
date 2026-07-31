@@ -1,0 +1,10 @@
+# Fixed eight-position Iranian plate contract with aspect-preserving training.
+max_plate_slots: 8
+alphabet: "0123456789ابپتثجدزژسشصطعفقکگلمنوهیDS_"
+pad_char: "_"
+img_height: 64
+img_width: 128
+keep_aspect_ratio: true
+interpolation: linear
+image_color_mode: rgb
+padding_color: [114, 114, 114]

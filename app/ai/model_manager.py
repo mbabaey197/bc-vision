@@ -8,12 +8,16 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import shutil
+import ssl
 import sys
 import tempfile
+import time
+import urllib.error
 import urllib.request
 
 DETECTOR_URL = (
@@ -145,10 +149,45 @@ def active_crnn_model() -> tuple[Path, str, int]:
     return crnn_path(), CRNN_SHA256, CRNN_SIZE
 
 
+def active_crnn_training_checkpoint() -> tuple[Path, str, int] | None:
+    """Return the hash-verified state dict paired with a promoted CRNN."""
+
+    manifest = _active_crnn_manifest_path()
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        filename = str(
+            payload.get("training_checkpoint_filename", "")
+        ).strip()
+        digest = str(
+            payload.get("training_checkpoint_sha256", "")
+        ).strip().upper()
+        size = int(payload.get("training_checkpoint_size", 0))
+        custom_root = (
+            _data_dir()
+            / "models"
+            / "crnn"
+            / "custom"
+        ).resolve()
+        checkpoint = (custom_root / filename).resolve()
+        checkpoint.relative_to(custom_root)
+        if (
+            filename
+            and digest
+            and size > 0
+            and verify_file(checkpoint, digest, size)
+        ):
+            return checkpoint, digest, size
+    except Exception:
+        pass
+    return None
+
+
 def promote_crnn_candidate(
     candidate: Path,
     expected_sha256: str,
     source_run_id: int,
+    training_checkpoint: Path | None = None,
+    training_checkpoint_sha256: str = "",
 ) -> dict:
     candidate = Path(candidate)
     digest = str(expected_sha256).upper()
@@ -171,6 +210,53 @@ def promote_crnn_candidate(
             temporary.unlink(missing_ok=True)
             raise ValueError("Promoted CRNN copy verification failed")
         os.replace(temporary, target)
+    checkpoint_target = None
+    checkpoint_digest = ""
+    checkpoint_size = 0
+    if training_checkpoint is not None:
+        training_checkpoint = Path(training_checkpoint)
+        checkpoint_digest = str(
+            training_checkpoint_sha256
+        ).upper()
+        checkpoint_size = (
+            training_checkpoint.stat().st_size
+            if training_checkpoint.is_file()
+            else 0
+        )
+        if (
+            checkpoint_size <= 0
+            or not verify_file(
+                training_checkpoint,
+                checkpoint_digest,
+                checkpoint_size,
+            )
+        ):
+            raise ValueError(
+                "Candidate CRNN training checkpoint verification failed"
+            )
+        checkpoint_target = custom_root / (
+            f"run-{int(source_run_id)}-{checkpoint_digest[:16]}.pt"
+        )
+        if not verify_file(
+            checkpoint_target,
+            checkpoint_digest,
+            checkpoint_size,
+        ):
+            temporary_checkpoint = checkpoint_target.with_suffix(".tmp")
+            shutil.copy2(
+                training_checkpoint,
+                temporary_checkpoint,
+            )
+            if not verify_file(
+                temporary_checkpoint,
+                checkpoint_digest,
+                checkpoint_size,
+            ):
+                temporary_checkpoint.unlink(missing_ok=True)
+                raise ValueError(
+                    "Promoted CRNN checkpoint copy verification failed"
+                )
+            os.replace(temporary_checkpoint, checkpoint_target)
     manifest = _active_crnn_manifest_path()
     manifest.parent.mkdir(parents=True, exist_ok=True)
     temporary_manifest = manifest.with_suffix(".tmp")
@@ -182,6 +268,13 @@ def promote_crnn_candidate(
                 "sha256": digest,
                 "size": size,
                 "source_run_id": int(source_run_id),
+                "training_checkpoint_filename": (
+                    checkpoint_target.name
+                    if checkpoint_target is not None
+                    else ""
+                ),
+                "training_checkpoint_sha256": checkpoint_digest,
+                "training_checkpoint_size": checkpoint_size,
             },
             ensure_ascii=False,
             indent=2,
@@ -200,6 +293,12 @@ def promote_crnn_candidate(
         "sha256": digest,
         "size": size,
         "source_run_id": int(source_run_id),
+        "training_checkpoint_path": (
+            str(checkpoint_target)
+            if checkpoint_target is not None
+            else ""
+        ),
+        "training_checkpoint_sha256": checkpoint_digest,
     }
 
 
@@ -270,6 +369,8 @@ def _download_verified(
     expected_sha256: str,
     expected_size: int,
     timeout=90,
+    attempts=3,
+    retry_delay=2,
 ) -> Path:
     if not url.lower().startswith("https://"):
         raise ValueError("Only HTTPS model downloads are allowed")
@@ -278,49 +379,63 @@ def _download_verified(
     if verify_file(target, expected_sha256, expected_size):
         return target
 
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "BCVision-ANPR/2.2"},
+    network_errors = (
+        urllib.error.URLError,
+        TimeoutError,
+        ConnectionError,
+        http.client.IncompleteRead,
+        ssl.SSLError,
     )
-    temp_path = None
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=timeout,
-        ) as response:
-            with tempfile.NamedTemporaryFile(
-                "wb",
-                delete=False,
-                dir=target.parent,
-                prefix=target.name + ".",
-                suffix=".part",
-            ) as output:
-                temp_path = Path(output.name)
-                total = 0
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > expected_size + 1024:
-                        raise ValueError(
-                            "Downloaded model exceeds the expected size"
-                        )
-                    output.write(chunk)
-        if not verify_file(
-            temp_path,
-            expected_sha256,
-            expected_size,
-        ):
-            raise ValueError(
-                "Downloaded model failed SHA-256 or size verification"
-            )
-        os.replace(temp_path, target)
+    max_attempts = max(1, int(attempts))
+    for attempt in range(max_attempts):
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "BCVision-ANPR/2.2"},
+        )
         temp_path = None
-        return target
-    finally:
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=timeout,
+            ) as response:
+                with tempfile.NamedTemporaryFile(
+                    "wb",
+                    delete=False,
+                    dir=target.parent,
+                    prefix=target.name + ".",
+                    suffix=".part",
+                ) as output:
+                    temp_path = Path(output.name)
+                    total = 0
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > expected_size + 1024:
+                            raise ValueError(
+                                "Downloaded model exceeds the expected size"
+                            )
+                        output.write(chunk)
+            if not verify_file(
+                temp_path,
+                expected_sha256,
+                expected_size,
+            ):
+                raise ValueError(
+                    "Downloaded model failed SHA-256 or size verification"
+                )
+            os.replace(temp_path, target)
+            temp_path = None
+            return target
+        except network_errors:
+            if attempt + 1 >= max_attempts:
+                raise
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+        if retry_delay:
+            time.sleep(float(retry_delay) * (attempt + 1))
 
 
 def ensure_detector_model(download=True) -> Path:
@@ -555,7 +670,7 @@ def model_status() -> dict:
     active_crnn, active_crnn_sha, active_crnn_size = (
         active_crnn_model()
     )
-    return {
+    status = {
         "detector_path": str(detector),
         "detector_ready": verify_file(
             detector,
@@ -590,6 +705,18 @@ def model_status() -> dict:
         ),
         "easyocr_ready": False,
     }
+    try:
+        from .next_models import next_models_status
+
+        next_status = next_models_status()
+    except Exception as exc:
+        next_status = {
+            "ready": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    status["next_engine_ready"] = bool(next_status.get("ready"))
+    status["next_engine"] = next_status
+    return status
 
 
 def main(argv=None):
