@@ -131,8 +131,7 @@ jobs:
         shell: cmd
         run: |
           python -m pip install --disable-pip-version-check --upgrade pip --quiet
-          python -m pip install -r requirements-ai-lock.txt --quiet
-          python -m pip install gdown==5.2.0 --quiet
+          python -m pip install onnxruntime==1.28.0 opencv-python-headless==5.0.0.93 gdown==5.2.0 --quiet
           python -m pip check
       - name: Materialize one-off benchmark script
         shell: pwsh
