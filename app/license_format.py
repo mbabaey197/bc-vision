@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.abc
+import importlib.machinery
 import json
 import os
+import sys
 from typing import Iterable
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -125,3 +128,64 @@ def decode_document(
             except Exception:
                 continue
     raise ValueError("license is not bound to this machine")
+
+
+def _patch_live_worker(module) -> None:
+    original = getattr(module, "submit_live_frame", None)
+    if original is None or getattr(original, "_bc_license_guarded", False):
+        return
+
+    def guarded_submit(camera_id, *args, **kwargs):
+        try:
+            from app.license import runtime_camera_allowed
+
+            if not runtime_camera_allowed(int(camera_id)):
+                return None
+        except Exception:
+            return None
+        return original(camera_id, *args, **kwargs)
+
+    guarded_submit._bc_license_guarded = True
+    guarded_submit._bc_original = original
+    module.submit_live_frame = guarded_submit
+
+
+class _GuardedLiveWorkerLoader(importlib.abc.Loader):
+    def __init__(self, loader):
+        self.loader = loader
+
+    def create_module(self, spec):
+        create = getattr(self.loader, "create_module", None)
+        return create(spec) if create else None
+
+    def exec_module(self, module):
+        self.loader.exec_module(module)
+        _patch_live_worker(module)
+
+
+class _LiveWorkerGuardFinder(importlib.abc.MetaPathFinder):
+    marker = "bc-vision-license-runtime-guard"
+
+    def find_spec(self, fullname, path, target=None):
+        if fullname != "app.ai.live_worker":
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if spec is None or spec.loader is None:
+            return spec
+        spec.loader = _GuardedLiveWorkerLoader(spec.loader)
+        return spec
+
+
+def install_runtime_license_guard() -> None:
+    existing = sys.modules.get("app.ai.live_worker")
+    if existing is not None:
+        _patch_live_worker(existing)
+        return
+    if not any(
+        getattr(finder, "marker", "") == _LiveWorkerGuardFinder.marker
+        for finder in sys.meta_path
+    ):
+        sys.meta_path.insert(0, _LiveWorkerGuardFinder())
+
+
+install_runtime_license_guard()
