@@ -1,2 +1,2 @@
 Run isolated 505-image company-owned crop benchmark.
-Attempt 2 after installing the temporary self-hosted workflow.
+Attempt 3 after the PR workflow entrypoint was installed on main.
