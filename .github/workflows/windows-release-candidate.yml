@@ -87,16 +87,51 @@ jobs:
           python scripts\verify_windows_gui_subsystem.py `
             dist\BCVision\BCVision.exe
 
-      - name: Install Inno Setup
+      - name: Install verified Inno Setup
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
-        run: choco install innosetup --no-progress -y
+        run: |
+          $ErrorActionPreference = "Stop"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $innoDir = Join-Path $env:RUNNER_TEMP "inno-setup-6.7.3"
+          $installer = Join-Path $env:RUNNER_TEMP "innosetup-6.7.3.exe"
+          Invoke-WebRequest -UseBasicParsing `
+            -Uri "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe" `
+            -OutFile $installer
+          $signature = Get-AuthenticodeSignature $installer
+          if (
+            $signature.Status -ne "Valid" -or
+            $signature.SignerCertificate.Subject -notmatch "Pyrsys B\.V\."
+          ) {
+            throw "Inno Setup Authenticode verification failed"
+          }
+          $install = Start-Process -FilePath $installer -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/CURRENTUSER",
+            "/DIR=$innoDir"
+          ) -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            throw "Inno Setup installer exited with $($install.ExitCode)"
+          }
+          $iscc = Join-Path $innoDir "ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            throw "ISCC.exe was not installed"
+          }
+          "INNO_ISCC=$iscc" >> $env:GITHUB_ENV
 
       - name: Build installer and updater
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $iscc = $env:INNO_ISCC
+          if (-not $iscc -or -not (Test-Path $iscc)) {
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
           if (-not (Test-Path $iscc)) {
             $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path $iscc)) {
+            throw "ISCC.exe was not found"
           }
           & $iscc installer\BCVision.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
