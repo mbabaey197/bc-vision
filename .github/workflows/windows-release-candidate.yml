@@ -46,7 +46,7 @@ jobs:
 
       - name: Read candidate version
         id: version
-        shell: pwsh
+        shell: powershell
         run: |
           $value = (Get-Content VERSION -Raw).Trim()
           "value=$value" >> $env:GITHUB_OUTPUT
@@ -61,7 +61,7 @@ jobs:
             requirements-ai-lock.txt
 
       - name: Run source regression
-        shell: pwsh
+        shell: powershell
         run: |
           python -m pip install --disable-pip-version-check -r requirements-test.txt --quiet
           python -m compileall -q app launcher.py
@@ -72,17 +72,17 @@ jobs:
         run: BUILD_PORTABLE_EXE.bat
 
       - name: Verify windowless Windows service host
-        shell: pwsh
+        shell: powershell
         run: |
           python scripts\verify_windows_gui_subsystem.py `
             dist\BCVision\BCVision.exe
 
       - name: Install Inno Setup
-        shell: pwsh
+        shell: powershell
         run: choco install innosetup --no-progress -y
 
       - name: Build installer and updater
-        shell: pwsh
+        shell: powershell
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) {
@@ -94,7 +94,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify clean install, update and persistent data
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           $version = (Get-Content VERSION -Raw).Trim()
@@ -194,7 +194,7 @@ jobs:
           }
 
       - name: Create release bundle and checksums
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           $version = (Get-Content VERSION -Raw).Trim()
