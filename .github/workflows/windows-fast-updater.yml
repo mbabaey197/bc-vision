@@ -6,24 +6,6 @@ name: Windows fast updater
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - "agent/**"
-    paths:
-      - "app/**"
-      - "installer/**"
-      - "scripts/build_dependency_stamp.py"
-      - "scripts/ensure_inno_setup.ps1"
-      - "scripts/verify_fast_update.ps1"
-      - "tests/**"
-      - "launcher.py"
-      - "VERSION"
-      - "BUILD_PORTABLE_EXE.bat"
-      - "requirements-lock.txt"
-      - "requirements-ai-lock.txt"
-      - "requirements-test.txt"
-      - ".github/workflows/windows-fast-updater.yml"
-
 permissions:
   contents: read
 
