@@ -55,3 +55,13 @@ PLATE_DIR = DATA_DIR / "plates"
 VIDEO_DIR = DATA_DIR / "videos"
 for folder in (BACKUP_DIR, SNAPSHOT_DIR, PLATE_DIR, VIDEO_DIR):
     folder.mkdir(parents=True, exist_ok=True)
+
+# Main imports this module before registering HTTP routes. Installing the
+# policy here removes online activation from the web surface while keeping
+# non-web licensing tools independent of FastAPI.
+try:
+    from app.offline_license_policy import install_offline_license_policy
+
+    install_offline_license_policy()
+except ImportError:
+    pass
