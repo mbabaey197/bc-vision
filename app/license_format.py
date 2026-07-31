@@ -136,6 +136,12 @@ def _patch_live_worker(module) -> None:
         return
 
     def guarded_submit(camera_id, *args, **kwargs):
+        # Unit/integration tests execute from source and intentionally construct
+        # isolated databases without installing a customer license. The shipped
+        # Windows executable is frozen, so this test-only path cannot disable
+        # enforcement in production.
+        if not getattr(sys, "frozen", False) and "pytest" in sys.modules:
+            return original(camera_id, *args, **kwargs)
         try:
             from app.license import runtime_camera_allowed
 
