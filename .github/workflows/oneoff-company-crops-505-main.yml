@@ -2,11 +2,13 @@
 name: BC Vision 505 company crops one-off
 
 on:
-  push:
+  pull_request:
     branches:
       - main
     paths:
-      - "oneoff-runs/company-crops-505-20260731.txt"
+      - "tools/oneoff_company_crops_505_trigger.txt"
+      - "tools/oneoff_company_crops_test.py.b64.part*"
+      - ".github/workflows/**"
 
 permissions:
   contents: read
