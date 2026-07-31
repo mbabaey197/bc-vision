@@ -1,4 +1,4 @@
-# Temporary trusted one-off IR-LPR retest workflow.
+# Trusted, isolated validation for BC Vision pull requests.
 name: ANPR PR validation
 
 on:
@@ -6,8 +6,18 @@ on:
     branches:
       - main
     paths:
+      - "app/**"
+      - "installer/**"
+      - "launcher.py"
+      - "VERSION"
+      - "requirements-lock.txt"
+      - "requirements-ai-lock.txt"
+      - "requirements-test.txt"
+      - "requirements-cct-training.txt"
+      - "tests/**"
       - "tools/**"
-      - ".github/retest-trigger/**"
+      - "training/**"
+      - "docs/**"
       - ".github/workflows/**"
 
 permissions:
@@ -18,15 +28,49 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  oneoff-ir-lpr-retest:
+  regression:
     runs-on: [self-hosted, Windows, X64]
-    timeout-minutes: 90
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.0"
+          enable-cache: true
+          cache-python: true
+          cache-dependency-glob: requirements-test.txt
+      - name: Set up portable Python
+        shell: cmd
+        run: |
+          uv python install 3.13
+          uv venv --python 3.13 --seed .venv
+          echo %CD%\.venv\Scripts>>"%GITHUB_PATH%"
+      - name: Install test dependencies
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip --quiet
+          python -m pip install -r requirements-test.txt --quiet
+      - name: Compile and test
+        shell: cmd
+        env:
+          BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\regression
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -m compileall -q app
+          python -m pytest -q tests
+
+  ai-runtime:
+    needs: regression
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 45
     env:
+      BCVISION_RUN_AI_INTEGRATION: "1"
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           version: "0.12.0"
           enable-cache: true
@@ -38,91 +82,25 @@ jobs:
           uv python install 3.13
           uv venv --python 3.13 --seed .venv
           echo %CD%\.venv\Scripts>>"%GITHUB_PATH%"
-      - name: Install benchmark dependencies
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\bcvision-models
+          key: bcvision-anpr-models-v2-onnx
+      - name: Install AI runtime
         shell: cmd
         run: |
           python -m pip install --disable-pip-version-check --upgrade pip --quiet
-          python -m pip install onnxruntime==1.28.0 opencv-python-headless==5.0.0.93 gdown==5.2.0 --quiet
+          python -m pip install -r requirements-ai-lock.txt --quiet
+          python -m pip install pytest==9.0.2 --quiet
           python -m pip check
-      - name: Materialize one-off benchmark script
-        shell: powershell
+      - name: Verify real engines and models
+        shell: cmd
+        env:
+          BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\ai-runtime
+          BCVISION_PLATE_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo.onnx
+          BCVISION_PLATE_FALLBACK_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo_fallback.onnx
+          BCVISION_CRNN_MODEL: ${{ runner.temp }}\bcvision-models\crnn\ocr_crnn.onnx
+          BCVISION_CNN_MODEL: ${{ runner.temp }}\bcvision-models\cnn\ocr_cnn.onnx
         run: |
-          $workflow = [IO.File]::ReadAllText(".github/workflows/oneoff-ir-lpr-retest-20260731.yml")
-          $match = [regex]::Match($workflow, "(?ms)\$payload = @'\r?\n(.*?)\r?\n'@")
-          if (-not $match.Success) { throw "Embedded benchmark payload is missing." }
-          $gzip = Join-Path $env:RUNNER_TEMP "ir-lpr-retest.py.gz"
-          $script = Join-Path $env:RUNNER_TEMP "ir-lpr-retest.py"
-          [IO.File]::WriteAllBytes($gzip, [Convert]::FromBase64String(($match.Groups[1].Value -replace '\s','')))
-          python -c "import gzip,pathlib; pathlib.Path(r'$script').write_bytes(gzip.decompress(pathlib.Path(r'$gzip').read_bytes()))"
-          python -m py_compile "$script"
-          "BCVISION_RETEST_SCRIPT=$script" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Locate verified RC15 OCR model
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-          $expected = "AD8D77D69CD0C914CB0CB3E0AC4E18709C446F78625A440D8F2D7AD2FB669482"
-          $modelPath = $null
-          $roots = @(
-            (Join-Path $env:ProgramData "BCVision"),
-            (Join-Path $env:USERPROFILE "Downloads"),
-            (Join-Path $env:USERPROFILE "Desktop"),
-            $env:RUNNER_WORKSPACE,
-            $env:RUNNER_TEMP
-          ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
-          foreach ($root in $roots) {
-            foreach ($candidate in Get-ChildItem -LiteralPath $root -Filter *.onnx -File -Recurse -ErrorAction SilentlyContinue) {
-              if ((Get-FileHash -LiteralPath $candidate.FullName -Algorithm SHA256).Hash -eq $expected) {
-                $modelPath = $candidate.FullName
-                break
-              }
-            }
-            if ($modelPath) { break }
-          }
-          if (-not $modelPath) {
-            $installer = $null
-            foreach ($root in $roots) {
-              $installer = Get-ChildItem -LiteralPath $root -Filter BCVision_RC15_Experimental_Model_Installer.cmd -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($installer) { break }
-            }
-            if ($installer) {
-              $content = [IO.File]::ReadAllText($installer.FullName)
-              $match = [regex]::Match($content, '(?ms)^::BCVISION_PAYLOAD_BEGIN:ocr\r?\n(.*?)^::BCVISION_PAYLOAD_END:ocr\r?$')
-              if ($match.Success) {
-                $candidate = Join-Path $env:RUNNER_TEMP "rc15-cct-xs-ir-lpr-stage4.onnx"
-                [IO.File]::WriteAllBytes($candidate, [Convert]::FromBase64String(($match.Groups[1].Value -replace '\s','')))
-                if ((Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash -eq $expected) { $modelPath = $candidate }
-              }
-            }
-          }
-          if (-not $modelPath) { throw "Verified RC15 OCR model was not found on the runner." }
-          "BCVISION_RETEST_MODEL=$modelPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Download exact validation and test archives
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-          $validation = Join-Path $env:RUNNER_TEMP "plate_image_with_dummy-validation.zip"
-          $test = Join-Path $env:RUNNER_TEMP "plate_image_with_dummy-test.zip"
-          python -m gdown --fuzzy "https://drive.google.com/file/d/1yZYdSNYBPXOoT_QySlH2RVTQS0AySA1z/view" -O "$validation"
-          python -m gdown --fuzzy "https://drive.google.com/file/d/1HzZ5vgP5XsmbFCE-n8F70qlRRUtABIq6/view" -O "$test"
-          python -c "import sys,zipfile; [zipfile.ZipFile(p).testzip() is None or (_ for _ in ()).throw(RuntimeError(p)) for p in sys.argv[1:]]" "$validation" "$test"
-          "BCVISION_RETEST_VALIDATION=$validation" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "BCVISION_RETEST_TEST=$test" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Run direct old-vs-new benchmark
-        shell: powershell
-        run: |
-          $output = Join-Path $env:RUNNER_TEMP "bcvision-ir-lpr-retest"
-          python "$env:BCVISION_RETEST_SCRIPT" `
-            --model "$env:BCVISION_RETEST_MODEL" `
-            --validation-zip "$env:BCVISION_RETEST_VALIDATION" `
-            --test-zip "$env:BCVISION_RETEST_TEST" `
-            --output "$output" `
-            --source-commit "${{ github.event.pull_request.base.sha }}"
-          "BCVISION_RETEST_OUTPUT=$output" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Upload visual retest report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bcvision-ir-lpr-retest-20260731
-          path: ${{ env.BCVISION_RETEST_OUTPUT }}
-          if-no-files-found: error
-          retention-days: 7
+          python -m compileall -q app/ai
+          python -m pytest -q tests/test_ai_runtime.py
