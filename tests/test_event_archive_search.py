@@ -415,11 +415,78 @@ def test_city_is_historical_snapshot_and_region_filter_is_normalized(
     assert _report_event_ids(changed_camera.text) == []
 
 
+def test_plate_shaped_search_filters_each_position_and_supports_typed_letter(
+    isolated_archive,
+):
+    with database.connect() as con:
+        wanted = _insert_event(
+            con,
+            plate_text="12-ب-345-67",
+            plate_norm="12ب34567",
+            camera_name="POSITION-MATCH",
+        )
+        _insert_event(
+            con,
+            plate_text="12-ص-345-67",
+            plate_norm="12ص34567",
+            camera_name="WRONG-LETTER",
+        )
+        _insert_event(
+            con,
+            plate_text="12-ب-346-67",
+            plate_norm="12ب34667",
+            camera_name="WRONG-SERIAL",
+        )
+
+    with TestClient(main.app) as client:
+        response = client.get(
+            "/events",
+            params={
+                "q_prefix": "۱۲",
+                "q_letter": "ب",
+                "q_serial": "۳۴۵",
+                "q_plate_region": "۶۷",
+            },
+        )
+
+    assert response.status_code == 200
+    assert _report_event_ids(response.text) == [wanted]
+    assert "class='iran-plate-input'" in response.text
+    assert "list='iranPlateLetters'" in response.text
+    assert "name='q_letter'" in response.text
+    assert "value='ب'" in response.text
+    assert "حرف را از فهرست انتخاب کنید یا مستقیماً تایپ کنید" in response.text
+
+
+def test_plate_shaped_search_accepts_direct_alef_word_typing(
+    isolated_archive,
+):
+    with database.connect() as con:
+        wanted = _insert_event(
+            con,
+            plate_text="11-ا-222-33",
+            plate_norm="11ا22233",
+            camera_name="ALEF-MATCH",
+        )
+
+    with TestClient(main.app) as client:
+        response = client.get(
+            "/events",
+            params={"q_letter": "الف"},
+        )
+
+    assert response.status_code == 200
+    assert _report_event_ids(response.text) == [wanted]
+    assert "value='الف'" in response.text
+
+
 @pytest.mark.parametrize(
     "params",
     (
         {"q": "' OR 1=1 --"},
         {"q": "%%%%__"},
+        {"q_letter": "<script>"},
+        {"q_prefix": "12 OR 1=1"},
         {"city": "' OR 1=1 --"},
         {"region": "' OR 1=1 --"},
         {"date_from": "۱۴۰۵/۱۳/۰۱"},

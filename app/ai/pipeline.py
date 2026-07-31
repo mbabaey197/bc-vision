@@ -84,6 +84,45 @@ def _partial_plate_text(positions: dict[int, str]) -> str:
     )
 
 
+def _rescue_ocr_reason(item, direct_norm, direct_valid, confidence, quality):
+    """Return why the whole-plate reader should run for this crop.
+
+    The character detector remains the fast primary reader.  CRNN/CNN is a
+    rescue lane: it runs for missing/weak reads and for model alternatives that
+    disagree at the historically difficult Iranian-plate positions.  A strong,
+    unambiguous primary read does not pay the second-model CPU cost.
+    """
+
+    if not direct_valid:
+        return "primary-unreadable"
+    if not item.get("direct_ocr_attempted"):
+        return "primary-reader-unavailable"
+    if float(confidence) < 0.90:
+        return "primary-low-confidence"
+    if float(quality.get("score", 0.0)) < 0.42:
+        return "low-image-quality"
+
+    for hypothesis in item.get("plate_hypotheses", []):
+        alternative = normalize_plate(
+            hypothesis.get("plate_norm") or hypothesis.get("plate")
+        )
+        if not plausible_plate(alternative) or alternative == direct_norm:
+            continue
+        differences = [
+            index
+            for index, pair in enumerate(zip(direct_norm, alternative))
+            if pair[0] != pair[1]
+        ]
+        known_pair = any(
+            {direct_norm[index], alternative[index]}
+            in ({"2", "3"}, {"س", "ص"})
+            for index in differences
+        )
+        if known_pair or any(index in {2, 6, 7} for index in differences):
+            return "known-character-ambiguity"
+    return ""
+
+
 def process_frame(
     frame,
     min_detection_confidence=0.25,
@@ -128,7 +167,16 @@ def process_frame(
                 )
             )
         )
+        rescue_reason = _rescue_ocr_reason(
+            item,
+            direct_norm,
+            direct_valid,
+            ocr_confidence,
+            quality,
+        )
         crnn_eligible = bool(
+            rescue_reason
+            and
             float(item.get("confidence", 0.0)) >= 0.25
             and quality["score"] >= 0.12
             and crop.shape[0] >= 12
@@ -429,6 +477,8 @@ def process_frame(
             "ocr_alternative": ocr_alternative,
             "ocr_disagreement": ocr_disagreement,
             "whole_plate_ocr_attempted": whole_plate_ocr_attempted,
+            "rescue_ocr_attempted": whole_plate_ocr_attempted,
+            "rescue_ocr_reason": rescue_reason,
             "dedicated_ocr_attempted": bool(
                 item.get("direct_ocr_attempted")
             ),

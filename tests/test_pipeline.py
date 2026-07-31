@@ -843,10 +843,98 @@ def test_direct_yolo_text_is_compared_with_crnn_without_vehicle_ai(
     assert rows[0]["plate"] == "27-ط-253-74"
     assert rows[0]["valid"] is True
     assert rows[0]["whole_plate_ocr_attempted"] is True
+    assert rows[0]["rescue_ocr_reason"] == "primary-low-confidence"
     assert rows[0]["ocr_engine"].startswith(
         "multi-engine-agreement"
     )
     assert rows[0]["vehicle_type"] == "نامشخص"
+
+
+def test_strong_unambiguous_primary_read_skips_rescue_ocr(monkeypatch):
+    crop = np.random.default_rng(23).integers(
+        0,
+        255,
+        (48, 180, 3),
+        dtype=np.uint8,
+    )
+    monkeypatch.setattr(
+        "app.ai.pipeline.detect_plates",
+        lambda *_args, **_kwargs: [{
+            "crop": crop,
+            "bbox": (10, 20, 190, 68),
+            "confidence": 0.96,
+            "method": "yolo-plate+chars",
+            "direct_text": "84-ب-571-33",
+            "direct_ocr_confidence": 0.97,
+            "direct_ocr_attempted": True,
+            "plate_hypotheses": [{
+                "plate_norm": "84ب57133",
+                "score": 0.97,
+            }],
+        }],
+    )
+    monkeypatch.setattr(
+        "app.ai.pipeline.read_plate_candidate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("rescue OCR must stay idle")
+        ),
+    )
+
+    row = process_frame(
+        np.full((100, 220, 3), 100, dtype=np.uint8)
+    )[0]
+
+    assert row["plate_norm"] == "84ب57133"
+    assert row["whole_plate_ocr_attempted"] is False
+    assert row["rescue_ocr_attempted"] is False
+    assert row["rescue_ocr_reason"] == ""
+
+
+def test_known_two_three_ambiguity_forces_rescue_even_when_primary_is_strong(
+    monkeypatch,
+):
+    crop = np.random.default_rng(29).integers(
+        0,
+        255,
+        (48, 180, 3),
+        dtype=np.uint8,
+    )
+    calls = []
+    monkeypatch.setattr(
+        "app.ai.pipeline.detect_plates",
+        lambda *_args, **_kwargs: [{
+            "crop": crop,
+            "bbox": (10, 20, 190, 68),
+            "confidence": 0.96,
+            "method": "yolo-plate+chars",
+            "direct_text": "12-ب-345-67",
+            "direct_ocr_confidence": 0.96,
+            "direct_ocr_attempted": True,
+            "plate_hypotheses": [
+                {"plate_norm": "12ب34567", "score": 0.96},
+                {"plate_norm": "13ب34567", "score": 0.74},
+            ],
+        }],
+    )
+
+    def rescue(*_args, **_kwargs):
+        calls.append(True)
+        return "12-ب-345-67", 0.95, "crnn-onnx"
+
+    monkeypatch.setattr(
+        "app.ai.pipeline.read_plate_candidate",
+        rescue,
+    )
+
+    row = process_frame(
+        np.full((100, 220, 3), 100, dtype=np.uint8)
+    )[0]
+
+    assert calls == [True]
+    assert row["plate_norm"] == "12ب34567"
+    assert row["rescue_ocr_attempted"] is True
+    assert row["rescue_ocr_reason"] == "known-character-ambiguity"
+    assert row["ocr_engine"].startswith("multi-engine-agreement")
 
 
 def test_stronger_crnn_disagreement_is_reviewable_and_keeps_both_reads(

@@ -24,6 +24,7 @@ from urllib.parse import quote, urlencode
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.ai.plate_rules import (
+    ALLOWED_PLATE_LETTERS,
     iran_plate_parts,
     normalize_plate as canonical_normalize_plate,
     persian_digits,
@@ -331,6 +332,44 @@ def iran_plate_html(text, compact=False):
     )
 
 
+def plate_search_input_html(prefix='', letter='', serial='', plate_region=''):
+    """Render a position-aware search control shaped like an Iranian plate."""
+
+    letter_options = []
+    for value in ALLOWED_PLATE_LETTERS:
+        label = 'الف' if value == 'ا' else value
+        letter_options.append(
+            f"<option value='{escape(label)}'>{escape(label)}</option>"
+        )
+    return (
+        "<div class='plate-search-wrap'>"
+        "<label class='plate-search-label' id='plateSearchLabel'>"
+        "جست‌وجوی شماره پلاک؛ هر بخش می‌تواند خالی بماند</label>"
+        "<div class='iran-plate-input' dir='ltr' role='group' "
+        "aria-labelledby='plateSearchLabel'>"
+        "<span class='plate-input-blue' aria-hidden='true'>"
+        "<b>🇮🇷</b><small>I.R.<br>IRAN</small></span>"
+        f"<input class='plate-part plate-prefix-input' name='q_prefix' "
+        f"value='{escape(prefix)}' inputmode='numeric' maxlength='2' "
+        "placeholder='۱۲' aria-label='دو رقم اول پلاک' autocomplete='off'>"
+        f"<input class='plate-part plate-letter-input' name='q_letter' "
+        f"value='{escape(letter)}' list='iranPlateLetters' maxlength='3' "
+        "placeholder='حرف' aria-label='حرف پلاک' autocomplete='off'>"
+        f"<input class='plate-part plate-serial-input' name='q_serial' "
+        f"value='{escape(serial)}' inputmode='numeric' maxlength='3' "
+        "placeholder='۳۴۵' aria-label='سه رقم میانی پلاک' autocomplete='off'>"
+        "<span class='plate-input-region'>"
+        "<small>ایران</small>"
+        f"<input class='plate-part' name='q_plate_region' "
+        f"value='{escape(plate_region)}' inputmode='numeric' maxlength='2' "
+        "placeholder='۶۷' aria-label='کد دو رقمی ایران' autocomplete='off'>"
+        "</span></div>"
+        f"<datalist id='iranPlateLetters'>{''.join(letter_options)}</datalist>"
+        "<small class='plate-search-help'>حرف را از فهرست انتخاب کنید یا مستقیماً تایپ کنید.</small>"
+        "</div>"
+    )
+
+
 def anpr_confirmation_badge(status):
     value = str(status or "confirmed-ai")
     return {
@@ -440,7 +479,7 @@ label{display:block;font-weight:700;color:var(--bc-text);margin-bottom:3px}input
 @media(max-width:900px){.resource-chip span.label{display:none}.resource-chip{min-width:auto}}
 @media(max-width:760px){.sidebar{transform:translateX(110%);width:258px}.sidebar.mobile-open{transform:translateX(0)}.sidebar-toggle{display:none}.main,.main.collapsed{margin-right:0}.mobile-menu{display:grid}.topbar{padding:0 12px}.user-chip span:last-child{display:none}.wrap{padding:17px 12px}.stats-grid{grid-template-columns:1fr 1fr;gap:10px}.card{padding:15px}.live-grid{grid-template-columns:1fr!important}.two-col,.storage-grid{grid-template-columns:1fr}.toolbar h1{width:100%;font-size:23px}.login{margin:4vh 12px}}
 @media(max-width:440px){.stats-grid{grid-template-columns:1fr}.top-title{font-size:15px}}
-.thumb{width:110px;height:62px;object-fit:cover;border-radius:9px;border:1px solid var(--bc-border);background:#eef2f7;cursor:pointer}.plate-thumb{width:130px;height:48px}.recent-plate-result{display:flex;align-items:center;gap:10px;min-width:275px}.recent-plate-result .plate-thumb{flex:0 0 auto}.recent-vehicle-thumb{width:126px;height:72px;object-fit:cover;border-radius:10px;border:1px solid var(--bc-border);background:#eef2f7}.recent-media-missing{display:inline-flex;width:126px;height:72px;align-items:center;justify-content:center;border:1px dashed var(--bc-border);border-radius:10px;color:var(--bc-muted);font-size:12px}.status-pill{display:inline-block;padding:3px 9px;border-radius:999px;font-size:12px;font-weight:900}.status-pill.ok{background:#e5f7ef;color:#147a50}.status-pill.bad{background:#ffe8e8;color:#b42318}.status-pill.vip{background:#fff3cd;color:#8a6100}.event-blocked{background:rgba(214,69,69,.07)}.event-vip{background:rgba(229,161,26,.08)}.filter-grid{display:grid;grid-template-columns:repeat(5,minmax(140px,1fr));gap:10px;align-items:end}.modal-img{position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:5000;display:none;place-items:center;padding:30px}.modal-img.open{display:grid}.modal-img img{max-width:95vw;max-height:90vh;border-radius:14px}.modal-img button{position:absolute;top:20px;left:20px}@media(max-width:900px){.filter-grid{grid-template-columns:1fr 1fr}}
+.thumb{width:110px;height:62px;object-fit:cover;border-radius:9px;border:1px solid var(--bc-border);background:#eef2f7;cursor:pointer}.plate-thumb{width:130px;height:48px}.recent-plate-result{display:flex;align-items:center;gap:10px;min-width:275px}.recent-plate-result .plate-thumb{flex:0 0 auto}.recent-vehicle-thumb{width:126px;height:72px;object-fit:cover;border-radius:10px;border:1px solid var(--bc-border);background:#eef2f7}.recent-media-missing{display:inline-flex;width:126px;height:72px;align-items:center;justify-content:center;border:1px dashed var(--bc-border);border-radius:10px;color:var(--bc-muted);font-size:12px}.status-pill{display:inline-block;padding:3px 9px;border-radius:999px;font-size:12px;font-weight:900}.status-pill.ok{background:#e5f7ef;color:#147a50}.status-pill.bad{background:#ffe8e8;color:#b42318}.status-pill.vip{background:#fff3cd;color:#8a6100}.event-blocked{background:rgba(214,69,69,.07)}.event-vip{background:rgba(229,161,26,.08)}.filter-grid{display:grid;grid-template-columns:repeat(5,minmax(140px,1fr));gap:10px;align-items:end}.plate-search-wrap{grid-column:span 2;min-width:350px}.plate-search-label{display:block;font-weight:800;margin-bottom:6px}.iran-plate-input{display:flex;align-items:stretch;width:min(100%,430px);height:70px;border:3px solid #111820;border-radius:9px;overflow:hidden;background:#fff;color:#111;box-shadow:0 4px 12px rgba(0,0,0,.16)}.plate-input-blue{width:48px;flex:0 0 48px;background:#0868b7;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:15px;line-height:1.05}.plate-input-blue small{font:700 7px/1.15 Arial,sans-serif;margin-top:4px;text-align:center}.iran-plate-input .plate-part{height:100%;margin:0!important;padding:0 5px!important;border:0!important;border-radius:0!important;background:#fff!important;color:#111!important;box-shadow:none!important;text-align:center;font-size:24px;font-weight:900;direction:rtl;min-width:0}.iran-plate-input .plate-part:focus{outline:3px solid rgba(8,124,240,.32);outline-offset:-3px}.plate-prefix-input{width:68px;flex:0 0 68px}.plate-letter-input{width:76px;flex:0 0 76px;cursor:text}.plate-serial-input{flex:1;width:105px}.plate-input-region{width:82px;flex:0 0 82px;border-left:3px solid #111820;display:flex;flex-direction:column;align-items:stretch;justify-content:center;background:#fff}.plate-input-region small{height:21px;text-align:center;font-size:11px;font-weight:800;line-height:21px}.plate-input-region .plate-part{height:43px;width:100%;font-size:22px}.plate-search-help{display:block;margin-top:5px;color:var(--bc-muted)}.modal-img{position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:5000;display:none;place-items:center;padding:30px}.modal-img.open{display:grid}.modal-img img{max-width:95vw;max-height:90vh;border-radius:14px}.modal-img button{position:absolute;top:20px;left:20px}@media(max-width:900px){.filter-grid{grid-template-columns:1fr 1fr}.plate-search-wrap{grid-column:1/-1;min-width:0}}@media(max-width:520px){.iran-plate-input{height:62px}.plate-input-blue{width:40px;flex-basis:40px}.plate-prefix-input{width:56px;flex-basis:56px}.plate-letter-input{width:64px;flex-basis:64px}.plate-input-region{width:68px;flex-basis:68px}.iran-plate-input .plate-part{font-size:19px}}
 .event-evidence-layout{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(310px,.75fr);gap:18px;align-items:start}.evidence-images{display:grid;grid-template-columns:minmax(0,3fr) minmax(180px,1fr);gap:12px;align-items:stretch}.evidence-images>div{display:flex;flex-direction:column;gap:7px}.evidence-images img{width:100%;height:min(62vh,620px);object-fit:contain;background:#0b1220;border-radius:11px;cursor:zoom-in}.evidence-images>div:last-child img{height:min(30vh,250px)}@media(max-width:900px){.event-evidence-layout{grid-template-columns:1fr}.evidence-images{grid-template-columns:1fr}.evidence-images img,.evidence-images>div:last-child img{height:auto;max-height:65vh}}
 .login-page{min-height:100vh;display:grid;grid-template-columns:minmax(320px,520px) 1fr;background:linear-gradient(135deg,#071b3f 0%,#0b2e63 52%,#087cf0 100%);direction:ltr;overflow:hidden}.login-panel{direction:rtl;background:var(--bc-surface);padding:clamp(26px,5vw,68px);display:flex;align-items:center;justify-content:center;box-shadow:20px 0 60px rgba(0,0,0,.18);z-index:2}.login-box{width:100%;max-width:410px}.login-logo{display:flex;align-items:center;gap:13px;margin-bottom:34px}.login-logo .brand-mark{width:58px;height:58px;min-width:58px;font-size:22px}.login-logo h1{margin:0;font-size:28px}.login-logo p{margin:0;color:var(--bc-muted)}.login-title{font-size:25px;font-weight:900;margin:0 0 5px}.login-subtitle{color:var(--bc-muted);margin:0 0 26px}.password-wrap{position:relative}.password-wrap input{padding-left:48px}.password-toggle{position:absolute;left:7px;top:10px;width:36px;height:36px;background:transparent!important;color:var(--bc-muted)!important;box-shadow:none;padding:0}.password-toggle:hover{transform:none;background:var(--bc-surface2)!important}.login-submit{width:100%;height:46px;font-size:15px;margin-top:5px}.login-help{display:flex;justify-content:space-between;gap:12px;margin-top:17px;font-size:12px;color:var(--bc-muted)}.login-visual{direction:rtl;color:#fff;display:flex;align-items:center;justify-content:center;padding:60px;position:relative}.login-visual:before,.login-visual:after{content:'';position:absolute;border-radius:50%;background:rgba(255,255,255,.08)}.login-visual:before{width:420px;height:420px;left:-130px;top:-170px}.login-visual:after{width:300px;height:300px;right:8%;bottom:-140px}.login-hero{max-width:670px;position:relative;z-index:1}.login-hero h2{font-size:clamp(32px,4vw,54px);font-weight:900;line-height:1.35;margin:0 0 16px}.login-hero p{font-size:17px;opacity:.82;max-width:570px}.login-features{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:34px}.login-feature{padding:17px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.08);backdrop-filter:blur(10px);border-radius:15px}.login-feature b{display:block;font-size:15px;margin-bottom:3px}.login-feature span{font-size:12px;opacity:.75}.login-version{position:absolute;bottom:24px;left:30px;opacity:.62;font-size:12px}@media(max-width:900px){.login-page{grid-template-columns:1fr}.login-visual{display:none}.login-panel{min-height:100vh;padding:24px}.login-help{flex-direction:column}}
 .anpr-status{display:block;padding:7px 12px;color:#c8d5df;background:#0c141a;font-size:11px;line-height:1.7;border-top:1px solid #263945}.anpr-status.bad{color:#ffb4ab;background:#301716}.playback-controls{display:flex;gap:7px;padding:8px 11px;background:#0c141a;border-top:1px solid #263945}.playback-controls button{padding:6px 12px;font-size:12px;box-shadow:none}.playback-controls button.active{background:#16a36b}
@@ -1029,6 +1068,10 @@ def media(request:Request,path:str=''):
 def events(
     request:Request,
     q:str='',
+    q_prefix:str='',
+    q_letter:str='',
+    q_serial:str='',
+    q_plate_region:str='',
     camera:str='',
     city:str='',
     region:str='',
@@ -1044,18 +1087,74 @@ def events(
 ):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
-    q=q.strip();camera=camera.strip();city=city.strip();region=region.strip()
+    q=q.strip();q_prefix=q_prefix.strip();q_letter=q_letter.strip()
+    q_serial=q_serial.strip();q_plate_region=q_plate_region.strip()
+    camera=camera.strip();city=city.strip();region=region.strip()
     date_from=date_from.strip();date_to=date_to.strip()
     time_from=time_from.strip();time_to=time_to.strip()
     per_page=per_page if per_page in {25,50,100} else 25
     where=[];params=[];filter_error=''
-    normalized_query=normalize_plate(q)
-    if q:
-        if normalized_query:
+    # Keep old bookmarked q= URLs working, while presenting complete values in
+    # the new position-aware plate control.
+    legacy_query_requested=bool(
+        q and not any((q_prefix,q_letter,q_serial,q_plate_region))
+    )
+    if legacy_query_requested:
+        old_parts=split_iran_plate(q)
+        old_normalized=normalize_plate(q)
+        if old_parts:
+            q_prefix=persian_digits(old_parts['prefix'])
+            q_letter='الف' if old_parts['letter']=='ا' else old_parts['letter']
+            q_serial=persian_digits(old_parts['serial'])
+            q_plate_region=persian_digits(old_parts['region'])
+        elif old_normalized.isdigit() and len(old_normalized)<=2:
+            q_prefix=persian_digits(old_normalized)
+        elif old_normalized.isdigit() and len(old_normalized)==3:
+            q_serial=persian_digits(old_normalized)
+        elif old_normalized in ALLOWED_PLATE_LETTERS:
+            q_letter='الف' if old_normalized=='ا' else old_normalized
+    segmented_query=bool(
+        not legacy_query_requested
+        and any((q_prefix,q_letter,q_serial,q_plate_region))
+    )
+    plate_expression=(
+        "COALESCE(NULLIF(e.plate_norm,''),e.raw_guess_norm,'')"
+    )
+    if segmented_query:
+        for value,start,max_length,label in (
+            (q_prefix,1,2,'دو رقم اول'),
+            (q_serial,4,3,'سه رقم میانی'),
+            (q_plate_region,7,2,'کد ایران'),
+        ):
+            if not value:
+                continue
+            normalized=normalize_plate(value)
+            if not normalized.isdigit() or len(normalized)>max_length:
+                filter_error=(
+                    filter_error
+                    or f'{label} پلاک معتبر نیست.'
+                )
+                where.append('1=0')
+                continue
             where.append(
-                "INSTR(COALESCE(NULLIF(e.plate_norm,''),"
-                "e.raw_guess_norm,''),?)>0"
+                f'SUBSTR({plate_expression},{start},LENGTH(?))=?'
             )
+            params.extend([normalized,normalized])
+        if q_letter:
+            normalized_letter=normalize_plate(q_letter)
+            if (
+                len(normalized_letter)!=1
+                or normalized_letter not in ALLOWED_PLATE_LETTERS
+            ):
+                filter_error=filter_error or 'حرف پلاک معتبر نیست.'
+                where.append('1=0')
+            else:
+                where.append(f'SUBSTR({plate_expression},3,1)=?')
+                params.append(normalized_letter)
+    elif q:
+        normalized_query=normalize_plate(q)
+        if normalized_query:
+            where.append(f'INSTR({plate_expression},?)>0')
             params.append(normalized_query)
         else:
             filter_error='عبارت واردشده برای جست‌وجوی پلاک معتبر نیست.'
@@ -1199,8 +1298,17 @@ def events(
     color_opts=''.join(f"<option {'selected' if vehicle_color==v else ''}>{escape(v)}</option>" for v in vehicle_colors)
     city_opts=''.join(f"<option value='{escape(value)}'></option>" for value in cities)
     status_opts=''.join(f"<option value='{v}' {'selected' if status==v else ''}>{l}</option>" for v,l in [('allowed','مجاز'),('blocked','غیرمجاز'),('vip','VIP'),('unknown','ثبت‌نشده')])
+    plate_filter_params=(
+        {'q':q}
+        if legacy_query_requested
+        else {
+            'q_prefix':q_prefix,'q_letter':q_letter,
+            'q_serial':q_serial,'q_plate_region':q_plate_region,
+        }
+    )
     filter_params={
-        'q':q,'camera':camera,'city':city,'region':region,'status':status,
+        **plate_filter_params,
+        'camera':camera,'city':city,'region':region,'status':status,
         'vehicle_type':vehicle_type,'vehicle_color':vehicle_color,
         'date_from':date_from,'time_from':time_from,
         'date_to':date_to,'time_to':time_to,'per_page':per_page,
@@ -1214,7 +1322,7 @@ def events(
         if filter_error else ''
     )
     body=f"""<div class='wrap'><div class='toolbar'><h1 style='margin-left:auto'>گزارش ترددها</h1><a class='btn' href='/watchlist'>مدیریت پلاک‌ها</a><a class='btn secondary' href='/events/export.csv'>خروجی CSV</a></div>
-    {error_html}<div class='card'><form class='filter-grid'><div><label>پلاک؛ حتی یک یا دو رقم</label><input name='q' value='{escape(q)}' placeholder='مثال: ۱۲ یا ۳۴۵'></div><div><label>دوربین</label><select name='camera'><option value=''>همه</option>{cam_opts}</select></div><div><label>شهر محل ثبت</label><input name='city' list='eventCities' value='{escape(city)}' placeholder='مثال: تهران'><datalist id='eventCities'>{city_opts}</datalist></div><div><label>کد ناحیه پلاک</label><input name='region' inputmode='numeric' maxlength='2' value='{escape(region)}' placeholder='مثال: ۷۴'></div><div><label>وضعیت</label><select name='status'><option value=''>همه</option>{status_opts}</select></div><div><label>نوع خودرو</label><select name='vehicle_type'><option value=''>همه</option>{type_opts}</select></div><div><label>رنگ خودرو</label><select name='vehicle_color'><option value=''>همه</option>{color_opts}</select></div><div><label>از تاریخ شمسی</label><input name='date_from' value='{escape(date_from)}' placeholder='۱۴۰۵/۰۵/۰۸'></div><div><label>از ساعت</label><input type='time' name='time_from' value='{escape(time_from.translate(_ALL_DIGITS))}'></div><div><label>تا تاریخ شمسی</label><input name='date_to' value='{escape(date_to)}' placeholder='۱۴۰۵/۰۵/۰۸'></div><div><label>تا ساعت</label><input type='time' name='time_to' value='{escape(time_to.translate(_ALL_DIGITS))}'></div><div><label>تعداد در هر صفحه</label><select name='per_page'>{''.join(f"<option value='{size}' {'selected' if per_page==size else ''}>{persian_digits(size)}</option>" for size in (25,50,100))}</select></div><div><button>اعمال فیلتر</button> <a class='btn secondary' href='/events'>پاک‌کردن</a></div></form></div>
+    {error_html}<div class='card'><form class='filter-grid'>{plate_search_input_html(q_prefix,q_letter,q_serial,q_plate_region)}<div><label>دوربین</label><select name='camera'><option value=''>همه</option>{cam_opts}</select></div><div><label>شهر محل ثبت</label><input name='city' list='eventCities' value='{escape(city)}' placeholder='مثال: تهران'><datalist id='eventCities'>{city_opts}</datalist></div><div><label>وضعیت</label><select name='status'><option value=''>همه</option>{status_opts}</select></div><div><label>نوع خودرو</label><select name='vehicle_type'><option value=''>همه</option>{type_opts}</select></div><div><label>رنگ خودرو</label><select name='vehicle_color'><option value=''>همه</option>{color_opts}</select></div><div><label>از تاریخ شمسی</label><input name='date_from' value='{escape(date_from)}' placeholder='۱۴۰۵/۰۵/۰۸'></div><div><label>از ساعت</label><input type='time' name='time_from' value='{escape(time_from.translate(_ALL_DIGITS))}'></div><div><label>تا تاریخ شمسی</label><input name='date_to' value='{escape(date_to)}' placeholder='۱۴۰۵/۰۵/۰۸'></div><div><label>تا ساعت</label><input type='time' name='time_to' value='{escape(time_to.translate(_ALL_DIGITS))}'></div><div><label>تعداد در هر صفحه</label><select name='per_page'>{''.join(f"<option value='{size}' {'selected' if per_page==size else ''}>{persian_digits(size)}</option>" for size in (25,50,100))}</select></div><div><button>اعمال فیلتر</button> <a class='btn secondary' href='/events'>پاک‌کردن</a></div></form></div>
     <div class='card'><div class='table-wrap'><table><tr><th>ردیف</th><th>تصویر خودرو</th><th>تصویر پلاک</th><th>پلاک/وضعیت</th><th>مالک/خودرو</th><th>تشخیص خودرو</th><th>اطمینان</th><th>دوربین</th><th>شهر / کد ناحیه</th><th>تاریخ و ساعت شمسی</th><th>عملیات</th></tr>{trs}</table></div>{pager}</div></div>
     <div id='imgModal' class='modal-img' onclick='this.classList.remove("open")'><button>بستن</button><img id='modalImage'></div><script>function showImage(src){{document.getElementById('modalImage').src=src;document.getElementById('imgModal').classList.add('open')}}</script>"""
     return page('ترددها',body,u,request)

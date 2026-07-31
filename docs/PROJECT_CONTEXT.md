@@ -897,3 +897,20 @@ from both the dashboard and event archive.
 Database, users, camera settings and historical event rows are preserved. No
 historical media is deleted by this migration. The implementation record is
 `agent-results/latest/ANPR_VISUAL_ROI_STILL_EVIDENCE_RC18.md`.
+# RC19 — plate-shaped search and conditional rescue OCR (2026-07-31)
+
+- RC19 is based on the verified RC18 commit `eecc7b9` from Draft PR #32.
+- The event archive plate filter is now a real Iranian-plate-shaped, segmented
+  control: 2-digit prefix, searchable/typeable letter, 3-digit serial and
+  2-digit Iran region. Every part is optional and is queried at its canonical
+  plate position; legacy `q=` links remain supported.
+- The primary character detector remains fast and the existing strict
+  character-by-character temporal consensus still requires at least three
+  independent observations and a complete whole-plate witness.
+- CRNN/CNN now acts as a conditional rescue lane. It runs for unreadable,
+  low-confidence, low-quality or known `2↔3`, `س↔ص`, letter and region-position
+  ambiguity, while strong unambiguous primary reads skip the second model.
+- Existing operator-confirmed feedback, images, settings, users and historical
+  events are preserved. IR-LPR-derived candidate weights remain research/shadow
+  only until a written commercial license is obtained.
+
