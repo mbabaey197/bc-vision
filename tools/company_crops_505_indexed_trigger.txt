@@ -1,0 +1,1 @@
+Trigger the indexed unconditional 505-image benchmark workflow.
