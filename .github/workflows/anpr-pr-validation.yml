@@ -1,6 +1,4 @@
 # Trusted, isolated validation for BC Vision pull requests.
-# Licensing and ANPR changes must run both primary gates; unrelated one-off
-# research benchmarks are intentionally excluded from normal PR validation.
 name: ANPR PR validation
 
 on:
@@ -19,7 +17,7 @@ on:
       - "tests/**"
       - "tools/**"
       - "training/**"
-      - "docs/ANPR_MODELS.md"
+      - "docs/**"
       - ".github/workflows/**"
 
 permissions:
@@ -59,10 +57,11 @@ jobs:
           BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\regression
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
-          python -m compileall -q app/ai app/database.py app/streams.py
+          python -m compileall -q app
           python -m pytest -q tests
 
   ai-runtime:
+    needs: regression
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 45
     env:
