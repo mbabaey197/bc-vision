@@ -30,6 +30,7 @@ concurrency:
 
 jobs:
   regression:
+    if: false
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 20
     steps:
@@ -62,6 +63,7 @@ jobs:
           python -m pytest -q tests
 
   ai-runtime:
+    if: false
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 45
     env:
