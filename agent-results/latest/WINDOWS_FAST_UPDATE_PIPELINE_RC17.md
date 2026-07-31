@@ -12,7 +12,7 @@ application change into a multi-hour wait.
 
 ## Implemented split
 
-- `.github/workflows/windows-fast-updater.yml` is the automatic agent-branch
+- `.github/workflows/windows-fast-updater.yml` is the automatic pull-request
   path.  It retains ignored build state with `actions/checkout clean: false`,
   enables `BCVISION_INCREMENTAL_BUILD=1`, reuses the Python/PyInstaller/model
   caches and the verified Inno Setup installation, builds only the one-click
