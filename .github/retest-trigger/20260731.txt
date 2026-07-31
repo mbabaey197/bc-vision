@@ -1,2 +1,2 @@
 Run the one-off IR-LPR old-vs-new visual regression benchmark on the exact validation and test archives.
-Trigger attempt 2 after the workflow became available on main.
+Trigger attempt 3 after marking the PR ready for review.
