@@ -52,15 +52,21 @@ def crop_from_bbox(frame, bbox):
 
 
 def vehicle_snapshot(result: dict, frame):
-    """Build a real vehicle image with the detected plate marked."""
-    vehicle = result.get("vehicle_crop")
-    using_vehicle_crop = _nonempty_image(vehicle)
-    if using_vehicle_crop:
-        annotated = vehicle.copy()
-    elif _nonempty_image(frame):
+    """Keep the original full-resolution vehicle frame as event evidence.
+
+    Detector-provided vehicle crops can cut off the bonnet, roof or rear of a
+    fast-moving vehicle.  The live frame is therefore the primary evidence;
+    the crop remains only a recovery fallback for callers without a frame.
+    """
+    if _nonempty_image(frame):
         annotated = frame.copy()
+        using_vehicle_crop = False
     else:
-        return None
+        vehicle = result.get("vehicle_crop")
+        if not _nonempty_image(vehicle):
+            return None
+        annotated = vehicle.copy()
+        using_vehicle_crop = True
 
     bbox = result.get("bbox")
     if not bbox or len(bbox) != 4:

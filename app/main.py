@@ -18,7 +18,7 @@ from app.security import COOKIE_NAME, create_token, read_token, verify_password,
 from app.streams import manager, CV_OK
 from app.license import status as license_status, install_license, activate_online, deactivate_local, machine_id
 from html import escape
-import time, csv, shutil, os, json, secrets
+import time, csv, shutil, os, json, secrets, math
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlencode
 from pathlib import Path
@@ -360,14 +360,20 @@ def dashboard_event_row(row):
     image_path = row["image_path"] or ""
     plate_path = row["plate_image_path"] or ""
     vehicle = (
-        f"<a href='/events/{row['id']}'><img class='recent-vehicle-thumb' "
-        f"src='/media?path={quote(image_path)}' alt='تصویر خودرو'></a>"
+        f"<button type='button' class='media-preview' "
+        f"onclick='showImage(this.firstElementChild.src)' "
+        f"aria-label='نمایش تمام‌صفحه تصویر خودرو'><img "
+        f"class='recent-vehicle-thumb' loading='lazy' "
+        f"src='/media?path={quote(image_path)}' alt='تصویر خودرو'></button>"
         if image_path and Path(image_path).is_file()
         else "<span class='recent-media-missing'>بدون تصویر خودرو</span>"
     )
     plate_image = (
-        f"<a href='/events/{row['id']}'><img class='thumb plate-thumb' "
-        f"src='/media?path={quote(plate_path)}' alt='تصویر پلاک'></a>"
+        f"<button type='button' class='media-preview' "
+        f"onclick='showImage(this.firstElementChild.src)' "
+        f"aria-label='نمایش تمام‌صفحه تصویر پلاک'><img "
+        f"class='thumb plate-thumb' loading='lazy' "
+        f"src='/media?path={quote(plate_path)}' alt='تصویر پلاک'></button>"
         if plate_path and Path(plate_path).is_file()
         else "<span class='recent-media-missing' "
         "style='width:130px;height:48px'>بدون تصویر پلاک</span>"
@@ -429,12 +435,13 @@ CSS = """<style>
 .main{margin-right:var(--sidebar);min-height:100vh;transition:margin-right .22s}.main.collapsed{margin-right:84px}.topbar{height:70px;background:color-mix(in srgb,var(--bc-surface) 92%,transparent);backdrop-filter:blur(12px);border-bottom:1px solid var(--bc-border);display:flex;align-items:center;gap:12px;padding:0 24px;position:sticky;top:0;z-index:900}.top-title{font-size:18px;font-weight:900;color:var(--bc-navy);margin-left:auto}.resource-strip{display:flex;align-items:center;gap:7px;direction:ltr}.resource-chip{display:flex;align-items:center;gap:5px;min-width:66px;padding:5px 8px;border:1px solid var(--bc-border);background:var(--bc-surface);border-radius:10px;font-size:12px;font-weight:800}.resource-dot{width:8px;height:8px;border-radius:50%;background:#22a06b;box-shadow:0 0 0 3px rgba(34,160,107,.12)}.resource-chip.warn .resource-dot{background:#e5a11a}.resource-chip.danger .resource-dot{background:#d64545}.storage-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.drive-card{border:1px solid var(--bc-border);background:var(--bc-surface2);border-radius:13px;padding:14px}.storage-progress{height:10px;background:var(--bc-border);border-radius:8px;overflow:hidden;margin:9px 0}.storage-progress span{display:block;height:100%;background:linear-gradient(90deg,var(--bc-blue),var(--bc-cyan));border-radius:8px}[data-theme=dark] .top-title{color:#eaf2ff}.top-action{width:40px;height:40px;border-radius:11px;border:1px solid var(--bc-border);background:var(--bc-surface);color:var(--bc-text);display:grid;place-items:center;cursor:pointer;box-shadow:none;padding:0}.user-chip{display:flex;align-items:center;gap:9px;border:1px solid var(--bc-border);background:var(--bc-surface);padding:6px 10px;border-radius:12px}.avatar{width:29px;height:29px;border-radius:9px;background:linear-gradient(135deg,var(--bc-blue),var(--bc-cyan));color:#fff;display:grid;place-items:center;font-weight:900}.wrap{max-width:1550px;margin:auto;padding:25px}.page-title{font-weight:900;font-size:28px;margin:0;color:var(--bc-navy)}[data-theme=dark] .page-title,[data-theme=dark] h1{color:#edf4ff}h1{font-size:27px;font-weight:900;color:var(--bc-navy)}h3{font-size:18px;font-weight:800}.page-sub{color:var(--bc-muted);margin:2px 0 0}
 .card{background:var(--bc-surface);border:1px solid var(--bc-border);border-radius:var(--bc-radius);padding:20px;box-shadow:var(--bc-shadow);margin-bottom:17px}.login{max-width:430px;margin:7vh auto;padding:30px}.login .brand{text-align:center;font-size:28px;margin-bottom:3px}.login .muted{text-align:center}.brand{font-size:25px;font-weight:900;color:var(--bc-navy)}.muted{color:var(--bc-muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}.stats-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:15px;margin-bottom:17px}.stat-card{position:relative;overflow:hidden}.stat-card:after{content:"";position:absolute;width:90px;height:90px;border-radius:50%;left:-25px;top:-28px;background:rgba(8,124,240,.07)}.stat-head{display:flex;align-items:center;justify-content:space-between}.stat-icon{width:43px;height:43px;border-radius:13px;background:rgba(8,124,240,.1);color:var(--bc-blue);display:grid;place-items:center;font-size:21px}.stat{font-size:31px;font-weight:900;color:var(--bc-text);margin-top:5px;line-height:1.2}.trend{font-size:12px;color:var(--bc-muted)}
 label{display:block;font-weight:700;color:var(--bc-text);margin-bottom:3px}input,select,textarea,button{font-family:inherit;font-size:14px}input:not([type=checkbox]),select,textarea{width:100%;padding:10px 12px;border:1px solid var(--bc-border);border-radius:10px;margin:5px 0 13px;background:var(--bc-surface);color:var(--bc-text);outline:0;transition:.18s}input:focus,select:focus,textarea:focus{border-color:var(--bc-blue);box-shadow:0 0 0 3px rgba(8,124,240,.13)}button,.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:0;background:linear-gradient(135deg,var(--bc-blue),#075dc5);color:#fff!important;padding:9px 16px;border-radius:9px;text-decoration:none;cursor:pointer;font-weight:700;box-shadow:0 4px 12px rgba(8,124,240,.18);transition:.18s}button:hover,.btn:hover{transform:translateY(-1px);filter:brightness(1.04)}.secondary{background:#65738a!important;box-shadow:none}.danger{background:#c63838!important;box-shadow:none}.ok{color:#168458}.bad{color:#d34747}.replay-layout{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(300px,.8fr);gap:18px}.video-panel video{width:100%;max-height:70vh;background:#05080d;border-radius:14px}.replay-controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:12px}.replay-controls button{padding:8px 12px}.event-meta{display:grid;grid-template-columns:1fr 1fr;gap:10px}.meta-item{padding:10px;border:1px solid var(--bc-border);border-radius:10px;background:var(--bc-surface2)}.meta-item small{display:block;color:var(--bc-muted)}.detail-images{display:grid;grid-template-columns:1fr 1fr;gap:10px}.detail-images img{width:100%;height:165px;object-fit:contain;background:#0b1220;border-radius:11px}.time-badge{font-size:20px;font-weight:900;color:var(--bc-blue)}@media(max-width:900px){.replay-layout{grid-template-columns:1fr}.event-meta{grid-template-columns:1fr}}.alert{padding:12px 15px;border-radius:10px;background:#fff1f2;color:#9b1c2d;border:1px solid #ffd5da;margin-bottom:14px}.toast-box{position:fixed;left:22px;bottom:22px;z-index:2000;min-width:270px;background:var(--bc-surface);border:1px solid var(--bc-border);border-right:4px solid #168458;border-radius:12px;padding:12px 15px;box-shadow:var(--bc-shadow);animation:toastin .3s ease}.toast-box.hide{opacity:0;transform:translateY(12px);transition:.35s}@keyframes toastin{from{opacity:0;transform:translateY(15px)}}
-.table-wrap{overflow:auto}table{width:100%;border-collapse:separate;border-spacing:0;min-width:700px}th,td{padding:12px 11px;border-bottom:1px solid var(--bc-border);text-align:right;vertical-align:middle}th{font-size:13px;color:var(--bc-muted);background:var(--bc-surface2);font-weight:800}tr:last-child td{border-bottom:0}tbody tr:hover td{background:var(--bc-surface2)}.pagination{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-top:14px;padding-top:13px;border-top:1px solid var(--bc-border)}.pagination-summary{color:var(--bc-muted);font-weight:700}.pagination-controls{display:flex;align-items:center;gap:5px;direction:rtl}.page-nav,.page-number{min-width:37px;height:37px;padding:5px 10px;border:1px solid var(--bc-border);background:var(--bc-surface);border-radius:9px;text-decoration:none;display:grid;place-items:center;font-weight:800;color:var(--bc-text)}.page-nav{min-width:64px}.page-number.active{background:var(--bc-blue);border-color:var(--bc-blue);color:#fff}.page-nav.disabled{opacity:.42;cursor:not-allowed}.page-gap{padding:0 4px;color:var(--bc-muted)}.new-events-notice{display:none;margin:10px 0;padding:9px 12px;border-radius:10px;background:#e8f4ff;color:#075dc5;font-weight:800}.new-events-notice.show{display:block}.code{direction:ltr;text-align:left;font-family:Consolas,"Courier New",monospace}.live-grid{display:grid;grid-template-columns:repeat(var(--cols),minmax(0,520px));gap:14px;justify-content:start}.camera-tile{background:#101820;border-radius:14px;overflow:hidden;position:relative;min-height:160px;box-shadow:var(--bc-shadow)}.camera-tile img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;background:#101820}.camera-head{display:flex;justify-content:space-between;align-items:center;color:#fff;padding:8px 11px;background:#162631}.badge{font-size:11px;padding:4px 9px;border-radius:20px;background:#657180}.badge.online{background:#168458}.toolbar{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:17px}.toolbar h1{margin-left:auto;margin-bottom:0}.toolbar select{width:auto;margin:0}.two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px}.system-bars{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.meter-label{display:flex;justify-content:space-between;margin-bottom:7px}.meter{height:8px;border-radius:8px;background:var(--bc-border);overflow:hidden}.meter span{display:block;height:100%;background:linear-gradient(90deg,var(--bc-blue),var(--bc-cyan));border-radius:8px;transition:width .4s}.empty-state{text-align:center;padding:38px 20px}.grid-switch{display:flex;background:var(--bc-surface);border:1px solid var(--bc-border);border-radius:10px;padding:3px;gap:3px}.grid-switch button{box-shadow:none;background:transparent;color:var(--bc-muted)!important;padding:6px 10px}.grid-switch button.active{background:var(--bc-blue);color:#fff!important}.mobile-menu{display:none}
+.table-wrap{overflow:auto}table{width:100%;border-collapse:separate;border-spacing:0;min-width:700px}th,td{padding:12px 11px;border-bottom:1px solid var(--bc-border);text-align:right;vertical-align:middle}th{font-size:13px;color:var(--bc-muted);background:var(--bc-surface2);font-weight:800}tr:last-child td{border-bottom:0}tbody tr:hover td{background:var(--bc-surface2)}.pagination{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-top:14px;padding-top:13px;border-top:1px solid var(--bc-border)}.pagination-summary{color:var(--bc-muted);font-weight:700}.pagination-controls{display:flex;align-items:center;gap:5px;direction:rtl}.page-nav,.page-number{min-width:37px;height:37px;padding:5px 10px;border:1px solid var(--bc-border);background:var(--bc-surface);border-radius:9px;text-decoration:none;display:grid;place-items:center;font-weight:800;color:var(--bc-text)}.page-nav{min-width:64px}.page-number.active{background:var(--bc-blue);border-color:var(--bc-blue);color:#fff}.page-nav.disabled{opacity:.42;cursor:not-allowed}.page-gap{padding:0 4px;color:var(--bc-muted)}.new-events-notice{display:none;margin:10px 0;padding:9px 12px;border-radius:10px;background:#e8f4ff;color:#075dc5;font-weight:800}.new-events-notice.show{display:block}.code{direction:ltr;text-align:left;font-family:Consolas,"Courier New",monospace}.live-grid{display:grid;grid-template-columns:repeat(var(--cols),minmax(0,520px));gap:14px;justify-content:start}.camera-tile{background:#101820;border-radius:14px;overflow:hidden;position:relative;min-height:160px;box-shadow:var(--bc-shadow)}.camera-view{position:relative;width:100%;aspect-ratio:16/9;background:#101820;overflow:hidden;touch-action:none}.camera-tile .camera-view>img{display:block;width:100%;height:100%;aspect-ratio:auto;object-fit:fill;background:#101820}.roi-box{position:absolute;border:3px solid #22e279;background:transparent;box-shadow:0 0 0 1px rgba(0,0,0,.65),0 0 16px rgba(34,226,121,.35);cursor:move;z-index:12;min-width:18px;min-height:18px;touch-action:none}.roi-box[hidden]{display:none}.roi-label{position:absolute;right:-3px;top:-27px;background:#19a963;color:#fff;padding:2px 7px;border-radius:6px 6px 0 0;font-size:10px;font-weight:900;white-space:nowrap}.roi-handle{position:absolute;width:18px;height:18px;left:-9px;bottom:-9px;border-radius:4px;background:#fff;border:3px solid #19c96d;cursor:nesw-resize}.roi-message{font-size:11px;color:#8debb8;margin-right:auto;align-self:center}.media-preview{display:inline-flex;background:transparent!important;padding:0;border:0;border-radius:10px;box-shadow:none!important}.media-preview:hover{transform:none;filter:brightness(1.05)}.camera-head{display:flex;justify-content:space-between;align-items:center;color:#fff;padding:8px 11px;background:#162631}.badge{font-size:11px;padding:4px 9px;border-radius:20px;background:#657180}.badge.online{background:#168458}.toolbar{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:17px}.toolbar h1{margin-left:auto;margin-bottom:0}.toolbar select{width:auto;margin:0}.two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px}.system-bars{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.meter-label{display:flex;justify-content:space-between;margin-bottom:7px}.meter{height:8px;border-radius:8px;background:var(--bc-border);overflow:hidden}.meter span{display:block;height:100%;background:linear-gradient(90deg,var(--bc-blue),var(--bc-cyan));border-radius:8px;transition:width .4s}.empty-state{text-align:center;padding:38px 20px}.grid-switch{display:flex;background:var(--bc-surface);border:1px solid var(--bc-border);border-radius:10px;padding:3px;gap:3px}.grid-switch button{box-shadow:none;background:transparent;color:var(--bc-muted)!important;padding:6px 10px}.grid-switch button.active{background:var(--bc-blue);color:#fff!important}.mobile-menu{display:none}
 @media(max-width:1150px){.stats-grid{grid-template-columns:repeat(2,1fr)}.system-bars{grid-template-columns:1fr}}
 @media(max-width:900px){.resource-chip span.label{display:none}.resource-chip{min-width:auto}}
 @media(max-width:760px){.sidebar{transform:translateX(110%);width:258px}.sidebar.mobile-open{transform:translateX(0)}.sidebar-toggle{display:none}.main,.main.collapsed{margin-right:0}.mobile-menu{display:grid}.topbar{padding:0 12px}.user-chip span:last-child{display:none}.wrap{padding:17px 12px}.stats-grid{grid-template-columns:1fr 1fr;gap:10px}.card{padding:15px}.live-grid{grid-template-columns:1fr!important}.two-col,.storage-grid{grid-template-columns:1fr}.toolbar h1{width:100%;font-size:23px}.login{margin:4vh 12px}}
 @media(max-width:440px){.stats-grid{grid-template-columns:1fr}.top-title{font-size:15px}}
 .thumb{width:110px;height:62px;object-fit:cover;border-radius:9px;border:1px solid var(--bc-border);background:#eef2f7;cursor:pointer}.plate-thumb{width:130px;height:48px}.recent-plate-result{display:flex;align-items:center;gap:10px;min-width:275px}.recent-plate-result .plate-thumb{flex:0 0 auto}.recent-vehicle-thumb{width:126px;height:72px;object-fit:cover;border-radius:10px;border:1px solid var(--bc-border);background:#eef2f7}.recent-media-missing{display:inline-flex;width:126px;height:72px;align-items:center;justify-content:center;border:1px dashed var(--bc-border);border-radius:10px;color:var(--bc-muted);font-size:12px}.status-pill{display:inline-block;padding:3px 9px;border-radius:999px;font-size:12px;font-weight:900}.status-pill.ok{background:#e5f7ef;color:#147a50}.status-pill.bad{background:#ffe8e8;color:#b42318}.status-pill.vip{background:#fff3cd;color:#8a6100}.event-blocked{background:rgba(214,69,69,.07)}.event-vip{background:rgba(229,161,26,.08)}.filter-grid{display:grid;grid-template-columns:repeat(5,minmax(140px,1fr));gap:10px;align-items:end}.modal-img{position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:5000;display:none;place-items:center;padding:30px}.modal-img.open{display:grid}.modal-img img{max-width:95vw;max-height:90vh;border-radius:14px}.modal-img button{position:absolute;top:20px;left:20px}@media(max-width:900px){.filter-grid{grid-template-columns:1fr 1fr}}
+.event-evidence-layout{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(310px,.75fr);gap:18px;align-items:start}.evidence-images{display:grid;grid-template-columns:minmax(0,3fr) minmax(180px,1fr);gap:12px;align-items:stretch}.evidence-images>div{display:flex;flex-direction:column;gap:7px}.evidence-images img{width:100%;height:min(62vh,620px);object-fit:contain;background:#0b1220;border-radius:11px;cursor:zoom-in}.evidence-images>div:last-child img{height:min(30vh,250px)}@media(max-width:900px){.event-evidence-layout{grid-template-columns:1fr}.evidence-images{grid-template-columns:1fr}.evidence-images img,.evidence-images>div:last-child img{height:auto;max-height:65vh}}
 .login-page{min-height:100vh;display:grid;grid-template-columns:minmax(320px,520px) 1fr;background:linear-gradient(135deg,#071b3f 0%,#0b2e63 52%,#087cf0 100%);direction:ltr;overflow:hidden}.login-panel{direction:rtl;background:var(--bc-surface);padding:clamp(26px,5vw,68px);display:flex;align-items:center;justify-content:center;box-shadow:20px 0 60px rgba(0,0,0,.18);z-index:2}.login-box{width:100%;max-width:410px}.login-logo{display:flex;align-items:center;gap:13px;margin-bottom:34px}.login-logo .brand-mark{width:58px;height:58px;min-width:58px;font-size:22px}.login-logo h1{margin:0;font-size:28px}.login-logo p{margin:0;color:var(--bc-muted)}.login-title{font-size:25px;font-weight:900;margin:0 0 5px}.login-subtitle{color:var(--bc-muted);margin:0 0 26px}.password-wrap{position:relative}.password-wrap input{padding-left:48px}.password-toggle{position:absolute;left:7px;top:10px;width:36px;height:36px;background:transparent!important;color:var(--bc-muted)!important;box-shadow:none;padding:0}.password-toggle:hover{transform:none;background:var(--bc-surface2)!important}.login-submit{width:100%;height:46px;font-size:15px;margin-top:5px}.login-help{display:flex;justify-content:space-between;gap:12px;margin-top:17px;font-size:12px;color:var(--bc-muted)}.login-visual{direction:rtl;color:#fff;display:flex;align-items:center;justify-content:center;padding:60px;position:relative}.login-visual:before,.login-visual:after{content:'';position:absolute;border-radius:50%;background:rgba(255,255,255,.08)}.login-visual:before{width:420px;height:420px;left:-130px;top:-170px}.login-visual:after{width:300px;height:300px;right:8%;bottom:-140px}.login-hero{max-width:670px;position:relative;z-index:1}.login-hero h2{font-size:clamp(32px,4vw,54px);font-weight:900;line-height:1.35;margin:0 0 16px}.login-hero p{font-size:17px;opacity:.82;max-width:570px}.login-features{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:34px}.login-feature{padding:17px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.08);backdrop-filter:blur(10px);border-radius:15px}.login-feature b{display:block;font-size:15px;margin-bottom:3px}.login-feature span{font-size:12px;opacity:.75}.login-version{position:absolute;bottom:24px;left:30px;opacity:.62;font-size:12px}@media(max-width:900px){.login-page{grid-template-columns:1fr}.login-visual{display:none}.login-panel{min-height:100vh;padding:24px}.login-help{flex-direction:column}}
 .anpr-status{display:block;padding:7px 12px;color:#c8d5df;background:#0c141a;font-size:11px;line-height:1.7;border-top:1px solid #263945}.anpr-status.bad{color:#ffb4ab;background:#301716}.playback-controls{display:flex;gap:7px;padding:8px 11px;background:#0c141a;border-top:1px solid #263945}.playback-controls button{padding:6px 12px;font-size:12px;box-shadow:none}.playback-controls button.active{background:#16a36b}
 .iran-plate{display:inline-flex;direction:ltr;align-items:stretch;height:54px;min-width:250px;border:2px solid #15191f;border-radius:7px;overflow:hidden;background:#fff;color:#111;font-family:Tahoma,"Segoe UI",sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.14)}.iran-plate.compact{height:42px;min-width:205px}.plate-blue{width:32px;background:#0868b7;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:12px;line-height:1}.plate-blue small{font-size:7px;margin-top:3px}.plate-main{display:flex;align-items:center;justify-content:space-evenly;gap:8px;flex:1;padding:0 9px;font-size:21px}.compact .plate-main{font-size:17px;gap:6px;padding:0 7px}.plate-iran{width:54px;border-left:2px solid #15191f;display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1}.plate-iran small{font-size:9px}.plate-iran b{font-size:17px;margin-top:4px}.compact .plate-iran{width:46px}.compact .plate-iran b{font-size:14px}.plate-unreadable{display:inline-block;padding:6px 10px;border-radius:7px;background:#fff1c7;color:#714f00;font-weight:800}.read-badge{display:block;width:max-content;margin-top:5px;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:800}.read-badge.suggested{background:#fff1c7;color:#714f00}.read-badge.unreadable{background:#ffe8e8;color:#a12a2a}.read-badge.confirmed{background:#e5f7ef;color:#147a50}.read-badge.confirmed-ai{background:#e7f5ff;color:#0969a9}.read-badge.auto-confirmed{background:#e9f7ed;color:#226b35;border:1px solid #b9e2c4}.correction-form{display:flex;gap:7px;align-items:center;min-width:265px}.correction-form input:not([type=checkbox]){margin:0;min-width:170px;padding:7px 9px}.correction-form button{padding:7px 10px;white-space:nowrap}.feedback-note{font-size:12px;color:var(--bc-muted);margin-top:8px}
@@ -464,6 +471,7 @@ window.faDigits=function(value){return String(value).replace(/[0-9]/g,d=>'۰۱۲
  document.getElementById('mobileMenu')?.addEventListener('click',()=>st.classList.toggle('mobile-open'));
  document.getElementById('themeToggle')?.addEventListener('click',()=>{root.dataset.theme=root.dataset.theme==='dark'?'light':'dark';localStorage.setItem('bc-theme',root.dataset.theme)});
  const toast=document.querySelector('.toast-box');if(toast)setTimeout(()=>{toast.classList.add('hide');setTimeout(()=>toast.remove(),400)},3200);
+ document.querySelectorAll("input[name^='roi_']").forEach(input=>{input.step='0.01'});
  async function updateHeaderResources(){try{const r=await fetch('/api/system/status');if(!r.ok)return;const x=await r.json();for(const k of ['cpu','ram','disk']){const v=Math.round(x[k]||0), el=document.getElementById('head-'+k), val=document.getElementById('head-'+k+'-value');if(val)val.textContent=v+'%';if(el){el.classList.toggle('warn',v>=80&&v<90);el.classList.toggle('danger',v>=90)}}}catch(e){}}
  updateHeaderResources();setInterval(updateHeaderResources,5000);
 })();
@@ -632,27 +640,54 @@ def dashboard(
             ),
         ).fetchall()
     lic=license_status()
+    can_edit_roi=has_permission(request,'camera.manage')
     def camera_tile(c):
         camera_id=int(c['id'])
         is_video=str(c['rtsp_url']).startswith('video://')
         camera_place=' / '.join(
             value for value in (c['city'],c['location']) if value
         ) or 'بدون موقعیت'
-        controls=(
-            f"<div class='playback-controls'>"
+        playback=(
             f"<button type='button' id='play-{camera_id}' "
             f"onclick=\"videoPlayback({camera_id},'play')\">▶ پخش</button>"
             f"<button type='button' class='secondary' id='pause-{camera_id}' "
             f"onclick=\"videoPlayback({camera_id},'pause')\">⏸ توقف</button>"
-            f"</div>"
             if is_video else ""
         )
+        roi_controls=(
+            f"<button type='button' class='secondary' id='roi-edit-{camera_id}' "
+            f"onclick='openRoiEditor({camera_id})' title='تعیین محدوده پردازش'>"
+            f"▣ محدوده</button><button type='button' id='roi-save-{camera_id}' "
+            f"onclick='saveRoi({camera_id})' hidden>✓ ذخیره</button>"
+            f"<button type='button' class='secondary' id='roi-cancel-{camera_id}' "
+            f"onclick='closeRoiEditor({camera_id})' hidden>انصراف</button>"
+            f"<span class='roi-message' id='roi-message-{camera_id}'></span>"
+            if can_edit_roi else ""
+        )
+        controls=(
+            f"<div class='playback-controls'>{playback}{roi_controls}</div>"
+            if playback or roi_controls else ""
+        )
+        roi_x=float(c['roi_x'] or 0)
+        roi_y=float(c['roi_y'] or 0)
+        roi_w=float(c['roi_w'] or 100)
+        roi_h=float(c['roi_h'] or 100)
         return (
             f"<div class='camera-tile'><div class='camera-head'>"
             f"<span>{escape(c['name'])}</span><span class='badge' "
             f"id='st-{camera_id}'>در حال اتصال</span></div>"
-            f"<img loading='lazy' src='/live/{camera_id}?t={int(time.time())}' "
-            f"alt='{escape(c['name'])}'><span class='anpr-status' "
+            f"<div class='camera-view' id='camera-view-{camera_id}' "
+            f"data-roi-x='{roi_x:.4f}' data-roi-y='{roi_y:.4f}' "
+            f"data-roi-w='{roi_w:.4f}' data-roi-h='{roi_h:.4f}'>"
+            f"<img loading='lazy' draggable='false' "
+            f"src='/live/{camera_id}?t={int(time.time())}' "
+            f"alt='{escape(c['name'])}'><div class='roi-box' "
+            f"id='roi-box-{camera_id}' hidden "
+            f"onpointerdown=\"roiPointerDown(event,{camera_id},'move')\">"
+            f"<span class='roi-label'>محیط پردازش پلاک</span>"
+            f"<span class='roi-handle' "
+            f"onpointerdown=\"roiPointerDown(event,{camera_id},'resize')\"></span>"
+            f"</div></div><span class='anpr-status' "
             f"id='anpr-{camera_id}'>پلاک‌خوان: در انتظار اولین فریم</span>"
             f"{controls}<div class='camera-head'><small>"
             f"{escape(camera_place)}</small>"
@@ -678,6 +713,12 @@ def dashboard(
 const ids=[{ids}];
 async function cameraStatus(){{for(const id of ids){{try{{let r=await fetch('/api/cameras/'+id+'/status');let s=await r.json();let e=document.getElementById('st-'+id),a=document.getElementById('anpr-'+id),n=v=>Number(v||0).toLocaleString('fa-IR');e.textContent=s.paused?'متوقف':(s.online?'آنلاین':'آفلاین');e.className='badge '+(s.online?'online':'');const play=document.getElementById('play-'+id),pause=document.getElementById('pause-'+id);if(play)play.classList.toggle('active',!s.paused);if(pause)pause.classList.toggle('active',!!s.paused);const p=s.anpr||{{}},m=p.models||{{}};if(!m.ready){{a.textContent='پلاک‌خوان آماده نیست: مدل تشخیص یا OCR نصب نشده است';a.className='anpr-status bad'}}else if(p.last_error){{a.textContent='خطای پلاک‌خوان: '+p.last_error;a.className='anpr-status bad'}}else{{const idle=p.idle_mode?' | حالت کم‌مصرف':'';a.textContent='پردازش: '+n(p.processed_frames)+' فریم | تشخیص: '+n(p.detected_candidates)+' | ثبت: '+n(p.emitted_events)+idle;a.className='anpr-status'}}}}catch(e){{}}}}}}
 async function videoPlayback(id,action){{try{{const r=await fetch('/api/cameras/'+id+'/playback',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action}})}});if(!r.ok)throw new Error();await cameraStatus()}}catch(e){{alert('تغییر وضعیت پخش انجام نشد.')}}}}
+function roiElements(id){{return{{view:document.getElementById('camera-view-'+id),box:document.getElementById('roi-box-'+id),save:document.getElementById('roi-save-'+id),cancel:document.getElementById('roi-cancel-'+id),edit:document.getElementById('roi-edit-'+id),message:document.getElementById('roi-message-'+id)}}}}
+function positionRoi(id){{const e=roiElements(id);if(!e.view||!e.box)return;const x=Number(e.view.dataset.roiX||0),y=Number(e.view.dataset.roiY||0),w=Number(e.view.dataset.roiW||100),h=Number(e.view.dataset.roiH||100);e.box.style.left=x+'%';e.box.style.top=y+'%';e.box.style.width=w+'%';e.box.style.height=h+'%'}}
+function openRoiEditor(id){{const e=roiElements(id);if(!e.box)return;positionRoi(id);e.box.hidden=false;e.save.hidden=false;e.cancel.hidden=false;e.edit.hidden=true;if(e.message)e.message.textContent='کادر را جابه‌جا یا از گوشه تغییر اندازه دهید.'}}
+function closeRoiEditor(id){{const e=roiElements(id);if(!e.box)return;positionRoi(id);e.box.hidden=true;e.save.hidden=true;e.cancel.hidden=true;e.edit.hidden=false;if(e.message)e.message.textContent=''}}
+function roiPointerDown(event,id,mode){{const e=roiElements(id);if(!e.view||!e.box||e.box.hidden)return;event.preventDefault();event.stopPropagation();const startX=event.clientX,startY=event.clientY,startLeft=e.box.offsetLeft,startTop=e.box.offsetTop,startWidth=e.box.offsetWidth,startHeight=e.box.offsetHeight,minSize=24;const move=ev=>{{const dx=ev.clientX-startX,dy=ev.clientY-startY;if(mode==='resize'){{e.box.style.width=Math.max(minSize,Math.min(e.view.clientWidth-startLeft,startWidth+dx))+'px';e.box.style.height=Math.max(minSize,Math.min(e.view.clientHeight-startTop,startHeight+dy))+'px'}}else{{e.box.style.left=Math.max(0,Math.min(e.view.clientWidth-e.box.offsetWidth,startLeft+dx))+'px';e.box.style.top=Math.max(0,Math.min(e.view.clientHeight-e.box.offsetHeight,startTop+dy))+'px'}}}};const end=()=>{{window.removeEventListener('pointermove',move);window.removeEventListener('pointerup',end)}};window.addEventListener('pointermove',move);window.addEventListener('pointerup',end,{{once:true}})}}
+async function saveRoi(id){{const e=roiElements(id);if(!e.view||!e.box)return;const payload={{x:e.box.offsetLeft/e.view.clientWidth*100,y:e.box.offsetTop/e.view.clientHeight*100,w:e.box.offsetWidth/e.view.clientWidth*100,h:e.box.offsetHeight/e.view.clientHeight*100}};if(e.message)e.message.textContent='در حال ذخیره…';try{{const response=await fetch('/api/cameras/'+id+'/roi',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});const data=await response.json();if(!response.ok)throw new Error(data.error||'save failed');e.view.dataset.roiX=data.roi.x;e.view.dataset.roiY=data.roi.y;e.view.dataset.roiW=data.roi.w;e.view.dataset.roiH=data.roi.h;closeRoiEditor(id);if(e.message){{e.message.textContent='محدوده ذخیره شد';setTimeout(()=>{{if(e.message)e.message.textContent=''}},2500)}}}}catch(error){{if(e.message)e.message.textContent='ذخیره محدوده انجام نشد'}}}}
 let latestEventId={latest_event_id};
 let latestEventUpdated={json.dumps(latest_event_updated)};
 const dashboardEventsPage={events_page};
@@ -707,6 +748,7 @@ async function refreshRecentEvents(){{
  }}catch(e){{}}
 }}
 function setGrid(n){{document.getElementById('liveGrid').style.setProperty('--cols',n);document.querySelectorAll('.grid-switch button').forEach(b=>b.classList.toggle('active',Number(b.dataset.n)===n));localStorage.setItem('bc-grid',n)}}
+function showImage(src){{const modal=document.getElementById('imgModal'),image=document.getElementById('modalImage');if(!modal||!image)return;image.src=src;modal.classList.add('open')}}
 const savedGrid=Number(localStorage.getItem('bc-grid')||{cols});setGrid(savedGrid);cameraStatus();setInterval(cameraStatus,4000);setInterval(refreshRecentEvents,1500);
 </script>"""
     valid_class='ok' if lic['valid'] else 'bad'
@@ -718,7 +760,7 @@ const savedGrid=Number(localStorage.getItem('bc-grid')||{cols});setGrid(savedGri
       <div class='card stat-card'><div class='stat-head'><span class='muted'>وضعیت لایسنس</span><span class='stat-icon'>◆</span></div><div class='{valid_class}' style='font-size:20px;font-weight:900;margin-top:10px'>{escape(lic['plan'])}</div><div class='trend'>{escape(lic['message'])}</div></div>
     </div>
     <div class='card'><div class='toolbar'><div style='margin-left:auto'><h3 style='margin:0'>نمایش زنده</h3><span class='muted'>تصاویر دوربین‌های فعال</span></div><div class='grid-switch'><button data-n='1' onclick='setGrid(1)'>۱</button><button data-n='2' onclick='setGrid(2)'>۴</button><button data-n='3' onclick='setGrid(3)'>۹</button><button data-n='4' onclick='setGrid(4)'>۱۶</button></div><button class='secondary' onclick='document.documentElement.requestFullscreen?.()'>تمام‌صفحه</button></div><div class='live-grid' id='liveGrid' style='--cols:{cols}'>{tiles}</div></div>
-    <div class='card'><h3>آخرین تشخیص‌های پلاک و خودرو</h3><p class='feedback-note'>حدس کاملِ چندفریمی با نشان «تأیید خودکار مدل» در ترددها ثبت می‌شود. با زدن دکمهٔ تأیید/اصلاح، نتیجهٔ انسانی قطعی می‌شود، همان رویداد تصحیح می‌گردد و تصویر پلاک برای آموزش کنترل‌شده نگه‌داری می‌شود.</p><a id='newEventsNotice' class='new-events-notice' href='/dashboard'>رویداد جدید ثبت شد — نمایش صفحهٔ اول</a><div class='table-wrap'><table><thead><tr><th>تصویر خودرو</th><th>تصویر پلاک / پلاک خوانده‌شده</th><th>دوربین / شهر</th><th>اطمینان</th><th>زمان</th><th>تأیید، اصلاح و آموزش</th></tr></thead><tbody id='recentEventsBody'>{recent_rows}</tbody></table></div><div id='recentEventsPagination'>{recent_pagination}</div><div style='margin-top:12px'><a class='btn secondary' href='/events'>مشاهده همه گزارش‌ها</a> <a class='btn secondary' href='/settings'>وضعیت فنی سامانه</a></div></div>{js}</div>"""
+    <div class='card'><h3>آخرین تشخیص‌های پلاک و خودرو</h3><p class='feedback-note'>حدس کاملِ چندفریمی با نشان «تأیید خودکار مدل» در ترددها ثبت می‌شود. با زدن دکمهٔ تأیید/اصلاح، نتیجهٔ انسانی قطعی می‌شود، همان رویداد تصحیح می‌گردد و تصویر پلاک برای آموزش کنترل‌شده نگه‌داری می‌شود.</p><a id='newEventsNotice' class='new-events-notice' href='/dashboard'>رویداد جدید ثبت شد — نمایش صفحهٔ اول</a><div class='table-wrap'><table><thead><tr><th>تصویر خودرو</th><th>تصویر پلاک / پلاک خوانده‌شده</th><th>دوربین / شهر</th><th>اطمینان</th><th>زمان</th><th>تأیید، اصلاح و آموزش</th></tr></thead><tbody id='recentEventsBody'>{recent_rows}</tbody></table></div><div id='recentEventsPagination'>{recent_pagination}</div><div style='margin-top:12px'><a class='btn secondary' href='/events'>مشاهده همه گزارش‌ها</a> <a class='btn secondary' href='/settings'>وضعیت فنی سامانه</a></div></div><div id='imgModal' class='modal-img' onclick='this.classList.remove("open")'><button>بستن</button><img id='modalImage' alt='نمایش تمام‌صفحه'></div>{js}</div>"""
     return page('داشبورد',body,u,request)
 
 @app.get('/api/dashboard/recent-events')
@@ -814,6 +856,67 @@ async def camera_playback(camera_id:int,request:Request):
     audit(request,'video_playback',f'camera={camera_id}; action={action}')
     return JSONResponse({'ok':True,'action':action})
 
+
+def _validated_roi(payload):
+    try:
+        values = {
+            key: float(payload[key]) for key in ('x', 'y', 'w', 'h')
+        }
+    except (KeyError, TypeError, ValueError):
+        raise ValueError('مختصات محدوده کامل یا معتبر نیست.')
+    if not all(math.isfinite(value) for value in values.values()):
+        raise ValueError('مختصات محدوده معتبر نیست.')
+    x, y, width, height = (
+        values['x'], values['y'], values['w'], values['h']
+    )
+    if (
+        x < 0 or y < 0 or width < 2 or height < 2
+        or x + width > 100.001 or y + height > 100.001
+    ):
+        raise ValueError('محدوده باید کاملاً داخل تصویر و حداقل ۲٪ باشد.')
+    return {
+        'x': round(x, 2),
+        'y': round(y, 2),
+        'w': round(width, 2),
+        'h': round(height, 2),
+    }
+
+
+@app.post('/api/cameras/{camera_id}/roi')
+async def save_camera_roi(camera_id:int,request:Request):
+    if not auth(request):
+        return JSONResponse({'error':'unauthorized'},401)
+    if not has_permission(request,'camera.manage'):
+        return JSONResponse({'error':'forbidden'},403)
+    try:
+        roi=_validated_roi(await request.json())
+    except ValueError as exc:
+        return JSONResponse({'error':str(exc)},400)
+    except Exception:
+        return JSONResponse({'error':'invalid json'},400)
+    with connect() as con:
+        cursor=con.execute(
+            'UPDATE cameras SET roi_x=?,roi_y=?,roi_w=?,roi_h=? '
+            'WHERE id=?',
+            (roi['x'],roi['y'],roi['w'],roi['h'],camera_id),
+        )
+        if cursor.rowcount != 1:
+            return JSONResponse({'error':'camera not found'},404)
+    try:
+        from app.ai.live_worker import reload_live_camera_config
+        reload_live_camera_config(camera_id)
+    except Exception:
+        # The database remains authoritative and the normal five-second
+        # refresh still applies if the background worker is starting up.
+        pass
+    audit(
+        request,
+        'camera_roi_update',
+        f"camera={camera_id}; roi={roi['x']},{roi['y']},"
+        f"{roi['w']},{roi['h']}",
+    )
+    return JSONResponse({'ok':True,'roi':roi})
+
 @app.get('/cameras')
 def cameras(request:Request,msg:str=''):
     u=auth(request)
@@ -847,7 +950,7 @@ def new_cam_form(request:Request):
     if not has_permission(request,'camera.manage'):return access_denied()
     return page('افزودن دوربین',cam_form(),u,request)
 @app.post('/cameras/new')
-def new_cam(request:Request,name:str=Form(...),rtsp_url:str=Form(''),location:str=Form(''),city:str=Form(''),enabled:str|None=Form(None),is_demo:int=Form(0),sort_order:int=Form(0),lpr_enabled:str|None=Form(None),lpr_confidence:int=Form(60),frame_step:int=Form(5),duplicate_seconds:float=Form(30),roi_x:int=Form(0),roi_y:int=Form(0),roi_w:int=Form(100),roi_h:int=Form(100),line_y:int=Form(50)):
+def new_cam(request:Request,name:str=Form(...),rtsp_url:str=Form(''),location:str=Form(''),city:str=Form(''),enabled:str|None=Form(None),is_demo:int=Form(0),sort_order:int=Form(0),lpr_enabled:str|None=Form(None),lpr_confidence:int=Form(60),frame_step:int=Form(5),duplicate_seconds:float=Form(30),roi_x:float=Form(0),roi_y:float=Form(0),roi_w:float=Form(100),roi_h:float=Form(100),line_y:int=Form(50)):
     if not auth(request):return RedirectResponse('/login',302)
     if not has_permission(request,'camera.manage'):return access_denied()
     lic=license_status()
@@ -867,7 +970,7 @@ def edit_cam_form(camera_id:int,request:Request):
     if not c:return RedirectResponse('/cameras',302)
     return page('ویرایش دوربین',cam_form(c),u,request)
 @app.post('/cameras/{camera_id}/edit')
-def edit_cam(camera_id:int,request:Request,name:str=Form(...),rtsp_url:str=Form(''),location:str=Form(''),city:str=Form(''),enabled:str|None=Form(None),is_demo:int=Form(0),sort_order:int=Form(0),lpr_enabled:str|None=Form(None),lpr_confidence:int=Form(60),frame_step:int=Form(5),duplicate_seconds:float=Form(30),roi_x:int=Form(0),roi_y:int=Form(0),roi_w:int=Form(100),roi_h:int=Form(100),line_y:int=Form(50)):
+def edit_cam(camera_id:int,request:Request,name:str=Form(...),rtsp_url:str=Form(''),location:str=Form(''),city:str=Form(''),enabled:str|None=Form(None),is_demo:int=Form(0),sort_order:int=Form(0),lpr_enabled:str|None=Form(None),lpr_confidence:int=Form(60),frame_step:int=Form(5),duplicate_seconds:float=Form(30),roi_x:float=Form(0),roi_y:float=Form(0),roi_w:float=Form(100),roi_h:float=Form(100),line_y:int=Form(50)):
     if not auth(request):return RedirectResponse('/login',302)
     if not has_permission(request,'camera.manage'):return access_denied()
     url='demo://camera' if is_demo else rtsp_url.strip()
@@ -1089,7 +1192,7 @@ def events(
         confirmation=anpr_confirmation_badge(r['review_status'] if 'review_status' in r.keys() else 'confirmed-ai')
         city_label=escape(r['event_city'] or '—')
         region_label=persian_digits(r['plate_region'] or '—')
-        trs.append(f"<tr class='{cls}'><td>{persian_digits(r['id'])}</td><td>{vehicle}</td><td>{plateimg}</td><td>{iran_plate_html(r['plate_text'],True)}{confirmation}<br>{event_status_badge(st)}</td><td>{owner}</td><td>{escape(r['vehicle_type'] or 'نامشخص')}<br><span class='muted'>{escape(r['vehicle_color'] or 'نامشخص')}</span></td><td>{persian_digits(int((r['confidence'] or 0)*100))}٪</td><td>{escape(r['camera_name'] or '—')}</td><td>{city_label}<br><span class='muted'>کد پلاک: {region_label}</span></td><td>{persian_digits(jalali_datetime(r['created_at']))}</td><td><a class='btn' href='/events/{r['id']}'>جزئیات و پخش</a></td></tr>")
+        trs.append(f"<tr class='{cls}'><td>{persian_digits(r['id'])}</td><td>{vehicle}</td><td>{plateimg}</td><td>{iran_plate_html(r['plate_text'],True)}{confirmation}<br>{event_status_badge(st)}</td><td>{owner}</td><td>{escape(r['vehicle_type'] or 'نامشخص')}<br><span class='muted'>{escape(r['vehicle_color'] or 'نامشخص')}</span></td><td>{persian_digits(int((r['confidence'] or 0)*100))}٪</td><td>{escape(r['camera_name'] or '—')}</td><td>{city_label}<br><span class='muted'>کد پلاک: {region_label}</span></td><td>{persian_digits(jalali_datetime(r['created_at']))}</td><td><a class='btn' href='/events/{r['id']}'>جزئیات تصاویر</a></td></tr>")
     trs=''.join(trs) or "<tr><td colspan='11'>رکوردی با این فیلتر پیدا نشد.</td></tr>"
     cam_opts=''.join(f"<option {'selected' if camera==c else ''}>{escape(c)}</option>" for c in cameras)
     type_opts=''.join(f"<option {'selected' if vehicle_type==v else ''}>{escape(v)}</option>" for v in vehicle_types)
@@ -1239,13 +1342,10 @@ def event_detail(event_id:int, request:Request):
             FROM plate_events e LEFT JOIN plate_watchlist w ON w.plate_norm=e.plate_norm WHERE e.id=?""",(event_id,)).fetchone()
     if not r:return page('تردد پیدا نشد',"<div class='wrap'><div class='card'><h1>تردد پیدا نشد</h1><a class='btn' href='/events'>بازگشت</a></div></div>",u,request)
     st=r['watch_status'] or 'unknown'
-    second=float(r['video_second'] or 0)
-    video_ok=bool(r['video_path'] and Path(r['video_path']).is_file())
     image_ok=bool(r['image_path'] and Path(r['image_path']).is_file())
     plate_ok=bool(r['plate_image_path'] and Path(r['plate_image_path']).is_file())
-    video=(f"<video id='eventVideo' controls preload='metadata' src='/media?path={quote(r['video_path'])}'></video><div class='replay-controls'><button type='button' onclick='jumpToEvent()'>رفتن به لحظه عبور</button><button type='button' class='secondary' onclick='stepFrame(-1)'>فریم قبل</button><button type='button' class='secondary' onclick='stepFrame(1)'>فریم بعد</button><button type='button' class='secondary' onclick='setSpeed(.25)'>۰٫۲۵×</button><button type='button' class='secondary' onclick='setSpeed(.5)'>۰٫۵×</button><button type='button' class='secondary' onclick='setSpeed(1)'>۱×</button><button type='button' class='secondary' onclick='setSpeed(2)'>۲×</button><span id='speedLabel' class='muted'>سرعت: ۱×</span></div>" if video_ok else "<div class='alert'>فایل ویدئوی این تردد موجود نیست یا طبق تنظیمات نگهداری حذف شده است.</div>")
-    vehicle=(f"<img onclick='showImage(this.src)' src='/media?path={quote(r['image_path'])}'>" if image_ok else "<div class='muted'>تصویر خودرو موجود نیست</div>")
-    plate=(f"<img onclick='showImage(this.src)' src='/media?path={quote(r['plate_image_path'])}'>" if plate_ok else "<div class='muted'>تصویر پلاک موجود نیست</div>")
+    vehicle=(f"<img onclick='showImage(this.src)' loading='lazy' src='/media?path={quote(r['image_path'])}' alt='تصویر کامل خودرو'>" if image_ok else "<div class='muted'>تصویر خودرو موجود نیست</div>")
+    plate=(f"<img onclick='showImage(this.src)' loading='lazy' src='/media?path={quote(r['plate_image_path'])}' alt='برش پلاک'>" if plate_ok else "<div class='muted'>تصویر پلاک موجود نیست</div>")
     owner=' / '.join(x for x in [r['owner_name'],r['vehicle_model'],r['vehicle_color']] if x) or 'ثبت نشده'
     confirmation=anpr_confirmation_badge(r['review_status'] if 'review_status' in r.keys() else 'confirmed-ai')
     media_notice=(
@@ -1258,11 +1358,10 @@ def event_detail(event_id:int, request:Request):
     correction_value=escape(str(r['plate_text'] or ''))
     correction_form=f"""<form class='correction-form' method='post' action='/events/{r['id']}/correct'><input name='corrected_plate' required maxlength='20' value='{correction_value}' placeholder='مثال: ۱۲ ب ۳۴۵ ایران ۶۷'><button>تأیید/اصلاح و آموزش</button></form>"""
     body=f"""<div class='wrap'><div class='toolbar'><h1 style='margin-left:auto'>جزئیات تردد شماره {r['id']}</h1><a class='btn secondary' href='/events'>بازگشت به ترددها</a></div>
-    <div class='replay-layout'><div class='card video-panel'><h3>پخش ویدئو از لحظه عبور</h3><div class='time-badge'>زمان ثبت در ویدئو: {persian_digits(f"{second:.2f}").replace(".", "٫")} ثانیه</div>{video}</div>
-    <div>{media_notice}<div class='card'><h3>اطلاعات تردد</h3><div class='event-meta'><div class='meta-item' style='grid-column:1/-1'><small>پلاک</small>{iran_plate_html(r['plate_text'])}{confirmation}</div><div class='meta-item' style='grid-column:1/-1'><small>تأیید یا اصلاح اپراتور</small>{correction_form}</div><div class='meta-item'><small>وضعیت</small>{event_status_badge(st)}</div><div class='meta-item'><small>دوربین</small>{escape(r['camera_name'] or '—')}</div><div class='meta-item'><small>شهر محل ثبت</small>{escape(r['city'] or '—')}</div><div class='meta-item'><small>کد ناحیه پلاک</small>{persian_digits(r['plate_region'] or '—')}</div><div class='meta-item'><small>اطمینان</small>{persian_digits(f"{(r['confidence'] or 0)*100:.1f}")}٪</div><div class='meta-item'><small>تاریخ و ساعت شمسی</small>{persian_digits(jalali_datetime(r['created_at']))}</div><div class='meta-item'><small>روش تشخیص</small>{escape(r['detector_method'] or '—')}</div><div class='meta-item'><small>نوع خودرو</small>{escape(r['vehicle_type'] or 'نامشخص')}</div><div class='meta-item'><small>رنگ خودرو</small>{escape(r['vehicle_color'] or 'نامشخص')}</div><div class='meta-item'><small>اطمینان تشخیص خودرو</small>{persian_digits(f"{(r['vehicle_confidence'] or 0)*100:.1f}")}٪</div><div class='meta-item'><small>مالک / خودرو</small>{escape(owner)}</div><div class='meta-item'><small>شماره تماس</small>{persian_digits(r['phone'] or '—')}</div></div></div>
-    <div class='card'><h3>تصاویر ثبت‌شده</h3><div class='detail-images'><div>{vehicle}<small>تصویر خودرو</small></div><div>{plate}<small>تصویر پلاک</small></div></div></div></div></div></div>
+    {media_notice}<div class='event-evidence-layout'><div class='card'><h3>تصاویر ثبت‌شده</h3><p class='muted'>برای دیدن جزئیات، روی هر تصویر بزنید.</p><div class='evidence-images'><div>{vehicle}<small>تصویر کامل خودرو با کیفیت اصلی</small></div><div>{plate}<small>برش نزدیک پلاک</small></div></div></div>
+    <div class='card'><h3>اطلاعات تردد</h3><div class='event-meta'><div class='meta-item' style='grid-column:1/-1'><small>پلاک</small>{iran_plate_html(r['plate_text'])}{confirmation}</div><div class='meta-item' style='grid-column:1/-1'><small>تأیید یا اصلاح اپراتور</small>{correction_form}</div><div class='meta-item'><small>وضعیت</small>{event_status_badge(st)}</div><div class='meta-item'><small>دوربین</small>{escape(r['camera_name'] or '—')}</div><div class='meta-item'><small>شهر محل ثبت</small>{escape(r['city'] or '—')}</div><div class='meta-item'><small>کد ناحیه پلاک</small>{persian_digits(r['plate_region'] or '—')}</div><div class='meta-item'><small>اطمینان</small>{persian_digits(f"{(r['confidence'] or 0)*100:.1f}")}٪</div><div class='meta-item'><small>تاریخ و ساعت شمسی</small>{persian_digits(jalali_datetime(r['created_at']))}</div><div class='meta-item'><small>روش تشخیص</small>{escape(r['detector_method'] or '—')}</div><div class='meta-item'><small>نوع خودرو</small>{escape(r['vehicle_type'] or 'نامشخص')}</div><div class='meta-item'><small>رنگ خودرو</small>{escape(r['vehicle_color'] or 'نامشخص')}</div><div class='meta-item'><small>اطمینان تشخیص خودرو</small>{persian_digits(f"{(r['vehicle_confidence'] or 0)*100:.1f}")}٪</div><div class='meta-item'><small>مالک / خودرو</small>{escape(owner)}</div><div class='meta-item'><small>شماره تماس</small>{persian_digits(r['phone'] or '—')}</div></div></div></div></div>
     <div id='imgModal' class='modal-img' onclick='this.classList.remove("open")'><button>بستن</button><img id='modalImage'></div>
-    <script>const eventSecond={second:.3f};const v=document.getElementById('eventVideo');function jumpToEvent(){{if(!v)return;v.currentTime=Math.max(0,eventSecond-.5);v.play().catch(()=>{{}})}}function stepFrame(dir){{if(!v)return;v.pause();v.currentTime=Math.max(0,v.currentTime+dir/25)}}function setSpeed(rate){{if(!v)return;v.playbackRate=rate;document.getElementById('speedLabel').textContent='سرعت: '+window.faDigits(rate)+'×'}}function showImage(src){{document.getElementById('modalImage').src=src;document.getElementById('imgModal').classList.add('open')}}if(v){{v.addEventListener('loadedmetadata',jumpToEvent,{{once:true}})}}</script>"""
+    <script>function showImage(src){{document.getElementById('modalImage').src=src;document.getElementById('imgModal').classList.add('open')}}</script>"""
     return page('جزئیات تردد',body,u,request)
 
 @app.get('/watchlist')

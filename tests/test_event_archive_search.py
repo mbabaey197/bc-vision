@@ -92,7 +92,7 @@ def _report_event_ids(text):
     return [
         int(value)
         for value in re.findall(
-            r"href='/events/(\d+)'>جزئیات و پخش",
+            r"href='/events/(\d+)'>جزئیات تصاویر",
             text,
         )
     ]
@@ -578,6 +578,34 @@ def test_event_detail_matches_watchlist_by_canonical_plate_norm(
     assert response.status_code == 200
     assert "غیرمجاز" in response.text
     assert "مالک تست" in response.text
+
+
+def test_event_detail_shows_still_evidence_without_video_player(
+    isolated_archive,
+    tmp_path,
+):
+    vehicle = tmp_path / "vehicle.jpg"
+    plate = tmp_path / "plate.jpg"
+    video = tmp_path / "source.mp4"
+    vehicle.write_bytes(b"vehicle")
+    plate.write_bytes(b"plate")
+    video.write_bytes(b"video")
+    with database.connect() as con:
+        event_id = _insert_event(
+            con,
+            image_path=str(vehicle),
+            plate_image_path=str(plate),
+            video_path=str(video),
+        )
+
+    with TestClient(main.app) as client:
+        response = client.get(f"/events/{event_id}")
+
+    assert response.status_code == 200
+    assert "تصویر کامل خودرو با کیفیت اصلی" in response.text
+    assert "برش نزدیک پلاک" in response.text
+    assert "<video" not in response.text
+    assert "پخش ویدئو" not in response.text
 
 
 def test_media_allows_historical_references_outside_current_root_only(

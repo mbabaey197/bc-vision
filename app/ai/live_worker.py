@@ -110,6 +110,7 @@ class _CameraState:
     motion_score: float = 0.0
     motion_wakeups: int = 0
     overlay_mask_pixels: int = 0
+    config_generation: int = 0
 
 
 class LiveANPRWorker:
@@ -185,10 +186,10 @@ class LiveANPRWorker:
     @staticmethod
     def _roi_frame(frame, config):
         height, width = frame.shape[:2]
-        rx = float(config.get("roi_x", 0))
-        ry = float(config.get("roi_y", 0))
-        rw = float(config.get("roi_w", 100))
-        rh = float(config.get("roi_h", 100))
+        rx = max(0.0, min(99.9, float(config.get("roi_x", 0))))
+        ry = max(0.0, min(99.9, float(config.get("roi_y", 0))))
+        rw = max(0.1, min(100.0 - rx, float(config.get("roi_w", 100))))
+        rh = max(0.1, min(100.0 - ry, float(config.get("roi_h", 100))))
         x1 = max(0, min(width - 1, int(width * rx / 100.0)))
         y1 = max(0, min(height - 1, int(height * ry / 100.0)))
         x2 = max(
@@ -420,8 +421,6 @@ class LiveANPRWorker:
             if existing and "city" in existing.keys()
             else str(result.get("city") or camera_city)
         )
-        camera_url = str(camera_row["rtsp_url"] or "") if camera_row else ""
-
         values = {
             "plate_text": plate_text,
             "plate_norm": plate_norm,
@@ -439,11 +438,10 @@ class LiveANPRWorker:
             "updated_at": datetime.now(timezone.utc).strftime(
                 "%Y-%m-%d %H:%M:%S.%f"
             ),
-            "video_path": (
-                camera_url[len("video://"):]
-                if camera_url.startswith("video://")
-                else ""
-            ),
+            # Live ANPR events intentionally retain still evidence only.
+            # Uploaded video may continue driving a virtual camera, but its
+            # path is never attached to individual archived events.
+            "video_path": "",
             "video_second": 0.0,
             "detector_method": result.get("method", "live"),
             "ocr_confidence": float(
@@ -642,6 +640,7 @@ class LiveANPRWorker:
                 now,
                 selection_score,
                 activity,
+                state.config_generation,
             )
             if state.busy:
                 pending_score = (
@@ -721,6 +720,7 @@ class LiveANPRWorker:
     def _process(self, state: _CameraState, payload):
         camera_id, camera_name, frame, timestamp = payload[:4]
         activity = payload[5] if len(payload) > 5 else None
+        config_generation = payload[6] if len(payload) > 6 else 0
         started = time.perf_counter()
         try:
             config = state.config or {}
@@ -788,6 +788,10 @@ class LiveANPRWorker:
                 if outcome.mode == "shadow" and assisted_enabled
                 else rows + shadow_rows
             )
+            # A dashboard ROI change invalidates work already running against
+            # the old area.  Such detections must not reach tracking or disk.
+            if state.config_generation != config_generation:
+                return
             if outcome.mode == "shadow":
                 state.shadow_frames += 1
                 state.shadow_candidates += len(outcome.shadow)
@@ -1140,6 +1144,29 @@ class LiveANPRWorker:
         with self._lock:
             self._states.pop(int(camera_id), None)
 
+    def invalidate_config(self, camera_id: int):
+        """Apply a changed camera ROI immediately and clear stale tracks."""
+        with self._lock:
+            state = self._states.get(int(camera_id))
+            if not state:
+                return
+            state.config_generation += 1
+            state.config = None
+            state.config_loaded_at = 0.0
+            state.pending = None
+            state.tracker = PlateConsensusTracker(
+                min_votes=2,
+                max_age_seconds=2.2,
+                emit_cooldown=5.0,
+                emit_unreadable=True,
+            )
+            state.seen.clear()
+            state.track_event_ids.clear()
+            state.latest_detections = []
+            state.latest_detection_frame = None
+            state.latest_detections_at = time.time()
+            state.detection_revision += 1
+
     def shutdown(self):
         self._stopped = True
         self._executor.shutdown(
@@ -1169,3 +1196,7 @@ def live_anpr_detection_snapshot(camera_id, after_revision=0):
 
 def stop_live_camera(camera_id):
     worker.remove(camera_id)
+
+
+def reload_live_camera_config(camera_id):
+    worker.invalidate_config(camera_id)

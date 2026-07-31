@@ -445,6 +445,8 @@ def test_existing_event_keeps_original_observation_city(
 
 def test_roi_and_translation():
     frame = np.zeros((100, 200, 3), dtype=np.uint8)
+    frame[20:60, 20:120] = 173
+    frame[:15, :15] = 255
     source, x, y = live_worker.LiveANPRWorker._roi_frame(
         frame,
         {
@@ -456,6 +458,8 @@ def test_roi_and_translation():
     )
     assert source.shape[:2] == (40, 100)
     assert (x, y) == (20, 20)
+    assert int(source.min()) == 173
+    assert int(source.max()) == 173
     row = live_worker.LiveANPRWorker._translate(
         {
             "bbox": (1, 2, 11, 12),
@@ -466,6 +470,95 @@ def test_roi_and_translation():
     )
     assert row["bbox"] == (21, 22, 31, 32)
     assert row["vehicle_bbox"] == (20, 20, 40, 40)
+
+
+def test_roi_update_invalidates_cached_config_tracks_and_pending_frame():
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState(
+        config={"roi_x": 0, "roi_y": 0, "roi_w": 100, "roi_h": 100},
+        config_loaded_at=50.0,
+        pending=(1, "Gate", np.zeros((20, 30, 3)), 1.0),
+        latest_detections=[{"bbox": (1, 1, 10, 10)}],
+    )
+    state.seen["12ب34567"] = 1.0
+    state.track_event_ids[7] = 12
+    worker._states[4] = state
+
+    worker.invalidate_config(4)
+    worker.shutdown()
+
+    assert state.config_generation == 1
+    assert state.config is None
+    assert state.pending is None
+    assert state.seen == {}
+    assert state.track_event_ids == {}
+    assert state.latest_detections == []
+
+
+def test_vehicle_evidence_keeps_full_frame_when_detector_crop_exists():
+    frame = np.zeros((120, 220, 3), dtype=np.uint8)
+    frame[:, :] = (20, 40, 60)
+    result = {
+        "bbox": (80, 75, 150, 100),
+        "vehicle_bbox": (50, 35, 180, 115),
+        "vehicle_crop": frame[35:115, 50:180].copy(),
+    }
+
+    evidence = media_storage.vehicle_snapshot(result, frame)
+
+    assert evidence.shape == frame.shape
+    assert tuple(evidence[0, 0]) == (20, 40, 60)
+    assert int(evidence[:, :, 1].max()) == 255
+
+
+def test_live_event_never_attaches_virtual_camera_video(
+    tmp_path,
+    monkeypatch,
+):
+    import app.database
+
+    db_path = tmp_path / "still-only.db"
+    monkeypatch.setattr(app.database, "DB_PATH", db_path)
+    app.database.init_db()
+    with app.database.connect() as con:
+        camera_id = int(con.execute(
+            "INSERT INTO cameras(name,rtsp_url) VALUES(?,?)",
+            ("Uploaded test", "video://C:/private/source.mp4"),
+        ).lastrowid)
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    monkeypatch.setattr(
+        worker,
+        "_setting",
+        lambda key, default="": {
+            "save_plate_images": "0",
+            "save_snapshots": "0",
+            "plate_path": str(tmp_path / "plates"),
+            "snapshot_path": str(tmp_path / "vehicles"),
+        }.get(key, default),
+    )
+    frame = np.zeros((100, 180, 3), dtype=np.uint8)
+    event_id = worker._persist(
+        camera_id,
+        "Uploaded test",
+        frame,
+        {
+            "plate": "12-ب-345-67",
+            "plate_norm": "12ب34567",
+            "valid": True,
+            "confidence": 0.92,
+            "bbox": (40, 55, 140, 85),
+            "crop": frame[55:85, 40:140].copy(),
+        },
+        12.0,
+    )
+    worker.shutdown()
+
+    with app.database.connect() as con:
+        video_path = con.execute(
+            "SELECT video_path FROM plate_events WHERE id=?",
+            (event_id,),
+        ).fetchone()[0]
+    assert video_path == ""
 
 
 def test_operator_assisted_rows_replaces_only_unreadable_overlap():

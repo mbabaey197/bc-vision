@@ -105,6 +105,90 @@ def test_uploaded_video_playback_endpoint(monkeypatch):
     assert calls == [(12, "pause"), (12, "play")]
 
 
+def test_camera_roi_endpoint_persists_percentages_and_reloads_worker(
+    tmp_path,
+    monkeypatch,
+):
+    _as_role(monkeypatch, "admin")
+    db_path = tmp_path / "roi.db"
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    database.init_db()
+    with database.connect() as con:
+        camera_id = int(con.execute(
+            "INSERT INTO cameras(name,rtsp_url) VALUES(?,?)",
+            ("Gate", "rtsp://gate"),
+        ).lastrowid)
+    reloaded = []
+    monkeypatch.setattr(
+        "app.ai.live_worker.reload_live_camera_config",
+        lambda value: reloaded.append(value),
+    )
+    monkeypatch.setattr(main, "audit", lambda *_args: None)
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            f"/api/cameras/{camera_id}/roi",
+            json={"x": 12.5, "y": 18.25, "w": 71.5, "h": 64.5},
+        )
+        invalid = client.post(
+            f"/api/cameras/{camera_id}/roi",
+            json={"x": 95, "y": 10, "w": 20, "h": 40},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["roi"] == {
+        "x": 12.5,
+        "y": 18.25,
+        "w": 71.5,
+        "h": 64.5,
+    }
+    assert invalid.status_code == 400
+    assert reloaded == [camera_id]
+    with database.connect() as con:
+        row = con.execute(
+            "SELECT roi_x,roi_y,roi_w,roi_h FROM cameras WHERE id=?",
+            (camera_id,),
+        ).fetchone()
+    assert tuple(row) == (12.5, 18.25, 71.5, 64.5)
+
+
+def test_dashboard_renders_resizable_roi_control_for_camera_manager(
+    tmp_path,
+    monkeypatch,
+):
+    _as_role(monkeypatch, "admin")
+    db_path = tmp_path / "roi-dashboard.db"
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    database.init_db()
+    with database.connect() as con:
+        con.execute(
+            "INSERT INTO cameras(name,rtsp_url,roi_x,roi_y,roi_w,roi_h) "
+            "VALUES(?,?,?,?,?,?)",
+            ("Gate", "rtsp://gate", 11.5, 22.5, 70.0, 60.0),
+        )
+    monkeypatch.setattr(
+        main,
+        "license_status",
+        lambda: {
+            "valid": True,
+            "plan": "test",
+            "camera_limit": 8,
+            "message": "ok",
+        },
+    )
+
+    with TestClient(main.app) as client:
+        response = client.get("/dashboard")
+
+    assert response.status_code == 200
+    assert "▣ محدوده" in response.text
+    assert "class='roi-box'" in response.text
+    assert "data-roi-x='11.5000'" in response.text
+    assert "saveRoi(1)" in response.text
+
+
 def test_storage_children_must_be_distinct_and_below_root(tmp_path):
     root = tmp_path / "bcvision-data"
     paths = main._storage_paths(

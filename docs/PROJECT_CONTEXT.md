@@ -876,3 +876,24 @@ RC12 remains active; both candidates are Shadow-only and
 `activation_allowed=false`. Full verification is `360 passed, 1 skipped`
 (AI integration runtime disabled). The detailed record is
 `agent-results/latest/ANPR_OCR_ENGINE_GEOMETRY_V1.md`.
+
+## Per-camera visual ROI and still-only event evidence (RC18)
+
+RC18 adds a small ROI control beside each camera's live-view controls. Camera
+managers can open a hollow green rectangle directly over the MJPEG image,
+drag it, resize it from the corner and persist normalized percentages for that
+camera. The existing live ANPR worker already crops inference and activity
+analysis to the configured ROI; RC18 validates those bounds, invalidates the
+worker cache immediately and discards any in-flight result from the previous
+ROI generation before tracking or persistence.
+
+New live ANPR events intentionally keep still evidence only. The vehicle image
+is the original full-resolution frame so the full vehicle is not cut by a
+detector crop, while the plate remains a separate high-quality close crop.
+Event details no longer expose a video player or attach the virtual-camera
+source path to new events. Vehicle and plate images open in a full-screen modal
+from both the dashboard and event archive.
+
+Database, users, camera settings and historical event rows are preserved. No
+historical media is deleted by this migration. The implementation record is
+`agent-results/latest/ANPR_VISUAL_ROI_STILL_EVIDENCE_RC18.md`.
