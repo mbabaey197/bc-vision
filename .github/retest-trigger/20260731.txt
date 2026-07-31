@@ -1,2 +1,2 @@
 Run the one-off IR-LPR old-vs-new visual regression benchmark on the exact validation and test archives.
-Trigger attempt 4 using the trusted ANPR PR validation workflow.
+Trigger attempt 5 with only the dedicated benchmark job enabled.
