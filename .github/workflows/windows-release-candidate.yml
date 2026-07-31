@@ -1,7 +1,7 @@
 name: Windows release candidate
 
 # The complete clean installer/update gate is intentionally manual.  Daily
-# agent-branch pushes use windows-fast-updater.yml instead.
+# pull-request updates use windows-fast-updater.yml instead.
 
 on:
   workflow_dispatch:
