@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import inspect
 import re
 from functools import wraps
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
+from fastapi.routing import APIRouter
 
 _PATCH_MARKER = "_bcvision_offline_license_policy"
 _ONLINE_CARD = re.compile(
@@ -41,8 +41,8 @@ def _offline_page(endpoint):
     return wrapper
 
 
-def install_offline_license_policy() -> None:
-    current = FastAPI.add_api_route
+def _patch_router_type(router_type) -> None:
+    current = router_type.add_api_route
     if getattr(current, _PATCH_MARKER, False):
         return
 
@@ -61,7 +61,12 @@ def install_offline_license_policy() -> None:
         return current(self, path, endpoint, *args, **kwargs)
 
     setattr(add_api_route, _PATCH_MARKER, True)
-    FastAPI.add_api_route = add_api_route
+    router_type.add_api_route = add_api_route
+
+
+def install_offline_license_policy() -> None:
+    _patch_router_type(FastAPI)
+    _patch_router_type(APIRouter)
 
 
 install_offline_license_policy()
