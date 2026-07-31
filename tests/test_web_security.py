@@ -761,7 +761,7 @@ def test_uploaded_video_flows_through_worker_to_sqlite_and_dashboard(
             assert event["media_status"] == "complete"
             assert Path(event["plate_image_path"]).is_file()
             assert Path(event["image_path"]).is_file()
-            assert Path(event["video_path"]).is_file()
+            assert event["video_path"] == ""
             plate_media = client.get(
                 "/media",
                 params={"path": event["plate_image_path"]},
