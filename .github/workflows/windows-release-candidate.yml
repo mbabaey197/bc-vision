@@ -34,7 +34,7 @@ concurrency:
 
 jobs:
   build-and-verify:
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64, BC-Vision-Runner]
     timeout-minutes: 90
     env:
       PYTHONDONTWRITEBYTECODE: "1"
