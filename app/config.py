@@ -45,7 +45,9 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "bcvision.db"
 LOG_PATH = DATA_DIR / "BCVision.log"
 SECRET_PATH = DATA_DIR / ".secret"
-LICENSE_PATH = DATA_DIR / "license.dat"
+# Licensing stays in the fixed bootstrap directory. Changing archive/storage
+# drives therefore cannot move, clone, or accidentally delete the binding.
+LICENSE_PATH = BOOTSTRAP_DIR / "license.dat"
 LEGACY_LICENSE_PATH = DATA_DIR / "license.json"
 TRIAL_PATH = BOOTSTRAP_DIR / ".trial.dat"
 PUBLIC_KEY_PATH = BASE_DIR / "license_public_key.pem"
