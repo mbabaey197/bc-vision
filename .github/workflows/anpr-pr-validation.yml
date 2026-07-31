@@ -29,7 +29,7 @@ concurrency:
 
 jobs:
   regression:
-    runs-on: [self-hosted, Windows, X64]
+    runs-on: windows-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -57,13 +57,13 @@ jobs:
           BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\regression
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
-          python -m compileall -q app
+          python -m compileall -q app tools
           python -m pytest -q tests
 
   ai-runtime:
     needs: regression
-    runs-on: [self-hosted, Windows, X64]
-    timeout-minutes: 45
+    runs-on: windows-latest
+    timeout-minutes: 60
     env:
       BCVISION_RUN_AI_INTEGRATION: "1"
       PYTHONDONTWRITEBYTECODE: "1"
