@@ -26,6 +26,17 @@ jobs:
       BCVISION_CPU_THREADS: "2"
       BCVISION_TEST_OUTPUT: ${{ runner.temp }}\bcvision-company-crops-505\report
     steps:
+      - name: Publish runner-start heartbeat
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 39,
+              body: `<!-- bcvision-company-crops-505-start -->\nRunner started. Run ID: ${context.runId}; attempt: ${process.env.GITHUB_RUN_ATTEMPT}.`
+            });
+
       - name: Checkout isolated test branch
         uses: actions/checkout@v4
         with:
