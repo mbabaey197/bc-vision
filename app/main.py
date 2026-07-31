@@ -1153,7 +1153,14 @@ def events(
                 params.append(normalized_letter)
     elif q:
         normalized_query=normalize_plate(q)
-        if normalized_query:
+        query_is_plate_text=bool(
+            normalized_query
+            and all(
+                char.isdigit() or char in ALLOWED_PLATE_LETTERS
+                for char in normalized_query
+            )
+        )
+        if query_is_plate_text:
             where.append(f'INSTR({plate_expression},?)>0')
             params.append(normalized_query)
         else:
