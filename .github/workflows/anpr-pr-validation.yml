@@ -1,5 +1,6 @@
-# Trusted, isolated validation for BC Vision ANPR pull requests.
-# Per-job temporary storage keeps installed BC Vision data out of CI.
+# Trusted, isolated validation for BC Vision pull requests.
+# Licensing and ANPR changes must run both primary gates; unrelated one-off
+# research benchmarks are intentionally excluded from normal PR validation.
 name: ANPR PR validation
 
 on:
