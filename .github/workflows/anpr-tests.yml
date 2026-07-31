@@ -8,6 +8,8 @@ on:
 
 permissions:
   contents: read
+  issues: write
+  pull-requests: write
 
 concurrency:
   group: anpr-main-${{ github.ref }}
@@ -132,3 +134,130 @@ jobs:
         run: |
           Write-Error "ANPR AI integration failed. See the anpr-ai-test-output artifact."
           exit 1
+
+  company-crops-505-test:
+    if: contains(github.event.head_commit.message, '[company-crops-505]')
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 60
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      BCVISION_CPU_THREADS: "2"
+      BCVISION_TEST_OUTPUT: ${{ runner.temp }}\bcvision-company-crops-505\report
+    steps:
+      - name: Publish runner-start heartbeat
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 39,
+              body: `<!-- bcvision-company-crops-505-start -->\nRunner started. Run ID: ${context.runId}; attempt: ${process.env.GITHUB_RUN_ATTEMPT}.`
+            });
+
+      - name: Checkout isolated test branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/company-crops-505-test-20260731
+          clean: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          version: "0.12.0"
+          enable-cache: true
+          cache-python: true
+          cache-dependency-glob: requirements-ai-lock.txt
+
+      - name: Set up portable Python
+        shell: cmd
+        run: |
+          uv python install 3.13
+          uv venv --python 3.13 --seed .venv
+          echo %CD%\.venv\Scripts>>"%GITHUB_PATH%"
+
+      - name: Install OCR benchmark dependencies
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip --quiet
+          python -m pip install -r requirements-ai-lock.txt --quiet
+          python -m pip check
+
+      - name: Reconstruct and verify isolated benchmark script
+        shell: pwsh
+        run: |
+          $parts = Get-ChildItem tools\oneoff_company_crops_test.py.b64.part* | Sort-Object Name
+          $encoded = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ""
+          [IO.File]::WriteAllBytes("tools\oneoff_company_crops_test.py", [Convert]::FromBase64String($encoded))
+          $actual = (Get-FileHash tools\oneoff_company_crops_test.py -Algorithm SHA256).Hash
+          if ($actual -ne "1935B6CEBEDC74A13AE3F802D74B4D16633015271B0EDA68F7576CC735367267") { throw "Benchmark script digest mismatch" }
+          python -m py_compile tools\oneoff_company_crops_test.py
+
+      - name: Run full 505-image company-crop benchmark
+        shell: cmd
+        run: |
+          python tools\oneoff_company_crops_test.py --output "%BCVISION_TEST_OUTPUT%"
+
+      - name: Upload full visual report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bcvision-company-crops-505-full-report
+          path: |
+            ${{ env.BCVISION_TEST_OUTPUT }}\BCVision_505_Full_Test_Report.html
+            ${{ env.BCVISION_TEST_OUTPUT }}\BCVision_505_Detailed_Results.csv
+            ${{ env.BCVISION_TEST_OUTPUT }}\BCVision_505_Summary.json
+            ${{ env.BCVISION_TEST_OUTPUT }}\README_FA.md
+            ${{ runner.temp }}\bcvision-company-crops-505\BCVision_505_Company_Crops_Test_Report.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish sanitized run summary to temporary PR
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          REPORT_PATH: ${{ env.BCVISION_TEST_OUTPUT }}\BCVision_505_Summary.json
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- bcvision-company-crops-505-run -->';
+            let result = {
+              run_id: context.runId,
+              run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+              artifact_name: 'bcvision-company-crops-505-full-report',
+              status: 'failed-before-summary'
+            };
+            if (fs.existsSync(process.env.REPORT_PATH)) {
+              const s = JSON.parse(fs.readFileSync(process.env.REPORT_PATH, 'utf8'));
+              const clean = (m) => ({
+                samples: m?.samples ?? 0,
+                exact_matches: m?.exact_matches ?? 0,
+                full_plate_accuracy: m?.full_plate_accuracy ?? 0,
+                character_accuracy: m?.character_accuracy ?? 0,
+                accepted_samples: m?.accepted_samples ?? 0,
+                accepted_precision: m?.accepted_precision ?? 0,
+                rejection_rate: m?.rejection_rate ?? 0
+              });
+              result = {
+                run_id: context.runId,
+                run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+                artifact_name: 'bcvision-company-crops-505-full-report',
+                status: 'summary-ready',
+                image_count: s.source?.image_count ?? 0,
+                review: s.review ?? {},
+                old: clean(s.engines?.old?.confirmed_metrics),
+                production: clean(s.engines?.production?.confirmed_metrics),
+                shadow: clean(s.engines?.shadow?.confirmed_metrics),
+                production_mean_latency_ms: s.engines?.production?.mean_latency_ms ?? 0,
+                shadow_mean_latency_ms: s.engines?.shadow?.mean_latency_ms ?? 0,
+                shadow_sha256: s.engines?.shadow?.sha256 ?? '',
+                verdict: s.verdict ?? ''
+              };
+            }
+            const body = `${marker}\n\`\`\`json\n${JSON.stringify(result, null, 2)}\n\`\`\``;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 39,
+              body
+            });
