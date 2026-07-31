@@ -25,9 +25,10 @@ jobs:
       BCVISION_CPU_THREADS: "2"
       BCVISION_TEST_OUTPUT: ${{ runner.temp }}\bcvision-company-crops-505\report
     steps:
-      - name: Checkout isolated test branch
+      - name: Checkout isolated benchmark source
         uses: actions/checkout@v4
         with:
+          ref: agent/company-crops-505-final-run
           clean: true
 
       - name: Install uv
