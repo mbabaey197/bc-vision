@@ -1,0 +1,1 @@
+Run the one-off IR-LPR old-vs-new visual regression benchmark on the exact validation and test archives.
