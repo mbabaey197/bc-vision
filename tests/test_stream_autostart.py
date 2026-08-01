@@ -79,6 +79,9 @@ def test_stop_all_stops_every_stream():
             self.stopped = False
             self.waited = False
 
+        def request_stop(self):
+            self.stopped = True
+
         def stop(self, wait=False):
             self.stopped = True
             self.waited = wait
@@ -113,6 +116,52 @@ def test_remove_can_wait_for_uploaded_video_stream_shutdown():
     assert manager.remove(7, wait=True) is True
     assert stream.waited is True
     assert manager.streams == {}
+
+
+def test_remove_keeps_stream_reference_when_shutdown_times_out():
+    manager = StreamManager()
+
+    class FakeStream:
+        def stop(self, wait=False):
+            return False
+
+    stream = FakeStream()
+    manager.streams = {7: stream}
+
+    assert manager.remove(7,wait=True) is False
+    assert manager.streams[7] is stream
+
+
+def test_camera_stop_waits_for_decoder_before_worker(monkeypatch):
+    calls = []
+    stream = CameraStream(
+        camera_id=17,
+        url="video://sample.avi",
+        name="Uploaded video",
+    )
+
+    class FakeThread:
+        def __init__(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, _timeout):
+            calls.append("decoder")
+            self.alive = False
+
+    stream.thread = FakeThread()
+    monkeypatch.setattr(
+        app.ai.live_worker,
+        "stop_live_camera",
+        lambda camera_id, wait=False, timeout=0: calls.append(
+            ("worker",camera_id,wait)
+        ) or True,
+    )
+
+    assert stream.stop(wait=True) is True
+    assert calls == ["decoder",("worker",17,True)]
 
 
 def test_live_overlay_survives_stream_resize(monkeypatch):
