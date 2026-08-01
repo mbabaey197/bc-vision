@@ -111,6 +111,7 @@ class _CameraState:
     motion_wakeups: int = 0
     overlay_mask_pixels: int = 0
     config_generation: int = 0
+    cancelled: bool = False
 
 
 class LiveANPRWorker:
@@ -723,6 +724,8 @@ class LiveANPRWorker:
         config_generation = payload[6] if len(payload) > 6 else 0
         started = time.perf_counter()
         try:
+            if state.cancelled:
+                return
             config = state.config or {}
             source, offset_x, offset_y = self._roi_frame(
                 frame,
@@ -790,7 +793,10 @@ class LiveANPRWorker:
             )
             # A dashboard ROI change invalidates work already running against
             # the old area.  Such detections must not reach tracking or disk.
-            if state.config_generation != config_generation:
+            if (
+                state.cancelled
+                or state.config_generation != config_generation
+            ):
                 return
             if outcome.mode == "shadow":
                 state.shadow_frames += 1
@@ -936,6 +942,8 @@ class LiveANPRWorker:
             )
             processing_ms = processing_seconds * 1000.0
             for result in stable:
+                if state.cancelled:
+                    return
                 track_id = int(result.get("track_id") or 0)
                 event_id = state.track_event_ids.get(track_id)
                 capture_frame = result.pop("capture_frame", None)
@@ -1142,7 +1150,15 @@ class LiveANPRWorker:
 
     def remove(self, camera_id: int):
         with self._lock:
-            self._states.pop(int(camera_id), None)
+            state = self._states.pop(int(camera_id), None)
+            if state is not None:
+                state.cancelled = True
+                state.config_generation += 1
+                state.pending = None
+                state.latest_detections = []
+                state.latest_detection_frame = None
+                state.latest_detections_at = time.time()
+                state.detection_revision += 1
 
     def invalidate_config(self, camera_id: int):
         """Apply a changed camera ROI immediately and clear stale tracks."""
