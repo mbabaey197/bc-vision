@@ -721,6 +721,9 @@ class _Track:
     hits: int = 1
     misses: int = 0
     centers: deque = field(default_factory=lambda: deque(maxlen=6))
+    center_times: deque = field(
+        default_factory=lambda: deque(maxlen=6)
+    )
 
 
 class PlateConsensusTracker:
@@ -899,7 +902,7 @@ class PlateConsensusTracker:
             if timestamp - track.last_seen > self.max_age_seconds:
                 continue
             score, overlap, proximity, size_ratio, _direction = (
-                self._association_score(track, result)
+                self._association_score(track, result, timestamp)
             )
             if score > best_score and (
                 overlap >= 0.18
@@ -993,7 +996,79 @@ class PlateConsensusTracker:
         )
 
     @staticmethod
-    def _association_score(track: _Track, result: dict) -> tuple:
+    def _association_plate_candidates(result: dict) -> set[str]:
+        """Return bounded OCR evidence usable only for track association.
+
+        Association evidence never confirms a plate. It only keeps a moving
+        crop on the same physical track when CPU back-pressure skips source
+        frames. This separation lets low-ranked Beam hypotheses help motion
+        tracking without turning them into accepted OCR output.
+        """
+
+        candidates = {
+            normalize_plate(result.get("association_plate_norm", "")),
+            normalize_plate(result.get("plate_norm", "")),
+            normalize_plate(result.get("raw_guess_norm", "")),
+            normalize_plate(result.get("plate", "")),
+            normalize_plate(result.get("raw_guess_text", "")),
+        }
+        for hypothesis in list(result.get("plate_hypotheses", []))[:6]:
+            score = float(
+                hypothesis.get(
+                    "score",
+                    hypothesis.get("confidence", 0.0),
+                )
+            )
+            # A low-ranked Beam tail is too weak to override motion and can
+            # accidentally join two successive vehicles that briefly occupy
+            # the same lane. Keep only hypotheses with meaningful mass; the
+            # sparse-frame rescue regression supplies 0.40 evidence.
+            if score < 0.18:
+                continue
+            candidates.add(normalize_plate(
+                hypothesis.get("plate_norm")
+                or hypothesis.get("plate")
+            ))
+        return {
+            candidate
+            for candidate in candidates
+            if plausible_plate(candidate)
+        }
+
+    @classmethod
+    def _association_identity_similarity(
+        cls,
+        track: _Track,
+        result: dict,
+    ) -> float:
+        observed = cls._association_plate_candidates(result)
+        if not observed:
+            return 0.0
+        historical = set()
+        for row in list(track.observations)[-3:]:
+            historical.update(cls._association_plate_candidates(row))
+        if not historical:
+            return 0.0
+        best = 0.0
+        for left in historical:
+            for right in observed:
+                if len(left) != len(right):
+                    continue
+                distance = sum(
+                    left_char != right_char
+                    for left_char, right_char in zip(left, right)
+                )
+                best = max(best, 1.0 - distance / len(left))
+                if best >= 1.0:
+                    return 1.0
+        return best
+
+    @staticmethod
+    def _association_score(
+        track: _Track,
+        result: dict,
+        timestamp: float | None = None,
+    ) -> tuple:
         predicted = track.predicted_bbox or track.bbox
         if len(track.centers) >= 2:
             previous_x, previous_y = track.centers[-2]
@@ -1001,10 +1076,28 @@ class PlateConsensusTracker:
             velocity_x = current_x - previous_x
             velocity_y = current_y - previous_y
             if math.hypot(velocity_x, velocity_y) >= 2.0:
+                projection_steps = 1.0
+                if (
+                    timestamp is not None
+                    and len(track.center_times) >= 2
+                ):
+                    observation_interval = max(
+                        0.01,
+                        float(track.center_times[-1])
+                        - float(track.center_times[-2]),
+                    )
+                    prediction_interval = max(
+                        0.0,
+                        float(timestamp) - float(track.last_seen),
+                    )
+                    projection_steps = min(
+                        3.0,
+                        max(0.35, prediction_interval / observation_interval),
+                    )
                 width = max(2.0, predicted[2] - predicted[0])
                 height = max(2.0, predicted[3] - predicted[1])
-                projected_x = current_x + velocity_x
-                projected_y = current_y + velocity_y
+                projected_x = current_x + velocity_x * projection_steps
+                projected_y = current_y + velocity_y * projection_steps
                 predicted = (
                     projected_x - width / 2.0,
                     projected_y - height / 2.0,
@@ -1116,14 +1209,42 @@ class PlateConsensusTracker:
                         size_ratio,
                         direction_consistency,
                     ) = (
-                        self._association_score(track, results[index])
+                        self._association_score(
+                            track,
+                            results[index],
+                            timestamp,
+                        )
+                    )
+                    identity_similarity = (
+                        self._association_identity_similarity(
+                            track,
+                            results[index],
+                        )
+                    )
+                    observation_gap = max(
+                        0.0,
+                        float(timestamp) - float(track.last_seen),
+                    )
+                    gap_relaxation = min(
+                        0.26,
+                        max(0.0, observation_gap - 0.10) * 1.30,
+                    )
+                    proximity_threshold = (
+                        (0.52 if second_pass else 0.62)
+                        - gap_relaxation
                     )
                     accepted = (
                         overlap >= (0.08 if second_pass else 0.12)
                         or (
-                            proximity
-                            >= (0.52 if second_pass else 0.62)
-                            and size_ratio >= 0.55
+                            proximity >= proximity_threshold
+                            and size_ratio >= 0.50
+                        )
+                        or (
+                            identity_similarity >= 0.75
+                            and proximity >= 0.16
+                            and size_ratio >= 0.42
+                            and observation_gap
+                            <= min(1.20, self.max_age_seconds)
                         )
                     )
                     if (
@@ -1139,7 +1260,11 @@ class PlateConsensusTracker:
                         accepted = False
                     if accepted:
                         candidates.setdefault(index, []).append(
-                            (track.track_id, float(score))
+                            (
+                                track.track_id,
+                                float(score)
+                                + 0.18 * identity_similarity,
+                            )
                         )
 
             ordered_indices = tuple(
@@ -1886,6 +2011,7 @@ class PlateConsensusTracker:
                 (observed_bbox[0] + observed_bbox[2]) / 2.0,
                 (observed_bbox[1] + observed_bbox[3]) / 2.0,
             ))
+            track.center_times.append(timestamp)
             result["track_id"] = track.track_id
             result["tracking_engine"] = (
                 "bytetrack-kalman+optical-flow"
