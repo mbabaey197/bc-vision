@@ -283,6 +283,7 @@ def init_db():
             "locked_until": "TEXT",
             "last_login": "TEXT",
             "created_at": "TEXT",
+            "session_version": "INTEGER NOT NULL DEFAULT 0",
         })
         con.execute(
             "UPDATE users SET role='admin' "
