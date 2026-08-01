@@ -20,10 +20,14 @@ Both detector models come from the MIT-licensed Platrix model repository:
   - SHA-256:
     `A6974FCB0A79755C270D50F1EBEFD4D96D765C879A29051A19AAC00DFDA8B5AF`
 
-The primary detector runs first. The second ONNX detector runs only after a
-zero-result primary pass. Hardened OpenCV geometry is the final localization
-fallback. The retired 119 MB combined `best.pt` model and Ultralytics are not
-loaded or packaged by RC12.
+The primary detector runs first. RC22 runs the 640 detector adaptively when the
+primary result is absent or weak, merges both result sets with cross-model NMS,
+and applies rate-limited overlapping landscape tiles when a high-resolution
+frame still has insufficient evidence. A reliable local plate contour is also
+exposed as a perspective-normalized OCR variant; the raw detector crop remains
+available so geometry refinement cannot erase evidence. Hardened OpenCV
+geometry is the final localization fallback. The retired 119 MB combined
+`best.pt` model and Ultralytics are not loaded or packaged.
 
 ## Iranian OCR models
 
@@ -38,10 +42,16 @@ loaded or packaged by RC12.
   - SHA-256:
     `7D573C51CC855A8E080F1F88597477F4FB5A2B9CAFA1BB125BD6038E441F5BCA`
 
-CRNN reads the full crop first. The CNN is attempted only if CRNN has no valid
-complete Iranian plate and exactly eight real glyph regions can be segmented.
-Missing characters are never invented. EasyOCR and Tesseract are no longer in
-the RC12 production path or Windows package.
+CRNN reads the full crop first with a plate-layout-constrained CTC prefix beam.
+A plausible string is no longer accepted solely because it happens to match the
+Iranian layout: sequence confidence, per-position margin and decoder/view
+agreement are checked. Weak crops can use a perspective-refined view and one
+adaptive illumination/contrast view, while decisive crops still require one
+inference. Rejected beam hypotheses remain visible for operator review and are
+not silently converted into confirmed truth. The CNN is attempted only if CRNN
+has no accepted complete Iranian plate and exactly eight real glyph regions can
+be segmented. Missing characters are never invented. EasyOCR and Tesseract are
+not in the production path or Windows package.
 
 ## Persistent Windows paths
 
@@ -65,6 +75,13 @@ BCVISION_MODEL_SOURCE_DIR
 BCVISION_CRNN_SOURCE_DIR
 BCVISION_CNN_SOURCE_DIR
 BCVISION_ONNX_DETECTOR_SIZE
+BCVISION_DETECTOR_CASCADE=off|adaptive|accuracy
+BCVISION_TILE_RESCUE_INTERVAL
+BCVISION_CRNN_BEAM_WIDTH
+BCVISION_CRNN_RESCUE_VIEWS
+BCVISION_CRNN_MIN_CONFIDENCE
+BCVISION_CRNN_MIN_MARGIN
+BCVISION_CNN_MIN_CONFIDENCE
 BCVISION_CPU_THREADS
 ```
 

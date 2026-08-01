@@ -70,13 +70,31 @@ class CameraStream:
         )
         self.thread.start()
 
-    def stop(self):
+    def request_stop(self):
         self.stop_event.set()
+
+    def stop(self, wait=False, timeout=3.0):
+        self.request_stop()
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        thread = self.thread
+        if (
+            wait
+            and thread is not None
+            and thread is not threading.current_thread()
+        ):
+            thread.join(max(0.0, deadline - time.monotonic()))
+        decoder_stopped = not (thread and thread.is_alive())
+        worker_stopped = True
         try:
             from app.ai.live_worker import stop_live_camera
-            stop_live_camera(self.camera_id)
+            worker_stopped = stop_live_camera(
+                self.camera_id,
+                wait=wait,
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
         except Exception:
-            pass
+            worker_stopped = False
+        return bool(decoder_stopped and worker_stopped)
 
     def pause(self):
         if self.url.startswith("video://"):
@@ -667,7 +685,10 @@ class StreamManager:
         with self.lock:
             old = self.streams.get(camera_id)
             if old and getattr(old, "_key", None) != key:
-                old.stop()
+                if not old.stop(wait=True):
+                    raise RuntimeError(
+                        "Previous camera stream did not stop in time"
+                    )
                 self.streams.pop(camera_id, None)
                 old = None
             if not old:
@@ -716,13 +737,24 @@ class StreamManager:
             streams = list(self.streams.values())
             self.streams.clear()
         for stream in streams:
-            stream.stop()
+            stream.request_stop()
+        for stream in streams:
+            stream.stop(wait=True)
 
-    def remove(self, camera_id):
+    def remove(self, camera_id, wait=False):
         with self.lock:
             stream = self.streams.pop(camera_id, None)
         if stream:
-            stream.stop()
+            stopped = stream.stop(wait=wait)
+            if wait and not stopped:
+                with self.lock:
+                    self.streams.setdefault(camera_id,stream)
+            return stopped if wait else True
+        try:
+            from app.ai.live_worker import stop_live_camera
+            return stop_live_camera(camera_id,wait=wait)
+        except Exception:
+            return False
 
     def status(self, camera_id):
         stream = self.streams.get(camera_id)

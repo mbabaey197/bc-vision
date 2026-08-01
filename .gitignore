@@ -17,3 +17,32 @@ license.json
 training-data/
 training-runs/
 ir-lpr/
+
+# Generated release/source archives and local recovery snapshots
+BCVision_*_Source/
+BCVision_*_Source.zip
+BC_Vision_Source_*.zip
+_bcvision_*_backup_*/
+*_backup_*/
+
+# Runtime data and potentially sensitive local state
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+logs/
+backups/
+snapshots/
+plates/
+videos/
+storage_config.json
+.secret
+.trial.json
+
+# Models are supplied only through the verified model packaging pipeline
+.model-seed/
+model-seed/
+*.onnx.tmp
+*.pt.tmp

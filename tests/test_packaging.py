@@ -48,11 +48,17 @@ def test_launcher_self_test_uses_isolated_data_directory(tmp_path):
     assert result["database_ready"] is True
     assert result["public_key_ready"] is True
     assert result["web_app_ready"] is True
+    assert result["setup_required"] is True
 
 
 def test_release_version_metadata_stays_consistent():
     root = Path(__file__).resolve().parents[1]
     version = (root / "VERSION").read_text(encoding="utf-8").strip()
+    if "-rc" in version:
+        core_version, release_candidate = version.split("-rc", 1)
+        version_info = f"{core_version}.{int(release_candidate)}"
+    else:
+        version_info = f"{version}.0"
 
     config = (root / "app" / "config.py").read_text(encoding="utf-8")
     assert f'APP_VERSION = "{version}"' in config
@@ -66,7 +72,7 @@ def test_release_version_metadata_stays_consistent():
         ).read_text(encoding="utf-8")
         assert f'#define MyAppVersion "{version}"' in source
         assert f"OutputBaseFilename={prefix}{version}" in source
-        assert "VersionInfoVersion=2.2.0.19" in source
+        assert f"VersionInfoVersion={version_info}" in source
         assert "PrivilegesRequiredOverridesAllowed=commandline" in source
 
 
@@ -207,3 +213,36 @@ def test_anpr_validation_preserves_independent_runner_caches():
     assert ".venv-ai\\Scripts\\python.exe" in workflow
     assert workflow.count("build_dependency_stamp.py check") == 2
     assert ".ci-cache\\bcvision-models" in workflow
+
+
+def test_first_run_requires_explicit_admin_setup():
+    root = Path(__file__).resolve().parents[1]
+    database = (root / "app" / "database.py").read_text(encoding="utf-8")
+    main = (root / "app" / "main.py").read_text(encoding="utf-8")
+
+    assert 'hash_password("123456")' not in database
+    assert "ورود اولیه:" not in main
+    assert "@app.get('/setup')" in main
+    assert "@app.post('/setup')" in main
+    assert "len(password) < 10" in main
+    assert "secure=request.url.scheme == 'https'" in main
+
+
+def test_desktop_ui_has_no_runtime_cdn_dependency():
+    root = Path(__file__).resolve().parents[1]
+    main = (root / "app" / "main.py").read_text(encoding="utf-8")
+
+    assert "cdn.jsdelivr.net" not in main
+    assert 'BOOTSTRAP = ""' in main
+
+
+def test_password_changes_revoke_existing_sessions():
+    root = Path(__file__).resolve().parents[1]
+    database = (root / "app" / "database.py").read_text(encoding="utf-8")
+    security = (root / "app" / "security.py").read_text(encoding="utf-8")
+    main = (root / "app" / "main.py").read_text(encoding="utf-8")
+
+    assert '"session_version": "INTEGER NOT NULL DEFAULT 0"' in database
+    assert "def read_token_claims" in security
+    assert 'session_version=session_version+1' in main
+    assert "AND session_version=?" in main

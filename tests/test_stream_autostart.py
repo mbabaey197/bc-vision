@@ -77,9 +77,14 @@ def test_stop_all_stops_every_stream():
     class FakeStream:
         def __init__(self):
             self.stopped = False
+            self.waited = False
 
-        def stop(self):
+        def request_stop(self):
             self.stopped = True
+
+        def stop(self, wait=False):
+            self.stopped = True
+            self.waited = wait
 
     first = FakeStream()
     second = FakeStream()
@@ -89,7 +94,107 @@ def test_stop_all_stops_every_stream():
 
     assert first.stopped
     assert second.stopped
+    assert first.waited
+    assert second.waited
     assert manager.streams == {}
+
+
+def test_remove_can_wait_for_uploaded_video_stream_shutdown():
+    manager = StreamManager()
+
+    class FakeStream:
+        def __init__(self):
+            self.waited = None
+
+        def stop(self, wait=False):
+            self.waited = wait
+            return True
+
+    stream = FakeStream()
+    manager.streams = {7: stream}
+
+    assert manager.remove(7, wait=True) is True
+    assert stream.waited is True
+    assert manager.streams == {}
+
+
+def test_remove_keeps_stream_reference_when_shutdown_times_out():
+    manager = StreamManager()
+
+    class FakeStream:
+        def stop(self, wait=False):
+            return False
+
+    stream = FakeStream()
+    manager.streams = {7: stream}
+
+    assert manager.remove(7,wait=True) is False
+    assert manager.streams[7] is stream
+
+
+def test_non_waiting_remove_allows_same_key_stream_to_restart(monkeypatch):
+    manager = StreamManager()
+    key = ("rtsp://gate","Gate",640,5,70)
+
+    class OldStream:
+        _key = key
+
+        def stop(self,wait=False):
+            return False
+
+    manager.streams = {7: OldStream()}
+    assert manager.remove(7,wait=False) is True
+    assert manager.streams == {}
+
+    created = []
+
+    class NewStream:
+        def __init__(self,*args):
+            self.args = args
+            self.started = False
+            created.append(self)
+
+        def start(self):
+            self.started = True
+
+    monkeypatch.setattr(app.streams,"CameraStream",NewStream)
+    stream = manager.get(7,"rtsp://gate","Gate",640,5,70)
+
+    assert stream is created[0]
+    assert stream.started is True
+    assert manager.streams[7] is stream
+
+
+def test_camera_stop_waits_for_decoder_before_worker(monkeypatch):
+    calls = []
+    stream = CameraStream(
+        camera_id=17,
+        url="video://sample.avi",
+        name="Uploaded video",
+    )
+
+    class FakeThread:
+        def __init__(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, _timeout):
+            calls.append("decoder")
+            self.alive = False
+
+    stream.thread = FakeThread()
+    monkeypatch.setattr(
+        app.ai.live_worker,
+        "stop_live_camera",
+        lambda camera_id, wait=False, timeout=0: calls.append(
+            ("worker",camera_id,wait)
+        ) or True,
+    )
+
+    assert stream.stop(wait=True) is True
+    assert calls == ["decoder",("worker",17,True)]
 
 
 def test_live_overlay_survives_stream_resize(monkeypatch):
