@@ -1081,19 +1081,42 @@ def cameras(request:Request,msg:str=''):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
     if not has_permission(request,'camera.manage'):return access_denied()
-    rows=camera_rows(); trs=''.join(f"<tr><td>{c['id']}</td><td>{escape(c['name'])}</td><td>{escape(c['city'] or '—')}</td><td>{escape(c['location'])}</td><td>{'فعال' if c['enabled'] else 'غیرفعال'}</td><td>{'ویدئوی آپلودی' if str(c['rtsp_url']).startswith('video://') else ('آزمایشی' if c['is_demo'] else 'RTSP')}</td><td><a class='btn' href='/cameras/{c['id']}/edit'>ویرایش</a> <form style='display:inline' method='post' action='/cameras/{c['id']}/delete' onsubmit=\"return confirm('حذف شود؟')\"><button class='danger'>حذف</button></form></td></tr>" for c in rows) or "<tr><td colspan='7'>دوربینی ثبت نشده است.</td></tr>"
+    rows=camera_rows(); trs=''.join(f"<tr><td>{c['id']}</td><td>{escape(c['name'])}</td><td>{escape(c['city'] or '—')}</td><td>{escape(c['location'])}</td><td>{'فعال' if c['enabled'] else 'غیرفعال'}</td><td>{'ویدئوی آپلودی' if str(c['rtsp_url']).startswith('video://') else ('آزمایشی' if c['is_demo'] else 'RTSP')}</td><td><a class='btn' href='/cameras/{c['id']}/edit'>ویرایش</a> <form style='display:inline' method='post' action='/cameras/{c['id']}/delete' onsubmit=\"return confirm('حذف شود؟')\"><button class='danger'>{'حذف ویدئو' if str(c['rtsp_url']).startswith('video://') else 'حذف'}</button></form></td></tr>" for c in rows) or "<tr><td colspan='7'>دوربینی ثبت نشده است.</td></tr>"
+    source_cameras=[c for c in rows if not str(c['rtsp_url']).startswith('video://')]
+    source_options=''.join(
+        f"<option value='{c['id']}'>{escape(c['name'])}</option>"
+        for c in source_cameras
+    )
+    source_options+=(
+        "<option value='0'>تنظیمات پیش‌فرض پلاک‌خوان</option>"
+    )
     notice="<div class='card ok'>عملیات انجام شد.</div>" if msg else ''
-    return page('دوربین‌ها',f"""<div class='wrap'><div class='toolbar'><h1 style='margin-left:auto'>مدیریت دوربین‌ها</h1><a class='btn' href='/cameras/new'>افزودن دوربین</a></div>{notice}<div class='card'><div class='table-wrap'><table><tr><th>ID</th><th>نام</th><th>شهر</th><th>موقعیت</th><th>وضعیت</th><th>نوع</th><th>عملیات</th></tr>{trs}</table></div></div><div class='card'><h2>🎞️ نمایش ویدئو به‌صورت دوربین زنده</h2><p class='muted'>پس از پایان آپلود، ویدئو به‌عنوان یک دوربین مجازی در داشبورد پخش می‌شود و پلاک‌خوان در پس‌زمینه روی آن کار می‌کند.</p><form id='videoUploadForm' action='/cameras/video-upload' method='post' enctype='multipart/form-data'><label>تنظیمات کدام دوربین استفاده شود؟</label><select name='camera_id'>{''.join(f"<option value='{c['id']}'>{escape(c['name'])}</option>" for c in rows if not str(c['rtsp_url']).startswith('video://'))}</select><br><label>فایل ویدئو</label><input type='file' name='video' accept='.mp4,.avi,.mkv,.mov' required><div id='uploadState' class='muted' style='display:none;margin:10px 0'>در حال آپلود: <b id='uploadPercent'>۰٪</b><progress id='uploadProgress' value='0' max='100' style='width:100%'></progress></div><br><button id='uploadButton'>آپلود و نمایش در پخش زنده</button></form></div></div>
+    return page('دوربین‌ها',f"""<div class='wrap'><div class='toolbar'><h1 style='margin-left:auto'>مدیریت دوربین‌ها</h1><a class='btn' href='/cameras/new'>افزودن دوربین</a></div>{notice}<div class='card'><div class='table-wrap'><table><tr><th>ID</th><th>نام</th><th>شهر</th><th>موقعیت</th><th>وضعیت</th><th>نوع</th><th>عملیات</th></tr>{trs}</table></div></div><div class='card'><h2>🎞️ نمایش ویدئو به‌صورت دوربین زنده</h2><p class='muted'>پس از پایان آپلود، ویدئو به‌عنوان یک دوربین مجازی در داشبورد پخش می‌شود و پلاک‌خوان در پس‌زمینه روی آن کار می‌کند. اگر دوربینی تعریف نشده باشد، تنظیمات پیش‌فرض به‌طور خودکار استفاده می‌شود.</p><form id='videoUploadForm' action='/cameras/video-upload' method='post' enctype='multipart/form-data'><label>تنظیمات کدام دوربین استفاده شود؟</label><select name='camera_id'>{source_options}</select><br><label>فایل ویدئو</label><input id='videoUploadInput' type='file' name='video' accept='.mp4,.avi,.mkv,.mov,.m4v' required><div id='uploadState' class='muted' style='display:none;margin:10px 0'>در حال آپلود: <b id='uploadPercent'>۰٪</b><progress id='uploadProgress' value='0' max='100' style='width:100%'></progress></div><br><button id='uploadButton'>آپلود و نمایش در پخش زنده</button></form></div></div>
 <script>
 const uploadForm=document.getElementById('videoUploadForm');
+const uploadInput=document.getElementById('videoUploadInput');
+const uploadButton=document.getElementById('uploadButton');
+const uploadState=document.getElementById('uploadState');
+const uploadProgress=document.getElementById('uploadProgress');
+const uploadPercent=document.getElementById('uploadPercent');
+function resetVideoUploadUi(resetProgress=false){{
+ if(uploadButton){{uploadButton.disabled=false;uploadButton.textContent='آپلود و نمایش در پخش زنده'}}
+ if(resetProgress&&uploadProgress&&uploadPercent){{uploadProgress.value=0;uploadPercent.textContent='۰٪';uploadState.style.display='none'}}
+}}
+window.addEventListener('pageshow',()=>resetVideoUploadUi(true));
+uploadInput?.addEventListener('change',()=>resetVideoUploadUi(true));
 uploadForm?.addEventListener('submit',event=>{{
  event.preventDefault();
- const button=document.getElementById('uploadButton'),state=document.getElementById('uploadState'),bar=document.getElementById('uploadProgress'),percent=document.getElementById('uploadPercent');
- button.disabled=true;button.textContent='در حال آپلود…';state.style.display='block';
- const xhr=new XMLHttpRequest();xhr.open('POST',uploadForm.action);xhr.setRequestHeader('X-Requested-With','XMLHttpRequest');
- xhr.upload.onprogress=e=>{{if(e.lengthComputable){{const p=Math.round(e.loaded/e.total*100);bar.value=p;percent.textContent=p.toLocaleString('fa-IR')+'٪'}}}};
- xhr.onload=()=>{{let result={{}};try{{result=JSON.parse(xhr.responseText)}}catch(e){{}}if(xhr.status>=200&&xhr.status<300&&result.ok){{location.href=result.redirect||'/dashboard'}}else{{alert(result.error||'آپلود ویدئو انجام نشد.');button.disabled=false;button.textContent='آپلود و نمایش در پخش زنده'}}}};
- xhr.onerror=()=>{{alert('ارتباط هنگام آپلود قطع شد.');button.disabled=false;button.textContent='تلاش دوباره'}};
+ if(!uploadInput?.files?.length){{alert('ابتدا فایل ویدئو را انتخاب کنید.');return}}
+ uploadButton.disabled=true;uploadButton.textContent='در حال آپلود…';uploadState.style.display='block';
+ let redirecting=false;
+ const xhr=new XMLHttpRequest();xhr.open('POST',uploadForm.action);xhr.timeout=2*60*60*1000;xhr.setRequestHeader('X-Requested-With','XMLHttpRequest');
+ xhr.upload.onprogress=e=>{{if(e.lengthComputable){{const p=Math.round(e.loaded/e.total*100);uploadProgress.value=p;uploadPercent.textContent=p.toLocaleString('fa-IR')+'٪'}}}};
+ xhr.onload=()=>{{let result={{}};try{{result=JSON.parse(xhr.responseText)}}catch(e){{}}if(xhr.status>=200&&xhr.status<300&&result.ok){{redirecting=true;location.assign(result.redirect||'/dashboard')}}else{{const detail=Array.isArray(result.detail)?result.detail.map(item=>item.msg).join('؛ '):result.detail;alert(result.error||detail||'آپلود ویدئو انجام نشد.')}}}};
+ xhr.onerror=()=>alert('ارتباط هنگام آپلود قطع شد. دوباره تلاش کنید.');
+ xhr.onabort=()=>alert('آپلود لغو شد. دوباره تلاش کنید.');
+ xhr.ontimeout=()=>alert('زمان آپلود تمام شد. دوباره تلاش کنید.');
+ xhr.onloadend=()=>{{if(!redirecting)resetVideoUploadUi(false)}};
  xhr.send(new FormData(uploadForm));
 }});
 </script>""",u,request)
@@ -1139,8 +1162,19 @@ def edit_cam(camera_id:int,request:Request,name:str=Form(...),rtsp_url:str=Form(
 def delete_cam(camera_id:int,request:Request):
     if not auth(request):return RedirectResponse('/login',302)
     if not has_permission(request,'camera.manage'):return access_denied()
-    with connect() as con:con.execute('DELETE FROM cameras WHERE id=?',(camera_id,))
-    manager.remove(camera_id);return RedirectResponse('/cameras?msg=1',303)
+    with connect() as con:
+        camera=con.execute(
+            'SELECT id,rtsp_url FROM cameras WHERE id=?',
+            (camera_id,),
+        ).fetchone()
+    if not camera:
+        return RedirectResponse('/cameras',303)
+    manager.remove(camera_id,wait=True)
+    with connect() as con:
+        con.execute('DELETE FROM cameras WHERE id=?',(camera_id,))
+    if str(camera['rtsp_url']).startswith('video://'):
+        _delete_uploaded_video_if_unused(camera['rtsp_url'])
+    return RedirectResponse('/cameras?msg=1',303)
 
 @app.get('/media')
 def media(request:Request,path:str=''):
@@ -1718,10 +1752,42 @@ async def _save_video_upload(video, save_dir, suffix):
                 if size>MAX_VIDEO_UPLOAD_BYTES:
                     raise ValueError('حجم ویدئو بیشتر از ۲ گیگابایت است.')
                 f.write(chunk)
-    except Exception:
+        if size == 0:
+            raise ValueError('فایل ویدئو خالی است.')
+    except BaseException:
         target.unlink(missing_ok=True)
         raise
+    finally:
+        try:
+            await video.close()
+        except Exception:
+            pass
     return target
+
+def _delete_uploaded_video_if_unused(video_url):
+    prefix='video://'
+    value=str(video_url or '')
+    if not value.startswith(prefix):
+        return False
+    try:
+        target=Path(value[len(prefix):]).resolve()
+        video_root=_configured_storage_child('video_path',VIDEO_DIR).resolve()
+        target.relative_to(video_root)
+        with connect() as con:
+            camera_reference=con.execute(
+                "SELECT 1 FROM cameras WHERE rtsp_url=? LIMIT 1",
+                (value,),
+            ).fetchone()
+            event_reference=con.execute(
+                "SELECT 1 FROM plate_events WHERE video_path=? LIMIT 1",
+                (str(target),),
+            ).fetchone()
+        if camera_reference or event_reference:
+            return False
+        target.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
 
 def _cleanup_old_files(folder, days, storage_root):
     if days <= 0: return 0
@@ -2214,7 +2280,7 @@ def backup_database(request:Request):
 
 
 @app.post('/cameras/video-upload', response_class=HTMLResponse)
-async def cameras_video_upload(request: Request, camera_id: int = Form(...), video: UploadFile = File(...)):
+async def cameras_video_upload(request: Request, camera_id: int = Form(0), video: UploadFile = File(...)):
     u=auth(request)
     if not u: return RedirectResponse('/login',302)
     if not has_permission(request,'video.process'):return access_denied()
@@ -2228,19 +2294,42 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(...), vid
     suffix=_video_suffix(video.filename)
     if not suffix:
         return upload_error('فرمت فایل پشتیبانی نمی‌شود.')
-    with connect() as con:
-        source_camera=con.execute(
-            "SELECT * FROM cameras WHERE id=? AND rtsp_url NOT LIKE 'video://%'",
-            (camera_id,),
-        ).fetchone()
-    if not source_camera:
+    source_camera=None
+    if camera_id > 0:
+        with connect() as con:
+            source_camera=con.execute(
+                "SELECT * FROM cameras WHERE id=? AND rtsp_url NOT LIKE 'video://%'",
+                (camera_id,),
+            ).fetchone()
+    if camera_id > 0 and not source_camera:
         return upload_error('دوربین انتخاب‌شده پیدا نشد.')
+    if source_camera is None:
+        source_camera={
+            'name':'تنظیمات پیش‌فرض پلاک‌خوان',
+            'city':'',
+            'lpr_enabled':1,
+            'lpr_confidence':60,
+            'frame_step':5,
+            'duplicate_seconds':30,
+            'roi_x':0,
+            'roi_y':0,
+            'roi_w':100,
+            'roi_h':100,
+            'line_y':50,
+        }
     if not source_camera['lpr_enabled']:
         return upload_error('پلاک‌خوان دوربین انتخاب‌شده غیرفعال است.')
     try:
         target=await _save_video_upload(video,_configured_storage_child('video_path',VIDEO_DIR),suffix)
     except ValueError as e:
         return upload_error(e)
+    except OSError as e:
+        return upload_error(
+            f'ذخیره ویدئو روی دیسک انجام نشد: {e}',
+            500,
+        )
+    except Exception as e:
+        return upload_error(f'خطا هنگام دریافت ویدئو: {e}',500)
 
     virtual_camera_id=None
     try:
@@ -2252,9 +2341,11 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(...), vid
             tester.close()
         display_name=(Path(video.filename or target.name).stem or 'ویدئو')[:80]
         with connect() as con:
-            old_stream_ids=[
-                int(row['id']) for row in con.execute(
-                    "SELECT id FROM cameras WHERE rtsp_url LIKE 'video://%'"
+            old_streams=[
+                (int(row['id']),str(row['rtsp_url']))
+                for row in con.execute(
+                    "SELECT id,rtsp_url FROM cameras "
+                    "WHERE rtsp_url LIKE 'video://%'"
                 ).fetchall()
             ]
             cursor=con.execute(
@@ -2297,11 +2388,12 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(...), vid
                 "AND id<>?",
                 (virtual_camera_id,),
             )
-        for old_id in old_stream_ids:
+        for old_id,old_url in old_streams:
             try:
-                manager.remove(old_id)
+                manager.remove(old_id,wait=True)
             except Exception:
                 pass
+            _delete_uploaded_video_if_unused(old_url)
         if wants_json:
             return JSONResponse({
                 'ok':True,
@@ -2317,7 +2409,7 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(...), vid
     except Exception as e:
         if virtual_camera_id is not None:
             try:
-                manager.remove(virtual_camera_id)
+                manager.remove(virtual_camera_id,wait=True)
             except Exception:
                 pass
             try:
@@ -2618,6 +2710,15 @@ async def ai_video_test_upload(request: Request, video: UploadFile = File(...)):
         target=await _save_video_upload(video,_configured_storage_child('video_path',VIDEO_DIR),suffix)
     except ValueError as e:
         return page('خطای ویدئو',f"<div class='wrap'><div class='alert'>{escape(str(e))}</div></div>",u,request)
+    except OSError as e:
+        return page(
+            'خطای ویدئو',
+            f"<div class='wrap'><div class='alert'>"
+            f"ذخیره ویدئو روی دیسک انجام نشد: {escape(str(e))}"
+            "</div></div>",
+            u,
+            request,
+        )
     try:
         from app.ai.video_test import process_video
         run_name = target.stem
