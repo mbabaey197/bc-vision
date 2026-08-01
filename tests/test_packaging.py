@@ -207,3 +207,24 @@ def test_anpr_validation_preserves_independent_runner_caches():
     assert ".venv-ai\\Scripts\\python.exe" in workflow
     assert workflow.count("build_dependency_stamp.py check") == 2
     assert ".ci-cache\\bcvision-models" in workflow
+
+
+def test_first_run_requires_explicit_admin_setup():
+    root = Path(__file__).resolve().parents[1]
+    database = (root / "app" / "database.py").read_text(encoding="utf-8")
+    main = (root / "app" / "main.py").read_text(encoding="utf-8")
+
+    assert 'hash_password("123456")' not in database
+    assert "ورود اولیه:" not in main
+    assert "@app.get('/setup')" in main
+    assert "@app.post('/setup')" in main
+    assert "len(password) < 10" in main
+    assert "secure=request.url.scheme == 'https'" in main
+
+
+def test_desktop_ui_has_no_runtime_cdn_dependency():
+    root = Path(__file__).resolve().parents[1]
+    main = (root / "app" / "main.py").read_text(encoding="utf-8")
+
+    assert "cdn.jsdelivr.net" not in main
+    assert 'BOOTSTRAP = ""' in main
