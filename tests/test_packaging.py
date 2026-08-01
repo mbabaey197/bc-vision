@@ -228,3 +228,15 @@ def test_desktop_ui_has_no_runtime_cdn_dependency():
 
     assert "cdn.jsdelivr.net" not in main
     assert 'BOOTSTRAP = ""' in main
+
+
+def test_password_changes_revoke_existing_sessions():
+    root = Path(__file__).resolve().parents[1]
+    database = (root / "app" / "database.py").read_text(encoding="utf-8")
+    security = (root / "app" / "security.py").read_text(encoding="utf-8")
+    main = (root / "app" / "main.py").read_text(encoding="utf-8")
+
+    assert '"session_version": "INTEGER NOT NULL DEFAULT 0"' in database
+    assert "def read_token_claims" in security
+    assert 'session_version=session_version+1' in main
+    assert "AND session_version=?" in main
