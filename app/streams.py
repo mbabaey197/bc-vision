@@ -746,10 +746,10 @@ class StreamManager:
             stream = self.streams.pop(camera_id, None)
         if stream:
             stopped = stream.stop(wait=wait)
-            if not stopped:
+            if wait and not stopped:
                 with self.lock:
                     self.streams.setdefault(camera_id,stream)
-            return stopped
+            return stopped if wait else True
         try:
             from app.ai.live_worker import stop_live_camera
             return stop_live_camera(camera_id,wait=wait)
