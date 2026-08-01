@@ -18,6 +18,7 @@ from tools.license_service import (
 
 
 def _write_keypair(tmp_path: Path) -> tuple[Path, Path]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     private = Ed25519PrivateKey.generate()
     private_path = tmp_path / "private.pem"
     public_path = tmp_path / "public.pem"
