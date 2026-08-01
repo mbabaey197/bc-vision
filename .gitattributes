@@ -1,0 +1,27 @@
+# Keep repository text normalization deterministic across Windows and Linux.
+* text=auto
+
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.iss text eol=crlf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.onnx binary
+*.pt binary
+*.zip binary
+*.exe binary
+*.dll binary
+*.db binary
