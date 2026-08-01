@@ -4,7 +4,6 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.config import DB_PATH
-from app.security import hash_password
 
 
 def connect():
@@ -390,21 +389,6 @@ def init_db():
             "line_y": "INTEGER NOT NULL DEFAULT 50",
         })
         _backfill_event_metadata(con)
-
-        if con.execute(
-            "SELECT 1 FROM users WHERE username=?",
-            ("admin",),
-        ).fetchone() is None:
-            con.execute(
-                "INSERT INTO users(" 
-                "username,password_hash,display_name,is_admin"
-                ") VALUES(?,?,?,1)",
-                (
-                    "admin",
-                    hash_password("123456"),
-                    "مدیر سیستم",
-                ),
-            )
 
         defaults = {
             "company_name": "گیلاس آبی البرز",
