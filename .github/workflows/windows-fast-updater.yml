@@ -54,19 +54,17 @@ jobs:
           $value = (Get-Content VERSION -Raw).Trim()
           "value=$value" >> $env:GITHUB_OUTPUT
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v6
         with:
-          version: "0.12.0"
-          enable-cache: true
-          cache-python: true
-          cache-dependency-glob: requirements-test.txt
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-test.txt
 
-      - name: Reuse Python 3.13 test environment
+      - name: Create Python 3.13 test environment
         shell: cmd
         run: |
-          if not exist .venv\Scripts\python.exe uv python install 3.13
-          if not exist .venv\Scripts\python.exe uv venv --python 3.13 --seed .venv
+          python -m venv .venv
           echo %CD%\.venv\Scripts>>"%GITHUB_PATH%"
 
       - name: Run source regression
