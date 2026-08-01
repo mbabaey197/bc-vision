@@ -77,9 +77,11 @@ def test_stop_all_stops_every_stream():
     class FakeStream:
         def __init__(self):
             self.stopped = False
+            self.waited = False
 
-        def stop(self):
+        def stop(self, wait=False):
             self.stopped = True
+            self.waited = wait
 
     first = FakeStream()
     second = FakeStream()
@@ -89,6 +91,27 @@ def test_stop_all_stops_every_stream():
 
     assert first.stopped
     assert second.stopped
+    assert first.waited
+    assert second.waited
+    assert manager.streams == {}
+
+
+def test_remove_can_wait_for_uploaded_video_stream_shutdown():
+    manager = StreamManager()
+
+    class FakeStream:
+        def __init__(self):
+            self.waited = None
+
+        def stop(self, wait=False):
+            self.waited = wait
+            return True
+
+    stream = FakeStream()
+    manager.streams = {7: stream}
+
+    assert manager.remove(7, wait=True) is True
+    assert stream.waited is True
     assert manager.streams == {}
 
 
