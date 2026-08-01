@@ -14,12 +14,21 @@ from app.database import (
     set_settings_for_database,
     set_setting,
 )
-from app.security import COOKIE_NAME, create_token, read_token, verify_password, hash_password
+from app.security import (
+    COOKIE_NAME,
+    create_token,
+    hash_password,
+    read_token,
+    read_token_claims,
+    verify_password,
+)
 from app.streams import manager, CV_OK
 from app.license import status as license_status, install_license, activate_online, deactivate_local, machine_id
 from html import escape
 import time, csv, shutil, os, json, secrets, math
+import threading
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from urllib.parse import quote, urlencode
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -65,6 +74,13 @@ async def security_headers(request: Request, call_next):
     response.headers.setdefault(
         "Permissions-Policy",
         "camera=(), microphone=(), geolocation=()",
+    )
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data: blob:; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "connect-src 'self'; media-src 'self' blob:",
     )
     return response
 
@@ -486,7 +502,9 @@ label{display:block;font-weight:700;color:var(--bc-text);margin-bottom:3px}input
 .iran-plate{display:inline-flex;direction:ltr;align-items:stretch;height:54px;min-width:250px;border:2px solid #15191f;border-radius:7px;overflow:hidden;background:#fff;color:#111;font-family:Tahoma,"Segoe UI",sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.14)}.iran-plate.compact{height:42px;min-width:205px}.plate-blue{width:32px;background:#0868b7;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:12px;line-height:1}.plate-blue small{font-size:7px;margin-top:3px}.plate-main{display:flex;align-items:center;justify-content:space-evenly;gap:8px;flex:1;padding:0 9px;font-size:21px}.compact .plate-main{font-size:17px;gap:6px;padding:0 7px}.plate-iran{width:54px;border-left:2px solid #15191f;display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1}.plate-iran small{font-size:9px}.plate-iran b{font-size:17px;margin-top:4px}.compact .plate-iran{width:46px}.compact .plate-iran b{font-size:14px}.plate-unreadable{display:inline-block;padding:6px 10px;border-radius:7px;background:#fff1c7;color:#714f00;font-weight:800}.read-badge{display:block;width:max-content;margin-top:5px;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:800}.read-badge.suggested{background:#fff1c7;color:#714f00}.read-badge.unreadable{background:#ffe8e8;color:#a12a2a}.read-badge.confirmed{background:#e5f7ef;color:#147a50}.read-badge.confirmed-ai{background:#e7f5ff;color:#0969a9}.read-badge.auto-confirmed{background:#e9f7ed;color:#226b35;border:1px solid #b9e2c4}.correction-form{display:flex;gap:7px;align-items:center;min-width:265px}.correction-form input:not([type=checkbox]){margin:0;min-width:170px;padding:7px 9px}.correction-form button{padding:7px 10px;white-space:nowrap}.feedback-note{font-size:12px;color:var(--bc-muted);margin-top:8px}
 </style>"""
 
-BOOTSTRAP = "<link href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.rtl.min.css' rel='stylesheet'>"
+# The desktop service must remain fully usable without Internet access.
+# Component styling is bundled in CSS above; no runtime CDN is required.
+BOOTSTRAP = ""
 
 NAV_ITEMS = [
     ('/dashboard','⌂','داشبورد و نمایش زنده'),('/cameras','▣','دوربین‌ها'),('/events','▤','ترددها و گزارش‌ها'),
@@ -519,10 +537,15 @@ window.faDigits=function(value){return String(value).replace(/[0-9]/g,d=>'۰۱۲
 
 def user(request): return read_token(request)
 def auth(request):
-    username=read_token(request)
-    if not username:return None
+    claims=read_token_claims(request)
+    if not claims:return None
+    username,session_version=claims
     with connect() as con:
-        row=con.execute('SELECT * FROM users WHERE username=? AND is_active=1',(username,)).fetchone()
+        row=con.execute(
+            'SELECT * FROM users WHERE username=? AND is_active=1 '
+            'AND session_version=?',
+            (username,session_version),
+        ).fetchone()
     return row['username'] if row else None
 
 def current_user(request):
@@ -567,14 +590,103 @@ def camera_rows(enabled_only=False):
         q="SELECT * FROM cameras" + (" WHERE enabled=1" if enabled_only else "") + " ORDER BY sort_order,id"
         return con.execute(q).fetchall()
 
+
+def has_users():
+    with connect() as con:
+        return bool(con.execute("SELECT 1 FROM users LIMIT 1").fetchone())
+
+
 @app.get('/')
-def root(request:Request): return RedirectResponse('/dashboard' if user(request) else '/login',302)
+def root(request:Request):
+    if not has_users():
+        return RedirectResponse('/setup',302)
+    return RedirectResponse('/dashboard' if user(request) else '/login',302)
+
+
+@app.get('/setup')
+def setup_form(request:Request,error:str=''):
+    if has_users():
+        return RedirectResponse('/login',302)
+    alert=(
+        f"<div class='alert'>{escape(error)}</div>"
+        if error else ""
+    )
+    body=f"""<div class='login-page'>
+    <section class='login-panel'><div class='login-box'>
+      <div class='login-logo'><span class='brand-mark'>BC</span><div><h1>BC Vision</h1><p>{escape(COMPANY_NAME)}</p></div></div>
+      <h2 class='login-title'>راه‌اندازی امن سامانه</h2>
+      <p class='login-subtitle'>حساب مدیر اولیه را خودتان ایجاد کنید. هیچ رمز پیش‌فرضی در برنامه وجود ندارد.</p>
+      {alert}
+      <form method='post' action='/setup' autocomplete='off'>
+        <label for='username'>نام کاربری مدیر</label>
+        <input id='username' name='username' minlength='3' maxlength='50' autocomplete='username' required>
+        <label for='display_name'>نام نمایشی</label>
+        <input id='display_name' name='display_name' maxlength='100' required>
+        <label for='password'>رمز عبور</label>
+        <input id='password' type='password' name='password' minlength='10' autocomplete='new-password' required>
+        <label for='password_confirm'>تکرار رمز عبور</label>
+        <input id='password_confirm' type='password' name='password_confirm' minlength='10' autocomplete='new-password' required>
+        <button class='login-submit' type='submit'>ایجاد مدیر و ادامه</button>
+      </form>
+      <div class='login-help'><span>رمز باید حداقل ۱۰ نویسه داشته باشد.</span></div>
+    </div></section>
+    <section class='login-visual'><div class='login-hero'><h2>اول امنیت،<br>بعد شروع کار</h2><p>اطلاعات ورود فقط در همین دستگاه و به‌صورت هش‌شده ذخیره می‌شود.</p></div><span class='login-version'>نسخه {APP_VERSION}</span></section>
+    </div>"""
+    return page('راه‌اندازی اولیه',body)
+
+
+@app.post('/setup')
+def setup_create(
+    request:Request,
+    username:str=Form(...),
+    display_name:str=Form(...),
+    password:str=Form(...),
+    password_confirm:str=Form(...),
+):
+    username=username.strip()
+    display_name=display_name.strip()
+    if (
+        len(username) < 3
+        or len(username) > 50
+        or any(ch.isspace() for ch in username)
+        or not display_name
+    ):
+        return RedirectResponse('/setup?error='+quote('نام کاربری یا نام نمایشی معتبر نیست.'),303)
+    if len(password) < 10 or password != password_confirm:
+        return RedirectResponse('/setup?error='+quote('رمزها یکسان نیستند یا کمتر از ۱۰ نویسه‌اند.'),303)
+    with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        if con.execute("SELECT 1 FROM users LIMIT 1").fetchone():
+            return RedirectResponse('/login',303)
+        con.execute(
+            "INSERT INTO users("
+            "username,password_hash,display_name,is_admin,role,is_active"
+            ") VALUES(?,?,?,1,'admin',1)",
+            (username,hash_password(password),display_name),
+        )
+        con.execute(
+            "INSERT INTO audit_logs(username,action,details,ip_address) "
+            "VALUES(?,?,?,?)",
+            (
+                username,
+                'initial_admin_created',
+                'ایجاد امن مدیر اولیه',
+                request.client.host if request.client else '',
+            ),
+        )
+    return RedirectResponse('/login?setup=1',303)
 @app.get('/login')
-def login_form(request:Request,error:str='',next:str='/dashboard',logged_out:int=0):
+def login_form(request:Request,error:str='',next:str='/dashboard',logged_out:int=0,setup:int=0):
+    if not has_users(): return RedirectResponse('/setup',302)
     if user(request): return RedirectResponse('/dashboard',302)
     safe_next=next if next.startswith('/') and not next.startswith('//') else '/dashboard'
     alert="<div class='alert'>نام کاربری یا رمز عبور صحیح نیست.</div>" if error else ''
-    notice="<div class='alert' style='background:#eaf8f1;color:#146b45;border-color:#bdebd5'>با موفقیت از حساب خارج شدید.</div>" if logged_out else ''
+    notice=(
+        "<div class='alert' style='background:#eaf8f1;color:#146b45;border-color:#bdebd5'>"
+        + ("حساب مدیر با موفقیت ساخته شد. اکنون وارد شوید." if setup else "با موفقیت از حساب خارج شدید.")
+        + "</div>"
+        if (logged_out or setup) else ''
+    )
     body=f"""<div class='login-page'>
     <section class='login-panel'><div class='login-box'>
       <div class='login-logo'><span class='brand-mark'>BC</span><div><h1>BC Vision</h1><p>{escape(COMPANY_NAME)}</p></div></div>
@@ -586,13 +698,15 @@ def login_form(request:Request,error:str='',next:str='/dashboard',logged_out:int
         <label for='password'>رمز عبور</label><div class='password-wrap'><input id='password' type='password' name='password' autocomplete='current-password' required placeholder='رمز عبور را وارد کنید'><button type='button' class='password-toggle' id='passwordToggle' aria-label='نمایش رمز'>◉</button></div>
         <button class='login-submit' type='submit'>ورود به BC Vision</button>
       </form>
-      <div class='login-help'><span>ورود اولیه: <b>admin</b> / <b>123456</b></span><span>پس از ورود رمز را تغییر دهید.</span></div>
+      <div class='login-help'><span>برای امنیت، رمز پیش‌فرض در برنامه وجود ندارد.</span></div>
     </div></section>
     <section class='login-visual'><div class='login-hero'><h2>مدیریت هوشمند<br>نظارت و تردد خودرو</h2><p>مشاهده زنده دوربین‌ها، پلاک‌خوانی، جست‌وجوی رویدادها و گزارش‌گیری در یک محیط یکپارچه.</p><div class='login-features'><div class='login-feature'><b>نمایش زنده</b><span>مدیریت هم‌زمان چند دوربین</span></div><div class='login-feature'><b>پلاک‌خوان هوشمند</b><span>ثبت و جست‌وجوی سریع ترددها</span></div><div class='login-feature'><b>گزارش‌های دقیق</b><span>فیلتر بر اساس دوربین، رنگ و نوع خودرو</span></div><div class='login-feature'><b>امنیت حساب</b><span>نشست رمزنگاری‌شده و خروج امن</span></div></div></div><span class='login-version'>نسخه {APP_VERSION}</span></section>
     </div><script>document.getElementById('passwordToggle').addEventListener('click',function(){{const p=document.getElementById('password');p.type=p.type==='password'?'text':'password';this.textContent=p.type==='password'?'◉':'⊘';}});</script>"""
     return page('ورود',body)
 @app.post('/login')
 def login(request:Request,username:str=Form(...),password:str=Form(...),next:str=Form('/dashboard')):
+    if not has_users():
+        return RedirectResponse('/setup',303)
     username=username.strip()
     safe_next=next if next.startswith('/') and not next.startswith('//') else '/dashboard'
     with connect() as con:
@@ -613,7 +727,15 @@ def login(request:Request,username:str=Form(...),password:str=Form(...),next:str
         con.execute('UPDATE users SET failed_attempts=0,locked_until=NULL,last_login=CURRENT_TIMESTAMP WHERE id=?',(u['id'],))
         con.execute('INSERT INTO audit_logs(username,action,details,ip_address) VALUES(?,?,?,?)',(username,'login','ورود موفق',request.client.host if request.client else ''))
     r=RedirectResponse(safe_next,303)
-    r.set_cookie(COOKIE_NAME,create_token(u['username']),httponly=True,samesite='lax',secure=False,max_age=43200,path='/')
+    r.set_cookie(
+        COOKIE_NAME,
+        create_token(u['username'],u['session_version']),
+        httponly=True,
+        samesite='lax',
+        secure=request.url.scheme == 'https',
+        max_age=43200,
+        path='/',
+    )
     return r
 @app.get('/logout')
 def logout(request:Request):
@@ -961,20 +1083,52 @@ def cameras(request:Request,msg:str=''):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
     if not has_permission(request,'camera.manage'):return access_denied()
-    rows=camera_rows(); trs=''.join(f"<tr><td>{c['id']}</td><td>{escape(c['name'])}</td><td>{escape(c['city'] or '—')}</td><td>{escape(c['location'])}</td><td>{'فعال' if c['enabled'] else 'غیرفعال'}</td><td>{'ویدئوی آپلودی' if str(c['rtsp_url']).startswith('video://') else ('آزمایشی' if c['is_demo'] else 'RTSP')}</td><td><a class='btn' href='/cameras/{c['id']}/edit'>ویرایش</a> <form style='display:inline' method='post' action='/cameras/{c['id']}/delete' onsubmit=\"return confirm('حذف شود؟')\"><button class='danger'>حذف</button></form></td></tr>" for c in rows) or "<tr><td colspan='7'>دوربینی ثبت نشده است.</td></tr>"
+    rows=camera_rows(); trs=''.join(f"<tr><td>{c['id']}</td><td>{escape(c['name'])}</td><td>{escape(c['city'] or '—')}</td><td>{escape(c['location'])}</td><td>{'فعال' if c['enabled'] else 'غیرفعال'}</td><td>{'ویدئوی آپلودی' if str(c['rtsp_url']).startswith('video://') else ('آزمایشی' if c['is_demo'] else 'RTSP')}</td><td><a class='btn' href='/cameras/{c['id']}/edit'>ویرایش</a> <form style='display:inline' method='post' action='/cameras/{c['id']}/delete' onsubmit=\"return confirm('حذف شود؟')\"><button class='danger'>{'حذف ویدئو' if str(c['rtsp_url']).startswith('video://') else 'حذف'}</button></form></td></tr>" for c in rows) or "<tr><td colspan='7'>دوربینی ثبت نشده است.</td></tr>"
+    source_cameras=[c for c in rows if not str(c['rtsp_url']).startswith('video://')]
+    source_options=''.join(
+        f"<option value='{c['id']}'>{escape(c['name'])}</option>"
+        for c in source_cameras
+    )
+    source_options+=(
+        "<option value='0'>تنظیمات پیش‌فرض پلاک‌خوان</option>"
+    )
     notice="<div class='card ok'>عملیات انجام شد.</div>" if msg else ''
-    return page('دوربین‌ها',f"""<div class='wrap'><div class='toolbar'><h1 style='margin-left:auto'>مدیریت دوربین‌ها</h1><a class='btn' href='/cameras/new'>افزودن دوربین</a></div>{notice}<div class='card'><div class='table-wrap'><table><tr><th>ID</th><th>نام</th><th>شهر</th><th>موقعیت</th><th>وضعیت</th><th>نوع</th><th>عملیات</th></tr>{trs}</table></div></div><div class='card'><h2>🎞️ نمایش ویدئو به‌صورت دوربین زنده</h2><p class='muted'>پس از پایان آپلود، ویدئو به‌عنوان یک دوربین مجازی در داشبورد پخش می‌شود و پلاک‌خوان در پس‌زمینه روی آن کار می‌کند.</p><form id='videoUploadForm' action='/cameras/video-upload' method='post' enctype='multipart/form-data'><label>تنظیمات کدام دوربین استفاده شود؟</label><select name='camera_id'>{''.join(f"<option value='{c['id']}'>{escape(c['name'])}</option>" for c in rows if not str(c['rtsp_url']).startswith('video://'))}</select><br><label>فایل ویدئو</label><input type='file' name='video' accept='.mp4,.avi,.mkv,.mov' required><div id='uploadState' class='muted' style='display:none;margin:10px 0'>در حال آپلود: <b id='uploadPercent'>۰٪</b><progress id='uploadProgress' value='0' max='100' style='width:100%'></progress></div><br><button id='uploadButton'>آپلود و نمایش در پخش زنده</button></form></div></div>
+    return page('دوربین‌ها',f"""<div class='wrap'><div class='toolbar'><h1 style='margin-left:auto'>مدیریت دوربین‌ها</h1><a class='btn' href='/cameras/new'>افزودن دوربین</a></div>{notice}<div class='card'><div class='table-wrap'><table><tr><th>ID</th><th>نام</th><th>شهر</th><th>موقعیت</th><th>وضعیت</th><th>نوع</th><th>عملیات</th></tr>{trs}</table></div></div><div class='card'><h2>🎞️ نمایش ویدئو به‌صورت دوربین زنده</h2><p class='muted'>پس از پایان آپلود، ویدئو به‌عنوان یک دوربین مجازی در داشبورد پخش می‌شود و پلاک‌خوان در پس‌زمینه روی آن کار می‌کند. اگر دوربینی تعریف نشده باشد، تنظیمات پیش‌فرض به‌طور خودکار استفاده می‌شود.</p><form id='videoUploadForm' action='/cameras/video-upload' method='post' enctype='multipart/form-data'><label>تنظیمات کدام دوربین استفاده شود؟</label><select name='camera_id'>{source_options}</select><br><label>فایل ویدئو</label><input id='videoUploadInput' type='file' name='video' accept='.mp4,.avi,.mkv,.mov,.m4v' required><div id='uploadState' class='muted' style='display:none;margin:10px 0'>در حال آپلود: <b id='uploadPercent'>۰٪</b><progress id='uploadProgress' value='0' max='100' style='width:100%'></progress></div><br><button id='uploadButton'>آپلود و نمایش در پخش زنده</button></form></div></div>
 <script>
 const uploadForm=document.getElementById('videoUploadForm');
+const uploadInput=document.getElementById('videoUploadInput');
+const uploadButton=document.getElementById('uploadButton');
+const uploadState=document.getElementById('uploadState');
+ const uploadProgress=document.getElementById('uploadProgress');
+const uploadPercent=document.getElementById('uploadPercent');
+const uploadSource=document.querySelector("#videoUploadForm select[name='camera_id']");
+let videoUploadInProgress=false;
+function resetVideoUploadUi(resetProgress=false){{
+ if(videoUploadInProgress)return;
+ if(uploadButton){{uploadButton.disabled=false;uploadButton.textContent='آپلود و نمایش در پخش زنده'}}
+ if(uploadInput)uploadInput.disabled=false;
+ if(uploadSource)uploadSource.disabled=false;
+ if(resetProgress&&uploadProgress&&uploadPercent){{uploadProgress.value=0;uploadPercent.textContent='۰٪';uploadState.style.display='none'}}
+}}
+window.addEventListener('pageshow',()=>{{videoUploadInProgress=false;resetVideoUploadUi(true)}});
+uploadInput?.addEventListener('change',()=>resetVideoUploadUi(true));
 uploadForm?.addEventListener('submit',event=>{{
  event.preventDefault();
- const button=document.getElementById('uploadButton'),state=document.getElementById('uploadState'),bar=document.getElementById('uploadProgress'),percent=document.getElementById('uploadPercent');
- button.disabled=true;button.textContent='در حال آپلود…';state.style.display='block';
- const xhr=new XMLHttpRequest();xhr.open('POST',uploadForm.action);xhr.setRequestHeader('X-Requested-With','XMLHttpRequest');
- xhr.upload.onprogress=e=>{{if(e.lengthComputable){{const p=Math.round(e.loaded/e.total*100);bar.value=p;percent.textContent=p.toLocaleString('fa-IR')+'٪'}}}};
- xhr.onload=()=>{{let result={{}};try{{result=JSON.parse(xhr.responseText)}}catch(e){{}}if(xhr.status>=200&&xhr.status<300&&result.ok){{location.href=result.redirect||'/dashboard'}}else{{alert(result.error||'آپلود ویدئو انجام نشد.');button.disabled=false;button.textContent='آپلود و نمایش در پخش زنده'}}}};
- xhr.onerror=()=>{{alert('ارتباط هنگام آپلود قطع شد.');button.disabled=false;button.textContent='تلاش دوباره'}};
- xhr.send(new FormData(uploadForm));
+ if(videoUploadInProgress)return;
+ if(!uploadInput?.files?.length){{alert('ابتدا فایل ویدئو را انتخاب کنید.');return}}
+ const uploadPayload=new FormData(uploadForm);
+ videoUploadInProgress=true;
+ uploadButton.disabled=true;uploadButton.textContent='در حال آپلود…';uploadState.style.display='block';
+ uploadInput.disabled=true;if(uploadSource)uploadSource.disabled=true;
+ let redirecting=false;
+ const xhr=new XMLHttpRequest();xhr.open('POST',uploadForm.action);xhr.timeout=2*60*60*1000;xhr.setRequestHeader('X-Requested-With','XMLHttpRequest');
+ xhr.upload.onprogress=e=>{{if(e.lengthComputable){{const p=Math.round(e.loaded/e.total*100);uploadProgress.value=p;uploadPercent.textContent=p.toLocaleString('fa-IR')+'٪'}}}};
+ xhr.onload=()=>{{let result={{}};try{{result=JSON.parse(xhr.responseText)}}catch(e){{}}if(xhr.status>=200&&xhr.status<300&&result.ok){{redirecting=true;location.assign(result.redirect||'/dashboard')}}else{{const detail=Array.isArray(result.detail)?result.detail.map(item=>item.msg).join('؛ '):result.detail;alert(result.error||detail||'آپلود ویدئو انجام نشد.')}}}};
+ xhr.onerror=()=>alert('ارتباط هنگام آپلود قطع شد. دوباره تلاش کنید.');
+ xhr.onabort=()=>alert('آپلود لغو شد. دوباره تلاش کنید.');
+ xhr.ontimeout=()=>alert('زمان آپلود تمام شد. دوباره تلاش کنید.');
+ xhr.onloadend=()=>{{if(!redirecting){{videoUploadInProgress=false;resetVideoUploadUi(false)}}}};
+ xhr.send(uploadPayload);
 }});
 </script>""",u,request)
 
@@ -1019,8 +1173,28 @@ def edit_cam(camera_id:int,request:Request,name:str=Form(...),rtsp_url:str=Form(
 def delete_cam(camera_id:int,request:Request):
     if not auth(request):return RedirectResponse('/login',302)
     if not has_permission(request,'camera.manage'):return access_denied()
-    with connect() as con:con.execute('DELETE FROM cameras WHERE id=?',(camera_id,))
-    manager.remove(camera_id);return RedirectResponse('/cameras?msg=1',303)
+    with connect() as con:
+        camera=con.execute(
+            'SELECT id,rtsp_url FROM cameras WHERE id=?',
+            (camera_id,),
+        ).fetchone()
+    if not camera:
+        return RedirectResponse('/cameras',303)
+    if not manager.remove(camera_id,wait=True):
+        return page(
+            'خطای حذف ویدئو',
+            "<div class='wrap'><div class='alert'>"
+            "پردازش ویدئو هنوز در حال توقف است. چند ثانیه دیگر "
+            "دوباره حذف را بزنید.</div><a class='btn secondary' "
+            "href='/cameras'>بازگشت</a></div>",
+            auth(request),
+            request,
+        )
+    with connect() as con:
+        con.execute('DELETE FROM cameras WHERE id=?',(camera_id,))
+    if str(camera['rtsp_url']).startswith('video://'):
+        _delete_uploaded_video_if_unused(camera['rtsp_url'])
+    return RedirectResponse('/cameras?msg=1',303)
 
 @app.get('/media')
 def media(request:Request,path:str=''):
@@ -1598,10 +1772,42 @@ async def _save_video_upload(video, save_dir, suffix):
                 if size>MAX_VIDEO_UPLOAD_BYTES:
                     raise ValueError('حجم ویدئو بیشتر از ۲ گیگابایت است.')
                 f.write(chunk)
-    except Exception:
+        if size == 0:
+            raise ValueError('فایل ویدئو خالی است.')
+    except BaseException:
         target.unlink(missing_ok=True)
         raise
+    finally:
+        try:
+            await video.close()
+        except Exception:
+            pass
     return target
+
+def _delete_uploaded_video_if_unused(video_url):
+    prefix='video://'
+    value=str(video_url or '')
+    if not value.startswith(prefix):
+        return False
+    try:
+        target=Path(value[len(prefix):]).resolve()
+        video_root=_configured_storage_child('video_path',VIDEO_DIR).resolve()
+        target.relative_to(video_root)
+        with connect() as con:
+            camera_reference=con.execute(
+                "SELECT 1 FROM cameras WHERE rtsp_url=? LIMIT 1",
+                (value,),
+            ).fetchone()
+            event_reference=con.execute(
+                "SELECT 1 FROM plate_events WHERE video_path=? LIMIT 1",
+                (str(target),),
+            ).fetchone()
+        if camera_reference or event_reference:
+            return False
+        target.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
 
 def _cleanup_old_files(folder, days, storage_root):
     if days <= 0: return 0
@@ -1678,7 +1884,7 @@ def edit_user_form(user_id:int,request:Request):
 def edit_user_route(user_id:int,request:Request,display_name:str=Form(...),role:str=Form(...),password:str=Form('')):
     if not require_admin(request):return RedirectResponse('/dashboard',303)
     with connect() as con:
-        if password:con.execute('UPDATE users SET display_name=?,role=?,is_admin=?,password_hash=? WHERE id=?',(display_name.strip(),role,1 if role=='admin' else 0,hash_password(password),user_id))
+        if password:con.execute('UPDATE users SET display_name=?,role=?,is_admin=?,password_hash=?,session_version=session_version+1 WHERE id=?',(display_name.strip(),role,1 if role=='admin' else 0,hash_password(password),user_id))
         else:con.execute('UPDATE users SET display_name=?,role=?,is_admin=? WHERE id=?',(display_name.strip(),role,1 if role=='admin' else 0,user_id))
     audit(request,'user_update',f'ویرایش کاربر شماره {user_id}')
     return RedirectResponse('/users?msg=1',303)
@@ -1845,7 +2051,7 @@ def save_display_settings(request:Request,dashboard_grid:int=Form(2),dashboard_e
     if not has_permission(request,'system.manage'):return access_denied()
     set_setting('dashboard_grid',max(1,min(4,dashboard_grid)));set_setting('dashboard_event_rows',max(6,min(50,dashboard_event_rows)));set_setting('live_fps',max(1,min(15,live_fps)));set_setting('stream_width',stream_width);set_setting('jpeg_quality',max(30,min(95,jpeg_quality)))
     if new_password.strip():
-        with connect() as con:con.execute('UPDATE users SET password_hash=? WHERE username=?',(hash_password(new_password.strip()),u))
+        with connect() as con:con.execute('UPDATE users SET password_hash=?,session_version=session_version+1 WHERE username=?',(hash_password(new_password.strip()),u))
     for cid in list(manager.streams): manager.remove(cid)
     return RedirectResponse('/settings?saved=1',303)
 
@@ -2093,8 +2299,32 @@ def backup_database(request:Request):
     return FileResponse(out,media_type='application/octet-stream',filename=out.name)
 
 
+_VIDEO_UPLOAD_LOCK=threading.Lock()
+
+def _single_video_upload(func):
+    @wraps(func)
+    async def serialized(*args,**kwargs):
+        if not _VIDEO_UPLOAD_LOCK.acquire(blocking=False):
+            return JSONResponse(
+                {
+                    'ok':False,
+                    'error':(
+                        'یک ویدئو در حال آماده‌سازی است. پس از پایان آن '
+                        'دوباره تلاش کنید.'
+                    ),
+                },
+                409,
+            )
+        try:
+            return await func(*args,**kwargs)
+        finally:
+            _VIDEO_UPLOAD_LOCK.release()
+    return serialized
+
+
 @app.post('/cameras/video-upload', response_class=HTMLResponse)
-async def cameras_video_upload(request: Request, camera_id: int = Form(...), video: UploadFile = File(...)):
+@_single_video_upload
+async def cameras_video_upload(request: Request, camera_id: int = Form(0), video: UploadFile = File(...)):
     u=auth(request)
     if not u: return RedirectResponse('/login',302)
     if not has_permission(request,'video.process'):return access_denied()
@@ -2108,19 +2338,42 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(...), vid
     suffix=_video_suffix(video.filename)
     if not suffix:
         return upload_error('فرمت فایل پشتیبانی نمی‌شود.')
-    with connect() as con:
-        source_camera=con.execute(
-            "SELECT * FROM cameras WHERE id=? AND rtsp_url NOT LIKE 'video://%'",
-            (camera_id,),
-        ).fetchone()
-    if not source_camera:
+    source_camera=None
+    if camera_id > 0:
+        with connect() as con:
+            source_camera=con.execute(
+                "SELECT * FROM cameras WHERE id=? AND rtsp_url NOT LIKE 'video://%'",
+                (camera_id,),
+            ).fetchone()
+    if camera_id > 0 and not source_camera:
         return upload_error('دوربین انتخاب‌شده پیدا نشد.')
+    if source_camera is None:
+        source_camera={
+            'name':'تنظیمات پیش‌فرض پلاک‌خوان',
+            'city':'',
+            'lpr_enabled':1,
+            'lpr_confidence':60,
+            'frame_step':5,
+            'duplicate_seconds':30,
+            'roi_x':0,
+            'roi_y':0,
+            'roi_w':100,
+            'roi_h':100,
+            'line_y':50,
+        }
     if not source_camera['lpr_enabled']:
         return upload_error('پلاک‌خوان دوربین انتخاب‌شده غیرفعال است.')
     try:
         target=await _save_video_upload(video,_configured_storage_child('video_path',VIDEO_DIR),suffix)
     except ValueError as e:
         return upload_error(e)
+    except OSError as e:
+        return upload_error(
+            f'ذخیره ویدئو روی دیسک انجام نشد: {e}',
+            500,
+        )
+    except Exception as e:
+        return upload_error(f'خطا هنگام دریافت ویدئو: {e}',500)
 
     virtual_camera_id=None
     try:
@@ -2132,9 +2385,11 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(...), vid
             tester.close()
         display_name=(Path(video.filename or target.name).stem or 'ویدئو')[:80]
         with connect() as con:
-            old_stream_ids=[
-                int(row['id']) for row in con.execute(
-                    "SELECT id FROM cameras WHERE rtsp_url LIKE 'video://%'"
+            old_streams=[
+                (int(row['id']),str(row['rtsp_url']))
+                for row in con.execute(
+                    "SELECT id,rtsp_url FROM cameras "
+                    "WHERE rtsp_url LIKE 'video://%'"
                 ).fetchall()
             ]
             cursor=con.execute(
@@ -2171,17 +2426,20 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(...), vid
             int(get_setting('live_fps','5')),
             int(get_setting('jpeg_quality','70')),
         )
+        for old_id,_old_url in old_streams:
+            if not manager.remove(old_id,wait=True):
+                raise RuntimeError(
+                    'ویدئوی قبلی هنوز در حال توقف است؛ چند ثانیه '
+                    'دیگر دوباره تلاش کنید.'
+                )
         with connect() as con:
             con.execute(
                 "DELETE FROM cameras WHERE rtsp_url LIKE 'video://%' "
                 "AND id<>?",
                 (virtual_camera_id,),
             )
-        for old_id in old_stream_ids:
-            try:
-                manager.remove(old_id)
-            except Exception:
-                pass
+        for old_id,old_url in old_streams:
+            _delete_uploaded_video_if_unused(old_url)
         if wants_json:
             return JSONResponse({
                 'ok':True,
@@ -2197,9 +2455,19 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(...), vid
     except Exception as e:
         if virtual_camera_id is not None:
             try:
-                manager.remove(virtual_camera_id)
+                virtual_stopped=manager.remove(
+                    virtual_camera_id,
+                    wait=True,
+                )
             except Exception:
-                pass
+                virtual_stopped=False
+            if not virtual_stopped:
+                return upload_error(
+                    'ویدئوی جدید ساخته شد اما پردازش آن هنوز متوقف '
+                    'نشده است. برنامه را باز نگه دارید و چند ثانیه '
+                    'دیگر دوباره حذف را بزنید.',
+                    500,
+                )
             try:
                 with connect() as con:
                     con.execute(
@@ -2498,6 +2766,15 @@ async def ai_video_test_upload(request: Request, video: UploadFile = File(...)):
         target=await _save_video_upload(video,_configured_storage_child('video_path',VIDEO_DIR),suffix)
     except ValueError as e:
         return page('خطای ویدئو',f"<div class='wrap'><div class='alert'>{escape(str(e))}</div></div>",u,request)
+    except OSError as e:
+        return page(
+            'خطای ویدئو',
+            f"<div class='wrap'><div class='alert'>"
+            f"ذخیره ویدئو روی دیسک انجام نشد: {escape(str(e))}"
+            "</div></div>",
+            u,
+            request,
+        )
     try:
         from app.ai.video_test import process_video
         run_name = target.stem

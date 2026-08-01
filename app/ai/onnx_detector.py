@@ -3,7 +3,8 @@
 The model and post-processing contract are based on the MIT-licensed Platrix
 reference implementation by AliAkrami1375, adapted for BC Vision's verified
 model store, per-camera sessions, two-thread CPU ceiling and fail-closed model
-loading.  The secondary detector runs only when the primary finds no plate.
+loading. The secondary detector and tiled high-resolution rescue run only when
+the adaptive confidence policy says the primary evidence is insufficient.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 import threading
+import time
 
 import cv2
 import numpy as np
@@ -22,6 +24,8 @@ from app.cpu_budget import parallel_camera_limit, threads_per_camera
 PRIMARY_SIZE = 416
 FALLBACK_SIZE = 640
 MIN_CAMERA_SESSION_CACHE = 3
+ADAPTIVE_FALLBACK_CONFIDENCE = 0.58
+TILE_MIN_WIDTH = 960
 
 
 @dataclass
@@ -31,6 +35,7 @@ class _SessionEntry:
     fallback: object | None
     fallback_input: str
     run_lock: threading.Lock
+    last_tile_rescue_at: float = 0.0
 
 
 _cache_lock = threading.RLock()
@@ -45,6 +50,8 @@ _last_status = {
     "fallback_path": "",
     "fallback_loaded": False,
     "fallback_used": False,
+    "cascade_mode": "adaptive",
+    "tile_rescue_used": False,
     "engine_key": "",
     "detections": 0,
     "error": "",
@@ -67,6 +74,8 @@ def clear_detector_sessions() -> None:
             fallback_path="",
             fallback_loaded=False,
             fallback_used=False,
+            cascade_mode="adaptive",
+            tile_rescue_used=False,
             engine_key="",
             detections=0,
             error="",
@@ -261,6 +270,257 @@ def _nms(
     return keep
 
 
+def _bbox_iou(left, right) -> float:
+    lx1, ly1, lx2, ly2 = (float(value) for value in left)
+    rx1, ry1, rx2, ry2 = (float(value) for value in right)
+    ix1, iy1 = max(lx1, rx1), max(ly1, ry1)
+    ix2, iy2 = min(lx2, rx2), min(ly2, ry2)
+    intersection = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if intersection <= 0.0:
+        return 0.0
+    left_area = max(1.0, (lx2 - lx1) * (ly2 - ly1))
+    right_area = max(1.0, (rx2 - rx1) * (ry2 - ry1))
+    return intersection / max(
+        1e-9,
+        left_area + right_area - intersection,
+    )
+
+
+def _merge_detections(
+    *collections,
+    max_results: int,
+    iou_threshold: float = 0.42,
+) -> list[dict]:
+    """Merge cascade/tile detections without losing the best crop."""
+
+    merged: list[dict] = []
+    candidates = [
+        dict(row)
+        for rows in collections
+        for row in (rows or [])
+        if row.get("bbox")
+    ]
+    candidates.sort(
+        key=lambda row: (
+            float(row.get("confidence", 0.0)),
+            (row["bbox"][2] - row["bbox"][0])
+            * (row["bbox"][3] - row["bbox"][1]),
+        ),
+        reverse=True,
+    )
+    for candidate in candidates:
+        duplicate = next(
+            (
+                row
+                for row in merged
+                if _bbox_iou(candidate["bbox"], row["bbox"])
+                >= float(iou_threshold)
+            ),
+            None,
+        )
+        if duplicate is None:
+            merged.append(candidate)
+        elif (
+            float(candidate.get("confidence", 0.0))
+            > float(duplicate.get("confidence", 0.0))
+        ):
+            duplicate.clear()
+            duplicate.update(candidate)
+    return merged[:max(1, int(max_results))]
+
+
+def _order_quad(points: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float32).reshape(4, 2)
+    ordered = np.zeros((4, 2), dtype=np.float32)
+    sums = points.sum(axis=1)
+    differences = np.diff(points, axis=1).reshape(-1)
+    ordered[0] = points[np.argmin(sums)]
+    ordered[2] = points[np.argmax(sums)]
+    ordered[1] = points[np.argmin(differences)]
+    ordered[3] = points[np.argmax(differences)]
+    return ordered
+
+
+def _rectified_ocr_variant(crop: np.ndarray):
+    """Return a conservative perspective-normalized OCR view when reliable."""
+
+    if crop is None or getattr(crop, "size", 0) == 0:
+        return None, None
+    height, width = crop.shape[:2]
+    if height < 14 or width < 56:
+        return None, None
+    gray = (
+        cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        if crop.ndim == 3
+        else crop
+    )
+    enhanced = cv2.createCLAHE(
+        clipLimit=2.2,
+        tileGridSize=(8, 4),
+    ).apply(gray)
+    edges = cv2.Canny(enhanced, 45, 150)
+    edges = cv2.morphologyEx(
+        edges,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3)),
+        iterations=2,
+    )
+    contours, _ = cv2.findContours(
+        edges,
+        cv2.RETR_LIST,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    crop_area = float(height * width)
+    best = None
+    for contour in sorted(
+        contours,
+        key=cv2.contourArea,
+        reverse=True,
+    )[:16]:
+        rectangle = cv2.minAreaRect(contour)
+        rect_width, rect_height = rectangle[1]
+        short = max(1.0, min(rect_width, rect_height))
+        long = max(rect_width, rect_height)
+        ratio = long / short
+        box_area = long * short
+        coverage = box_area / max(crop_area, 1.0)
+        if not (2.0 <= ratio <= 8.5 and 0.34 <= coverage <= 1.12):
+            continue
+        score = coverage * min(1.0, ratio / 4.0)
+        if best is None or score > best[0]:
+            best = (score, cv2.boxPoints(rectangle))
+    if best is None:
+        return None, None
+
+    box = _order_quad(best[1])
+    center = box.mean(axis=0)
+    box = center + (box - center) * np.array(
+        [1.04, 1.12],
+        dtype=np.float32,
+    )
+    box[:, 0] = np.clip(box[:, 0], 0, width - 1)
+    box[:, 1] = np.clip(box[:, 1], 0, height - 1)
+    top_left, top_right, bottom_right, bottom_left = box
+    output_width = int(max(
+        np.linalg.norm(top_right - top_left),
+        np.linalg.norm(bottom_right - bottom_left),
+    ))
+    output_height = int(max(
+        np.linalg.norm(bottom_left - top_left),
+        np.linalg.norm(bottom_right - top_right),
+    ))
+    if output_height > output_width:
+        box = np.array(
+            [bottom_left, top_left, top_right, bottom_right],
+            dtype=np.float32,
+        )
+        output_width, output_height = output_height, output_width
+    if output_width < 48 or output_height < 12:
+        return None, None
+    ratio = output_width / max(output_height, 1)
+    if not 2.0 <= ratio <= 8.5:
+        return None, None
+    destination = np.array(
+        [
+            [0, 0],
+            [output_width - 1, 0],
+            [output_width - 1, output_height - 1],
+            [0, output_height - 1],
+        ],
+        dtype=np.float32,
+    )
+    matrix = cv2.getPerspectiveTransform(box, destination)
+    rectified = cv2.warpPerspective(
+        crop,
+        matrix,
+        (output_width, output_height),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    if rectified.size == 0:
+        return None, None
+    return rectified, box
+
+
+def _attach_ocr_variants(row: dict) -> dict:
+    crop = row.get("crop")
+    rectified, local_box = _rectified_ocr_variant(crop)
+    if rectified is None:
+        return row
+    output = dict(row)
+    output["ocr_crop_variants"] = [rectified]
+    output["ocr_variant_geometry"] = "perspective-refined"
+    if local_box is not None:
+        x1, y1, _x2, _y2 = output["bbox"]
+        output["ocr_quadrilateral"] = [
+            [
+                round(float(point[0]) + float(x1), 3),
+                round(float(point[1]) + float(y1), 3),
+            ]
+            for point in local_box
+        ]
+    return output
+
+
+def _tile_regions(frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Two overlapping landscape tiles give distant plates more model pixels."""
+
+    height, width = frame.shape[:2]
+    if width < TILE_MIN_WIDTH or width / max(height, 1) < 1.25:
+        return []
+    tile_width = int(round(width * 0.62))
+    return [
+        (0, 0, tile_width, height),
+        (width - tile_width, 0, width, height),
+    ]
+
+
+def _run_tiles(
+    frame: np.ndarray,
+    session,
+    input_name: str,
+    confidence: float,
+    max_results: int,
+) -> list[dict]:
+    rows = []
+    for tile_index, (x1, y1, x2, y2) in enumerate(
+        _tile_regions(frame)
+    ):
+        tile = frame[y1:y2, x1:x2]
+        detections = _run(
+            tile,
+            session,
+            input_name,
+            FALLBACK_SIZE,
+            confidence,
+            max_results,
+            "yolov8-onnx-tile-rescue",
+        )
+        for row in detections:
+            translated = dict(row)
+            bx1, by1, bx2, by2 = translated["bbox"]
+            translated["bbox"] = (
+                bx1 + x1,
+                by1 + y1,
+                bx2 + x1,
+                by2 + y1,
+            )
+            if translated.get("ocr_quadrilateral"):
+                translated["ocr_quadrilateral"] = [
+                    [
+                        float(point[0]) + x1,
+                        float(point[1]) + y1,
+                    ]
+                    for point in translated["ocr_quadrilateral"]
+                ]
+            translated["tile_index"] = tile_index
+            rows.append(translated)
+    return _merge_detections(
+        rows,
+        max_results=max_results,
+    )
+
+
 def _run(
     frame: np.ndarray,
     session,
@@ -311,7 +571,7 @@ def _run(
             "crop_geometry": "axis-aligned",
             "direct_ocr_attempted": False,
         })
-    return detections
+    return [_attach_ocr_variants(row) for row in detections]
 
 
 def detect_plates_onnx(
@@ -338,8 +598,14 @@ def detect_plates_onnx(
                 )),
             ),
         )
+        cascade_mode = os.environ.get(
+            "BCVISION_DETECTOR_CASCADE",
+            "adaptive",
+        ).strip().lower()
+        if cascade_mode not in {"off", "adaptive", "accuracy"}:
+            cascade_mode = "adaptive"
         with entry.run_lock:
-            detections = _run(
+            primary_detections = _run(
                 frame,
                 entry.primary,
                 entry.primary_input,
@@ -349,9 +615,27 @@ def detect_plates_onnx(
                 "yolov8-onnx-light",
             )
             fallback_used = False
-            if not detections and entry.fallback is not None:
+            weakest_primary = min(
+                (
+                    float(row.get("confidence", 0.0))
+                    for row in primary_detections
+                ),
+                default=0.0,
+            )
+            fallback_needed = bool(
+                entry.fallback is not None
+                and cascade_mode != "off"
+                and (
+                    not primary_detections
+                    or cascade_mode == "accuracy"
+                    or weakest_primary
+                    < ADAPTIVE_FALLBACK_CONFIDENCE
+                )
+            )
+            fallback_detections = []
+            if fallback_needed:
                 fallback_used = True
-                detections = _run(
+                fallback_detections = _run(
                     frame,
                     entry.fallback,
                     entry.fallback_input,
@@ -363,6 +647,68 @@ def detect_plates_onnx(
                     max_results,
                     "yolov8-onnx-light-fallback",
                 )
+            detections = _merge_detections(
+                primary_detections,
+                fallback_detections,
+                max_results=max_results,
+            )
+            tile_rescue = []
+            tile_interval = max(
+                0.0,
+                min(
+                    3.0,
+                    float(os.environ.get(
+                        "BCVISION_TILE_RESCUE_INTERVAL",
+                        "0.45",
+                    )),
+                ),
+            )
+            tile_ready = (
+                time.monotonic()
+                - float(getattr(entry, "last_tile_rescue_at", 0.0))
+                >= tile_interval
+            )
+            tile_needed = bool(
+                entry.fallback is not None
+                and cascade_mode != "off"
+                and tile_ready
+                and _tile_regions(frame)
+                and (
+                    not detections
+                    or (
+                        cascade_mode == "accuracy"
+                        and len(detections) < max_results
+                    )
+                    or (
+                        len(detections) < 2
+                        and max(
+                            (
+                                float(row.get("confidence", 0.0))
+                                for row in detections
+                            ),
+                            default=0.0,
+                        ) < 0.55
+                    )
+                )
+            )
+            if tile_needed:
+                entry.last_tile_rescue_at = time.monotonic()
+                fallback_used = True
+                tile_rescue = _run_tiles(
+                    frame,
+                    entry.fallback,
+                    entry.fallback_input,
+                    min(
+                        0.40,
+                        max(0.10, float(min_confidence) * 0.72),
+                    ),
+                    max_results,
+                )
+                detections = _merge_detections(
+                    detections,
+                    tile_rescue,
+                    max_results=max_results,
+                )
         with _cache_lock:
             _last_status.update(
                 attempted=True,
@@ -373,6 +719,8 @@ def detect_plates_onnx(
                 ),
                 fallback_loaded=entry.fallback is not None,
                 fallback_used=fallback_used,
+                cascade_mode=cascade_mode,
+                tile_rescue_used=bool(tile_rescue),
                 engine_key=camera_key,
                 detections=len(detections),
                 error="",
@@ -385,6 +733,7 @@ def detect_plates_onnx(
                 attempted=True,
                 model_loaded=False,
                 fallback_used=False,
+                tile_rescue_used=False,
                 engine_key=camera_key,
                 detections=0,
                 error=f"{type(exc).__name__}: {exc}",
