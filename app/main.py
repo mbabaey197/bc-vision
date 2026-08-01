@@ -66,6 +66,13 @@ async def security_headers(request: Request, call_next):
         "Permissions-Policy",
         "camera=(), microphone=(), geolocation=()",
     )
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data: blob:; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "connect-src 'self'; media-src 'self' blob:",
+    )
     return response
 
 
@@ -486,7 +493,9 @@ label{display:block;font-weight:700;color:var(--bc-text);margin-bottom:3px}input
 .iran-plate{display:inline-flex;direction:ltr;align-items:stretch;height:54px;min-width:250px;border:2px solid #15191f;border-radius:7px;overflow:hidden;background:#fff;color:#111;font-family:Tahoma,"Segoe UI",sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.14)}.iran-plate.compact{height:42px;min-width:205px}.plate-blue{width:32px;background:#0868b7;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:12px;line-height:1}.plate-blue small{font-size:7px;margin-top:3px}.plate-main{display:flex;align-items:center;justify-content:space-evenly;gap:8px;flex:1;padding:0 9px;font-size:21px}.compact .plate-main{font-size:17px;gap:6px;padding:0 7px}.plate-iran{width:54px;border-left:2px solid #15191f;display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1}.plate-iran small{font-size:9px}.plate-iran b{font-size:17px;margin-top:4px}.compact .plate-iran{width:46px}.compact .plate-iran b{font-size:14px}.plate-unreadable{display:inline-block;padding:6px 10px;border-radius:7px;background:#fff1c7;color:#714f00;font-weight:800}.read-badge{display:block;width:max-content;margin-top:5px;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:800}.read-badge.suggested{background:#fff1c7;color:#714f00}.read-badge.unreadable{background:#ffe8e8;color:#a12a2a}.read-badge.confirmed{background:#e5f7ef;color:#147a50}.read-badge.confirmed-ai{background:#e7f5ff;color:#0969a9}.read-badge.auto-confirmed{background:#e9f7ed;color:#226b35;border:1px solid #b9e2c4}.correction-form{display:flex;gap:7px;align-items:center;min-width:265px}.correction-form input:not([type=checkbox]){margin:0;min-width:170px;padding:7px 9px}.correction-form button{padding:7px 10px;white-space:nowrap}.feedback-note{font-size:12px;color:var(--bc-muted);margin-top:8px}
 </style>"""
 
-BOOTSTRAP = "<link href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.rtl.min.css' rel='stylesheet'>"
+# The desktop service must remain fully usable without Internet access.
+# Component styling is bundled in CSS above; no runtime CDN is required.
+BOOTSTRAP = ""
 
 NAV_ITEMS = [
     ('/dashboard','⌂','داشبورد و نمایش زنده'),('/cameras','▣','دوربین‌ها'),('/events','▤','ترددها و گزارش‌ها'),
@@ -567,14 +576,103 @@ def camera_rows(enabled_only=False):
         q="SELECT * FROM cameras" + (" WHERE enabled=1" if enabled_only else "") + " ORDER BY sort_order,id"
         return con.execute(q).fetchall()
 
+
+def has_users():
+    with connect() as con:
+        return bool(con.execute("SELECT 1 FROM users LIMIT 1").fetchone())
+
+
 @app.get('/')
-def root(request:Request): return RedirectResponse('/dashboard' if user(request) else '/login',302)
+def root(request:Request):
+    if not has_users():
+        return RedirectResponse('/setup',302)
+    return RedirectResponse('/dashboard' if user(request) else '/login',302)
+
+
+@app.get('/setup')
+def setup_form(request:Request,error:str=''):
+    if has_users():
+        return RedirectResponse('/login',302)
+    alert=(
+        f"<div class='alert'>{escape(error)}</div>"
+        if error else ""
+    )
+    body=f"""<div class='login-page'>
+    <section class='login-panel'><div class='login-box'>
+      <div class='login-logo'><span class='brand-mark'>BC</span><div><h1>BC Vision</h1><p>{escape(COMPANY_NAME)}</p></div></div>
+      <h2 class='login-title'>راه‌اندازی امن سامانه</h2>
+      <p class='login-subtitle'>حساب مدیر اولیه را خودتان ایجاد کنید. هیچ رمز پیش‌فرضی در برنامه وجود ندارد.</p>
+      {alert}
+      <form method='post' action='/setup' autocomplete='off'>
+        <label for='username'>نام کاربری مدیر</label>
+        <input id='username' name='username' minlength='3' maxlength='50' autocomplete='username' required>
+        <label for='display_name'>نام نمایشی</label>
+        <input id='display_name' name='display_name' maxlength='100' required>
+        <label for='password'>رمز عبور</label>
+        <input id='password' type='password' name='password' minlength='10' autocomplete='new-password' required>
+        <label for='password_confirm'>تکرار رمز عبور</label>
+        <input id='password_confirm' type='password' name='password_confirm' minlength='10' autocomplete='new-password' required>
+        <button class='login-submit' type='submit'>ایجاد مدیر و ادامه</button>
+      </form>
+      <div class='login-help'><span>رمز باید حداقل ۱۰ نویسه داشته باشد.</span></div>
+    </div></section>
+    <section class='login-visual'><div class='login-hero'><h2>اول امنیت،<br>بعد شروع کار</h2><p>اطلاعات ورود فقط در همین دستگاه و به‌صورت هش‌شده ذخیره می‌شود.</p></div><span class='login-version'>نسخه {APP_VERSION}</span></section>
+    </div>"""
+    return page('راه‌اندازی اولیه',body)
+
+
+@app.post('/setup')
+def setup_create(
+    request:Request,
+    username:str=Form(...),
+    display_name:str=Form(...),
+    password:str=Form(...),
+    password_confirm:str=Form(...),
+):
+    username=username.strip()
+    display_name=display_name.strip()
+    if (
+        len(username) < 3
+        or len(username) > 50
+        or any(ch.isspace() for ch in username)
+        or not display_name
+    ):
+        return RedirectResponse('/setup?error='+quote('نام کاربری یا نام نمایشی معتبر نیست.'),303)
+    if len(password) < 10 or password != password_confirm:
+        return RedirectResponse('/setup?error='+quote('رمزها یکسان نیستند یا کمتر از ۱۰ نویسه‌اند.'),303)
+    with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        if con.execute("SELECT 1 FROM users LIMIT 1").fetchone():
+            return RedirectResponse('/login',303)
+        con.execute(
+            "INSERT INTO users("
+            "username,password_hash,display_name,is_admin,role,is_active"
+            ") VALUES(?,?,?,1,'admin',1)",
+            (username,hash_password(password),display_name),
+        )
+        con.execute(
+            "INSERT INTO audit_logs(username,action,details,ip_address) "
+            "VALUES(?,?,?,?)",
+            (
+                username,
+                'initial_admin_created',
+                'ایجاد امن مدیر اولیه',
+                request.client.host if request.client else '',
+            ),
+        )
+    return RedirectResponse('/login?setup=1',303)
 @app.get('/login')
-def login_form(request:Request,error:str='',next:str='/dashboard',logged_out:int=0):
+def login_form(request:Request,error:str='',next:str='/dashboard',logged_out:int=0,setup:int=0):
+    if not has_users(): return RedirectResponse('/setup',302)
     if user(request): return RedirectResponse('/dashboard',302)
     safe_next=next if next.startswith('/') and not next.startswith('//') else '/dashboard'
     alert="<div class='alert'>نام کاربری یا رمز عبور صحیح نیست.</div>" if error else ''
-    notice="<div class='alert' style='background:#eaf8f1;color:#146b45;border-color:#bdebd5'>با موفقیت از حساب خارج شدید.</div>" if logged_out else ''
+    notice=(
+        "<div class='alert' style='background:#eaf8f1;color:#146b45;border-color:#bdebd5'>"
+        + ("حساب مدیر با موفقیت ساخته شد. اکنون وارد شوید." if setup else "با موفقیت از حساب خارج شدید.")
+        + "</div>"
+        if (logged_out or setup) else ''
+    )
     body=f"""<div class='login-page'>
     <section class='login-panel'><div class='login-box'>
       <div class='login-logo'><span class='brand-mark'>BC</span><div><h1>BC Vision</h1><p>{escape(COMPANY_NAME)}</p></div></div>
@@ -586,13 +684,15 @@ def login_form(request:Request,error:str='',next:str='/dashboard',logged_out:int
         <label for='password'>رمز عبور</label><div class='password-wrap'><input id='password' type='password' name='password' autocomplete='current-password' required placeholder='رمز عبور را وارد کنید'><button type='button' class='password-toggle' id='passwordToggle' aria-label='نمایش رمز'>◉</button></div>
         <button class='login-submit' type='submit'>ورود به BC Vision</button>
       </form>
-      <div class='login-help'><span>ورود اولیه: <b>admin</b> / <b>123456</b></span><span>پس از ورود رمز را تغییر دهید.</span></div>
+      <div class='login-help'><span>برای امنیت، رمز پیش‌فرض در برنامه وجود ندارد.</span></div>
     </div></section>
     <section class='login-visual'><div class='login-hero'><h2>مدیریت هوشمند<br>نظارت و تردد خودرو</h2><p>مشاهده زنده دوربین‌ها، پلاک‌خوانی، جست‌وجوی رویدادها و گزارش‌گیری در یک محیط یکپارچه.</p><div class='login-features'><div class='login-feature'><b>نمایش زنده</b><span>مدیریت هم‌زمان چند دوربین</span></div><div class='login-feature'><b>پلاک‌خوان هوشمند</b><span>ثبت و جست‌وجوی سریع ترددها</span></div><div class='login-feature'><b>گزارش‌های دقیق</b><span>فیلتر بر اساس دوربین، رنگ و نوع خودرو</span></div><div class='login-feature'><b>امنیت حساب</b><span>نشست رمزنگاری‌شده و خروج امن</span></div></div></div><span class='login-version'>نسخه {APP_VERSION}</span></section>
     </div><script>document.getElementById('passwordToggle').addEventListener('click',function(){{const p=document.getElementById('password');p.type=p.type==='password'?'text':'password';this.textContent=p.type==='password'?'◉':'⊘';}});</script>"""
     return page('ورود',body)
 @app.post('/login')
 def login(request:Request,username:str=Form(...),password:str=Form(...),next:str=Form('/dashboard')):
+    if not has_users():
+        return RedirectResponse('/setup',303)
     username=username.strip()
     safe_next=next if next.startswith('/') and not next.startswith('//') else '/dashboard'
     with connect() as con:
@@ -613,7 +713,15 @@ def login(request:Request,username:str=Form(...),password:str=Form(...),next:str
         con.execute('UPDATE users SET failed_attempts=0,locked_until=NULL,last_login=CURRENT_TIMESTAMP WHERE id=?',(u['id'],))
         con.execute('INSERT INTO audit_logs(username,action,details,ip_address) VALUES(?,?,?,?)',(username,'login','ورود موفق',request.client.host if request.client else ''))
     r=RedirectResponse(safe_next,303)
-    r.set_cookie(COOKIE_NAME,create_token(u['username']),httponly=True,samesite='lax',secure=False,max_age=43200,path='/')
+    r.set_cookie(
+        COOKIE_NAME,
+        create_token(u['username']),
+        httponly=True,
+        samesite='lax',
+        secure=request.url.scheme == 'https',
+        max_age=43200,
+        path='/',
+    )
     return r
 @app.get('/logout')
 def logout(request:Request):
