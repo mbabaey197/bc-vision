@@ -37,7 +37,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     env:
-      BCVISION_INCREMENTAL_BUILD: "0"
+      BCVISION_INCREMENTAL_BUILD: "1"
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUTF8: "1"
 
