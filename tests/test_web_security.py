@@ -625,7 +625,7 @@ def test_failed_virtual_stream_start_preserves_previous_camera(
     monkeypatch.setattr(
         main.manager,
         "remove",
-        lambda camera_id, wait=False: removed.append(camera_id),
+        lambda camera_id, wait=False: removed.append(camera_id) or True,
     )
 
     with TestClient(main.app) as client, source_path.open("rb") as source:
@@ -755,6 +755,47 @@ def test_video_can_be_uploaded_again_after_only_virtual_camera_is_deleted(
     assert Path(str(rows[0]["rtsp_url"])[len("video://"):]).is_file()
 
 
+def test_video_delete_timeout_preserves_database_row_and_file(
+    tmp_path,
+    monkeypatch,
+):
+    _as_role(monkeypatch,"admin")
+    db_path=tmp_path / "delete-timeout.db"
+    video_path=tmp_path / "locked.avi"
+    video_path.write_bytes(b"locked")
+    monkeypatch.setattr(database,"DB_PATH",db_path)
+    monkeypatch.setattr(main,"DB_PATH",db_path)
+    database.init_db()
+    with database.connect() as con:
+        camera_id=int(con.execute(
+            "INSERT INTO cameras(name,rtsp_url,enabled,is_demo) "
+            "VALUES(?,?,1,1)",
+            ("Locked video",f"video://{video_path}"),
+        ).lastrowid)
+    monkeypatch.setattr(
+        main.manager,
+        "remove",
+        lambda camera_id,wait=False: False,
+    )
+
+    with TestClient(main.app) as client:
+        response=client.post(
+            f"/cameras/{camera_id}/delete",
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 200
+    assert "هنوز در حال توقف است" in response.text
+    with database.connect() as con:
+        row=con.execute(
+            "SELECT rtsp_url FROM cameras WHERE id=?",
+            (camera_id,),
+        ).fetchone()
+    assert row is not None
+    assert row["rtsp_url"] == f"video://{video_path}"
+    assert video_path.is_file()
+
+
 def test_video_upload_page_has_default_source_and_retry_recovery(
     tmp_path,
     monkeypatch,
@@ -772,10 +813,30 @@ def test_video_upload_page_has_default_source_and_retry_recovery(
     assert "value='0'>تنظیمات پیش‌فرض پلاک‌خوان" in response.text
     assert "id='videoUploadInput'" in response.text
     assert "resetVideoUploadUi" in response.text
+    assert "videoUploadInProgress" in response.text
+    assert "uploadInput.disabled=true" in response.text
+    assert "uploadSource.disabled=true" in response.text
     assert "pageshow" in response.text
     assert "xhr.onabort" in response.text
     assert "xhr.timeout=2*60*60*1000" in response.text
     assert "xhr.onloadend" in response.text
+
+
+def test_video_upload_endpoint_has_process_wide_serialization():
+    assert hasattr(main.cameras_video_upload,"__wrapped__")
+    assert main._VIDEO_UPLOAD_LOCK.acquire(blocking=False) is True
+    try:
+        with TestClient(main.app) as client:
+            response = client.post(
+                "/cameras/video-upload",
+                files={"video": ("traffic.mp4", b"data", "video/mp4")},
+                headers={"X-Requested-With": "XMLHttpRequest"},
+            )
+        assert response.status_code == 409
+        assert response.json()["ok"] is False
+        assert "در حال آماده‌سازی" in response.json()["error"]
+    finally:
+        main._VIDEO_UPLOAD_LOCK.release()
 
 
 def test_video_upload_filesystem_error_returns_actionable_json(monkeypatch):
