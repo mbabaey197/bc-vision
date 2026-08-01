@@ -1,8 +1,8 @@
 name: Windows fast updater
 
-# Daily agent-branch updates reuse the self-hosted runner's local PyInstaller
-# cache and publish only the one-click updater.  The complete clean release
-# workflow remains a separate, manually triggered final gate.
+# Recovery updates run on an isolated GitHub-hosted Windows runner and publish
+# only the verified one-click updater. The complete clean release workflow
+# remains a separate, manually triggered final gate.
 
 on:
   workflow_dispatch:
@@ -34,15 +34,15 @@ concurrency:
 
 jobs:
   build-test-update:
-    runs-on: [self-hosted, Windows, X64]
+    runs-on: windows-latest
     timeout-minutes: 60
     env:
-      BCVISION_INCREMENTAL_BUILD: "1"
+      BCVISION_INCREMENTAL_BUILD: "0"
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUTF8: "1"
 
     steps:
-      - name: Checkout candidate without deleting local build caches
+      - name: Checkout candidate
         uses: actions/checkout@v4
         with:
           clean: false
@@ -81,7 +81,7 @@ jobs:
           python -m compileall -q app launcher.py
           python -m pytest -q tests
 
-      - name: Build Windows application with the warm local cache
+      - name: Build Windows application
         shell: cmd
         run: BUILD_PORTABLE_EXE.bat
 
