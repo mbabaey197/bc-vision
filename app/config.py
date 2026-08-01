@@ -45,8 +45,11 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "bcvision.db"
 LOG_PATH = DATA_DIR / "BCVision.log"
 SECRET_PATH = DATA_DIR / ".secret"
-LICENSE_PATH = DATA_DIR / "license.json"
-TRIAL_PATH = DATA_DIR / ".trial.json"
+# Licensing remains in the fixed bootstrap directory. Changing archive or
+# storage drives cannot move, clone, or accidentally delete the binding.
+LICENSE_PATH = BOOTSTRAP_DIR / "license.dat"
+LEGACY_LICENSE_PATH = DATA_DIR / "license.json"
+TRIAL_PATH = BOOTSTRAP_DIR / ".trial.dat"
 PUBLIC_KEY_PATH = BASE_DIR / "license_public_key.pem"
 BACKUP_DIR = DATA_DIR / "backups"
 SNAPSHOT_DIR = DATA_DIR / "snapshots"
@@ -54,3 +57,12 @@ PLATE_DIR = DATA_DIR / "plates"
 VIDEO_DIR = DATA_DIR / "videos"
 for folder in (BACKUP_DIR, SNAPSHOT_DIR, PLATE_DIR, VIDEO_DIR):
     folder.mkdir(parents=True, exist_ok=True)
+
+# Main imports config before registering HTTP routes. Install the offline-only
+# policy here so online activation is never exposed by the web application.
+try:
+    from app.offline_license_policy import install_offline_license_policy
+
+    install_offline_license_policy()
+except ImportError:
+    pass
