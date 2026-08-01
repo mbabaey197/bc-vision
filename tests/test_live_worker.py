@@ -776,16 +776,33 @@ def test_remove_invalidates_inflight_video_inference(monkeypatch):
         args=(state, (camera_id, "old video", frame, 0.0)),
         daemon=True,
     )
+    state.busy = True
+    state.processing_done.clear()
     processing.start()
     assert started.wait(2.0)
 
-    worker.remove(camera_id)
+    removed = []
+    removal = threading.Thread(
+        target=lambda: removed.append(
+            worker.remove(camera_id,wait=True,timeout=2.0)
+        ),
+        daemon=True,
+    )
+    removal.start()
+    for _ in range(100):
+        if state.cancelled:
+            break
+        time.sleep(0.005)
+    assert state.cancelled is True
+    assert removal.is_alive()
     release.set()
     processing.join(2.0)
+    removal.join(2.0)
     worker.shutdown()
 
     assert not processing.is_alive()
-    assert state.cancelled is True
+    assert not removal.is_alive()
+    assert removed == [True]
     assert persisted == []
     assert worker.status(camera_id)["active"] is False
 
