@@ -132,6 +132,39 @@ def test_remove_keeps_stream_reference_when_shutdown_times_out():
     assert manager.streams[7] is stream
 
 
+def test_non_waiting_remove_allows_same_key_stream_to_restart(monkeypatch):
+    manager = StreamManager()
+    key = ("rtsp://gate","Gate",640,5,70)
+
+    class OldStream:
+        _key = key
+
+        def stop(self,wait=False):
+            return False
+
+    manager.streams = {7: OldStream()}
+    assert manager.remove(7,wait=False) is True
+    assert manager.streams == {}
+
+    created = []
+
+    class NewStream:
+        def __init__(self,*args):
+            self.args = args
+            self.started = False
+            created.append(self)
+
+        def start(self):
+            self.started = True
+
+    monkeypatch.setattr(app.streams,"CameraStream",NewStream)
+    stream = manager.get(7,"rtsp://gate","Gate",640,5,70)
+
+    assert stream is created[0]
+    assert stream.started is True
+    assert manager.streams[7] is stream
+
+
 def test_camera_stop_waits_for_decoder_before_worker(monkeypatch):
     calls = []
     stream = CameraStream(
