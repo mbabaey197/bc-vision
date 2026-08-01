@@ -48,11 +48,17 @@ def test_launcher_self_test_uses_isolated_data_directory(tmp_path):
     assert result["database_ready"] is True
     assert result["public_key_ready"] is True
     assert result["web_app_ready"] is True
+    assert result["setup_required"] is True
 
 
 def test_release_version_metadata_stays_consistent():
     root = Path(__file__).resolve().parents[1]
     version = (root / "VERSION").read_text(encoding="utf-8").strip()
+    if "-rc" in version:
+        core_version, release_candidate = version.split("-rc", 1)
+        version_info = f"{core_version}.{int(release_candidate)}"
+    else:
+        version_info = f"{version}.0"
 
     config = (root / "app" / "config.py").read_text(encoding="utf-8")
     assert f'APP_VERSION = "{version}"' in config
@@ -66,7 +72,7 @@ def test_release_version_metadata_stays_consistent():
         ).read_text(encoding="utf-8")
         assert f'#define MyAppVersion "{version}"' in source
         assert f"OutputBaseFilename={prefix}{version}" in source
-        assert "VersionInfoVersion=2.2.0.19" in source
+        assert f"VersionInfoVersion={version_info}" in source
         assert "PrivilegesRequiredOverridesAllowed=commandline" in source
 
 
