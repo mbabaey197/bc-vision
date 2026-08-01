@@ -1,19 +1,20 @@
 # BC Vision ANPR Engine Contract
 
-این سند قرارداد موتور فعال RC19 است و از اجرای ناخواسته مدل یا Fallback متفاوت در Build جلوگیری می‌کند.
+این سند قرارداد موتور فعال RC22 است و از اجرای ناخواسته مدل یا Fallback متفاوت در Build جلوگیری می‌کند.
 
 ## مسیر فعال (Baseline)
 
 | نقش | موتور | وضعیت |
 |---|---|---|
-| Detector اصلی | YOLOv8 ONNX، `plate_yolo.onnx` | فعال |
-| Detector جایگزین | YOLOv8 ONNX، `plate_yolo_fallback.onnx` | فقط هنگام ضعف/عدم دسترسی مسیر اصلی |
-| OCR سریع | Dedicated character detector | انتخاب اول |
-| OCR نجات | CRNN ONNX، `ocr_crnn.onnx` | فقط برای خوانش مفقود یا ضعیف |
-| OCR نهایی سبک | Character CNN ONNX، `ocr_cnn.onnx` | فقط روی Crop معتبر و در صورت نیاز |
+| Detector اصلی | YOLOv8 ONNX، `plate_yolo.onnx` در 416 | فعال |
+| Detector تطبیقی | YOLOv8 ONNX، `plate_yolo_fallback.onnx` در 640 | هنگام نبودن یا ضعیف‌بودن نتیجه اصلی |
+| Detector پلاک دور | Tile rescue هم‌پوشان در 640 | زمان‌بندی‌شده و فقط برای فریم عریضِ ضعیف/خالی |
+| OCR اصلی | CRNN ONNX، `ocr_crnn.onnx` + constrained CTC beam | فعال |
+| OCR نجات تصویری | Perspective crop + adaptive contrast | فقط هنگام خوانش غیردقیق؛ حداکثر سه نمای کنترل‌شده |
+| OCR نهایی سبک | Character CNN ONNX، `ocr_cnn.onnx` | فقط وقتی CRNN نتیجه پذیرفته‌شده ندارد |
 | تصمیم نهایی | Multi-frame consensus + review policy | فعال |
 
-CRNN و CNN برای هر Crop بدون شرط با هم اجرا نمی‌شوند. `app/ai/pipeline.py` فقط در شرایط Rescue، OCR دوم را فعال می‌کند تا مصرف CPU کنترل شود.
+مدل قدیمیِ ترکیبی که هم‌زمان کاراکترها را تشخیص می‌داد در مسیر RC22 بارگذاری نمی‌شود؛ بنابراین نام `Dedicated character detector` دیگر نباید به‌عنوان OCR فعال گزارش شود. CRNN ابتدا فقط نمای اصلی را می‌خواند. Beam Search به قالب واقعی `2+letter+3+2` محدود است و نمای پرسپکتیو/کنتراست فقط وقتی فعال می‌شود که نتیجه اول قاطع نباشد. CRNN و CNN بدون شرط با هم اجرا نمی‌شوند و همه Sessionها سقف دو Thread را حفظ می‌کنند.
 
 ## موتور نسل بعد
 
@@ -41,6 +42,8 @@ CRNN و CNN برای هر Crop بدون شرط با هم اجرا نمی‌شو�
 ## آستانه‌ها
 
 - Confidence دوربین و Frame step از تنظیم هر دوربین خوانده می‌شود.
+- CRNN فقط با حداقل اطمینان توالی، Margin کاراکترها و توافق Decoder پذیرفته می‌شود؛ خروجی ضعیف به‌صورت حدس قابل‌بررسی باقی می‌ماند.
+- Cascade و Tile rescue تطبیقی هستند و از طریق متغیرهای مستند قابل تنظیم‌اند؛ تغییر Profile نباید سقف Thread را افزایش دهد.
 - Thresholdهای موتور نسل بعد فقط از Manifest امضاشده پذیرفته می‌شوند.
 - خروجی دارای اختلاف OCR یا شواهد ناکافی با `needs_review` ذخیره می‌شود.
 - تأیید اپراتور منبع آموزش است؛ حدس خام به‌تنهایی حقیقت آموزشی محسوب نمی‌شود.

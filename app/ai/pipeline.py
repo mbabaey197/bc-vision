@@ -87,10 +87,11 @@ def _partial_plate_text(positions: dict[int, str]) -> str:
 def _rescue_ocr_reason(item, direct_norm, direct_valid, confidence, quality):
     """Return why the whole-plate reader should run for this crop.
 
-    The character detector remains the fast primary reader.  CRNN/CNN is a
-    rescue lane: it runs for missing/weak reads and for model alternatives that
-    disagree at the historically difficult Iranian-plate positions.  A strong,
-    unambiguous primary read does not pay the second-model CPU cost.
+    A legacy character-aware detector may still provide direct OCR evidence,
+    but the active lightweight detector localizes plates only. In that normal
+    path CRNN is the primary reader and CNN is its gated fallback. A future
+    direct reader can still skip rescue when its result is strong and
+    unambiguous.
     """
 
     if not direct_valid:
@@ -185,30 +186,46 @@ def process_frame(
         fallback_text = ""
         fallback_confidence = 0.0
         fallback_engine = "none"
+        fallback_details = {
+            "plate_hypotheses": [],
+            "position_hypotheses": [],
+            "crnn": {},
+        }
         if crnn_eligible or generic_fallback_eligible:
             whole_plate_ocr_attempted = True
+            fallback_output = read_plate_candidate(
+                crop,
+                engine_key=engine_key,
+                allow_legacy=generic_fallback_eligible,
+                variants=item.get("ocr_crop_variants", []),
+                include_hypotheses=True,
+            )
             (
                 fallback_text,
                 fallback_confidence,
                 fallback_engine,
-            ) = read_plate_candidate(
-                crop,
-                engine_key=engine_key,
-                allow_legacy=generic_fallback_eligible,
-            )
+            ) = fallback_output[:3]
+            if len(fallback_output) >= 4 and isinstance(
+                fallback_output[3],
+                dict,
+            ):
+                fallback_details = fallback_output[3]
             generic_ocr_attempted = bool(
                 generic_fallback_eligible
                 and fallback_engine in {"cnn-onnx", "none"}
             )
         plate_hypotheses = []
-        for hypothesis in item.get("plate_hypotheses", []):
+        for hypothesis in (
+            list(item.get("plate_hypotheses", []))
+            + list(fallback_details.get("plate_hypotheses", []))
+        ):
             normalized = normalize_plate(
                 hypothesis.get("plate_norm")
                 or hypothesis.get("plate")
             )
             if not plausible_plate(normalized):
                 continue
-            plate_hypotheses.append({
+            candidate_hypothesis = {
                 "plate": format_iran_plate(normalized),
                 "plate_norm": normalized,
                 "engine": hypothesis.get(
@@ -234,7 +251,19 @@ def process_frame(
                         ),
                     ),
                 ),
-            })
+            }
+            existing_hypothesis = next(
+                (
+                    row
+                    for row in plate_hypotheses
+                    if row["plate_norm"] == normalized
+                ),
+                None,
+            )
+            if existing_hypothesis is None:
+                plate_hypotheses.append(candidate_hypothesis)
+            elif candidate_hypothesis["score"] > existing_hypothesis["score"]:
+                existing_hypothesis.update(candidate_hypothesis)
         if direct_valid and all(
             row["plate_norm"] != direct_norm
             for row in plate_hypotheses
@@ -476,6 +505,27 @@ def process_frame(
             "ocr_engine": ocr_engine,
             "ocr_alternative": ocr_alternative,
             "ocr_disagreement": ocr_disagreement,
+            "ocr_decoder": fallback_details.get(
+                "crnn",
+                {},
+            ).get("decoder", ""),
+            "ocr_variant_views": int(
+                fallback_details.get("crnn", {}).get("views", 0)
+            ),
+            "ocr_rejection_reason": fallback_details.get(
+                "crnn",
+                {},
+            ).get("reason", ""),
+            "ocr_position_margin": min(
+                (
+                    float(row.get("margin", 0.0))
+                    for row in fallback_details.get(
+                        "crnn",
+                        {},
+                    ).get("position_details", [])
+                ),
+                default=0.0,
+            ),
             "whole_plate_ocr_attempted": whole_plate_ocr_attempted,
             "rescue_ocr_attempted": whole_plate_ocr_attempted,
             "rescue_ocr_reason": rescue_reason,

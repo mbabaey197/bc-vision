@@ -1,5 +1,6 @@
 import hashlib
 import sys
+import threading
 import types
 
 import numpy as np
@@ -30,6 +31,103 @@ def test_ctc_decoder_collapses_repeats_and_blank():
 
     assert text == "12ب34567"
     assert confidence > 0.99
+
+
+def test_constrained_beam_recovers_second_best_valid_letter_path():
+    logits = _logits_for("12ب34567")
+    letter_timestep = 1 + 2 * 3
+    logits[letter_timestep, :] = -8.0
+    # Greedy takes an illegal digit at the letter position. The grammar-aware
+    # beam must keep the close Persian-letter path and recover the real plate.
+    logits[letter_timestep, onnx_crnn.CRNN_LABELS.index("8")] = 4.0
+    logits[letter_timestep, onnx_crnn.CRNN_LABELS.index("ب")] = 3.5
+
+    greedy_text, _confidence = onnx_crnn.ctc_greedy_decode(logits)
+    hypotheses = onnx_crnn.ctc_beam_hypotheses(logits, beam_width=16)
+
+    assert greedy_text == "128ب34567"
+    assert hypotheses[0]["plate_norm"] == "12ب34567"
+    assert hypotheses[0]["confidence"] > 0.90
+
+
+def test_low_information_sequence_is_rejected_instead_of_confirmed(
+    monkeypatch,
+):
+    logits = np.zeros_like(_logits_for("12ب34567"))
+    blank = len(onnx_crnn.CRNN_LABELS)
+    indices = [blank]
+    for character in "12ب34567":
+        index = onnx_crnn.CRNN_LABELS.index(character)
+        indices.extend((index, index, blank))
+    for timestep, index in enumerate(indices):
+        logits[timestep, index] = 0.4
+
+    class FakeSession:
+        @staticmethod
+        def run(_outputs, _inputs):
+            return [logits[None, ...]]
+
+    entry = types.SimpleNamespace(
+        session=FakeSession(),
+        input_name="input",
+        run_lock=threading.Lock(),
+    )
+    monkeypatch.setattr(
+        onnx_crnn,
+        "_verified_model_path",
+        lambda: types.SimpleNamespace(__str__=lambda _self: "model.onnx"),
+    )
+    monkeypatch.setattr(onnx_crnn, "_load_session", lambda **_kwargs: entry)
+    monkeypatch.setenv("BCVISION_CRNN_RESCUE_VIEWS", "1")
+
+    text, confidence, details = onnx_crnn.read_plate_crnn(
+        np.full((40, 160, 3), 120, dtype=np.uint8),
+        return_details=True,
+    )
+
+    assert text == ""
+    assert confidence < 0.50
+    assert details["accepted"] is False
+    assert details["reason"] == "low-sequence-confidence"
+
+
+def test_weak_raw_crop_uses_one_gated_rescue_view(monkeypatch):
+    weak = np.zeros_like(_logits_for("12ب34567"))
+    strong = _logits_for("31ط55674")
+    outputs = [weak, strong]
+
+    class FakeSession:
+        @staticmethod
+        def run(_outputs, _inputs):
+            return [outputs.pop(0)[None, ...]]
+
+    entry = types.SimpleNamespace(
+        session=FakeSession(),
+        input_name="input",
+        run_lock=threading.Lock(),
+    )
+    monkeypatch.setattr(
+        onnx_crnn,
+        "_verified_model_path",
+        lambda: types.SimpleNamespace(__str__=lambda _self: "model.onnx"),
+    )
+    monkeypatch.setattr(onnx_crnn, "_load_session", lambda **_kwargs: entry)
+    monkeypatch.setattr(
+        onnx_crnn,
+        "_adaptive_ocr_variant",
+        lambda image: np.full(image.shape[:2], 180, dtype=np.uint8),
+    )
+    monkeypatch.setenv("BCVISION_CRNN_RESCUE_VIEWS", "2")
+
+    text, _confidence, details = onnx_crnn.read_plate_crnn(
+        np.full((40, 160, 3), 90, dtype=np.uint8),
+        return_details=True,
+    )
+
+    assert text == "31-ط-556-74"
+    assert details["accepted"] is True
+    assert details["views"] == 2
+    assert outputs == []
 
 
 def test_crnn_preprocessing_has_expected_shape_and_range():

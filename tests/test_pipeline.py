@@ -518,6 +518,59 @@ def test_complete_low_confidence_hypothesis_is_exposed_for_review(
     assert rows[0]["read_status"] == "experimental-guess"
 
 
+def test_rejected_crnn_beam_hypothesis_reaches_operator_review(
+    monkeypatch,
+):
+    crop = np.full((44, 170, 3), 145, dtype=np.uint8)
+    monkeypatch.setattr(
+        "app.ai.pipeline.detect_plates",
+        lambda *_args, **_kwargs: [{
+            "crop": crop,
+            "bbox": (10, 20, 180, 64),
+            "confidence": 0.76,
+            "method": "yolov8-onnx-light",
+            "direct_ocr_attempted": False,
+        }],
+    )
+    monkeypatch.setattr(
+        "app.ai.pipeline.read_plate_candidate",
+        lambda *_args, **_kwargs: (
+            "",
+            0.0,
+            "none",
+            {
+                "plate_hypotheses": [{
+                    "plate_norm": "31ط55674",
+                    "confidence": 0.47,
+                    "score": 0.47,
+                    "engine": "crnn-onnx-beam",
+                }],
+                "crnn": {
+                    "decoder": "ctc-constrained-beam",
+                    "views": 2,
+                    "reason": "ambiguous-character-margin",
+                    "position_details": [
+                        {"margin": 0.04}
+                        for _index in range(8)
+                    ],
+                },
+            },
+        ),
+    )
+
+    row = process_frame(
+        np.full((100, 220, 3), 100, dtype=np.uint8)
+    )[0]
+
+    assert row["valid"] is False
+    assert row["raw_guess_norm"] == "31ط55674"
+    assert row["raw_guess_engine"] == "crnn-onnx-beam"
+    assert row["ocr_decoder"] == "ctc-constrained-beam"
+    assert row["ocr_variant_views"] == 2
+    assert row["ocr_rejection_reason"] == "ambiguous-character-margin"
+    assert row["ocr_position_margin"] == 0.04
+
+
 def test_position_only_ambiguity_stays_unconfirmed_for_review():
     tracker = PlateConsensusTracker(
         emit_unreadable=True,
