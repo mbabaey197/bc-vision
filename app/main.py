@@ -26,7 +26,9 @@ from app.streams import manager, CV_OK
 from app.license import status as license_status, install_license, activate_online, deactivate_local, machine_id
 from html import escape
 import time, csv, shutil, os, json, secrets, math
+import threading
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from urllib.parse import quote, urlencode
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -1097,18 +1099,27 @@ const uploadForm=document.getElementById('videoUploadForm');
 const uploadInput=document.getElementById('videoUploadInput');
 const uploadButton=document.getElementById('uploadButton');
 const uploadState=document.getElementById('uploadState');
-const uploadProgress=document.getElementById('uploadProgress');
+ const uploadProgress=document.getElementById('uploadProgress');
 const uploadPercent=document.getElementById('uploadPercent');
+const uploadSource=document.querySelector("#videoUploadForm select[name='camera_id']");
+let videoUploadInProgress=false;
 function resetVideoUploadUi(resetProgress=false){{
+ if(videoUploadInProgress)return;
  if(uploadButton){{uploadButton.disabled=false;uploadButton.textContent='آپلود و نمایش در پخش زنده'}}
+ if(uploadInput)uploadInput.disabled=false;
+ if(uploadSource)uploadSource.disabled=false;
  if(resetProgress&&uploadProgress&&uploadPercent){{uploadProgress.value=0;uploadPercent.textContent='۰٪';uploadState.style.display='none'}}
 }}
-window.addEventListener('pageshow',()=>resetVideoUploadUi(true));
+window.addEventListener('pageshow',()=>{{videoUploadInProgress=false;resetVideoUploadUi(true)}});
 uploadInput?.addEventListener('change',()=>resetVideoUploadUi(true));
 uploadForm?.addEventListener('submit',event=>{{
  event.preventDefault();
+ if(videoUploadInProgress)return;
  if(!uploadInput?.files?.length){{alert('ابتدا فایل ویدئو را انتخاب کنید.');return}}
+ const uploadPayload=new FormData(uploadForm);
+ videoUploadInProgress=true;
  uploadButton.disabled=true;uploadButton.textContent='در حال آپلود…';uploadState.style.display='block';
+ uploadInput.disabled=true;if(uploadSource)uploadSource.disabled=true;
  let redirecting=false;
  const xhr=new XMLHttpRequest();xhr.open('POST',uploadForm.action);xhr.timeout=2*60*60*1000;xhr.setRequestHeader('X-Requested-With','XMLHttpRequest');
  xhr.upload.onprogress=e=>{{if(e.lengthComputable){{const p=Math.round(e.loaded/e.total*100);uploadProgress.value=p;uploadPercent.textContent=p.toLocaleString('fa-IR')+'٪'}}}};
@@ -1116,8 +1127,8 @@ uploadForm?.addEventListener('submit',event=>{{
  xhr.onerror=()=>alert('ارتباط هنگام آپلود قطع شد. دوباره تلاش کنید.');
  xhr.onabort=()=>alert('آپلود لغو شد. دوباره تلاش کنید.');
  xhr.ontimeout=()=>alert('زمان آپلود تمام شد. دوباره تلاش کنید.');
- xhr.onloadend=()=>{{if(!redirecting)resetVideoUploadUi(false)}};
- xhr.send(new FormData(uploadForm));
+ xhr.onloadend=()=>{{if(!redirecting){{videoUploadInProgress=false;resetVideoUploadUi(false)}}}};
+ xhr.send(uploadPayload);
 }});
 </script>""",u,request)
 
@@ -1169,7 +1180,16 @@ def delete_cam(camera_id:int,request:Request):
         ).fetchone()
     if not camera:
         return RedirectResponse('/cameras',303)
-    manager.remove(camera_id,wait=True)
+    if not manager.remove(camera_id,wait=True):
+        return page(
+            'خطای حذف ویدئو',
+            "<div class='wrap'><div class='alert'>"
+            "پردازش ویدئو هنوز در حال توقف است. چند ثانیه دیگر "
+            "دوباره حذف را بزنید.</div><a class='btn secondary' "
+            "href='/cameras'>بازگشت</a></div>",
+            auth(request),
+            request,
+        )
     with connect() as con:
         con.execute('DELETE FROM cameras WHERE id=?',(camera_id,))
     if str(camera['rtsp_url']).startswith('video://'):
@@ -2279,7 +2299,31 @@ def backup_database(request:Request):
     return FileResponse(out,media_type='application/octet-stream',filename=out.name)
 
 
+_VIDEO_UPLOAD_LOCK=threading.Lock()
+
+def _single_video_upload(func):
+    @wraps(func)
+    async def serialized(*args,**kwargs):
+        if not _VIDEO_UPLOAD_LOCK.acquire(blocking=False):
+            return JSONResponse(
+                {
+                    'ok':False,
+                    'error':(
+                        'یک ویدئو در حال آماده‌سازی است. پس از پایان آن '
+                        'دوباره تلاش کنید.'
+                    ),
+                },
+                409,
+            )
+        try:
+            return await func(*args,**kwargs)
+        finally:
+            _VIDEO_UPLOAD_LOCK.release()
+    return serialized
+
+
 @app.post('/cameras/video-upload', response_class=HTMLResponse)
+@_single_video_upload
 async def cameras_video_upload(request: Request, camera_id: int = Form(0), video: UploadFile = File(...)):
     u=auth(request)
     if not u: return RedirectResponse('/login',302)
@@ -2382,6 +2426,12 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(0), video
             int(get_setting('live_fps','5')),
             int(get_setting('jpeg_quality','70')),
         )
+        for old_id,_old_url in old_streams:
+            if not manager.remove(old_id,wait=True):
+                raise RuntimeError(
+                    'ویدئوی قبلی هنوز در حال توقف است؛ چند ثانیه '
+                    'دیگر دوباره تلاش کنید.'
+                )
         with connect() as con:
             con.execute(
                 "DELETE FROM cameras WHERE rtsp_url LIKE 'video://%' "
@@ -2389,10 +2439,6 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(0), video
                 (virtual_camera_id,),
             )
         for old_id,old_url in old_streams:
-            try:
-                manager.remove(old_id,wait=True)
-            except Exception:
-                pass
             _delete_uploaded_video_if_unused(old_url)
         if wants_json:
             return JSONResponse({
@@ -2409,9 +2455,19 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(0), video
     except Exception as e:
         if virtual_camera_id is not None:
             try:
-                manager.remove(virtual_camera_id,wait=True)
+                virtual_stopped=manager.remove(
+                    virtual_camera_id,
+                    wait=True,
+                )
             except Exception:
-                pass
+                virtual_stopped=False
+            if not virtual_stopped:
+                return upload_error(
+                    'ویدئوی جدید ساخته شد اما پردازش آن هنوز متوقف '
+                    'نشده است. برنامه را باز نگه دارید و چند ثانیه '
+                    'دیگر دوباره حذف را بزنید.',
+                    500,
+                )
             try:
                 with connect() as con:
                     con.execute(
