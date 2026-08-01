@@ -14,7 +14,14 @@ from app.database import (
     set_settings_for_database,
     set_setting,
 )
-from app.security import COOKIE_NAME, create_token, read_token, verify_password, hash_password
+from app.security import (
+    COOKIE_NAME,
+    create_token,
+    hash_password,
+    read_token,
+    read_token_claims,
+    verify_password,
+)
 from app.streams import manager, CV_OK
 from app.license import status as license_status, install_license, activate_online, deactivate_local, machine_id
 from html import escape
@@ -528,10 +535,15 @@ window.faDigits=function(value){return String(value).replace(/[0-9]/g,d=>'۰۱۲
 
 def user(request): return read_token(request)
 def auth(request):
-    username=read_token(request)
-    if not username:return None
+    claims=read_token_claims(request)
+    if not claims:return None
+    username,session_version=claims
     with connect() as con:
-        row=con.execute('SELECT * FROM users WHERE username=? AND is_active=1',(username,)).fetchone()
+        row=con.execute(
+            'SELECT * FROM users WHERE username=? AND is_active=1 '
+            'AND session_version=?',
+            (username,session_version),
+        ).fetchone()
     return row['username'] if row else None
 
 def current_user(request):
@@ -715,7 +727,7 @@ def login(request:Request,username:str=Form(...),password:str=Form(...),next:str
     r=RedirectResponse(safe_next,303)
     r.set_cookie(
         COOKIE_NAME,
-        create_token(u['username']),
+        create_token(u['username'],u['session_version']),
         httponly=True,
         samesite='lax',
         secure=request.url.scheme == 'https',
@@ -1786,7 +1798,7 @@ def edit_user_form(user_id:int,request:Request):
 def edit_user_route(user_id:int,request:Request,display_name:str=Form(...),role:str=Form(...),password:str=Form('')):
     if not require_admin(request):return RedirectResponse('/dashboard',303)
     with connect() as con:
-        if password:con.execute('UPDATE users SET display_name=?,role=?,is_admin=?,password_hash=? WHERE id=?',(display_name.strip(),role,1 if role=='admin' else 0,hash_password(password),user_id))
+        if password:con.execute('UPDATE users SET display_name=?,role=?,is_admin=?,password_hash=?,session_version=session_version+1 WHERE id=?',(display_name.strip(),role,1 if role=='admin' else 0,hash_password(password),user_id))
         else:con.execute('UPDATE users SET display_name=?,role=?,is_admin=? WHERE id=?',(display_name.strip(),role,1 if role=='admin' else 0,user_id))
     audit(request,'user_update',f'ویرایش کاربر شماره {user_id}')
     return RedirectResponse('/users?msg=1',303)
@@ -1953,7 +1965,7 @@ def save_display_settings(request:Request,dashboard_grid:int=Form(2),dashboard_e
     if not has_permission(request,'system.manage'):return access_denied()
     set_setting('dashboard_grid',max(1,min(4,dashboard_grid)));set_setting('dashboard_event_rows',max(6,min(50,dashboard_event_rows)));set_setting('live_fps',max(1,min(15,live_fps)));set_setting('stream_width',stream_width);set_setting('jpeg_quality',max(30,min(95,jpeg_quality)))
     if new_password.strip():
-        with connect() as con:con.execute('UPDATE users SET password_hash=? WHERE username=?',(hash_password(new_password.strip()),u))
+        with connect() as con:con.execute('UPDATE users SET password_hash=?,session_version=session_version+1 WHERE username=?',(hash_password(new_password.strip()),u))
     for cid in list(manager.streams): manager.remove(cid)
     return RedirectResponse('/settings?saved=1',303)
 
