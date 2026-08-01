@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 from pathlib import Path
@@ -536,7 +537,9 @@ def test_camera_video_upload_registers_live_source_without_batch_processing(
     monkeypatch.setattr(
         main.manager,
         "remove",
-        lambda camera_id: calls["remove"].append(camera_id),
+        lambda camera_id, wait=False: calls["remove"].append(
+            (camera_id, wait)
+        ),
     )
 
     started = time.monotonic()
@@ -622,7 +625,7 @@ def test_failed_virtual_stream_start_preserves_previous_camera(
     monkeypatch.setattr(
         main.manager,
         "remove",
-        lambda camera_id: removed.append(camera_id),
+        lambda camera_id, wait=False: removed.append(camera_id) or True,
     )
 
     with TestClient(main.app) as client, source_path.open("rb") as source:
@@ -643,6 +646,243 @@ def test_failed_virtual_stream_start_preserves_previous_camera(
     assert virtual_rows[0]["rtsp_url"] == f"video://{old_video}"
     assert old_id not in removed
     assert list(video_dir.iterdir()) == [old_video]
+
+
+def test_video_can_be_uploaded_again_after_only_virtual_camera_is_deleted(
+    tmp_path,
+    monkeypatch,
+):
+    _as_role(monkeypatch, "admin")
+    db_path = tmp_path / "reupload.db"
+    video_dir = tmp_path / "videos"
+    first_source = tmp_path / "first.avi"
+    second_source = tmp_path / "second.avi"
+
+    for path, values in (
+        (first_source, (20, 70, 120)),
+        (second_source, (35, 95, 155)),
+    ):
+        writer = cv2.VideoWriter(
+            str(path),
+            cv2.VideoWriter_fourcc(*"MJPG"),
+            10.0,
+            (160, 90),
+        )
+        assert writer.isOpened()
+        for value in values:
+            writer.write(
+                np.full((90, 160, 3), value, dtype=np.uint8)
+            )
+        writer.release()
+
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    database.init_db()
+    monkeypatch.setattr(
+        main,
+        "_configured_storage_child",
+        lambda setting_key, default: video_dir,
+    )
+    calls = {"get": [], "remove": []}
+    monkeypatch.setattr(
+        main.manager,
+        "get",
+        lambda *args: calls["get"].append(args),
+    )
+    monkeypatch.setattr(
+        main.manager,
+        "remove",
+        lambda camera_id, wait=False: calls["remove"].append(
+            (camera_id, wait)
+        ) or True,
+    )
+
+    with TestClient(main.app) as client:
+        with first_source.open("rb") as source:
+            first = client.post(
+                "/cameras/video-upload",
+                files={
+                    "video": (
+                        "first.avi",
+                        source,
+                        "video/x-msvideo",
+                    )
+                },
+                headers={"X-Requested-With": "XMLHttpRequest"},
+            )
+        assert first.status_code == 200
+        first_id = int(first.json()["camera_id"])
+        with database.connect() as con:
+            first_row = con.execute(
+                "SELECT rtsp_url FROM cameras WHERE id=?",
+                (first_id,),
+            ).fetchone()
+        first_path = Path(str(first_row["rtsp_url"])[len("video://"):])
+        assert first_path.is_file()
+
+        deleted = client.post(
+            f"/cameras/{first_id}/delete",
+            follow_redirects=False,
+        )
+        assert deleted.status_code == 303
+        assert not first_path.exists()
+
+        with second_source.open("rb") as source:
+            second = client.post(
+                "/cameras/video-upload",
+                files={
+                    "video": (
+                        "second.avi",
+                        source,
+                        "video/x-msvideo",
+                    )
+                },
+                headers={"X-Requested-With": "XMLHttpRequest"},
+            )
+
+    assert second.status_code == 200
+    second_id = int(second.json()["camera_id"])
+    assert second_id != first_id
+    assert calls["remove"] == [(first_id, True)]
+    with database.connect() as con:
+        rows = con.execute(
+            "SELECT id,name,rtsp_url FROM cameras "
+            "WHERE rtsp_url LIKE 'video://%'"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["id"] == second_id
+    assert rows[0]["name"] == "ویدئو: second"
+    assert Path(str(rows[0]["rtsp_url"])[len("video://"):]).is_file()
+
+
+def test_video_delete_timeout_preserves_database_row_and_file(
+    tmp_path,
+    monkeypatch,
+):
+    _as_role(monkeypatch,"admin")
+    db_path=tmp_path / "delete-timeout.db"
+    video_path=tmp_path / "locked.avi"
+    video_path.write_bytes(b"locked")
+    monkeypatch.setattr(database,"DB_PATH",db_path)
+    monkeypatch.setattr(main,"DB_PATH",db_path)
+    database.init_db()
+    with database.connect() as con:
+        camera_id=int(con.execute(
+            "INSERT INTO cameras(name,rtsp_url,enabled,is_demo) "
+            "VALUES(?,?,1,1)",
+            ("Locked video",f"video://{video_path}"),
+        ).lastrowid)
+    monkeypatch.setattr(
+        main.manager,
+        "remove",
+        lambda camera_id,wait=False: False,
+    )
+
+    with TestClient(main.app) as client:
+        response=client.post(
+            f"/cameras/{camera_id}/delete",
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 200
+    assert "هنوز در حال توقف است" in response.text
+    with database.connect() as con:
+        row=con.execute(
+            "SELECT rtsp_url FROM cameras WHERE id=?",
+            (camera_id,),
+        ).fetchone()
+    assert row is not None
+    assert row["rtsp_url"] == f"video://{video_path}"
+    assert video_path.is_file()
+
+
+def test_video_upload_page_has_default_source_and_retry_recovery(
+    tmp_path,
+    monkeypatch,
+):
+    _as_role(monkeypatch, "admin")
+    db_path = tmp_path / "upload-page.db"
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    database.init_db()
+
+    with TestClient(main.app) as client:
+        response = client.get("/cameras")
+
+    assert response.status_code == 200
+    assert "value='0'>تنظیمات پیش‌فرض پلاک‌خوان" in response.text
+    assert "id='videoUploadInput'" in response.text
+    assert "resetVideoUploadUi" in response.text
+    assert "videoUploadInProgress" in response.text
+    assert "uploadInput.disabled=true" in response.text
+    assert "uploadSource.disabled=true" in response.text
+    assert "pageshow" in response.text
+    assert "xhr.onabort" in response.text
+    assert "xhr.timeout=2*60*60*1000" in response.text
+    assert "xhr.onloadend" in response.text
+
+
+def test_video_upload_endpoint_has_process_wide_serialization():
+    assert hasattr(main.cameras_video_upload,"__wrapped__")
+    assert main._VIDEO_UPLOAD_LOCK.acquire(blocking=False) is True
+    try:
+        with TestClient(main.app) as client:
+            response = client.post(
+                "/cameras/video-upload",
+                files={"video": ("traffic.mp4", b"data", "video/mp4")},
+                headers={"X-Requested-With": "XMLHttpRequest"},
+            )
+        assert response.status_code == 409
+        assert response.json()["ok"] is False
+        assert "در حال آماده‌سازی" in response.json()["error"]
+    finally:
+        main._VIDEO_UPLOAD_LOCK.release()
+
+
+def test_video_upload_filesystem_error_returns_actionable_json(monkeypatch):
+    _as_role(monkeypatch, "admin")
+
+    async def fail_save(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(main, "_save_video_upload", fail_save)
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/cameras/video-upload",
+            files={"video": ("traffic.mp4", b"data", "video/mp4")},
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+
+    assert response.status_code == 500
+    assert response.json()["ok"] is False
+    assert "ذخیره ویدئو روی دیسک انجام نشد" in response.json()["error"]
+
+
+def test_cancelled_video_upload_removes_partial_file(tmp_path):
+    class CancelledUpload:
+        filename = "cancelled.mp4"
+
+        def __init__(self):
+            self.reads = 0
+            self.closed = False
+
+        async def read(self, _size):
+            self.reads += 1
+            if self.reads == 1:
+                return b"partial"
+            raise asyncio.CancelledError()
+
+        async def close(self):
+            self.closed = True
+
+    upload = CancelledUpload()
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            main._save_video_upload(upload, tmp_path, ".mp4")
+        )
+
+    assert upload.closed is True
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_uploaded_video_flows_through_worker_to_sqlite_and_dashboard(

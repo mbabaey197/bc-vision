@@ -26,24 +26,35 @@ def verify_password(password: str, encoded: str) -> bool:
     except Exception:
         return False
 
-def create_token(username: str, hours: int = 12) -> str:
+def create_token(
+    username: str,
+    session_version: int = 0,
+    hours: int = 12,
+) -> str:
     exp = int(time.time()) + hours * 3600
-    payload = f"{username}|{exp}".encode()
+    payload = f"{username}|{exp}|{int(session_version)}".encode()
     sig = hmac.new(_secret(), payload, hashlib.sha256).digest()
     return base64.urlsafe_b64encode(payload + b"|" + sig).decode()
 
-def read_token(request: Request) -> str | None:
+
+def read_token_claims(request: Request) -> tuple[str, int] | None:
     token = request.cookies.get(COOKIE_NAME)
     if not token:
         return None
     try:
         raw = base64.urlsafe_b64decode(token.encode())
-        username, exp, sig = raw.split(b"|", 2)
-        payload = username + b"|" + exp
-        if not hmac.compare_digest(sig, hmac.new(_secret(), payload, hashlib.sha256).digest()):
+        username, exp, version, sig = raw.split(b"|", 3)
+        payload = username + b"|" + exp + b"|" + version
+        expected = hmac.new(_secret(), payload, hashlib.sha256).digest()
+        if not hmac.compare_digest(sig, expected):
             return None
         if int(exp) < int(time.time()):
             return None
-        return username.decode()
+        return username.decode(), int(version)
     except Exception:
         return None
+
+
+def read_token(request: Request) -> str | None:
+    claims = read_token_claims(request)
+    return claims[0] if claims else None

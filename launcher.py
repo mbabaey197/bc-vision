@@ -204,6 +204,7 @@ def run_self_test() -> int:
         "public_key_ready": False,
         "web_app_ready": False,
         "anpr_ready": False,
+        "setup_required": False,
     }
     try:
         from app.config import (
@@ -269,7 +270,6 @@ def run_self_test() -> int:
                 DB_PATH.is_file()
                 and PUBLIC_KEY_PATH.is_file()
                 and table_count >= 6
-                and user_count >= 1
                 and app is not None
                 and anpr_ready
             ),
@@ -280,6 +280,7 @@ def run_self_test() -> int:
             "public_key_ready": PUBLIC_KEY_PATH.is_file(),
             "web_app_ready": app is not None,
             "anpr_ready": anpr_ready,
+            "setup_required": user_count == 0,
             "user_count": user_count,
             "table_count": table_count,
         })

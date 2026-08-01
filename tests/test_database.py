@@ -200,6 +200,9 @@ def test_new_database_has_no_automatic_demo_camera(
             "SELECT COUNT(*) FROM cameras"
         ).fetchone()[0] == 0
         assert con.execute(
+            "SELECT COUNT(*) FROM users"
+        ).fetchone()[0] == 0
+        assert con.execute(
             "SELECT value FROM settings "
             "WHERE key='migration_remove_builtin_demo_camera_v1'"
         ).fetchone()[0] == "1"
