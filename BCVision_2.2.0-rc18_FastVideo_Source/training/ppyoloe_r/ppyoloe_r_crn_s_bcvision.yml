@@ -1,0 +1,41 @@
+_BASE_: [
+  'bcvision_dataset.yml',
+  '../../../PaddleDetection/configs/runtime.yml',
+  '../../../PaddleDetection/configs/rotate/ppyoloe_r/_base_/optimizer_3x.yml',
+  '../../../PaddleDetection/configs/rotate/ppyoloe_r/_base_/ppyoloe_r_reader.yml',
+  '../../../PaddleDetection/configs/rotate/ppyoloe_r/_base_/ppyoloe_r_crn.yml'
+]
+
+# BC Vision uses the official Apache-2.0 PP-YOLOE-R-s architecture. The
+# pre-trained DOTA head is never treated as an Iranian plate detector.
+pretrain_weights: https://paddledet.bj.bcebos.com/models/pretrained/CSPResNetb_s_pretrained.pdparams
+depth_mult: 0.33
+width_mult: 0.50
+weights: output/bcvision_ppyoloe_r_crn_s/model_final
+snapshot_epoch: 1
+log_iter: 20
+
+PPYOLOERHead:
+  num_classes: 1
+  fpn_strides: [32, 16, 8]
+  grid_cell_offset: 0.5
+  use_varifocal_loss: true
+  static_assigner_epoch: -1
+  loss_weight: {class: 1.0, iou: 2.5, dfl: 0.05}
+  static_assigner:
+    name: FCOSRAssigner
+    factor: 12
+    threshold: 0.23
+    boundary: [[512, 10000], [256, 512], [-1, 256]]
+  assigner:
+    name: RotatedTaskAlignedAssigner
+    topk: 13
+    alpha: 1.0
+    beta: 6.0
+  nms:
+    name: MultiClassNMS
+    nms_top_k: 2000
+    keep_top_k: 32
+    score_threshold: 0.1
+    nms_threshold: 0.1
+    normalized: false

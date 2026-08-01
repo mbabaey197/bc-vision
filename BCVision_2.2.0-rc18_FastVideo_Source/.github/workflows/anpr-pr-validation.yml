@@ -1,0 +1,106 @@
+# Trusted, isolated validation for BC Vision pull requests.
+name: ANPR PR validation
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "app/**"
+      - "installer/**"
+      - "launcher.py"
+      - "VERSION"
+      - "requirements-lock.txt"
+      - "requirements-ai-lock.txt"
+      - "requirements-test.txt"
+      - "requirements-cct-training.txt"
+      - "tests/**"
+      - "tools/**"
+      - "training/**"
+      - "docs/**"
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: anpr-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.0"
+          enable-cache: true
+          cache-python: true
+          cache-dependency-glob: requirements-test.txt
+      - name: Set up portable Python
+        shell: cmd
+        run: |
+          uv python install 3.13
+          uv venv --python 3.13 --seed .venv
+          echo %CD%\.venv\Scripts>>"%GITHUB_PATH%"
+      - name: Install test dependencies
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip --quiet
+          python -m pip install -r requirements-test.txt --quiet
+      - name: Compile and test
+        shell: cmd
+        env:
+          BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\regression
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -m compileall -q app
+          python -m pytest -q tests
+
+  ai-runtime:
+    needs: regression
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 45
+    env:
+      BCVISION_RUN_AI_INTEGRATION: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.0"
+          enable-cache: true
+          cache-python: true
+          cache-dependency-glob: requirements-ai-lock.txt
+      - name: Set up portable Python
+        shell: cmd
+        run: |
+          uv python install 3.13
+          uv venv --python 3.13 --seed .venv
+          echo %CD%\.venv\Scripts>>"%GITHUB_PATH%"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\bcvision-models
+          key: bcvision-anpr-models-v2-onnx
+      - name: Install AI runtime
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip --quiet
+          python -m pip install -r requirements-ai-lock.txt --quiet
+          python -m pip install pytest==9.0.2 --quiet
+          python -m pip check
+      - name: Verify real engines and models
+        shell: cmd
+        env:
+          BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\ai-runtime
+          BCVISION_PLATE_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo.onnx
+          BCVISION_PLATE_FALLBACK_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo_fallback.onnx
+          BCVISION_CRNN_MODEL: ${{ runner.temp }}\bcvision-models\crnn\ocr_crnn.onnx
+          BCVISION_CNN_MODEL: ${{ runner.temp }}\bcvision-models\cnn\ocr_cnn.onnx
+        run: |
+          python -m compileall -q app/ai
+          python -m pytest -q tests/test_ai_runtime.py

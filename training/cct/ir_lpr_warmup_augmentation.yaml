@@ -1,0 +1,54 @@
+__version__: 2.0.8
+transform:
+  __class_fullname__: Compose
+  additional_targets: {}
+  bbox_params: null
+  is_check_shapes: true
+  keypoint_params: null
+  p: 1.0
+  transforms:
+  - __class_fullname__: Affine
+    balanced_scale: false
+    border_mode: 0
+    fill: [114.0, 114.0, 114.0]
+    fill_mask: 0.0
+    fit_output: false
+    interpolation: 1
+    keep_ratio: false
+    mask_interpolation: 0
+    p: 0.4
+    rotate: [-5.0, 5.0]
+    rotate_method: largest_box
+    scale:
+      x: [0.92, 1.05]
+      y: [0.92, 1.05]
+    shear:
+      x: [0.0, 0.0]
+      y: [0.0, 0.0]
+    translate_percent:
+      x: [-0.01, 0.01]
+      y: [-0.01, 0.01]
+    translate_px: null
+  - __class_fullname__: RandomBrightnessContrast
+    brightness_by_max: true
+    brightness_limit: [-0.08, 0.08]
+    contrast_limit: [-0.08, 0.08]
+    ensure_safe_range: false
+    p: 0.3
+  - __class_fullname__: OneOf
+    p: 0.08
+    transforms:
+    - __class_fullname__: GaussianBlur
+      blur_limit: [3, 3]
+      p: 0.5
+      sigma_limit: [0.2, 0.4]
+    - __class_fullname__: MotionBlur
+      allow_shifted: true
+      angle_range: [0.0, 360.0]
+      blur_limit: [3, 3]
+      direction_range: [-1.0, 1.0]
+      p: 0.5
+  - __class_fullname__: ImageCompression
+    compression_type: jpeg
+    p: 0.1
+    quality_range: [70, 95]

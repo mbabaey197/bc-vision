@@ -1,0 +1,76 @@
+name: Publish standalone updater
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful Windows release-candidate run ID
+        required: true
+        type: string
+      version:
+        description: BC Vision version, for example 2.2.0-rc7
+        required: true
+        type: string
+  workflow_run:
+    workflows:
+      - Windows release candidate
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  extract-updater:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download manually selected release bundle
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/download-artifact@v4
+        with:
+          name: BCVision-${{ inputs.version }}-windows
+          path: bundle
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download completed release bundle
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          path: bundle
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Select updater and write checksum
+        id: updater
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_file="$(find bundle -type f -name 'BCVision_Update_v*.exe' -print -quit)"
+          if [[ -z "$source_file" ]]; then
+            echo "Verified updater was not found" >&2
+            exit 1
+          fi
+          filename="$(basename "$source_file")"
+          version="${filename#BCVision_Update_v}"
+          version="${version%.exe}"
+          mkdir -p standalone-updater
+          cp "$source_file" "standalone-updater/$filename"
+          (cd standalone-updater && sha256sum "$filename" > "$filename.sha256")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Upload standalone verified updater
+        uses: actions/upload-artifact@v4
+        with:
+          name: BCVision-${{ steps.updater.outputs.version }}-updater
+          path: standalone-updater/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0

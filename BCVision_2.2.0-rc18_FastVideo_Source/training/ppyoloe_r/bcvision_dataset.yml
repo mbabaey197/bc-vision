@@ -1,0 +1,21 @@
+metric: RBOX
+num_classes: 1
+
+TrainDataset:
+  !COCODataSet
+    image_dir: train/images
+    anno_path: train/annotations.json
+    dataset_dir: dataset/bcvision_ppyoloe_r/
+    data_fields: ['image', 'gt_bbox', 'gt_class', 'is_crowd', 'gt_poly']
+
+EvalDataset:
+  !COCODataSet
+    image_dir: validation/images
+    anno_path: validation/annotations.json
+    dataset_dir: dataset/bcvision_ppyoloe_r/
+    data_fields: ['image', 'gt_bbox', 'gt_class', 'is_crowd', 'gt_poly']
+
+TestDataset:
+  !ImageFolder
+    anno_path: validation/annotations.json
+    dataset_dir: dataset/bcvision_ppyoloe_r/
