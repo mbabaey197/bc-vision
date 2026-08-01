@@ -70,13 +70,21 @@ class CameraStream:
         )
         self.thread.start()
 
-    def stop(self):
+    def stop(self, wait=False, timeout=3.0):
         self.stop_event.set()
         try:
             from app.ai.live_worker import stop_live_camera
             stop_live_camera(self.camera_id)
         except Exception:
             pass
+        thread = self.thread
+        if (
+            wait
+            and thread is not None
+            and thread is not threading.current_thread()
+        ):
+            thread.join(max(0.0, float(timeout)))
+        return not (thread and thread.is_alive())
 
     def pause(self):
         if self.url.startswith("video://"):
@@ -716,13 +724,16 @@ class StreamManager:
             streams = list(self.streams.values())
             self.streams.clear()
         for stream in streams:
-            stream.stop()
+            stream.stop(wait=False)
+        for stream in streams:
+            stream.stop(wait=True)
 
-    def remove(self, camera_id):
+    def remove(self, camera_id, wait=False):
         with self.lock:
             stream = self.streams.pop(camera_id, None)
         if stream:
-            stream.stop()
+            return stream.stop(wait=wait)
+        return True
 
     def status(self, camera_id):
         stream = self.streams.get(camera_id)
