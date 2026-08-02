@@ -102,6 +102,9 @@ class _CameraState:
     processing_samples: deque = field(
         default_factory=lambda: deque(maxlen=60)
     )
+    positive_processing_samples: deque = field(
+        default_factory=lambda: deque(maxlen=60)
+    )
     no_plate_streak: int = 0
     next_inference_at: float = 0.0
     latest_detections: list = field(default_factory=list)
@@ -111,6 +114,7 @@ class _CameraState:
     last_submitted_at: float = 0.0
     last_received_at: float = 0.0
     source_fps_ema: float = 0.0
+    source_max_gap_seconds: float = 0.0
     source_timestamps: deque = field(
         default_factory=lambda: deque(maxlen=240)
     )
@@ -614,6 +618,13 @@ class LiveANPRWorker:
 
     @staticmethod
     def _observe_source_rate(state: _CameraState, now: float) -> None:
+        if (
+            state.last_received_at > 0.0
+            and float(now) - state.last_received_at > 2.0
+        ):
+            state.source_timestamps.clear()
+            state.source_fps_ema = 0.0
+            state.source_max_gap_seconds = 0.0
         state.source_timestamps.append(float(now))
         while (
             len(state.source_timestamps) > 2
@@ -632,24 +643,73 @@ class LiveANPRWorker:
                 state.source_fps_ema = (
                     (len(state.source_timestamps) - 1) / elapsed
                 )
+                state.source_max_gap_seconds = max(
+                    later - earlier
+                    for earlier, later in zip(
+                        state.source_timestamps,
+                        list(state.source_timestamps)[1:],
+                    )
+                )
         state.last_received_at = float(now)
 
     @staticmethod
-    def _frame_budget(state: _CameraState, config: dict) -> dict:
+    def _frame_budget(
+        state: _CameraState,
+        config: dict,
+        now: float | None = None,
+    ) -> dict:
         with state.lock:
             samples = sorted(
                 float(value) for value in state.processing_samples
             )
-            source_fps = float(state.source_fps_ema)
-        p95_seconds = (
-            samples[min(len(samples) - 1, math.ceil(len(samples) * 0.95) - 1)]
-            if len(samples) >= 20
-            else 0.0
-        )
+            positive_samples = sorted(
+                float(value)
+                for value in state.positive_processing_samples
+            )
+            observed_now = (
+                time.monotonic()
+                if now is None
+                else float(now)
+            )
+            telemetry_fresh = (
+                state.last_received_at > 0.0
+                and observed_now - state.last_received_at <= 2.0
+            )
+            source_fps = (
+                float(state.source_fps_ema)
+                if telemetry_fresh
+                else 0.0
+            )
+            source_max_gap_ms = (
+                float(state.source_max_gap_seconds) * 1000.0
+                if telemetry_fresh
+                else 0.0
+            )
+        if len(samples) >= 20 and positive_samples:
+            all_p95 = samples[
+                min(
+                    len(samples) - 1,
+                    math.ceil(len(samples) * 0.95) - 1,
+                )
+            ]
+            positive_p95 = (
+                positive_samples[
+                    min(
+                        len(positive_samples) - 1,
+                        math.ceil(len(positive_samples) * 0.95) - 1,
+                    )
+                ]
+                if len(positive_samples) >= 20
+                else max(positive_samples)
+            )
+            p95_seconds = max(all_p95, positive_p95)
+        else:
+            p95_seconds = 0.0
         budget = calculate_frame_budget(
             max_speed_kmh=config.get("max_vehicle_speed_kmh", 150),
             recognition_zone_m=config.get("recognition_zone_m", 10),
             source_fps=source_fps,
+            source_max_gap_ms=source_max_gap_ms,
             processing_p95_ms=p95_seconds * 1000.0,
             geometry_calibrated=bool(
                 int(config.get("recognition_zone_calibrated", 0) or 0)
@@ -663,8 +723,9 @@ class LiveANPRWorker:
         cls,
         state: _CameraState,
         config: dict,
+        now: float | None = None,
     ) -> float:
-        plan = cls._frame_budget(state, config)
+        plan = cls._frame_budget(state, config, now=now)
         recommended = float(plan["recommended_capture_fps"])
         source_fps = float(plan["source_fps"])
         target = (
@@ -811,7 +872,7 @@ class LiveANPRWorker:
             )
             if activity.wake_inference:
                 state.motion_wakeups += 1
-                plan = self._frame_budget(state, config)
+                plan = self._frame_budget(state, config, now=now)
                 planned_observations = max(
                     5,
                     min(
@@ -856,7 +917,7 @@ class LiveANPRWorker:
             # room. Keep the newest frame and cap inference frequency
             # adaptively; this reduces load without lowering image quality.
             minimum_interval = (
-                self._burst_interval(state, config)
+                self._burst_interval(state, config, now=now)
                 if (
                     activity.wake_inference
                     or state.burst_frames_remaining
@@ -920,6 +981,7 @@ class LiveANPRWorker:
         config_generation = payload[6] if len(payload) > 6 else 0
         started = time.perf_counter()
         model_seconds = None
+        positive_path = False
         try:
             with state.lock:
                 if state.cancelled:
@@ -997,6 +1059,7 @@ class LiveANPRWorker:
                 if outcome.mode == "shadow" and assisted_enabled
                 else rows + shadow_rows
             )
+            positive_path = bool(rows or shadow_rows)
             # A dashboard ROI change invalidates work already running against
             # the old area.  Such detections must not reach tracking or disk.
             with state.lock:
@@ -1234,6 +1297,10 @@ class LiveANPRWorker:
             )
             with state.lock:
                 state.processing_samples.append(end_to_end_seconds)
+                if positive_path:
+                    state.positive_processing_samples.append(
+                        end_to_end_seconds
+                    )
                 if state.processing_seconds_ema:
                     state.processing_seconds_ema = (
                         state.processing_seconds_ema * 0.70
@@ -1253,6 +1320,7 @@ class LiveANPRWorker:
                     interval = self._burst_interval(
                         state,
                         state.config or {},
+                        now=finished_at,
                     )
                     # Deadline is start-to-start. If inference already took
                     # longer than the interval, the latest pending frame may
