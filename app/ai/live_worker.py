@@ -5,10 +5,12 @@ apply ROI, multi-frame consensus, duplicate suppression, and persist events.
 """
 from __future__ import annotations
 
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+import math
 import threading
 import time
 
@@ -26,6 +28,7 @@ from .pipeline import (
 )
 from .plate_rules import normalize_plate, split_iran_plate
 from .feedback import apply_learned_correction
+from .frame_budget import calculate_frame_budget
 from .next_engine import engine_router
 from .review_policy import (
     auto_confirm_guess,
@@ -92,6 +95,9 @@ class _CameraState:
     last_processed_at: float = 0.0
     last_processing_ms: float = 0.0
     processing_seconds_ema: float = 0.0
+    processing_samples: deque = field(
+        default_factory=lambda: deque(maxlen=60)
+    )
     no_plate_streak: int = 0
     next_inference_at: float = 0.0
     latest_detections: list = field(default_factory=list)
@@ -99,6 +105,11 @@ class _CameraState:
     latest_detection_frame: object | None = None
     detection_revision: int = 0
     last_submitted_at: float = 0.0
+    last_received_at: float = 0.0
+    source_fps_ema: float = 0.0
+    pending_replacements: int = 0
+    admission_drops: int = 0
+    target_burst_fps: float = 0.0
     burst_frames_remaining: int = 0
     plate_visible: bool = False
     shadow_frames: int = 0
@@ -589,6 +600,54 @@ class LiveANPRWorker:
         )
         return max(processing_gap, empty_gap)
 
+    @staticmethod
+    def _observe_source_rate(state: _CameraState, now: float) -> None:
+        if state.last_received_at > 0.0:
+            interval = float(now) - state.last_received_at
+            if 1.0 / 240.0 <= interval <= 2.0:
+                instant_fps = 1.0 / interval
+                if state.source_fps_ema:
+                    state.source_fps_ema = (
+                        state.source_fps_ema * 0.85
+                        + instant_fps * 0.15
+                    )
+                else:
+                    state.source_fps_ema = instant_fps
+        state.last_received_at = float(now)
+
+    @staticmethod
+    def _frame_budget(state: _CameraState, config: dict) -> dict:
+        samples = sorted(float(value) for value in state.processing_samples)
+        p95_seconds = (
+            samples[min(len(samples) - 1, math.ceil(len(samples) * 0.95) - 1)]
+            if samples
+            else state.processing_seconds_ema
+        )
+        budget = calculate_frame_budget(
+            max_speed_kmh=config.get("max_vehicle_speed_kmh", 150),
+            recognition_zone_m=config.get("recognition_zone_m", 10),
+            source_fps=state.source_fps_ema,
+            processing_p95_ms=p95_seconds * 1000.0,
+        )
+        return budget.as_dict()
+
+    @classmethod
+    def _burst_interval(
+        cls,
+        state: _CameraState,
+        config: dict,
+    ) -> float:
+        plan = cls._frame_budget(state, config)
+        recommended = float(plan["recommended_capture_fps"])
+        source_fps = float(plan["source_fps"])
+        target = (
+            min(source_fps, recommended)
+            if source_fps > 0.0
+            else recommended
+        )
+        state.target_burst_fps = max(1.0, min(120.0, target))
+        return 1.0 / state.target_burst_fps
+
     def submit(self, camera_id: int, camera_name: str, frame):
         if (
             self._stopped
@@ -605,6 +664,7 @@ class LiveANPRWorker:
             if state.cancelled:
                 return
             state.frame_counter += 1
+            self._observe_source_rate(state, now)
             try:
                 config = self._config(int(camera_id), state, now)
             except Exception as exc:
@@ -616,7 +676,6 @@ class LiveANPRWorker:
                 or not int(config.get("lpr_enabled", 0))
             ):
                 return
-            selection_score = self._selection_score(frame, config)
             activity_source, _, _ = self._roi_frame(frame, config)
             activity = state.activity.observe(activity_source)
             state.motion_score = float(activity.motion_score)
@@ -627,97 +686,74 @@ class LiveANPRWorker:
             )
             if activity.wake_inference:
                 state.motion_wakeups += 1
+                plan = self._frame_budget(state, config)
+                planned_observations = max(
+                    5,
+                    min(
+                        8,
+                        int(math.ceil(
+                            float(plan["recommended_capture_fps"])
+                            * float(plan["zone_seconds"])
+                        )),
+                    ),
+                )
                 state.burst_frames_remaining = max(
                     state.burst_frames_remaining,
-                    4,
+                    planned_observations,
                 )
                 state.next_inference_at = min(
                     state.next_inference_at,
                     now,
                 )
-                selection_score += min(
-                    0.40,
-                    0.18 + float(activity.motion_score),
-                )
             payload = (
                 int(camera_id),
                 str(camera_name),
-                frame.copy(),
+                frame,
                 now,
-                selection_score,
+                0.0,
                 activity,
                 state.config_generation,
             )
             if state.busy:
-                pending_score = (
-                    float(state.pending[4])
-                    if state.pending is not None and len(state.pending) > 4
-                    else -1.0
-                )
-                pending_at = (
-                    float(state.pending[3])
-                    if state.pending is not None
-                    else -1e12
-                )
-                if (
-                    state.pending is None
-                    or selection_score >= pending_score
-                    or now - pending_at >= 0.35
-                ):
-                    state.pending = payload
+                if state.pending is not None:
+                    state.pending_replacements += 1
+                # Exactly one latest-frame slot is retained. Quality ranking
+                # happens on per-track crops, never by keeping an old frame in
+                # the inference queue.
+                state.pending = payload
                 return
             # Do not let a slow CPU run ANPR continuously with no breathing
             # room. Keep the newest frame and cap inference frequency
             # adaptively; this reduces load without lowering image quality.
-            minimum_interval = max(
-                0.0,
-                (
-                    0.0
-                    if activity.wake_inference
-                    else state.next_inference_at - now
-                ),
-                (
-                    0.0
-                    if state.burst_frames_remaining
-                    else (
-                        max(
-                            0.20,
-                            min(
-                                1.25,
-                                state.processing_seconds_ema * 0.45,
-                            ),
-                        )
-                        if state.processing_seconds_ema
-                        else 0.0
+            minimum_interval = (
+                self._burst_interval(state, config)
+                if (
+                    activity.wake_inference
+                    or state.burst_frames_remaining
+                )
+                else (
+                    max(
+                        0.20,
+                        min(
+                            1.25,
+                            state.processing_seconds_ema * 0.45,
+                        ),
                     )
-                ),
+                    if state.processing_seconds_ema
+                    else 0.0
+                )
             )
             if (
                 now - state.last_submitted_at < minimum_interval
-                or (
-                    now < state.next_inference_at
-                    and not activity.wake_inference
-                )
+                or now < state.next_inference_at
             ):
-                pending_score = (
-                    float(state.pending[4])
-                    if state.pending is not None and len(state.pending) > 4
-                    else -1.0
-                )
-                if (
-                    state.pending is None
-                    or selection_score >= pending_score
-                ):
-                    state.pending = payload
+                state.admission_drops += 1
+                # No worker is active, so the next native source frame will
+                # be newer than anything retained here.
+                state.pending = None
                 return
             if state.pending is not None:
-                pending_score = float(state.pending[4])
-                pending_at = float(state.pending[3])
-                if (
-                    pending_score > selection_score
-                    and now - pending_at < 0.8
-                ):
-                    payload = state.pending
+                state.admission_drops += 1
                 state.pending = None
             state.last_submitted_at = now
             state.processing_done.clear()
@@ -809,6 +845,7 @@ class LiveANPRWorker:
                 state.shadow_candidates += len(outcome.shadow)
                 state.shadow_errors += int(bool(outcome.error))
             processing_seconds = time.perf_counter() - started
+            state.processing_samples.append(processing_seconds)
             if state.processing_seconds_ema:
                 state.processing_seconds_ema = (
                     state.processing_seconds_ema * 0.70
@@ -1022,7 +1059,10 @@ class LiveANPRWorker:
                 # which kept detector/OCR threads continuously busy even when
                 # every inference returned no plate.
                 state.next_inference_at = time.monotonic() + (
-                    0.04
+                    self._burst_interval(
+                        state,
+                        state.config or {},
+                    )
                     if (
                         state.burst_frames_remaining
                         or (
@@ -1064,7 +1104,12 @@ class LiveANPRWorker:
                     },
                     "threads_per_camera": threads_per_camera(),
                     "parallel_camera_limit": self._worker_capacity,
+                    "sampling": calculate_frame_budget().as_dict(),
                 }
+            sampling = self._frame_budget(
+                state,
+                state.config or {},
+            )
             return {
                 "active": bool(state.busy or state.config),
                 "received_frames": state.frame_counter,
@@ -1084,6 +1129,15 @@ class LiveANPRWorker:
                     2,
                 ),
                 "burst_frames_remaining": state.burst_frames_remaining,
+                "source_fps": round(state.source_fps_ema, 2),
+                "target_burst_fps": round(
+                    state.target_burst_fps,
+                    2,
+                ),
+                "pending_replacements": state.pending_replacements,
+                "admission_drops": state.admission_drops,
+                "queue_depth": int(state.pending is not None),
+                "sampling": sampling,
                 "motion_score": round(state.motion_score, 5),
                 "motion_wakeups": state.motion_wakeups,
                 "overlay_mask_pixels": state.overlay_mask_pixels,
