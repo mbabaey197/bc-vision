@@ -508,9 +508,13 @@ def read_plate_candidate(
     image,
     engine_key=None,
     allow_legacy=True,
-) -> tuple[str, float, str]:
+    *,
+    variants=None,
+    include_hypotheses=False,
+):
     if image is None or getattr(image, "size", 0) == 0:
-        return "", 0.0, "none"
+        empty = ("", 0.0, "none")
+        return (*empty, {"plate_hypotheses": []}) if include_hypotheses else empty
 
     mode = os.environ.get(
         "BCVISION_OCR_ENGINE",
@@ -519,21 +523,37 @@ def read_plate_candidate(
     if mode not in {"hybrid", "crnn", "cnn"}:
         mode = "hybrid"
 
+    details = {
+        "plate_hypotheses": [],
+        "position_hypotheses": [],
+        "crnn": {},
+        "cnn": {},
+    }
+
     if mode != "cnn":
-        crnn_text, crnn_confidence = read_plate_crnn(
+        crnn_text, crnn_confidence, crnn_details = read_plate_crnn(
             image,
             engine_key=engine_key,
+            alternate_images=variants,
+            return_details=True,
+        )
+        details["crnn"] = crnn_details
+        details["plate_hypotheses"].extend(
+            dict(row)
+            for row in crnn_details.get("hypotheses", [])
         )
         if plausible_plate(crnn_text):
             _last_status.update(
                 engine="crnn-onnx",
                 crnn_error="",
+                candidate_count=len(details["plate_hypotheses"]),
             )
-            return (
+            output = (
                 format_iran_plate(crnn_text),
                 float(crnn_confidence),
                 "crnn-onnx",
             )
+            return (*output, details) if include_hypotheses else output
         crnn_status = get_crnn_status()
         _last_status["crnn_error"] = crnn_status.get(
             "error",
@@ -541,25 +561,70 @@ def read_plate_candidate(
         )
 
     if mode == "crnn" or not allow_legacy:
-        return "", 0.0, "crnn-onnx"
+        output = ("", 0.0, "crnn-onnx")
+        return (*output, details) if include_hypotheses else output
 
     cnn_text, cnn_confidence = read_plate_cnn(
         image,
         engine_key=engine_key,
     )
-    if plausible_plate(cnn_text):
+    cnn_min_confidence = min(
+        0.95,
+        max(
+            0.20,
+            float(os.environ.get("BCVISION_CNN_MIN_CONFIDENCE", "0.58")),
+        ),
+    )
+    cnn_valid = plausible_plate(cnn_text)
+    details["cnn"] = {
+        "plate": format_iran_plate(cnn_text) if cnn_valid else "",
+        "plate_norm": normalize_plate(cnn_text) if cnn_valid else "",
+        "confidence": float(cnn_confidence),
+        "accepted": bool(
+            cnn_valid and float(cnn_confidence) >= cnn_min_confidence
+        ),
+        "minimum_confidence": cnn_min_confidence,
+    }
+    if cnn_valid:
+        normalized = normalize_plate(cnn_text)
+        existing = next(
+            (
+                row
+                for row in details["plate_hypotheses"]
+                if normalize_plate(row.get("plate_norm")) == normalized
+            ),
+            None,
+        )
+        candidate = {
+            "plate": format_iran_plate(normalized),
+            "plate_norm": normalized,
+            "confidence": float(cnn_confidence),
+            "score": float(cnn_confidence),
+            "engine": "cnn-onnx",
+        }
+        if existing is None:
+            details["plate_hypotheses"].append(candidate)
+        elif float(cnn_confidence) > float(
+            existing.get("confidence", 0.0)
+        ):
+            existing.update(candidate)
+    if cnn_valid and float(cnn_confidence) >= cnn_min_confidence:
         _last_status.update(
             engine="cnn-onnx",
             cnn_error="",
+            candidate_count=len(details["plate_hypotheses"]),
         )
-        return (
+        output = (
             format_iran_plate(cnn_text),
             float(cnn_confidence),
             "cnn-onnx",
         )
+        return (*output, details) if include_hypotheses else output
     _last_status["cnn_error"] = get_cnn_status().get("error", "")
+    _last_status["candidate_count"] = len(details["plate_hypotheses"])
 
-    return "", 0.0, "none"
+    output = ("", 0.0, "none")
+    return (*output, details) if include_hypotheses else output
 
 
 def read_plate(

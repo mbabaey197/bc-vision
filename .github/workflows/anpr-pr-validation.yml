@@ -6,6 +6,7 @@ on:
   pull_request:
     branches:
       - main
+      - agent/anpr-rescue-plate-search-rc19
     paths:
       - "app/**"
       - "installer/**"

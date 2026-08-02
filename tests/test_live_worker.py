@@ -2,6 +2,7 @@ import time
 import sqlite3
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -717,6 +718,93 @@ def test_slow_cpu_keeps_three_observations_for_consensus(monkeypatch):
     # Slow inference must preserve consecutive observations without leaving a
     # physical track open long enough to absorb a later vehicle.
     assert state.tracker.max_age_seconds == 6.0
+
+
+def test_remove_invalidates_inflight_video_inference(monkeypatch):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState()
+    state.config = {
+        "enabled": 1,
+        "lpr_enabled": 1,
+        "lpr_confidence": 50,
+        "duplicate_seconds": 0,
+        "roi_x": 0,
+        "roi_y": 0,
+        "roi_w": 100,
+        "roi_h": 100,
+    }
+    camera_id = 91
+    worker._states[camera_id] = state
+    started = threading.Event()
+    release = threading.Event()
+    frame = np.full((90, 160, 3), 80, dtype=np.uint8)
+    result = {
+        "plate": "12-ب-345-67",
+        "plate_norm": "12ب34567",
+        "valid": True,
+        "confidence": 0.90,
+        "quality_score": 0.80,
+        "bbox": (30, 30, 130, 65),
+        "crop": frame[30:65, 30:130].copy(),
+        "method": "blocked-video-test",
+    }
+
+    def blocked_process(*_args, **_kwargs):
+        started.set()
+        assert release.wait(2.0)
+        return [dict(result)]
+
+    persisted = []
+    monkeypatch.setattr(live_worker, "process_frame", blocked_process)
+    monkeypatch.setattr(
+        live_worker.engine_router,
+        "process",
+        lambda _source, baseline, **_kwargs: SimpleNamespace(
+            primary=baseline(),
+            shadow=[],
+            mode="baseline",
+            error="",
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_persist",
+        lambda *_args, **_kwargs: persisted.append(True) or 1,
+    )
+    processing = threading.Thread(
+        target=worker._process,
+        args=(state, (camera_id, "old video", frame, 0.0)),
+        daemon=True,
+    )
+    state.busy = True
+    state.processing_done.clear()
+    processing.start()
+    assert started.wait(2.0)
+
+    removed = []
+    removal = threading.Thread(
+        target=lambda: removed.append(
+            worker.remove(camera_id,wait=True,timeout=2.0)
+        ),
+        daemon=True,
+    )
+    removal.start()
+    for _ in range(100):
+        if state.cancelled:
+            break
+        time.sleep(0.005)
+    assert state.cancelled is True
+    assert removal.is_alive()
+    release.set()
+    processing.join(2.0)
+    removal.join(2.0)
+    worker.shutdown()
+
+    assert not processing.is_alive()
+    assert not removal.is_alive()
+    assert removed == [True]
+    assert persisted == []
+    assert worker.status(camera_id)["active"] is False
 
 
 def test_latest_detection_is_available_for_live_overlay(monkeypatch):

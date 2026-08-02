@@ -291,6 +291,8 @@ def _predict_crnn_session(session, image) -> tuple[str, float]:
 
     from .onnx_crnn import (
         CRNN_LABELS,
+        accept_crnn_hypotheses,
+        ctc_beam_hypotheses,
         ctc_greedy_decode,
         prepare_crnn_input,
     )
@@ -313,8 +315,13 @@ def _predict_crnn_session(session, image) -> tuple[str, float]:
             "Unexpected Golden CRNN output shape: "
             + str(tuple(np.asarray(output).shape))
         )
-    raw, _confidence = ctc_greedy_decode(logits)
-    return normalize_plate(raw), latency_ms
+    raw, greedy_confidence = ctc_greedy_decode(logits)
+    decision = accept_crnn_hypotheses(
+        ctc_beam_hypotheses(logits),
+        greedy_text=raw,
+        greedy_confidence=greedy_confidence,
+    )
+    return normalize_plate(decision["plate_norm"]), latency_ms
 
 
 def compare_crnn_candidate_on_golden(
