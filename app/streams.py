@@ -520,6 +520,12 @@ class CameraStream:
 
     def _observe_source_frame(self, captured_at):
         self.state.decoded_frames += 1
+        if (
+            self._last_source_at > 0.0
+            and float(captured_at) - self._last_source_at > 2.0
+        ):
+            self._source_timestamps.clear()
+            self._source_fps_ema = 0.0
         self._source_timestamps.append(float(captured_at))
         while (
             len(self._source_timestamps) > 2
