@@ -115,6 +115,7 @@ class _CameraState:
     last_received_at: float = 0.0
     source_fps_ema: float = 0.0
     source_max_gap_seconds: float = 0.0
+    source_p95_gap_seconds: float = 0.0
     source_timestamps: deque = field(
         default_factory=lambda: deque(maxlen=240)
     )
@@ -625,6 +626,7 @@ class LiveANPRWorker:
             state.source_timestamps.clear()
             state.source_fps_ema = 0.0
             state.source_max_gap_seconds = 0.0
+            state.source_p95_gap_seconds = 0.0
         state.source_timestamps.append(float(now))
         while (
             len(state.source_timestamps) > 2
@@ -643,13 +645,20 @@ class LiveANPRWorker:
                 state.source_fps_ema = (
                     (len(state.source_timestamps) - 1) / elapsed
                 )
-                state.source_max_gap_seconds = max(
+                gaps = sorted(
                     later - earlier
                     for earlier, later in zip(
                         state.source_timestamps,
                         list(state.source_timestamps)[1:],
                     )
                 )
+                state.source_max_gap_seconds = gaps[-1]
+                state.source_p95_gap_seconds = gaps[
+                    min(
+                        len(gaps) - 1,
+                        math.ceil(len(gaps) * 0.95) - 1,
+                    )
+                ]
         state.last_received_at = float(now)
 
     @staticmethod
@@ -685,6 +694,11 @@ class LiveANPRWorker:
                 if telemetry_fresh
                 else 0.0
             )
+            source_p95_gap_ms = (
+                float(state.source_p95_gap_seconds) * 1000.0
+                if telemetry_fresh
+                else 0.0
+            )
         if len(samples) >= 20 and positive_samples:
             all_p95 = samples[
                 min(
@@ -710,6 +724,7 @@ class LiveANPRWorker:
             recognition_zone_m=config.get("recognition_zone_m", 10),
             source_fps=source_fps,
             source_max_gap_ms=source_max_gap_ms,
+            source_p95_gap_ms=source_p95_gap_ms,
             processing_p95_ms=p95_seconds * 1000.0,
             geometry_calibrated=bool(
                 int(config.get("recognition_zone_calibrated", 0) or 0)
