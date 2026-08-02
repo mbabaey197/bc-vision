@@ -41,12 +41,13 @@ def test_detector_latency_capacity_is_checked_separately_from_source():
         max_speed_kmh=150,
         recognition_zone_m=8,
         source_fps=30,
-        processing_p95_ms=50,
+        processing_p95_ms=30,
     )
 
     assert slow.source_sufficient is True
     assert slow.processing_sufficient is False
-    assert slow.expected_processed_observations == 2.4
+    assert slow.expected_processed_raw_frames == 2.4
+    assert slow.expected_processed_observations == 1.344
     assert "processing-capacity-insufficient" in slow.warning()
     assert fast.processing_sufficient is True
     assert fast.sufficient is True
@@ -56,9 +57,39 @@ def test_unknown_runtime_telemetry_does_not_raise_false_alarm():
     budget = calculate_frame_budget(
         max_speed_kmh=150,
         recognition_zone_m=10,
+        telemetry_required=True,
     )
 
     assert budget.source_fps == 0.0
     assert budget.processing_p95_ms == 0.0
-    assert budget.sufficient is True
-    assert budget.warning() == ""
+    assert budget.source_verified is False
+    assert budget.processing_verified is False
+    assert budget.sufficient is False
+    assert "source-fps-warming-up" in budget.warning()
+
+
+def test_uncalibrated_geometry_is_never_reported_safe():
+    budget = calculate_frame_budget(
+        max_speed_kmh=150,
+        recognition_zone_m=10,
+        source_fps=30,
+        processing_p95_ms=30,
+        geometry_calibrated=False,
+        telemetry_required=True,
+    )
+
+    assert budget.sufficient is False
+    assert "recognition-zone-uncalibrated" in budget.warning()
+
+
+def test_processing_budget_applies_quality_and_safety_allowance():
+    budget = calculate_frame_budget(
+        max_speed_kmh=150,
+        recognition_zone_m=8,
+        source_fps=30,
+        processing_p95_ms=50,
+    )
+
+    assert budget.expected_processed_raw_frames == 3.84
+    assert budget.expected_processed_observations == 2.15
+    assert budget.processing_sufficient is False
