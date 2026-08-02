@@ -93,3 +93,19 @@ def test_processing_budget_applies_quality_and_safety_allowance():
     assert budget.expected_processed_raw_frames == 3.84
     assert budget.expected_processed_observations == 2.15
     assert budget.processing_sufficient is False
+
+
+def test_long_source_gap_rejects_a_safe_average_fps():
+    budget = calculate_frame_budget(
+        max_speed_kmh=150,
+        recognition_zone_m=8,
+        source_fps=30,
+        source_max_gap_ms=200,
+        processing_p95_ms=30,
+        telemetry_required=True,
+    )
+
+    assert budget.source_sufficient is True
+    assert budget.cadence_sufficient is False
+    assert budget.sufficient is False
+    assert "source-cadence-insufficient" in budget.warning()
