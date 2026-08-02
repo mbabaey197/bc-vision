@@ -40,13 +40,25 @@ class FrameBudget:
     expected_raw_frames: float
     expected_usable_frames: float
     detector_capacity_fps: float
+    effective_processing_fps: float
+    expected_processed_raw_frames: float
     expected_processed_observations: float
+    geometry_calibrated: bool
+    telemetry_required: bool
+    source_verified: bool
+    processing_verified: bool
     source_sufficient: bool
     processing_sufficient: bool
 
     @property
     def sufficient(self) -> bool:
-        return self.source_sufficient and self.processing_sufficient
+        return (
+            self.geometry_calibrated
+            and self.source_verified
+            and self.processing_verified
+            and self.source_sufficient
+            and self.processing_sufficient
+        )
 
     def as_dict(self) -> dict:
         value = asdict(self)
@@ -55,6 +67,21 @@ class FrameBudget:
         return value
 
     def warning(self) -> str:
+        if not self.geometry_calibrated:
+            return (
+                "recognition-zone-uncalibrated: confirm the real readable "
+                "road distance for this camera"
+            )
+        if not self.source_verified:
+            return (
+                "source-fps-warming-up: waiting for a stable camera-rate "
+                "measurement"
+            )
+        if not self.processing_verified:
+            return (
+                "processing-capacity-warming-up: waiting for enough "
+                "end-to-end inference samples"
+            )
         if not self.source_sufficient:
             return (
                 "source-fps-insufficient: camera supplies "
@@ -79,11 +106,14 @@ def calculate_frame_budget(
     required_good_crops=3,
     usable_frame_ratio=0.70,
     safety_margin=1.25,
+    geometry_calibrated=True,
+    telemetry_required=False,
 ) -> FrameBudget:
     """Return the capture and processing budget for one calibrated camera.
 
     ``source_fps=0`` and ``processing_p95_ms=0`` mean that runtime telemetry is
-    not available yet. Unknown telemetry is not reported as a failure.
+    not available yet. Runtime callers set ``telemetry_required`` so unknown
+    measurements remain explicitly unverified instead of being called safe.
     """
 
     speed_kmh = _bounded(max_speed_kmh, 5.0, 300.0)
@@ -108,15 +138,19 @@ def calculate_frame_budget(
         if p95_ms > 0.0
         else 0.0
     )
-    processed = (
-        min(native_fps, detector_capacity) * zone_seconds
+    effective_processing_fps = (
+        min(native_fps, detector_capacity, float(recommended))
         if native_fps > 0.0 and detector_capacity > 0.0
         else 0.0
     )
+    processed_raw = effective_processing_fps * zone_seconds
+    processed = processed_raw * usable_ratio / margin
+    source_verified = native_fps > 0.0 or not telemetry_required
+    processing_verified = p95_ms > 0.0 or not telemetry_required
     source_sufficient = (
         True
         if native_fps <= 0.0
-        else native_fps + 0.25 >= minimum_native_fps
+        else native_fps >= minimum_native_fps
     )
     processing_sufficient = (
         True
@@ -139,7 +173,13 @@ def calculate_frame_budget(
         expected_raw_frames=round(expected_raw, 3),
         expected_usable_frames=round(expected_usable, 3),
         detector_capacity_fps=round(detector_capacity, 3),
+        effective_processing_fps=round(effective_processing_fps, 3),
+        expected_processed_raw_frames=round(processed_raw, 3),
         expected_processed_observations=round(processed, 3),
+        geometry_calibrated=bool(geometry_calibrated),
+        telemetry_required=bool(telemetry_required),
+        source_verified=bool(source_verified),
+        processing_verified=bool(processing_verified),
         source_sufficient=source_sufficient,
         processing_sufficient=processing_sufficient,
     )
