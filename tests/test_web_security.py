@@ -1024,7 +1024,18 @@ def test_uploaded_video_flows_through_worker_to_sqlite_and_dashboard(
         assert dashboard.status_code == 200
         assert f"id='anpr-{virtual_id}'" in dashboard.text
         assert "ویدئو: traffic" in dashboard.text
-        assert main.manager.streams[virtual_id].latest.startswith(b"\xff\xd8")
+        # RC24 does not spend CPU encoding dashboard JPEGs until the browser
+        # opens the MJPEG feed. Recognition still runs on every source frame.
+        stream = main.manager.streams[virtual_id]
+        assert stream.state.ai_submitted_frames > 0
+        assert stream.latest is None
+        preview = stream.frames()
+        try:
+            chunk = next(preview)
+            assert b"Content-Type: image/jpeg" in chunk
+            assert b"\xff\xd8" in chunk
+        finally:
+            preview.close()
     finally:
         if virtual_id is not None:
             main.manager.remove(virtual_id)
