@@ -71,6 +71,93 @@ def test_start_enabled_cameras_uses_persistent_settings(
     ]
 
 
+def test_native_ai_ingest_is_independent_from_eight_fps_preview(
+    monkeypatch,
+):
+    stream = CameraStream(
+        camera_id=4,
+        url="rtsp://gate",
+        name="Gate",
+        fps=8,
+    )
+    stream._preview_viewers = 1
+    submitted = []
+    encoded = []
+    monkeypatch.setattr(
+        app.ai.live_worker,
+        "submit_live_frame",
+        lambda camera_id, name, frame: submitted.append(
+            (camera_id, name, int(frame[0, 0, 0]))
+        ),
+    )
+    monkeypatch.setattr(
+        stream,
+        "_encode",
+        lambda frame: encoded.append(int(frame[0, 0, 0])) or b"jpeg",
+    )
+
+    for index in range(30):
+        stream._publish(
+            np.full((10, 20, 3), index, dtype=np.uint8),
+            captured_at=index / 30.0,
+        )
+
+    assert len(submitted) == 30
+    assert len(encoded) == 8
+    assert stream.state.decoded_frames == 30
+    assert stream.state.ai_submitted_frames == 30
+    assert stream.state.preview_frames == 8
+
+
+def test_closed_dashboard_skips_jpeg_but_anpr_keeps_running(
+    monkeypatch,
+):
+    stream = CameraStream(5, "rtsp://gate", "Gate", fps=8)
+    submitted = []
+    encoded = []
+    monkeypatch.setattr(
+        app.ai.live_worker,
+        "submit_live_frame",
+        lambda *_args: submitted.append(True),
+    )
+    monkeypatch.setattr(
+        stream,
+        "_encode",
+        lambda _frame: encoded.append(True) or b"jpeg",
+    )
+
+    for index in range(20):
+        stream._publish(
+            np.zeros((10, 20, 3), dtype=np.uint8),
+            captured_at=index / 25.0,
+        )
+
+    assert len(submitted) == 20
+    assert encoded == []
+    assert stream.state.preview_frames == 0
+
+
+def test_preview_encoder_failure_cannot_drop_ai_frame(monkeypatch):
+    stream = CameraStream(6, "rtsp://gate", "Gate", fps=8)
+    stream._preview_viewers = 1
+    submitted = []
+    monkeypatch.setattr(
+        app.ai.live_worker,
+        "submit_live_frame",
+        lambda *_args: submitted.append(True),
+    )
+    monkeypatch.setattr(stream, "_encode", lambda _frame: None)
+
+    stream._publish(
+        np.zeros((10, 20, 3), dtype=np.uint8),
+        captured_at=0.0,
+    )
+
+    assert submitted == [True]
+    assert stream.state.ai_submitted_frames == 1
+    assert stream.state.preview_frames == 0
+
+
 def test_stop_all_stops_every_stream():
     manager = StreamManager()
 
@@ -97,6 +184,23 @@ def test_stop_all_stops_every_stream():
     assert first.waited
     assert second.waited
     assert manager.streams == {}
+
+
+def test_preview_settings_change_does_not_restart_anpr_stream():
+    manager = StreamManager()
+    stream = CameraStream(11, "rtsp://gate", "Gate", 640, 5, 70)
+    stream._key = ("rtsp://gate", "Gate", 640, 5, 70)
+    stream.latest = b"old"
+    manager.streams = {11: stream}
+
+    manager.configure_preview(960, 8, 82)
+
+    assert manager.streams[11] is stream
+    assert stream.width == 960
+    assert stream.preview_fps == 8
+    assert stream.quality == 82
+    assert stream.latest is None
+    assert stream._key == ("rtsp://gate", "Gate", 960, 8, 82)
 
 
 def test_remove_can_wait_for_uploaded_video_stream_shutdown():
