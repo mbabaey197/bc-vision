@@ -1037,6 +1037,7 @@ def test_status_reports_150_kmh_capture_and_processing_capacity(
         },
         source_fps_ema=25.0,
         source_max_gap_seconds=0.04,
+        source_p95_gap_seconds=0.04,
         last_received_at=time.monotonic(),
     )
     state.processing_samples.extend([0.03] * 20)
@@ -1067,12 +1068,14 @@ def test_source_rate_window_is_not_biased_by_rtsp_jitter():
 
     assert 19.5 <= state.source_fps_ema <= 20.5
     assert 0.089 <= state.source_max_gap_seconds <= 0.091
+    assert 0.089 <= state.source_p95_gap_seconds <= 0.091
 
 
 def test_source_rate_resets_after_reconnect_gap():
     state = live_worker._CameraState(
         source_fps_ema=30.0,
         source_max_gap_seconds=0.04,
+        source_p95_gap_seconds=0.04,
         last_received_at=10.0,
     )
     state.source_timestamps.extend([8.0, 9.0, 10.0])
@@ -1081,6 +1084,7 @@ def test_source_rate_resets_after_reconnect_gap():
 
     assert state.source_fps_ema == 0.0
     assert state.source_max_gap_seconds == 0.0
+    assert state.source_p95_gap_seconds == 0.0
     assert list(state.source_timestamps) == [13.0]
 
 
@@ -1098,6 +1102,7 @@ def test_empty_scene_latency_cannot_verify_positive_path_capacity(
         },
         source_fps_ema=25.0,
         source_max_gap_seconds=0.04,
+        source_p95_gap_seconds=0.04,
         last_received_at=time.monotonic(),
     )
     state.processing_samples.extend([0.02] * 20)
