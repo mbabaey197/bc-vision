@@ -6,7 +6,14 @@ on:
     branches:
       - agent/anpr-rescue-plate-search-rc19
     paths:
-      - "installer/BCVision.iss"
+      - "app/**"
+      - "installer/**"
+      - "scripts/**"
+      - "tests/**"
+      - "launcher.py"
+      - "VERSION"
+      - "BUILD_PORTABLE_EXE.bat"
+      - "requirements*.txt"
       - ".github/workflows/windows-full-installer-rc24.yml"
 
 permissions:
@@ -14,7 +21,7 @@ permissions:
 
 concurrency:
   group: windows-full-installer-rc24-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build-test-installer:
