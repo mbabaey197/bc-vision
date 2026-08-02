@@ -384,6 +384,7 @@ def init_db():
             "frame_step": "INTEGER NOT NULL DEFAULT 5",
             "max_vehicle_speed_kmh": "REAL NOT NULL DEFAULT 150",
             "recognition_zone_m": "REAL NOT NULL DEFAULT 10",
+            "recognition_zone_calibrated": "INTEGER NOT NULL DEFAULT 0",
             "duplicate_seconds": "REAL NOT NULL DEFAULT 30",
             "roi_x": "INTEGER NOT NULL DEFAULT 0",
             "roi_y": "INTEGER NOT NULL DEFAULT 0",
