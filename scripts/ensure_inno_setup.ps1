@@ -6,13 +6,13 @@ param(
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$knownPaths = @(
+$knownPath = @(
     "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
     "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
-) | Where-Object { $_ -and (Test-Path $_) }
+) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
 
-if ($knownPaths.Count -gt 0) {
-    Write-Output $knownPaths[0]
+if ($knownPath) {
+    Write-Output $knownPath
     exit 0
 }
 

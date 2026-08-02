@@ -4,7 +4,6 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.config import DB_PATH
-from app.security import hash_password
 
 
 def connect():
@@ -284,6 +283,7 @@ def init_db():
             "locked_until": "TEXT",
             "last_login": "TEXT",
             "created_at": "TEXT",
+            "session_version": "INTEGER NOT NULL DEFAULT 0",
         })
         con.execute(
             "UPDATE users SET role='admin' "
@@ -382,6 +382,9 @@ def init_db():
             "lpr_enabled": "INTEGER NOT NULL DEFAULT 1",
             "lpr_confidence": "INTEGER NOT NULL DEFAULT 60",
             "frame_step": "INTEGER NOT NULL DEFAULT 5",
+            "max_vehicle_speed_kmh": "REAL NOT NULL DEFAULT 150",
+            "recognition_zone_m": "REAL NOT NULL DEFAULT 10",
+            "recognition_zone_calibrated": "INTEGER NOT NULL DEFAULT 0",
             "duplicate_seconds": "REAL NOT NULL DEFAULT 30",
             "roi_x": "INTEGER NOT NULL DEFAULT 0",
             "roi_y": "INTEGER NOT NULL DEFAULT 0",
@@ -391,26 +394,12 @@ def init_db():
         })
         _backfill_event_metadata(con)
 
-        if con.execute(
-            "SELECT 1 FROM users WHERE username=?",
-            ("admin",),
-        ).fetchone() is None:
-            con.execute(
-                "INSERT INTO users(" 
-                "username,password_hash,display_name,is_admin"
-                ") VALUES(?,?,?,1)",
-                (
-                    "admin",
-                    hash_password("123456"),
-                    "مدیر سیستم",
-                ),
-            )
-
         defaults = {
             "company_name": "گیلاس آبی البرز",
             "dashboard_grid": "2",
             "dashboard_event_rows": "12",
             "live_fps": "5",
+            "dashboard_preview_fps": "8",
             "stream_width": "640",
             "jpeg_quality": "70",
             "storage_root": str(DB_PATH.parent),

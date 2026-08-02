@@ -71,15 +71,107 @@ def test_start_enabled_cameras_uses_persistent_settings(
     ]
 
 
+def test_native_ai_ingest_is_independent_from_eight_fps_preview(
+    monkeypatch,
+):
+    stream = CameraStream(
+        camera_id=4,
+        url="rtsp://gate",
+        name="Gate",
+        fps=8,
+    )
+    stream._preview_viewers = 1
+    submitted = []
+    encoded = []
+    monkeypatch.setattr(
+        app.ai.live_worker,
+        "submit_live_frame",
+        lambda camera_id, name, frame: submitted.append(
+            (camera_id, name, int(frame[0, 0, 0]))
+        ),
+    )
+    monkeypatch.setattr(
+        stream,
+        "_encode",
+        lambda frame: encoded.append(int(frame[0, 0, 0])) or b"jpeg",
+    )
+
+    for index in range(30):
+        stream._publish(
+            np.full((10, 20, 3), index, dtype=np.uint8),
+            captured_at=index / 30.0,
+        )
+
+    assert len(submitted) == 30
+    assert len(encoded) == 8
+    assert stream.state.decoded_frames == 30
+    assert stream.state.ai_submitted_frames == 30
+    assert stream.state.preview_frames == 8
+
+
+def test_closed_dashboard_skips_jpeg_but_anpr_keeps_running(
+    monkeypatch,
+):
+    stream = CameraStream(5, "rtsp://gate", "Gate", fps=8)
+    submitted = []
+    encoded = []
+    monkeypatch.setattr(
+        app.ai.live_worker,
+        "submit_live_frame",
+        lambda *_args: submitted.append(True),
+    )
+    monkeypatch.setattr(
+        stream,
+        "_encode",
+        lambda _frame: encoded.append(True) or b"jpeg",
+    )
+
+    for index in range(20):
+        stream._publish(
+            np.zeros((10, 20, 3), dtype=np.uint8),
+            captured_at=index / 25.0,
+        )
+
+    assert len(submitted) == 20
+    assert encoded == []
+    assert stream.state.preview_frames == 0
+
+
+def test_preview_encoder_failure_cannot_drop_ai_frame(monkeypatch):
+    stream = CameraStream(6, "rtsp://gate", "Gate", fps=8)
+    stream._preview_viewers = 1
+    submitted = []
+    monkeypatch.setattr(
+        app.ai.live_worker,
+        "submit_live_frame",
+        lambda *_args: submitted.append(True),
+    )
+    monkeypatch.setattr(stream, "_encode", lambda _frame: None)
+
+    stream._publish(
+        np.zeros((10, 20, 3), dtype=np.uint8),
+        captured_at=0.0,
+    )
+
+    assert submitted == [True]
+    assert stream.state.ai_submitted_frames == 1
+    assert stream.state.preview_frames == 0
+
+
 def test_stop_all_stops_every_stream():
     manager = StreamManager()
 
     class FakeStream:
         def __init__(self):
             self.stopped = False
+            self.waited = False
 
-        def stop(self):
+        def request_stop(self):
             self.stopped = True
+
+        def stop(self, wait=False):
+            self.stopped = True
+            self.waited = wait
 
     first = FakeStream()
     second = FakeStream()
@@ -89,7 +181,124 @@ def test_stop_all_stops_every_stream():
 
     assert first.stopped
     assert second.stopped
+    assert first.waited
+    assert second.waited
     assert manager.streams == {}
+
+
+def test_preview_settings_change_does_not_restart_anpr_stream():
+    manager = StreamManager()
+    stream = CameraStream(11, "rtsp://gate", "Gate", 640, 5, 70)
+    stream._key = ("rtsp://gate", "Gate", 640, 5, 70)
+    stream.latest = b"old"
+    manager.streams = {11: stream}
+
+    manager.configure_preview(960, 8, 82)
+
+    assert manager.streams[11] is stream
+    assert stream.width == 960
+    assert stream.preview_fps == 8
+    assert stream.quality == 82
+    assert stream.latest is None
+    assert stream._key == ("rtsp://gate", "Gate", 960, 8, 82)
+
+
+def test_remove_can_wait_for_uploaded_video_stream_shutdown():
+    manager = StreamManager()
+
+    class FakeStream:
+        def __init__(self):
+            self.waited = None
+
+        def stop(self, wait=False):
+            self.waited = wait
+            return True
+
+    stream = FakeStream()
+    manager.streams = {7: stream}
+
+    assert manager.remove(7, wait=True) is True
+    assert stream.waited is True
+    assert manager.streams == {}
+
+
+def test_remove_keeps_stream_reference_when_shutdown_times_out():
+    manager = StreamManager()
+
+    class FakeStream:
+        def stop(self, wait=False):
+            return False
+
+    stream = FakeStream()
+    manager.streams = {7: stream}
+
+    assert manager.remove(7,wait=True) is False
+    assert manager.streams[7] is stream
+
+
+def test_non_waiting_remove_allows_same_key_stream_to_restart(monkeypatch):
+    manager = StreamManager()
+    key = ("rtsp://gate","Gate",640,5,70)
+
+    class OldStream:
+        _key = key
+
+        def stop(self,wait=False):
+            return False
+
+    manager.streams = {7: OldStream()}
+    assert manager.remove(7,wait=False) is True
+    assert manager.streams == {}
+
+    created = []
+
+    class NewStream:
+        def __init__(self,*args):
+            self.args = args
+            self.started = False
+            created.append(self)
+
+        def start(self):
+            self.started = True
+
+    monkeypatch.setattr(app.streams,"CameraStream",NewStream)
+    stream = manager.get(7,"rtsp://gate","Gate",640,5,70)
+
+    assert stream is created[0]
+    assert stream.started is True
+    assert manager.streams[7] is stream
+
+
+def test_camera_stop_waits_for_decoder_before_worker(monkeypatch):
+    calls = []
+    stream = CameraStream(
+        camera_id=17,
+        url="video://sample.avi",
+        name="Uploaded video",
+    )
+
+    class FakeThread:
+        def __init__(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, _timeout):
+            calls.append("decoder")
+            self.alive = False
+
+    stream.thread = FakeThread()
+    monkeypatch.setattr(
+        app.ai.live_worker,
+        "stop_live_camera",
+        lambda camera_id, wait=False, timeout=0: calls.append(
+            ("worker",camera_id,wait)
+        ) or True,
+    )
+
+    assert stream.stop(wait=True) is True
+    assert calls == ["decoder",("worker",17,True)]
 
 
 def test_live_overlay_survives_stream_resize(monkeypatch):

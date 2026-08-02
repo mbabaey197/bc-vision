@@ -69,6 +69,85 @@ def test_equal_ocr_text_never_links_distant_vehicles():
     assert len(tracker.active_track_ids()) == 2
 
 
+def test_sparse_fast_vehicle_keeps_one_track_and_reaches_consensus():
+    """CPU frame skipping must not reset a fast plate on every inference."""
+
+    tracker = PlateConsensusTracker(
+        min_votes=3,
+        emit_unreadable=True,
+        min_confirmation_span_seconds=0.12,
+    )
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    observations = [
+        ("55-ط-629-74", (991, 258, 1114, 309)),
+        ("55-ط-639-24", (892, 341, 1021, 390)),
+        ("55-ط-639-74", (781, 428, 919, 493)),
+        ("55-ط-639-74", (666, 549, 813, 604)),
+        ("55-ط-639-74", (505, 688, 665, 740)),
+    ]
+    emitted = []
+    track_ids = []
+    for index, (plate, bbox) in enumerate(observations):
+        row = result(plate, 0.90, bbox=bbox)
+        row.update({
+            "ocr_confidence": 0.90,
+            "detector_confidence": 0.45,
+            "plate_hypotheses": [{
+                "plate_norm": "55ط63974",
+                "score": 0.40,
+            }],
+        })
+        emitted.extend(
+            tracker.update(
+                [row],
+                timestamp=index * 0.22,
+                frame=frame,
+            )
+        )
+        track_ids.append(row["track_id"])
+
+    confirmed = [
+        row
+        for row in emitted
+        if row.get("plate_norm") == "55ط63974"
+    ]
+    assert len(set(track_ids)) == 1
+    assert len(confirmed) == 1
+    assert confirmed[0]["consensus_votes"] >= 3
+
+
+def test_low_rank_beam_guess_cannot_join_close_successor():
+    """A weak shared Beam tail must not merge two one-frame vehicles."""
+
+    tracker = PlateConsensusTracker(
+        min_votes=3,
+        max_age_seconds=3.0,
+    )
+
+    def weak_detection(bbox):
+        row = result("ناخوانا", 0.35, bbox=bbox)
+        row.update({
+            "valid": False,
+            "plate": "",
+            "plate_norm": "",
+            "raw_guess_norm": "",
+            "detector_confidence": 0.45,
+            "hypotheses_accepted_for_consensus": False,
+            "plate_hypotheses": [{
+                "plate_norm": "55ط63974",
+                "score": 0.08,
+            }],
+        })
+        return row
+
+    first = weak_detection((500, 100, 600, 140))
+    tracker.update([first], timestamp=0.0)
+    successor = weak_detection((390, 170, 490, 210))
+    tracker.update([successor], timestamp=0.22)
+
+    assert first["track_id"] != successor["track_id"]
+
+
 def test_position_voting_corrects_lam_tah_confusion():
     tracker = PlateConsensusTracker(emit_cooldown=10)
     observations = [
@@ -516,6 +595,59 @@ def test_complete_low_confidence_hypothesis_is_exposed_for_review(
     assert rows[0]["needs_review"] is True
     assert rows[0]["raw_guess_norm"] == "31ط55674"
     assert rows[0]["read_status"] == "experimental-guess"
+
+
+def test_rejected_crnn_beam_hypothesis_reaches_operator_review(
+    monkeypatch,
+):
+    crop = np.full((44, 170, 3), 145, dtype=np.uint8)
+    monkeypatch.setattr(
+        "app.ai.pipeline.detect_plates",
+        lambda *_args, **_kwargs: [{
+            "crop": crop,
+            "bbox": (10, 20, 180, 64),
+            "confidence": 0.76,
+            "method": "yolov8-onnx-light",
+            "direct_ocr_attempted": False,
+        }],
+    )
+    monkeypatch.setattr(
+        "app.ai.pipeline.read_plate_candidate",
+        lambda *_args, **_kwargs: (
+            "",
+            0.0,
+            "none",
+            {
+                "plate_hypotheses": [{
+                    "plate_norm": "31ط55674",
+                    "confidence": 0.47,
+                    "score": 0.47,
+                    "engine": "crnn-onnx-beam",
+                }],
+                "crnn": {
+                    "decoder": "ctc-constrained-beam",
+                    "views": 2,
+                    "reason": "ambiguous-character-margin",
+                    "position_details": [
+                        {"margin": 0.04}
+                        for _index in range(8)
+                    ],
+                },
+            },
+        ),
+    )
+
+    row = process_frame(
+        np.full((100, 220, 3), 100, dtype=np.uint8)
+    )[0]
+
+    assert row["valid"] is False
+    assert row["raw_guess_norm"] == "31ط55674"
+    assert row["raw_guess_engine"] == "crnn-onnx-beam"
+    assert row["ocr_decoder"] == "ctc-constrained-beam"
+    assert row["ocr_variant_views"] == 2
+    assert row["ocr_rejection_reason"] == "ambiguous-character-margin"
+    assert row["ocr_position_margin"] == 0.04
 
 
 def test_position_only_ambiguity_stays_unconfirmed_for_review():

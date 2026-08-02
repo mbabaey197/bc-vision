@@ -323,6 +323,7 @@ def test_uploaded_video_stream_produces_real_jpeg(tmp_path):
         "Dashboard upload",
         fps=30,
     )
+    stream._preview_viewers = 1
     stream.start()
     for _ in range(100):
         if stream.latest:

@@ -2,6 +2,7 @@ import time
 import sqlite3
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -719,6 +720,93 @@ def test_slow_cpu_keeps_three_observations_for_consensus(monkeypatch):
     assert state.tracker.max_age_seconds == 6.0
 
 
+def test_remove_invalidates_inflight_video_inference(monkeypatch):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState()
+    state.config = {
+        "enabled": 1,
+        "lpr_enabled": 1,
+        "lpr_confidence": 50,
+        "duplicate_seconds": 0,
+        "roi_x": 0,
+        "roi_y": 0,
+        "roi_w": 100,
+        "roi_h": 100,
+    }
+    camera_id = 91
+    worker._states[camera_id] = state
+    started = threading.Event()
+    release = threading.Event()
+    frame = np.full((90, 160, 3), 80, dtype=np.uint8)
+    result = {
+        "plate": "12-ب-345-67",
+        "plate_norm": "12ب34567",
+        "valid": True,
+        "confidence": 0.90,
+        "quality_score": 0.80,
+        "bbox": (30, 30, 130, 65),
+        "crop": frame[30:65, 30:130].copy(),
+        "method": "blocked-video-test",
+    }
+
+    def blocked_process(*_args, **_kwargs):
+        started.set()
+        assert release.wait(2.0)
+        return [dict(result)]
+
+    persisted = []
+    monkeypatch.setattr(live_worker, "process_frame", blocked_process)
+    monkeypatch.setattr(
+        live_worker.engine_router,
+        "process",
+        lambda _source, baseline, **_kwargs: SimpleNamespace(
+            primary=baseline(),
+            shadow=[],
+            mode="baseline",
+            error="",
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_persist",
+        lambda *_args, **_kwargs: persisted.append(True) or 1,
+    )
+    processing = threading.Thread(
+        target=worker._process,
+        args=(state, (camera_id, "old video", frame, 0.0)),
+        daemon=True,
+    )
+    state.busy = True
+    state.processing_done.clear()
+    processing.start()
+    assert started.wait(2.0)
+
+    removed = []
+    removal = threading.Thread(
+        target=lambda: removed.append(
+            worker.remove(camera_id,wait=True,timeout=2.0)
+        ),
+        daemon=True,
+    )
+    removal.start()
+    for _ in range(100):
+        if state.cancelled:
+            break
+        time.sleep(0.005)
+    assert state.cancelled is True
+    assert removal.is_alive()
+    release.set()
+    processing.join(2.0)
+    removal.join(2.0)
+    worker.shutdown()
+
+    assert not processing.is_alive()
+    assert not removal.is_alive()
+    assert removed == [True]
+    assert persisted == []
+    assert worker.status(camera_id)["active"] is False
+
+
 def test_latest_detection_is_available_for_live_overlay(monkeypatch):
     worker = live_worker.LiveANPRWorker(max_workers=1)
     state = live_worker._CameraState()
@@ -807,7 +895,7 @@ def test_submit_adaptively_spaces_slow_cpu_inference(monkeypatch):
     assert len(submitted) == 2
 
 
-def test_every_received_frame_can_improve_pending_ocr_selection(
+def test_busy_worker_keeps_only_the_latest_pending_frame(
     monkeypatch,
 ):
     worker = live_worker.LiveANPRWorker(max_workers=1)
@@ -827,11 +915,6 @@ def test_every_received_frame_can_improve_pending_ocr_selection(
         "_config",
         lambda _camera_id, current, _now: current.config,
     )
-    monkeypatch.setattr(
-        worker,
-        "_selection_score",
-        lambda frame, _config: float(frame[0, 0, 0]),
-    )
     times = iter((200.0, 200.1, 200.2))
     monkeypatch.setattr(
         live_worker.time,
@@ -849,7 +932,8 @@ def test_every_received_frame_can_improve_pending_ocr_selection(
     worker.shutdown()
 
     assert state.frame_counter == 3
-    assert selected == 200
+    assert selected == 80
+    assert state.pending_replacements == 2
 # RC7-RC9 regression coverage for adaptive live-frame processing.
 
 
@@ -937,6 +1021,201 @@ def test_no_plate_backoff_grows_but_recognition_stays_responsive():
     assert delay(0.25, 3) == 1.60
     assert delay(0.25, 4) == 3.20
     assert delay(0.25, 10) == 3.20
+
+
+def test_status_reports_150_kmh_capture_and_processing_capacity(
+    monkeypatch,
+):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState(
+        config={
+            "enabled": 1,
+            "lpr_enabled": 1,
+            "max_vehicle_speed_kmh": 150,
+            "recognition_zone_m": 10,
+            "recognition_zone_calibrated": 1,
+        },
+        source_fps_ema=25.0,
+        source_max_gap_seconds=0.04,
+        source_p95_gap_seconds=0.04,
+        last_received_at=time.monotonic(),
+    )
+    state.processing_samples.extend([0.03] * 20)
+    state.positive_processing_samples.extend([0.03] * 3)
+    worker._states[31] = state
+    monkeypatch.setattr(worker, "_models", lambda: {"ready": True})
+
+    sampling = worker.status(31)["sampling"]
+    worker.shutdown()
+
+    assert sampling["recommended_capture_fps"] == 25
+    assert sampling["expected_raw_frames"] == 6.0
+    assert sampling["source_sufficient"] is True
+    assert sampling["processing_sufficient"] is True
+    assert sampling["warning"] == ""
+
+
+def test_source_rate_window_is_not_biased_by_rtsp_jitter():
+    state = live_worker._CameraState()
+    timestamp = 100.0
+    live_worker.LiveANPRWorker._observe_source_rate(state, timestamp)
+    for interval in [0.01, 0.09] * 40:
+        timestamp += interval
+        live_worker.LiveANPRWorker._observe_source_rate(
+            state,
+            timestamp,
+        )
+
+    assert 19.5 <= state.source_fps_ema <= 20.5
+    assert 0.089 <= state.source_max_gap_seconds <= 0.091
+    assert 0.089 <= state.source_p95_gap_seconds <= 0.091
+
+
+def test_source_rate_resets_after_reconnect_gap():
+    state = live_worker._CameraState(
+        source_fps_ema=30.0,
+        source_max_gap_seconds=0.04,
+        source_p95_gap_seconds=0.04,
+        last_received_at=10.0,
+    )
+    state.source_timestamps.extend([8.0, 9.0, 10.0])
+
+    live_worker.LiveANPRWorker._observe_source_rate(state, 13.0)
+
+    assert state.source_fps_ema == 0.0
+    assert state.source_max_gap_seconds == 0.0
+    assert state.source_p95_gap_seconds == 0.0
+    assert list(state.source_timestamps) == [13.0]
+
+
+def test_empty_scene_latency_cannot_verify_positive_path_capacity(
+    monkeypatch,
+):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState(
+        config={
+            "enabled": 1,
+            "lpr_enabled": 1,
+            "max_vehicle_speed_kmh": 150,
+            "recognition_zone_m": 10,
+            "recognition_zone_calibrated": 1,
+        },
+        source_fps_ema=25.0,
+        source_max_gap_seconds=0.04,
+        source_p95_gap_seconds=0.04,
+        last_received_at=time.monotonic(),
+    )
+    state.processing_samples.extend([0.02] * 20)
+    worker._states[32] = state
+    monkeypatch.setattr(worker, "_models", lambda: {"ready": True})
+
+    sampling = worker.status(32)["sampling"]
+    worker.shutdown()
+
+    assert sampling["processing_verified"] is False
+    assert sampling["sufficient"] is False
+    assert "plate-positive" in sampling["warning"]
+
+
+def test_slow_burst_does_not_pay_capture_interval_twice(monkeypatch):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState(
+        config={
+            "enabled": 1,
+            "lpr_enabled": 1,
+            "max_vehicle_speed_kmh": 150,
+            "recognition_zone_m": 10,
+            "recognition_zone_calibrated": 1,
+            "lpr_confidence": 50,
+            "duplicate_seconds": 0,
+            "roi_x": 0,
+            "roi_y": 0,
+            "roi_w": 100,
+            "roi_h": 100,
+        },
+        busy=True,
+        burst_frames_remaining=2,
+    )
+    worker._states[41] = state
+    frame = np.zeros((32, 64, 3), dtype=np.uint8)
+
+    def slow_empty(*_args, **_kwargs):
+        time.sleep(0.06)
+        return SimpleNamespace(
+            primary=[],
+            shadow=[],
+            mode="baseline",
+            error="",
+        )
+
+    monkeypatch.setattr(live_worker.engine_router, "process", slow_empty)
+    started_at = time.monotonic()
+    state.last_submitted_at = started_at
+    worker._process(state, (41, "burst", frame, started_at))
+    finished_at = time.monotonic()
+    worker.shutdown()
+
+    assert state.next_inference_at <= finished_at + 0.01
+
+
+def test_real_finalizer_dispatches_latest_pending_frame(monkeypatch):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState(
+        config={
+            "enabled": 1,
+            "lpr_enabled": 1,
+            "max_vehicle_speed_kmh": 150,
+            "recognition_zone_m": 10,
+            "recognition_zone_calibrated": 1,
+            "lpr_confidence": 50,
+            "duplicate_seconds": 0,
+            "roi_x": 0,
+            "roi_y": 0,
+            "roi_w": 100,
+            "roi_h": 100,
+        },
+        busy=True,
+        burst_frames_remaining=2,
+    )
+    worker._states[42] = state
+    first = np.zeros((32, 64, 3), dtype=np.uint8)
+    latest = np.full((32, 64, 3), 7, dtype=np.uint8)
+    activity = SimpleNamespace(
+        wake_inference=True,
+        exclusion_mask=None,
+    )
+    now = time.monotonic()
+    state.last_submitted_at = now - 0.10
+    state.pending = (42, "burst", latest, now, 0.0, activity, 0)
+    dispatched = threading.Event()
+    submitted = []
+
+    monkeypatch.setattr(
+        live_worker.engine_router,
+        "process",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            primary=[],
+            shadow=[],
+            mode="baseline",
+            error="",
+        ),
+    )
+
+    def record_submit(_function, _state, payload):
+        submitted.append(payload)
+        dispatched.set()
+        return SimpleNamespace()
+
+    monkeypatch.setattr(worker._executor, "submit", record_submit)
+    worker._process(
+        state,
+        (42, "burst", first, now - 0.02, 0.0, activity, 0),
+    )
+    assert dispatched.wait(0.5)
+    worker.shutdown()
+
+    assert int(submitted[0][2][0, 0, 0]) == 7
+    assert submitted[0][4] > 0.0
 
 
 def test_motion_wakes_camera_during_long_empty_scene_backoff(

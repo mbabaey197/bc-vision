@@ -164,7 +164,12 @@ def test_old_database_migrates_without_data_loss(
             item[1]
             for item in con.execute("PRAGMA table_info(cameras)")
         }
-        assert "city" in camera_columns
+        assert {
+            "city",
+            "max_vehicle_speed_kmh",
+            "recognition_zone_m",
+            "recognition_zone_calibrated",
+        } <= camera_columns
         assert con.execute(
             "SELECT city FROM cameras WHERE id=7"
         ).fetchone()[0] == ""
@@ -172,6 +177,10 @@ def test_old_database_migrates_without_data_loss(
             "SELECT COUNT(*) FROM users "
             "WHERE username='existing'"
         ).fetchone()[0] == 1
+        assert con.execute(
+            "SELECT value FROM settings "
+            "WHERE key='dashboard_preview_fps'"
+        ).fetchone()[0] == "8"
         indexes = {
             row[1]
             for row in con.execute(
@@ -198,6 +207,9 @@ def test_new_database_has_no_automatic_demo_camera(
     with sqlite3.connect(db_path) as con:
         assert con.execute(
             "SELECT COUNT(*) FROM cameras"
+        ).fetchone()[0] == 0
+        assert con.execute(
+            "SELECT COUNT(*) FROM users"
         ).fetchone()[0] == 0
         assert con.execute(
             "SELECT value FROM settings "
