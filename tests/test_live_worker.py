@@ -1036,8 +1036,11 @@ def test_status_reports_150_kmh_capture_and_processing_capacity(
             "recognition_zone_calibrated": 1,
         },
         source_fps_ema=25.0,
+        source_max_gap_seconds=0.04,
+        last_received_at=time.monotonic(),
     )
     state.processing_samples.extend([0.03] * 20)
+    state.positive_processing_samples.extend([0.03] * 3)
     worker._states[31] = state
     monkeypatch.setattr(worker, "_models", lambda: {"ready": True})
 
@@ -1063,6 +1066,50 @@ def test_source_rate_window_is_not_biased_by_rtsp_jitter():
         )
 
     assert 19.5 <= state.source_fps_ema <= 20.5
+    assert 0.089 <= state.source_max_gap_seconds <= 0.091
+
+
+def test_source_rate_resets_after_reconnect_gap():
+    state = live_worker._CameraState(
+        source_fps_ema=30.0,
+        source_max_gap_seconds=0.04,
+        last_received_at=10.0,
+    )
+    state.source_timestamps.extend([8.0, 9.0, 10.0])
+
+    live_worker.LiveANPRWorker._observe_source_rate(state, 13.0)
+
+    assert state.source_fps_ema == 0.0
+    assert state.source_max_gap_seconds == 0.0
+    assert list(state.source_timestamps) == [13.0]
+
+
+def test_empty_scene_latency_cannot_verify_positive_path_capacity(
+    monkeypatch,
+):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState(
+        config={
+            "enabled": 1,
+            "lpr_enabled": 1,
+            "max_vehicle_speed_kmh": 150,
+            "recognition_zone_m": 10,
+            "recognition_zone_calibrated": 1,
+        },
+        source_fps_ema=25.0,
+        source_max_gap_seconds=0.04,
+        last_received_at=time.monotonic(),
+    )
+    state.processing_samples.extend([0.02] * 20)
+    worker._states[32] = state
+    monkeypatch.setattr(worker, "_models", lambda: {"ready": True})
+
+    sampling = worker.status(32)["sampling"]
+    worker.shutdown()
+
+    assert sampling["processing_verified"] is False
+    assert sampling["sufficient"] is False
+    assert "plate-positive" in sampling["warning"]
 
 
 def test_slow_burst_does_not_pay_capture_interval_twice(monkeypatch):
