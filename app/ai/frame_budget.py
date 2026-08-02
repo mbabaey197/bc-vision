@@ -30,6 +30,7 @@ class FrameBudget:
     recognition_zone_m: float
     source_fps: float
     source_max_gap_ms: float
+    source_p95_gap_ms: float
     processing_p95_ms: float
     required_good_crops: int
     usable_frame_ratio: float
@@ -95,9 +96,10 @@ class FrameBudget:
             )
         if not self.cadence_sufficient:
             return (
-                "source-cadence-insufficient: the camera paused for "
-                f"{self.source_max_gap_ms:.0f} ms inside a "
-                f"{self.zone_seconds * 1000.0:.0f} ms recognition window"
+                "source-cadence-insufficient: p95 frame gap is "
+                f"{self.source_p95_gap_ms:.0f} ms (budget allows about "
+                f"{1000.0 / self.minimum_native_fps:.0f} ms); maximum "
+                f"observed gap is {self.source_max_gap_ms:.0f} ms"
             )
         if not self.processing_verified:
             return (
@@ -119,6 +121,7 @@ def calculate_frame_budget(
     recognition_zone_m=10.0,
     source_fps=0.0,
     source_max_gap_ms=0.0,
+    source_p95_gap_ms=0.0,
     processing_p95_ms=0.0,
     required_good_crops=3,
     usable_frame_ratio=0.70,
@@ -137,6 +140,7 @@ def calculate_frame_budget(
     zone_m = _bounded(recognition_zone_m, 1.0, 100.0)
     native_fps = _bounded(source_fps, 0.0, 240.0)
     max_gap_ms = _bounded(source_max_gap_ms, 0.0, 60_000.0)
+    p95_gap_ms = _bounded(source_p95_gap_ms, 0.0, 60_000.0)
     p95_ms = _bounded(processing_p95_ms, 0.0, 60_000.0)
     good_crops = int(_bounded(required_good_crops, 3, 8))
     usable_ratio = _bounded(usable_frame_ratio, 0.35, 1.0)
@@ -164,7 +168,10 @@ def calculate_frame_budget(
     processed_raw = effective_processing_fps * zone_seconds
     processed = processed_raw * usable_ratio / margin
     source_verified = native_fps > 0.0 or not telemetry_required
-    cadence_verified = max_gap_ms > 0.0 or not telemetry_required
+    cadence_verified = (
+        (max_gap_ms > 0.0 and p95_gap_ms > 0.0)
+        or not telemetry_required
+    )
     processing_verified = p95_ms > 0.0 or not telemetry_required
     source_sufficient = (
         True
@@ -173,8 +180,12 @@ def calculate_frame_budget(
     )
     cadence_sufficient = (
         True
-        if max_gap_ms <= 0.0
-        else max_gap_ms / 1000.0 < zone_seconds
+        if max_gap_ms <= 0.0 or p95_gap_ms <= 0.0
+        else (
+            max_gap_ms / 1000.0 < zone_seconds
+            and p95_gap_ms / 1000.0
+            <= 1.0 / minimum_native_fps
+        )
     )
     processing_sufficient = (
         True
@@ -187,6 +198,7 @@ def calculate_frame_budget(
         recognition_zone_m=round(zone_m, 3),
         source_fps=round(native_fps, 3),
         source_max_gap_ms=round(max_gap_ms, 3),
+        source_p95_gap_ms=round(p95_gap_ms, 3),
         processing_p95_ms=round(p95_ms, 3),
         required_good_crops=good_crops,
         usable_frame_ratio=round(usable_ratio, 3),
