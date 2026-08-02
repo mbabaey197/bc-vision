@@ -29,6 +29,7 @@ class FrameBudget:
     max_speed_kmh: float
     recognition_zone_m: float
     source_fps: float
+    source_max_gap_ms: float
     processing_p95_ms: float
     required_good_crops: int
     usable_frame_ratio: float
@@ -46,8 +47,10 @@ class FrameBudget:
     geometry_calibrated: bool
     telemetry_required: bool
     source_verified: bool
+    cadence_verified: bool
     processing_verified: bool
     source_sufficient: bool
+    cadence_sufficient: bool
     processing_sufficient: bool
 
     @property
@@ -55,8 +58,10 @@ class FrameBudget:
         return (
             self.geometry_calibrated
             and self.source_verified
+            and self.cadence_verified
             and self.processing_verified
             and self.source_sufficient
+            and self.cadence_sufficient
             and self.processing_sufficient
         )
 
@@ -77,21 +82,32 @@ class FrameBudget:
                 "source-fps-warming-up: waiting for a stable camera-rate "
                 "measurement"
             )
-        if not self.processing_verified:
-            return (
-                "processing-capacity-warming-up: waiting for enough "
-                "end-to-end inference samples"
-            )
         if not self.source_sufficient:
             return (
                 "source-fps-insufficient: camera supplies "
                 f"{self.source_fps:.1f} FPS but this road geometry needs "
                 f"about {self.recommended_capture_fps} FPS"
             )
+        if not self.cadence_verified:
+            return (
+                "source-cadence-warming-up: waiting for a stable frame-gap "
+                "measurement"
+            )
+        if not self.cadence_sufficient:
+            return (
+                "source-cadence-insufficient: the camera paused for "
+                f"{self.source_max_gap_ms:.0f} ms inside a "
+                f"{self.zone_seconds * 1000.0:.0f} ms recognition window"
+            )
+        if not self.processing_verified:
+            return (
+                "processing-capacity-warming-up: waiting for enough "
+                "end-to-end samples including a plate-positive path"
+            )
         if not self.processing_sufficient:
             return (
                 "processing-capacity-insufficient: estimated detector "
-                f"capacity yields {self.expected_processed_observations:.1f} "
+                f"capacity yields {self.expected_processed_observations:.2f} "
                 f"observations; at least {self.required_good_crops} are needed"
             )
         return ""
@@ -102,6 +118,7 @@ def calculate_frame_budget(
     max_speed_kmh=150.0,
     recognition_zone_m=10.0,
     source_fps=0.0,
+    source_max_gap_ms=0.0,
     processing_p95_ms=0.0,
     required_good_crops=3,
     usable_frame_ratio=0.70,
@@ -119,6 +136,7 @@ def calculate_frame_budget(
     speed_kmh = _bounded(max_speed_kmh, 5.0, 300.0)
     zone_m = _bounded(recognition_zone_m, 1.0, 100.0)
     native_fps = _bounded(source_fps, 0.0, 240.0)
+    max_gap_ms = _bounded(source_max_gap_ms, 0.0, 60_000.0)
     p95_ms = _bounded(processing_p95_ms, 0.0, 60_000.0)
     good_crops = int(_bounded(required_good_crops, 3, 8))
     usable_ratio = _bounded(usable_frame_ratio, 0.35, 1.0)
@@ -146,11 +164,17 @@ def calculate_frame_budget(
     processed_raw = effective_processing_fps * zone_seconds
     processed = processed_raw * usable_ratio / margin
     source_verified = native_fps > 0.0 or not telemetry_required
+    cadence_verified = max_gap_ms > 0.0 or not telemetry_required
     processing_verified = p95_ms > 0.0 or not telemetry_required
     source_sufficient = (
         True
         if native_fps <= 0.0
         else native_fps >= minimum_native_fps
+    )
+    cadence_sufficient = (
+        True
+        if max_gap_ms <= 0.0
+        else max_gap_ms / 1000.0 < zone_seconds
     )
     processing_sufficient = (
         True
@@ -162,6 +186,7 @@ def calculate_frame_budget(
         max_speed_kmh=round(speed_kmh, 3),
         recognition_zone_m=round(zone_m, 3),
         source_fps=round(native_fps, 3),
+        source_max_gap_ms=round(max_gap_ms, 3),
         processing_p95_ms=round(p95_ms, 3),
         required_good_crops=good_crops,
         usable_frame_ratio=round(usable_ratio, 3),
@@ -179,7 +204,9 @@ def calculate_frame_budget(
         geometry_calibrated=bool(geometry_calibrated),
         telemetry_required=bool(telemetry_required),
         source_verified=bool(source_verified),
+        cadence_verified=bool(cadence_verified),
         processing_verified=bool(processing_verified),
         source_sufficient=source_sufficient,
+        cadence_sufficient=cadence_sufficient,
         processing_sufficient=processing_sufficient,
     )
