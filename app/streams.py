@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -66,6 +67,7 @@ class CameraStream:
         self._next_preview_at = 0.0
         self._last_source_at = 0.0
         self._source_fps_ema = 0.0
+        self._source_timestamps = deque(maxlen=240)
         self._overlay_rows: list[dict] = []
         self._overlay_gray = None
         self._overlay_revision = 0
@@ -518,17 +520,21 @@ class CameraStream:
 
     def _observe_source_frame(self, captured_at):
         self.state.decoded_frames += 1
-        if self._last_source_at > 0.0:
-            interval = float(captured_at) - self._last_source_at
-            if 1.0 / 240.0 <= interval <= 2.0:
-                instant_fps = 1.0 / interval
-                if self._source_fps_ema:
-                    self._source_fps_ema = (
-                        self._source_fps_ema * 0.85
-                        + instant_fps * 0.15
-                    )
-                else:
-                    self._source_fps_ema = instant_fps
+        self._source_timestamps.append(float(captured_at))
+        while (
+            len(self._source_timestamps) > 2
+            and float(captured_at) - self._source_timestamps[0] > 3.0
+        ):
+            self._source_timestamps.popleft()
+        if len(self._source_timestamps) >= 5:
+            elapsed = (
+                self._source_timestamps[-1]
+                - self._source_timestamps[0]
+            )
+            if elapsed >= 2.0:
+                self._source_fps_ema = (
+                    (len(self._source_timestamps) - 1) / elapsed
+                )
         self._last_source_at = float(captured_at)
         self.state.source_fps = self._source_fps_ema
 
