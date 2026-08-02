@@ -168,6 +168,7 @@ def test_old_database_migrates_without_data_loss(
             "city",
             "max_vehicle_speed_kmh",
             "recognition_zone_m",
+            "recognition_zone_calibrated",
         } <= camera_columns
         assert con.execute(
             "SELECT city FROM cameras WHERE id=7"
