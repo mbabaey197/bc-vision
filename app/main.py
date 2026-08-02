@@ -872,7 +872,7 @@ def dashboard(
     )
     js=f"""<script>
 const ids=[{ids}];
-async function cameraStatus(){{for(const id of ids){{try{{let r=await fetch('/api/cameras/'+id+'/status');let s=await r.json();let e=document.getElementById('st-'+id),a=document.getElementById('anpr-'+id),n=v=>Number(v||0).toLocaleString('fa-IR');e.textContent=s.paused?'متوقف':(s.online?'آنلاین':'آفلاین');e.className='badge '+(s.online?'online':'');const play=document.getElementById('play-'+id),pause=document.getElementById('pause-'+id);if(play)play.classList.toggle('active',!s.paused);if(pause)pause.classList.toggle('active',!!s.paused);const p=s.anpr||{{}},m=p.models||{{}};if(!m.ready){{a.textContent='پلاک‌خوان آماده نیست: مدل تشخیص یا OCR نصب نشده است';a.className='anpr-status bad'}}else if(p.last_error){{a.textContent='خطای پلاک‌خوان: '+p.last_error;a.className='anpr-status bad'}}else{{const idle=p.idle_mode?' | حالت کم‌مصرف':'';a.textContent='پردازش: '+n(p.processed_frames)+' فریم | تشخیص: '+n(p.detected_candidates)+' | ثبت: '+n(p.emitted_events)+idle;a.className='anpr-status'}}}}catch(e){{}}}}}}
+async function cameraStatus(){{for(const id of ids){{try{{let r=await fetch('/api/cameras/'+id+'/status');let s=await r.json();let e=document.getElementById('st-'+id),a=document.getElementById('anpr-'+id),n=v=>Number(v||0).toLocaleString('fa-IR');e.textContent=s.paused?'متوقف':(s.online?'آنلاین':'آفلاین');e.className='badge '+(s.online?'online':'');const play=document.getElementById('play-'+id),pause=document.getElementById('pause-'+id);if(play)play.classList.toggle('active',!s.paused);if(pause)pause.classList.toggle('active',!!s.paused);const p=s.anpr||{{}},m=p.models||{{}},plan=p.sampling||{{}},rates=' | ورودی: '+n(s.source_fps)+' FPS | نمایش: '+n(s.preview_fps)+' FPS';if(!m.ready){{a.textContent='پلاک‌خوان آماده نیست: مدل تشخیص یا OCR نصب نشده است'+rates;a.className='anpr-status bad'}}else if(p.last_error){{a.textContent='خطای پلاک‌خوان: '+p.last_error;a.className='anpr-status bad'}}else if(plan.warning){{const capacity=plan.source_sufficient===false?'فریم دوربین کافی نیست؛ نرخ پیشنهادی '+n(plan.recommended_capture_fps)+' FPS است':'توان پردازش برای حداقل سه مشاهده کافی نیست';a.textContent='هشدار سرعت بالا: '+capacity+rates;a.className='anpr-status bad'}}else{{const idle=p.idle_mode?' | حالت کم‌مصرف':'';a.textContent='پردازش: '+n(p.processed_frames)+' فریم | تشخیص: '+n(p.detected_candidates)+' | ثبت: '+n(p.emitted_events)+rates+idle;a.className='anpr-status'}}}}catch(e){{}}}}}}
 async function videoPlayback(id,action){{try{{const r=await fetch('/api/cameras/'+id+'/playback',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action}})}});if(!r.ok)throw new Error();await cameraStatus()}}catch(e){{alert('تغییر وضعیت پخش انجام نشد.')}}}}
 function roiElements(id){{return{{view:document.getElementById('camera-view-'+id),box:document.getElementById('roi-box-'+id),save:document.getElementById('roi-save-'+id),cancel:document.getElementById('roi-cancel-'+id),edit:document.getElementById('roi-edit-'+id),message:document.getElementById('roi-message-'+id)}}}}
 function positionRoi(id){{const e=roiElements(id);if(!e.view||!e.box)return;const x=Number(e.view.dataset.roiX||0),y=Number(e.view.dataset.roiY||0),w=Number(e.view.dataset.roiW||100),h=Number(e.view.dataset.roiH||100);e.box.style.left=x+'%';e.box.style.top=y+'%';e.box.style.width=w+'%';e.box.style.height=h+'%'}}
@@ -990,7 +990,8 @@ def live(camera_id:int,request:Request):
     if not auth(request): return RedirectResponse('/login',302)
     with connect() as con:c=con.execute('SELECT * FROM cameras WHERE id=? AND enabled=1',(camera_id,)).fetchone()
     if not c:return JSONResponse({'error':'camera not found'},404)
-    s=manager.get(c['id'],c['rtsp_url'],c['name'],int(get_setting('stream_width','640')),int(get_setting('live_fps','5')),int(get_setting('jpeg_quality','70')))
+    preview_fps=int(get_setting('dashboard_preview_fps',get_setting('live_fps','8')))
+    s=manager.get(c['id'],c['rtsp_url'],c['name'],int(get_setting('stream_width','640')),preview_fps,int(get_setting('jpeg_quality','70')))
     return StreamingResponse(s.frames(),media_type='multipart/x-mixed-replace; boundary=frame',headers={'Cache-Control':'no-store'})
 
 @app.get('/api/cameras/{camera_id}/status')
@@ -1133,9 +1134,9 @@ uploadForm?.addEventListener('submit',event=>{{
 </script>""",u,request)
 
 def cam_form(c=None):
-    c=dict(c) if c else {'id':'','name':'','rtsp_url':'','location':'','city':'','enabled':1,'is_demo':0,'sort_order':0,'lpr_enabled':1,'lpr_confidence':60,'frame_step':5,'duplicate_seconds':30,'roi_x':0,'roi_y':0,'roi_w':100,'roi_h':100,'line_y':50}
+    c=dict(c) if c else {'id':'','name':'','rtsp_url':'','location':'','city':'','enabled':1,'is_demo':0,'sort_order':0,'lpr_enabled':1,'lpr_confidence':60,'frame_step':1,'max_vehicle_speed_kmh':150,'recognition_zone_m':10,'duplicate_seconds':30,'roi_x':0,'roi_y':0,'roi_w':100,'roi_h':100,'line_y':50}
     action=f"/cameras/{c['id']}/edit" if c['id'] else '/cameras/new'
-    return f"""<div class='wrap'><h1>{'ویرایش' if c['id'] else 'افزودن'} دوربین</h1><div class='card'><form method='post' action='{action}'><div class='two-col'><div><label>نام دوربین</label><input name='name' value='{escape(str(c['name']))}' required></div><div><label>شهر</label><input name='city' value='{escape(str(c.get('city','')))}' placeholder='مثال: کرج'></div><div><label>موقعیت دقیق</label><input name='location' value='{escape(str(c['location']))}' placeholder='مثال: ورودی پارکینگ'></div></div><label>آدرس RTSP</label><input class='code' name='rtsp_url' value='{escape(str(c['rtsp_url']))}' placeholder='rtsp://user:pass@192.168.1.10:554/...'><div class='two-col'><div><label>ترتیب نمایش</label><input type='number' name='sort_order' value='{c['sort_order']}'></div><div><label>نوع تصویر</label><select name='is_demo'><option value='0' {'selected' if not c['is_demo'] else ''}>دوربین RTSP</option><option value='1' {'selected' if c['is_demo'] else ''}>دوربین آزمایشی</option></select></div></div><label><input style='width:auto' type='checkbox' name='enabled' value='1' {'checked' if c['enabled'] else ''}> فعال باشد</label><hr><h3>تنظیمات پلاک‌خوان این دوربین</h3><label><input style='width:auto' type='checkbox' name='lpr_enabled' value='1' {'checked' if c.get('lpr_enabled',1) else ''}> پلاک‌خوان فعال باشد</label><div class='two-col'><div><label>حداقل اطمینان تشخیص (درصد)</label><input type='number' min='1' max='99' name='lpr_confidence' value='{c.get('lpr_confidence',60)}'></div><div><label>پردازش هر چند فریم</label><input type='number' min='1' max='60' name='frame_step' value='{c.get('frame_step',5)}'></div><div><label>زمان حذف پلاک تکراری (ثانیه)</label><input type='number' min='0' max='3600' step='0.5' name='duplicate_seconds' value='{c.get('duplicate_seconds',30)}'></div><div><label>خط عبور عمودی (درصد ارتفاع تصویر)</label><input type='number' min='0' max='100' name='line_y' value='{c.get('line_y',50)}'></div></div><h3>منطقه تشخیص ROI برحسب درصد تصویر</h3><p class='muted'>برای بررسی کل تصویر: X=0، Y=0، عرض=100 و ارتفاع=100 قرار دهید.</p><div class='storage-grid'><div><label>X شروع</label><input type='number' min='0' max='99' name='roi_x' value='{c.get('roi_x',0)}'></div><div><label>Y شروع</label><input type='number' min='0' max='99' name='roi_y' value='{c.get('roi_y',0)}'></div><div><label>عرض ROI</label><input type='number' min='1' max='100' name='roi_w' value='{c.get('roi_w',100)}'></div><div><label>ارتفاع ROI</label><input type='number' min='1' max='100' name='roi_h' value='{c.get('roi_h',100)}'></div></div><button>ذخیره</button> <a class='btn secondary' href='/cameras'>انصراف</a></form></div></div>"""
+    return f"""<div class='wrap'><h1>{'ویرایش' if c['id'] else 'افزودن'} دوربین</h1><div class='card'><form method='post' action='{action}'><div class='two-col'><div><label>نام دوربین</label><input name='name' value='{escape(str(c['name']))}' required></div><div><label>شهر</label><input name='city' value='{escape(str(c.get('city','')))}' placeholder='مثال: کرج'></div><div><label>موقعیت دقیق</label><input name='location' value='{escape(str(c['location']))}' placeholder='مثال: ورودی پارکینگ'></div></div><label>آدرس RTSP</label><input class='code' name='rtsp_url' value='{escape(str(c['rtsp_url']))}' placeholder='rtsp://user:pass@192.168.1.10:554/...'><div class='two-col'><div><label>ترتیب نمایش</label><input type='number' name='sort_order' value='{c['sort_order']}'></div><div><label>نوع تصویر</label><select name='is_demo'><option value='0' {'selected' if not c['is_demo'] else ''}>دوربین RTSP</option><option value='1' {'selected' if c['is_demo'] else ''}>دوربین آزمایشی</option></select></div></div><label><input style='width:auto' type='checkbox' name='enabled' value='1' {'checked' if c['enabled'] else ''}> فعال باشد</label><hr><h3>تنظیمات پلاک‌خوان این دوربین</h3><label><input style='width:auto' type='checkbox' name='lpr_enabled' value='1' {'checked' if c.get('lpr_enabled',1) else ''}> پلاک‌خوان فعال باشد</label><input type='hidden' name='frame_step' value='1'><div class='two-col'><div><label>حداقل اطمینان تشخیص (درصد)</label><input type='number' min='1' max='99' name='lpr_confidence' value='{c.get('lpr_confidence',60)}'></div><div><label>حداکثر سرعت مسیر (km/h)</label><input type='number' min='5' max='300' step='1' name='max_vehicle_speed_kmh' value='{c.get('max_vehicle_speed_kmh',150)}'></div><div><label>طول واقعی ناحیه خوانش (متر)</label><input type='number' min='1' max='100' step='0.5' name='recognition_zone_m' value='{c.get('recognition_zone_m',10)}'></div><div><label>زمان حذف پلاک تکراری (ثانیه)</label><input type='number' min='0' max='3600' step='0.5' name='duplicate_seconds' value='{c.get('duplicate_seconds',30)}'></div><div><label>خط عبور عمودی (درصد ارتفاع تصویر)</label><input type='number' min='0' max='100' name='line_y' value='{c.get('line_y',50)}'></div></div><p class='muted'>نرم‌افزار نرخ فریم لازم را خودکار از سرعت مسیر و طول ناحیه محاسبه می‌کند. برای ۱۵۰ km/h، ناحیه ۱۰ متر حدود ۲۵ FPS و ناحیه ۵ متر حدود ۵۰ FPS نیاز دارد.</p><h3>منطقه تشخیص ROI برحسب درصد تصویر</h3><p class='muted'>برای بررسی کل تصویر: X=0، Y=0، عرض=100 و ارتفاع=100 قرار دهید.</p><div class='storage-grid'><div><label>X شروع</label><input type='number' min='0' max='99' name='roi_x' value='{c.get('roi_x',0)}'></div><div><label>Y شروع</label><input type='number' min='0' max='99' name='roi_y' value='{c.get('roi_y',0)}'></div><div><label>عرض ROI</label><input type='number' min='1' max='100' name='roi_w' value='{c.get('roi_w',100)}'></div><div><label>ارتفاع ROI</label><input type='number' min='1' max='100' name='roi_h' value='{c.get('roi_h',100)}'></div></div><button>ذخیره</button> <a class='btn secondary' href='/cameras'>انصراف</a></form></div></div>"""
 @app.get('/cameras/new')
 def new_cam_form(request:Request):
     u=auth(request)
@@ -1143,7 +1144,7 @@ def new_cam_form(request:Request):
     if not has_permission(request,'camera.manage'):return access_denied()
     return page('افزودن دوربین',cam_form(),u,request)
 @app.post('/cameras/new')
-def new_cam(request:Request,name:str=Form(...),rtsp_url:str=Form(''),location:str=Form(''),city:str=Form(''),enabled:str|None=Form(None),is_demo:int=Form(0),sort_order:int=Form(0),lpr_enabled:str|None=Form(None),lpr_confidence:int=Form(60),frame_step:int=Form(5),duplicate_seconds:float=Form(30),roi_x:float=Form(0),roi_y:float=Form(0),roi_w:float=Form(100),roi_h:float=Form(100),line_y:int=Form(50)):
+def new_cam(request:Request,name:str=Form(...),rtsp_url:str=Form(''),location:str=Form(''),city:str=Form(''),enabled:str|None=Form(None),is_demo:int=Form(0),sort_order:int=Form(0),lpr_enabled:str|None=Form(None),lpr_confidence:int=Form(60),frame_step:int=Form(1),max_vehicle_speed_kmh:float=Form(150),recognition_zone_m:float=Form(10),duplicate_seconds:float=Form(30),roi_x:float=Form(0),roi_y:float=Form(0),roi_w:float=Form(100),roi_h:float=Form(100),line_y:int=Form(50)):
     if not auth(request):return RedirectResponse('/login',302)
     if not has_permission(request,'camera.manage'):return access_denied()
     lic=license_status()
@@ -1152,7 +1153,7 @@ def new_cam(request:Request,name:str=Form(...),rtsp_url:str=Form(''),location:st
     if count >= lic['camera_limit']:
         return page('محدودیت لایسنس',f"<div class='wrap'><div class='card alert'>حداکثر تعداد دوربین در پلن {escape(lic['plan'])} برابر {lic['camera_limit']} است. برای افزایش ظرفیت، لایسنس را ارتقا دهید.</div><a class='btn' href='/license'>مدیریت لایسنس</a></div>",auth(request),request)
     url='demo://camera' if is_demo else rtsp_url.strip()
-    with connect() as con:con.execute('INSERT INTO cameras(name,rtsp_url,location,city,enabled,is_demo,sort_order,lpr_enabled,lpr_confidence,frame_step,duplicate_seconds,roi_x,roi_y,roi_w,roi_h,line_y) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(name.strip(),url,location.strip(),city.strip(),1 if enabled else 0,is_demo,sort_order,1 if lpr_enabled else 0,max(1,min(99,lpr_confidence)),max(1,min(60,frame_step)),max(0,min(3600,duplicate_seconds)),max(0,min(99,roi_x)),max(0,min(99,roi_y)),max(1,min(100-roi_x,roi_w)),max(1,min(100-roi_y,roi_h)),max(0,min(100,line_y))))
+    with connect() as con:con.execute('INSERT INTO cameras(name,rtsp_url,location,city,enabled,is_demo,sort_order,lpr_enabled,lpr_confidence,frame_step,max_vehicle_speed_kmh,recognition_zone_m,duplicate_seconds,roi_x,roi_y,roi_w,roi_h,line_y) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(name.strip(),url,location.strip(),city.strip(),1 if enabled else 0,is_demo,sort_order,1 if lpr_enabled else 0,max(1,min(99,lpr_confidence)),1,max(5,min(300,max_vehicle_speed_kmh)),max(1,min(100,recognition_zone_m)),max(0,min(3600,duplicate_seconds)),max(0,min(99,roi_x)),max(0,min(99,roi_y)),max(1,min(100-roi_x,roi_w)),max(1,min(100-roi_y,roi_h)),max(0,min(100,line_y))))
     return RedirectResponse('/cameras?msg=1',303)
 @app.get('/cameras/{camera_id}/edit')
 def edit_cam_form(camera_id:int,request:Request):
@@ -1163,11 +1164,11 @@ def edit_cam_form(camera_id:int,request:Request):
     if not c:return RedirectResponse('/cameras',302)
     return page('ویرایش دوربین',cam_form(c),u,request)
 @app.post('/cameras/{camera_id}/edit')
-def edit_cam(camera_id:int,request:Request,name:str=Form(...),rtsp_url:str=Form(''),location:str=Form(''),city:str=Form(''),enabled:str|None=Form(None),is_demo:int=Form(0),sort_order:int=Form(0),lpr_enabled:str|None=Form(None),lpr_confidence:int=Form(60),frame_step:int=Form(5),duplicate_seconds:float=Form(30),roi_x:float=Form(0),roi_y:float=Form(0),roi_w:float=Form(100),roi_h:float=Form(100),line_y:int=Form(50)):
+def edit_cam(camera_id:int,request:Request,name:str=Form(...),rtsp_url:str=Form(''),location:str=Form(''),city:str=Form(''),enabled:str|None=Form(None),is_demo:int=Form(0),sort_order:int=Form(0),lpr_enabled:str|None=Form(None),lpr_confidence:int=Form(60),frame_step:int=Form(1),max_vehicle_speed_kmh:float=Form(150),recognition_zone_m:float=Form(10),duplicate_seconds:float=Form(30),roi_x:float=Form(0),roi_y:float=Form(0),roi_w:float=Form(100),roi_h:float=Form(100),line_y:int=Form(50)):
     if not auth(request):return RedirectResponse('/login',302)
     if not has_permission(request,'camera.manage'):return access_denied()
     url='demo://camera' if is_demo else rtsp_url.strip()
-    with connect() as con:con.execute('UPDATE cameras SET name=?,rtsp_url=?,location=?,city=?,enabled=?,is_demo=?,sort_order=?,lpr_enabled=?,lpr_confidence=?,frame_step=?,duplicate_seconds=?,roi_x=?,roi_y=?,roi_w=?,roi_h=?,line_y=? WHERE id=?',(name.strip(),url,location.strip(),city.strip(),1 if enabled else 0,is_demo,sort_order,1 if lpr_enabled else 0,max(1,min(99,lpr_confidence)),max(1,min(60,frame_step)),max(0,min(3600,duplicate_seconds)),max(0,min(99,roi_x)),max(0,min(99,roi_y)),max(1,min(100-roi_x,roi_w)),max(1,min(100-roi_y,roi_h)),max(0,min(100,line_y)),camera_id))
+    with connect() as con:con.execute('UPDATE cameras SET name=?,rtsp_url=?,location=?,city=?,enabled=?,is_demo=?,sort_order=?,lpr_enabled=?,lpr_confidence=?,frame_step=?,max_vehicle_speed_kmh=?,recognition_zone_m=?,duplicate_seconds=?,roi_x=?,roi_y=?,roi_w=?,roi_h=?,line_y=? WHERE id=?',(name.strip(),url,location.strip(),city.strip(),1 if enabled else 0,is_demo,sort_order,1 if lpr_enabled else 0,max(1,min(99,lpr_confidence)),1,max(5,min(300,max_vehicle_speed_kmh)),max(1,min(100,recognition_zone_m)),max(0,min(3600,duplicate_seconds)),max(0,min(99,roi_x)),max(0,min(99,roi_y)),max(1,min(100-roi_x,roi_w)),max(1,min(100-roi_y,roi_h)),max(0,min(100,line_y)),camera_id))
     manager.remove(camera_id);return RedirectResponse('/cameras?msg=1',303)
 @app.post('/cameras/{camera_id}/delete')
 def delete_cam(camera_id:int,request:Request):
@@ -1989,7 +1990,7 @@ def settings(request:Request,saved:int=0,restart:int=0,error:str=''):
         for row in quality['by_model'][-6:]
     ) or "<tr><td colspan='4'>هنوز حدسی توسط اپراتور بررسی نشده است.</td></tr>"
     body=f"""<div class='wrap'><h1>تنظیمات</h1>{msg}
-    <div class='card'><h3>نمایش زنده</h3><form method='post' action='/settings/display'><div class='two-col'><div><label>تعداد ستون نمایش زنده</label><select name='dashboard_grid'>{''.join(f'<option value={x} '+('selected' if get_setting('dashboard_grid','2')==str(x) else '')+f'>{x} ستون</option>' for x in [1,2,3,4])}</select></div><div><label>تعداد سطرهای پلاک در داشبورد</label><input type='number' min='6' max='50' name='dashboard_event_rows' value='{get_setting('dashboard_event_rows','12')}'></div><div><label>تعداد فریم نمایش در ثانیه</label><input type='number' min='1' max='15' name='live_fps' value='{get_setting('live_fps','5')}'></div><div><label>عرض تصویر لایو</label><select name='stream_width'>{''.join(f'<option value={x} '+('selected' if get_setting('stream_width','640')==str(x) else '')+f'>{x}px</option>' for x in [480,640,960,1280])}</select></div><div><label>کیفیت JPEG</label><input type='number' min='30' max='95' name='jpeg_quality' value='{get_setting('jpeg_quality','70')}'></div></div><label>رمز جدید مدیر (اختیاری)</label><input type='password' name='new_password'><button>ذخیره تنظیمات نمایش</button></form></div>
+    <div class='card'><h3>نمایش زنده</h3><form method='post' action='/settings/display'><div class='two-col'><div><label>تعداد ستون نمایش زنده</label><select name='dashboard_grid'>{''.join(f'<option value={x} '+('selected' if get_setting('dashboard_grid','2')==str(x) else '')+f'>{x} ستون</option>' for x in [1,2,3,4])}</select></div><div><label>تعداد سطرهای پلاک در داشبورد</label><input type='number' min='6' max='50' name='dashboard_event_rows' value='{get_setting('dashboard_event_rows','12')}'></div><div><label>فریم نمایش داشبورد (مستقل از پلاک‌خوان)</label><input type='number' min='5' max='10' name='live_fps' value='{get_setting('dashboard_preview_fps',get_setting('live_fps','8'))}'></div><div><label>عرض تصویر لایو</label><select name='stream_width'>{''.join(f'<option value={x} '+('selected' if get_setting('stream_width','640')==str(x) else '')+f'>{x}px</option>' for x in [480,640,960,1280])}</select></div><div><label>کیفیت JPEG</label><input type='number' min='30' max='95' name='jpeg_quality' value='{get_setting('jpeg_quality','70')}'></div></div><p class='muted'>این نرخ فقط نمایش داشبورد را تغییر می‌دهد؛ موتور پلاک‌خوان فریم‌های لازم را مستقیماً از جریان اصلی دوربین دریافت می‌کند.</p><label>رمز جدید مدیر (اختیاری)</label><input type='password' name='new_password'><button>ذخیره تنظیمات نمایش</button></form></div>
     <div class='card' id='storage'><h3>ذخیره‌سازی</h3><p class='muted'>درایو یا پوشه اصلی و مسیر جداگانه هر نوع اطلاعات را انتخاب کنید.</p>{usage_html}<form method='post' action='/settings/storage' style='margin-top:18px'><label>مسیر اصلی ذخیره‌سازی</label><input class='code' name='storage_root' value='{escape(root)}' placeholder='D:\\BCVisionData'><div class='storage-grid'><div><label>تصاویر خودرو</label><input class='code' name='snapshot_path' value='{escape(snap)}'></div><div><label>تصاویر پلاک</label><input class='code' name='plate_path' value='{escape(plates)}'></div><div><label>ویدئوها</label><input class='code' name='video_path' value='{escape(videos)}'></div><div><label>نسخه‌های پشتیبان</label><input class='code' name='backup_path' value='{escape(backups)}'></div></div>
     <div class='two-col'><label><input style='width:auto' type='checkbox' name='save_snapshots' value='1' {checked('save_snapshots')}> ذخیره تصویر خودرو</label><label><input style='width:auto' type='checkbox' name='save_plate_images' value='1' {checked('save_plate_images')}> ذخیره تصویر پلاک</label><label><input style='width:auto' type='checkbox' name='save_videos' value='1' {checked('save_videos')}> ذخیره ویدئو</label><div><label>حداکثر فضای مجاز (GB؛ صفر یعنی نامحدود)</label><input type='number' min='0' name='max_storage_gb' value='{get_setting('max_storage_gb','0')}'></div></div>
     <label>وقتی فضا پر شد</label><select name='storage_full_action'><option value='delete_oldest' {selected('storage_full_action','delete_oldest')}>حذف قدیمی‌ترین اطلاعات</option><option value='stop' {selected('storage_full_action','stop')}>توقف ذخیره‌سازی</option><option value='alert' {selected('storage_full_action','alert')}>فقط نمایش هشدار</option></select>
@@ -2045,14 +2046,15 @@ name='anpr_auto_confirm_guesses' value='1'
     return page('تنظیمات',body,u,request)
 
 @app.post('/settings/display')
-def save_display_settings(request:Request,dashboard_grid:int=Form(2),dashboard_event_rows:int=Form(12),live_fps:int=Form(5),stream_width:int=Form(640),jpeg_quality:int=Form(70),new_password:str=Form('')):
+def save_display_settings(request:Request,dashboard_grid:int=Form(2),dashboard_event_rows:int=Form(12),live_fps:int=Form(8),stream_width:int=Form(640),jpeg_quality:int=Form(70),new_password:str=Form('')):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
     if not has_permission(request,'system.manage'):return access_denied()
-    set_setting('dashboard_grid',max(1,min(4,dashboard_grid)));set_setting('dashboard_event_rows',max(6,min(50,dashboard_event_rows)));set_setting('live_fps',max(1,min(15,live_fps)));set_setting('stream_width',stream_width);set_setting('jpeg_quality',max(30,min(95,jpeg_quality)))
+    preview_fps=max(5,min(10,live_fps)); quality=max(30,min(95,jpeg_quality))
+    set_setting('dashboard_grid',max(1,min(4,dashboard_grid)));set_setting('dashboard_event_rows',max(6,min(50,dashboard_event_rows)));set_setting('dashboard_preview_fps',preview_fps);set_setting('live_fps',preview_fps);set_setting('stream_width',stream_width);set_setting('jpeg_quality',quality)
     if new_password.strip():
         with connect() as con:con.execute('UPDATE users SET password_hash=?,session_version=session_version+1 WHERE username=?',(hash_password(new_password.strip()),u))
-    for cid in list(manager.streams): manager.remove(cid)
+    manager.configure_preview(stream_width,preview_fps,quality)
     return RedirectResponse('/settings?saved=1',303)
 
 @app.post('/settings/storage')
@@ -2353,7 +2355,9 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(0), video
             'city':'',
             'lpr_enabled':1,
             'lpr_confidence':60,
-            'frame_step':5,
+            'frame_step':1,
+            'max_vehicle_speed_kmh':150,
+            'recognition_zone_m':10,
             'duplicate_seconds':30,
             'roi_x':0,
             'roi_y':0,
@@ -2395,9 +2399,10 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(0), video
             cursor=con.execute(
                 "INSERT INTO cameras("
                 "name,rtsp_url,location,city,enabled,is_demo,sort_order,"
-                "lpr_enabled,lpr_confidence,frame_step,duplicate_seconds,"
+                "lpr_enabled,lpr_confidence,frame_step,"
+                "max_vehicle_speed_kmh,recognition_zone_m,duplicate_seconds,"
                 "roi_x,roi_y,roi_w,roi_h,line_y"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     f"ویدئو: {display_name}",
                     f"video://{target}",
@@ -2408,7 +2413,9 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(0), video
                     -1,
                     1,
                     source_camera['lpr_confidence'],
-                    source_camera['frame_step'],
+                    1,
+                    source_camera['max_vehicle_speed_kmh'],
+                    source_camera['recognition_zone_m'],
                     source_camera['duplicate_seconds'],
                     source_camera['roi_x'],
                     source_camera['roi_y'],
@@ -2423,7 +2430,7 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(0), video
             f"video://{target}",
             f"ویدئو: {display_name}",
             int(get_setting('stream_width','640')),
-            int(get_setting('live_fps','5')),
+            int(get_setting('dashboard_preview_fps',get_setting('live_fps','8'))),
             int(get_setting('jpeg_quality','70')),
         )
         for old_id,_old_url in old_streams:
