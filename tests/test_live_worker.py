@@ -895,7 +895,7 @@ def test_submit_adaptively_spaces_slow_cpu_inference(monkeypatch):
     assert len(submitted) == 2
 
 
-def test_every_received_frame_can_improve_pending_ocr_selection(
+def test_busy_worker_keeps_only_the_latest_pending_frame(
     monkeypatch,
 ):
     worker = live_worker.LiveANPRWorker(max_workers=1)
@@ -915,11 +915,6 @@ def test_every_received_frame_can_improve_pending_ocr_selection(
         "_config",
         lambda _camera_id, current, _now: current.config,
     )
-    monkeypatch.setattr(
-        worker,
-        "_selection_score",
-        lambda frame, _config: float(frame[0, 0, 0]),
-    )
     times = iter((200.0, 200.1, 200.2))
     monkeypatch.setattr(
         live_worker.time,
@@ -937,7 +932,8 @@ def test_every_received_frame_can_improve_pending_ocr_selection(
     worker.shutdown()
 
     assert state.frame_counter == 3
-    assert selected == 200
+    assert selected == 80
+    assert state.pending_replacements == 2
 # RC7-RC9 regression coverage for adaptive live-frame processing.
 
 
@@ -1025,6 +1021,33 @@ def test_no_plate_backoff_grows_but_recognition_stays_responsive():
     assert delay(0.25, 3) == 1.60
     assert delay(0.25, 4) == 3.20
     assert delay(0.25, 10) == 3.20
+
+
+def test_status_reports_150_kmh_capture_and_processing_capacity(
+    monkeypatch,
+):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState(
+        config={
+            "enabled": 1,
+            "lpr_enabled": 1,
+            "max_vehicle_speed_kmh": 150,
+            "recognition_zone_m": 10,
+        },
+        source_fps_ema=25.0,
+    )
+    state.processing_samples.extend([0.05] * 20)
+    worker._states[31] = state
+    monkeypatch.setattr(worker, "_models", lambda: {"ready": True})
+
+    sampling = worker.status(31)["sampling"]
+    worker.shutdown()
+
+    assert sampling["recommended_capture_fps"] == 25
+    assert sampling["expected_raw_frames"] == 6.0
+    assert sampling["source_sufficient"] is True
+    assert sampling["processing_sufficient"] is True
+    assert sampling["warning"] == ""
 
 
 def test_motion_wakes_camera_during_long_empty_scene_backoff(
