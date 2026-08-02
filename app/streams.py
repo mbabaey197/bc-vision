@@ -28,6 +28,10 @@ class StreamState:
     paused: bool = False
     last_error: str = ""
     last_frame_at: float = 0.0
+    decoded_frames: int = 0
+    ai_submitted_frames: int = 0
+    preview_frames: int = 0
+    source_fps: float = 0.0
 
 
 class CameraStream:
@@ -37,15 +41,18 @@ class CameraStream:
         url: str,
         name: str,
         width=640,
-        fps=5,
+        fps=8,
         quality=70,
     ):
         self.camera_id, self.url, self.name = camera_id, url, name
-        self.width, self.fps, self.quality = (
+        self.width, self.preview_fps, self.quality = (
             width,
-            max(1, fps),
+            max(1, min(10, int(fps))),
             quality,
         )
+        # ``fps`` is kept as a read-only compatibility alias for older tests
+        # and integrations. It now means dashboard preview FPS only.
+        self.fps = self.preview_fps
         self.state = StreamState()
         self.latest: bytes | None = None
         self.latest_frame = None
@@ -53,11 +60,30 @@ class CameraStream:
         self.pause_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.lock = threading.Lock()
+        self._preview_ready = threading.Condition(self.lock)
+        self._preview_revision = 0
+        self._preview_viewers = 0
+        self._next_preview_at = 0.0
+        self._last_source_at = 0.0
+        self._source_fps_ema = 0.0
         self._overlay_rows: list[dict] = []
         self._overlay_gray = None
         self._overlay_revision = 0
         self._overlay_updated_at = 0.0
         self._overlay_max_age = 4.0
+
+    def configure_preview(self, width, fps, quality):
+        """Update dashboard rendering without restarting camera/ANPR state."""
+
+        with self.lock:
+            self.width = max(160, int(width))
+            self.preview_fps = max(1, min(10, int(fps)))
+            self.fps = self.preview_fps
+            self.quality = max(30, min(95, int(quality)))
+            self._next_preview_at = 0.0
+            self.latest = None
+            self._preview_revision += 1
+            self._preview_ready.notify_all()
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -490,16 +516,47 @@ class CameraStream:
         )
         return bytes(buffer) if ok else None
 
-    def _publish(self, frame):
-        data = self._encode(frame)
-        if not data:
-            return
+    def _observe_source_frame(self, captured_at):
+        self.state.decoded_frames += 1
+        if self._last_source_at > 0.0:
+            interval = float(captured_at) - self._last_source_at
+            if 1.0 / 240.0 <= interval <= 2.0:
+                instant_fps = 1.0 / interval
+                if self._source_fps_ema:
+                    self._source_fps_ema = (
+                        self._source_fps_ema * 0.85
+                        + instant_fps * 0.15
+                    )
+                else:
+                    self._source_fps_ema = instant_fps
+        self._last_source_at = float(captured_at)
+        self.state.source_fps = self._source_fps_ema
+
+    def _preview_due(self, captured_at):
         with self.lock:
-            self.latest = data
-            self.latest_frame = frame
+            if self._preview_viewers <= 0:
+                return False
+            if float(captured_at) + 1e-9 < self._next_preview_at:
+                return False
+            self._next_preview_at = (
+                float(captured_at) + 1.0 / self.preview_fps
+            )
+            return True
+
+    def _publish(self, frame, captured_at=None):
+        """Ingest every source frame; render only the throttled preview lane."""
+
+        captured_at = (
+            time.monotonic()
+            if captured_at is None
+            else float(captured_at)
+        )
+        self._observe_source_frame(captured_at)
         self.state.online = True
         self.state.last_frame_at = time.time()
         self.state.last_error = ""
+        # Recognition receives the native frame before JPEG/overlay work.
+        # Preview failure or a closed dashboard must never suppress ANPR.
         try:
             from app.ai.live_worker import submit_live_frame
             submit_live_frame(
@@ -507,10 +564,22 @@ class CameraStream:
                 self.name,
                 frame,
             )
+            self.state.ai_submitted_frames += 1
         except Exception:
             # ANPR failures are reported through its own status and must never
             # interrupt or mark a healthy camera stream as offline.
             pass
+        if not self._preview_due(captured_at):
+            return
+        data = self._encode(frame)
+        if not data:
+            return
+        with self._preview_ready:
+            self.latest = data
+            self.latest_frame = frame
+            self.state.preview_frames += 1
+            self._preview_revision += 1
+            self._preview_ready.notify_all()
 
     def _demo_frame(self):
         height, width = 360, 640
@@ -569,7 +638,22 @@ class CameraStream:
         )
         return frame
 
-    def _run_pyav_video(self, source, delay):
+    def _wait_until(self, deadline):
+        remaining = float(deadline) - time.monotonic()
+        if remaining > 0.0:
+            self.stop_event.wait(remaining)
+
+    @staticmethod
+    def _capture_fps(capture, default=25.0):
+        try:
+            value = float(capture.get(cv2.CAP_PROP_FPS))
+        except Exception:
+            value = 0.0
+        if not np.isfinite(value) or not 1.0 <= value <= 240.0:
+            return float(default)
+        return value
+
+    def _run_pyav_video(self, source):
         """Decode an uploaded video with bundled FFmpeg when OpenCV cannot."""
         if not AV_OK:
             raise RuntimeError(
@@ -578,7 +662,22 @@ class CameraStream:
         while not self.stop_event.is_set():
             published = 0
             with av.open(str(source)) as container:
-                for video_frame in container.decode(video=0):
+                source_fps = 25.0
+                try:
+                    video_stream = container.streams.video[0]
+                    candidate = (
+                        video_stream.average_rate
+                        or video_stream.guessed_rate
+                    )
+                    if candidate:
+                        source_fps = float(candidate)
+                except Exception:
+                    pass
+                source_fps = max(1.0, min(240.0, source_fps))
+                loop_started = time.monotonic()
+                for frame_index, video_frame in enumerate(
+                    container.decode(video=0)
+                ):
                     if self.stop_event.is_set():
                         return
                     self._wait_while_paused()
@@ -587,8 +686,15 @@ class CameraStream:
                     frame = video_frame.to_ndarray(format="bgr24")
                     self._publish(frame)
                     published += 1
-                    if self.stop_event.wait(delay):
-                        return
+                    try:
+                        current_second = float(video_frame.time)
+                    except (AttributeError, TypeError, ValueError):
+                        current_second = frame_index / source_fps
+                    next_second = max(
+                        (frame_index + 1) / source_fps,
+                        current_second + 1.0 / source_fps,
+                    )
+                    self._wait_until(loop_started + next_second)
             if not published:
                 raise RuntimeError(
                     "FFmpeg could not decode any frame from the video"
@@ -598,11 +704,14 @@ class CameraStream:
         if not CV_OK:
             self.state.last_error = "OpenCV is not available"
             return
-        delay = 1.0 / self.fps
         if self.url.startswith("demo://"):
+            source_fps = 25.0
+            frame_index = 0
+            started = time.monotonic()
             while not self.stop_event.is_set():
                 self._publish(self._demo_frame())
-                time.sleep(delay)
+                frame_index += 1
+                self._wait_until(started + frame_index / source_fps)
             return
 
         is_video_file = self.url.startswith("video://")
@@ -625,6 +734,13 @@ class CameraStream:
                 if not capture.isOpened():
                     raise RuntimeError("Cannot open camera or video stream")
                 capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                source_fps = (
+                    self._capture_fps(capture)
+                    if is_video_file
+                    else 0.0
+                )
+                loop_started = time.monotonic()
+                frame_index = 0
                 while not self.stop_event.is_set():
                     self._wait_while_paused()
                     if self.stop_event.is_set():
@@ -637,18 +753,27 @@ class CameraStream:
                             if ok and frame is not None:
                                 self._publish(frame)
                                 published += 1
-                                time.sleep(delay)
+                                frame_index = 1
+                                loop_started = time.monotonic()
+                                self._wait_until(
+                                    loop_started
+                                    + frame_index / source_fps
+                                )
                                 continue
                         raise RuntimeError(
                             "Camera stopped sending frames"
                         )
                     self._publish(frame)
                     published += 1
-                    time.sleep(delay)
+                    if is_video_file:
+                        frame_index += 1
+                        self._wait_until(
+                            loop_started + frame_index / source_fps
+                        )
             except Exception as exc:
                 if is_video_file and published == 0 and AV_OK:
                     try:
-                        self._run_pyav_video(capture_source, delay)
+                        self._run_pyav_video(capture_source)
                         continue
                     except Exception as fallback_exc:
                         exc = fallback_exc
@@ -661,18 +786,39 @@ class CameraStream:
 
     def frames(self) -> Iterator[bytes]:
         self.start()
-        while not self.stop_event.is_set():
-            with self.lock:
-                frame = self.latest
-            if frame:
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n"
-                    b"Cache-Control: no-cache\r\n\r\n"
-                    + frame
-                    + b"\r\n"
+        revision = -1
+        with self._preview_ready:
+            self._preview_viewers += 1
+            self._next_preview_at = 0.0
+        try:
+            while not self.stop_event.is_set():
+                with self._preview_ready:
+                    if self._preview_revision == revision:
+                        self._preview_ready.wait(
+                            timeout=max(0.25, 2.0 / self.preview_fps)
+                        )
+                    frame = self.latest
+                    current_revision = self._preview_revision
+                if frame and current_revision != revision:
+                    revision = current_revision
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Cache-Control: no-cache\r\n\r\n"
+                        + frame
+                        + b"\r\n"
+                    )
+                elif current_revision != revision:
+                    # A settings change can intentionally invalidate the old
+                    # JPEG before the next source frame arrives. Acknowledge
+                    # that revision so an offline camera cannot busy-spin.
+                    revision = current_revision
+        finally:
+            with self._preview_ready:
+                self._preview_viewers = max(
+                    0,
+                    self._preview_viewers - 1,
                 )
-            time.sleep(1.0 / self.fps)
 
 
 class StreamManager:
@@ -705,12 +851,28 @@ class StreamManager:
                 old.start()
             return old
 
+    def configure_preview(self, width, fps, quality):
+        """Apply display-only changes without interrupting recognition."""
+
+        with self.lock:
+            streams = list(self.streams.values())
+        for stream in streams:
+            stream.configure_preview(width, fps, quality)
+            stream._key = (
+                stream.url,
+                stream.name,
+                stream.width,
+                stream.preview_fps,
+                stream.quality,
+            )
+
     def start_enabled_cameras(self):
         """Start every enabled camera for continuous background ANPR."""
         from app.database import connect, get_setting
 
         width = int(get_setting("stream_width", "640"))
-        fps = int(get_setting("live_fps", "5"))
+        legacy_fps = get_setting("live_fps", "8")
+        fps = int(get_setting("dashboard_preview_fps", legacy_fps))
         quality = int(get_setting("jpeg_quality", "70"))
         with connect() as con:
             rows = con.execute(
@@ -763,6 +925,12 @@ class StreamManager:
             "paused": False,
             "error": "stream not started",
             "last_frame_at": 0.0,
+            "decoded_frames": 0,
+            "ai_submitted_frames": 0,
+            "preview_frames": 0,
+            "source_fps": 0.0,
+            "preview_fps": 0,
+            "preview_viewers": 0,
         }
         if stream:
             base = {
@@ -770,6 +938,14 @@ class StreamManager:
                 "paused": stream.state.paused,
                 "error": stream.state.last_error,
                 "last_frame_at": stream.state.last_frame_at,
+                "decoded_frames": stream.state.decoded_frames,
+                "ai_submitted_frames": (
+                    stream.state.ai_submitted_frames
+                ),
+                "preview_frames": stream.state.preview_frames,
+                "source_fps": round(stream.state.source_fps, 2),
+                "preview_fps": stream.preview_fps,
+                "preview_viewers": stream._preview_viewers,
             }
         try:
             from app.ai.live_worker import live_anpr_status
