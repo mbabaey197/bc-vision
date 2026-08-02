@@ -67,6 +67,10 @@ def operator_assisted_rows(primary: list, shadow: list) -> list:
 
 @dataclass
 class _CameraState:
+    lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        repr=False,
+    )
     frame_counter: int = 0
     busy: bool = False
     pending: tuple | None = None
@@ -107,8 +111,16 @@ class _CameraState:
     last_submitted_at: float = 0.0
     last_received_at: float = 0.0
     source_fps_ema: float = 0.0
+    source_timestamps: deque = field(
+        default_factory=lambda: deque(maxlen=240)
+    )
     pending_replacements: int = 0
     admission_drops: int = 0
+    expired_frames: int = 0
+    pending_timer: threading.Timer | None = field(
+        default=None,
+        repr=False,
+    )
     target_burst_fps: float = 0.0
     burst_frames_remaining: int = 0
     plate_visible: bool = False
@@ -602,32 +614,47 @@ class LiveANPRWorker:
 
     @staticmethod
     def _observe_source_rate(state: _CameraState, now: float) -> None:
-        if state.last_received_at > 0.0:
-            interval = float(now) - state.last_received_at
-            if 1.0 / 240.0 <= interval <= 2.0:
-                instant_fps = 1.0 / interval
-                if state.source_fps_ema:
-                    state.source_fps_ema = (
-                        state.source_fps_ema * 0.85
-                        + instant_fps * 0.15
-                    )
-                else:
-                    state.source_fps_ema = instant_fps
+        state.source_timestamps.append(float(now))
+        while (
+            len(state.source_timestamps) > 2
+            and float(now) - state.source_timestamps[0] > 3.0
+        ):
+            state.source_timestamps.popleft()
+        if len(state.source_timestamps) >= 5:
+            elapsed = (
+                state.source_timestamps[-1]
+                - state.source_timestamps[0]
+            )
+            # A count-over-time window is robust to RTSP jitter. Averaging
+            # reciprocal frame intervals can overstate a 20 FPS source as
+            # more than 50 FPS when short and long intervals alternate.
+            if elapsed >= 2.0:
+                state.source_fps_ema = (
+                    (len(state.source_timestamps) - 1) / elapsed
+                )
         state.last_received_at = float(now)
 
     @staticmethod
     def _frame_budget(state: _CameraState, config: dict) -> dict:
-        samples = sorted(float(value) for value in state.processing_samples)
+        with state.lock:
+            samples = sorted(
+                float(value) for value in state.processing_samples
+            )
+            source_fps = float(state.source_fps_ema)
         p95_seconds = (
             samples[min(len(samples) - 1, math.ceil(len(samples) * 0.95) - 1)]
-            if samples
-            else state.processing_seconds_ema
+            if len(samples) >= 20
+            else 0.0
         )
         budget = calculate_frame_budget(
             max_speed_kmh=config.get("max_vehicle_speed_kmh", 150),
             recognition_zone_m=config.get("recognition_zone_m", 10),
-            source_fps=state.source_fps_ema,
+            source_fps=source_fps,
             processing_p95_ms=p95_seconds * 1000.0,
+            geometry_calibrated=bool(
+                int(config.get("recognition_zone_calibrated", 0) or 0)
+            ),
+            telemetry_required=True,
         )
         return budget.as_dict()
 
@@ -648,6 +675,86 @@ class LiveANPRWorker:
         state.target_burst_fps = max(1.0, min(120.0, target))
         return 1.0 / state.target_burst_fps
 
+    @staticmethod
+    def _max_frame_age(config: dict) -> float:
+        budget = calculate_frame_budget(
+            max_speed_kmh=config.get("max_vehicle_speed_kmh", 150),
+            recognition_zone_m=config.get("recognition_zone_m", 10),
+        )
+        return max(0.08, min(1.50, float(budget.zone_seconds)))
+
+    @staticmethod
+    def _with_dispatch_time(payload, dispatched_at: float):
+        values = list(payload)
+        values[4] = float(dispatched_at)
+        return tuple(values)
+
+    @staticmethod
+    def _cancel_pending_timer_locked(state: _CameraState) -> None:
+        timer = state.pending_timer
+        state.pending_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _schedule_pending_locked(
+        self,
+        camera_id: int,
+        state: _CameraState,
+        deadline: float,
+    ) -> None:
+        self._cancel_pending_timer_locked(state)
+        delay = max(0.0, float(deadline) - time.monotonic())
+        timer = threading.Timer(
+            delay,
+            self._dispatch_pending,
+            args=(int(camera_id), state),
+        )
+        timer.daemon = True
+        state.pending_timer = timer
+        timer.start()
+
+    def _dispatch_pending(
+        self,
+        camera_id: int,
+        state: _CameraState,
+    ) -> None:
+        payload = None
+        with state.lock:
+            state.pending_timer = None
+            if (
+                self._stopped
+                or state.cancelled
+                or state.busy
+                or state.pending is None
+            ):
+                return
+            now = time.monotonic()
+            if now + 1e-6 < state.next_inference_at:
+                self._schedule_pending_locked(
+                    camera_id,
+                    state,
+                    state.next_inference_at,
+                )
+                return
+            payload = state.pending
+            state.pending = None
+            if now - float(payload[3]) > self._max_frame_age(
+                state.config or {}
+            ):
+                state.expired_frames += 1
+                state.admission_drops += 1
+                return
+            state.last_submitted_at = now
+            state.processing_done.clear()
+            state.busy = True
+            payload = self._with_dispatch_time(payload, now)
+        try:
+            self._executor.submit(self._process, state, payload)
+        except RuntimeError:
+            with state.lock:
+                state.busy = False
+                state.processing_done.set()
+
     def submit(self, camera_id: int, camera_name: str, frame):
         if (
             self._stopped
@@ -661,6 +768,7 @@ class LiveANPRWorker:
                 int(camera_id),
                 _CameraState(),
             )
+        with state.lock:
             if state.cancelled:
                 return
             state.frame_counter += 1
@@ -676,8 +784,25 @@ class LiveANPRWorker:
                 or not int(config.get("lpr_enabled", 0))
             ):
                 return
+            config_generation = state.config_generation
+        # Activity analysis is per camera and intentionally runs outside the
+        # worker-wide mapping lock. Four camera decoder threads must not be
+        # serialized through resize/blur/morphology/Canny work.
+        try:
             activity_source, _, _ = self._roi_frame(frame, config)
             activity = state.activity.observe(activity_source)
+        except Exception as exc:
+            with state.lock:
+                state.last_error = f"{type(exc).__name__}: {exc}"
+            return
+
+        payload_to_submit = None
+        with state.lock:
+            if (
+                state.cancelled
+                or state.config_generation != config_generation
+            ):
+                return
             state.motion_score = float(activity.motion_score)
             state.overlay_mask_pixels = (
                 int(cv2.countNonZero(activity.exclusion_mask))
@@ -705,6 +830,10 @@ class LiveANPRWorker:
                     state.next_inference_at,
                     now,
                 )
+            burst_active = bool(
+                activity.wake_inference
+                or state.burst_frames_remaining
+            )
             payload = (
                 int(camera_id),
                 str(camera_name),
@@ -712,14 +841,15 @@ class LiveANPRWorker:
                 now,
                 0.0,
                 activity,
-                state.config_generation,
+                config_generation,
             )
             if state.busy:
                 if state.pending is not None:
                     state.pending_replacements += 1
                 # Exactly one latest-frame slot is retained. Quality ranking
                 # happens on per-track crops, never by keeping an old frame in
-                # the inference queue.
+                # the inference queue. Idle work clears this slot on finish;
+                # a motion burst consumes it at its start-to-start deadline.
                 state.pending = payload
                 return
             # Do not let a slow CPU run ANPR continuously with no breathing
@@ -743,32 +873,66 @@ class LiveANPRWorker:
                     else 0.0
                 )
             )
-            if (
-                now - state.last_submitted_at < minimum_interval
-                or now < state.next_inference_at
-            ):
+            due_at = max(
+                state.last_submitted_at + minimum_interval,
+                state.next_inference_at,
+            )
+            if now + 1e-9 < due_at:
                 state.admission_drops += 1
-                # No worker is active, so the next native source frame will
-                # be newer than anything retained here.
-                state.pending = None
+                if burst_active:
+                    if state.pending is not None:
+                        state.pending_replacements += 1
+                    state.pending = payload
+                    self._schedule_pending_locked(
+                        int(camera_id),
+                        state,
+                        due_at,
+                    )
+                else:
+                    state.pending = None
+                    self._cancel_pending_timer_locked(state)
                 return
             if state.pending is not None:
                 state.admission_drops += 1
                 state.pending = None
+            self._cancel_pending_timer_locked(state)
             state.last_submitted_at = now
             state.processing_done.clear()
             state.busy = True
-        self._executor.submit(self._process, state, payload)
+            payload_to_submit = self._with_dispatch_time(payload, now)
+        try:
+            self._executor.submit(
+                self._process,
+                state,
+                payload_to_submit,
+            )
+        except RuntimeError:
+            with state.lock:
+                state.busy = False
+                state.processing_done.set()
 
     def _process(self, state: _CameraState, payload):
         camera_id, camera_name, frame, timestamp = payload[:4]
+        has_dispatch_timestamp = bool(
+            len(payload) > 4 and payload[4]
+        )
         activity = payload[5] if len(payload) > 5 else None
         config_generation = payload[6] if len(payload) > 6 else 0
         started = time.perf_counter()
+        model_seconds = None
         try:
-            if state.cancelled:
+            with state.lock:
+                if state.cancelled:
+                    return
+                config = dict(state.config or {})
+            frame_age = time.monotonic() - float(timestamp)
+            if (
+                has_dispatch_timestamp
+                and frame_age > self._max_frame_age(config)
+            ):
+                with state.lock:
+                    state.expired_frames += 1
                 return
-            config = state.config or {}
             source, offset_x, offset_y = self._roi_frame(
                 frame,
                 config,
@@ -835,27 +999,26 @@ class LiveANPRWorker:
             )
             # A dashboard ROI change invalidates work already running against
             # the old area.  Such detections must not reach tracking or disk.
-            if (
-                state.cancelled
-                or state.config_generation != config_generation
-            ):
-                return
+            with state.lock:
+                if (
+                    state.cancelled
+                    or state.config_generation != config_generation
+                ):
+                    return
             if outcome.mode == "shadow":
                 state.shadow_frames += 1
                 state.shadow_candidates += len(outcome.shadow)
                 state.shadow_errors += int(bool(outcome.error))
-            processing_seconds = time.perf_counter() - started
-            state.processing_samples.append(processing_seconds)
-            if state.processing_seconds_ema:
-                state.processing_seconds_ema = (
-                    state.processing_seconds_ema * 0.70
-                    + processing_seconds * 0.30
-                )
-            else:
-                state.processing_seconds_ema = processing_seconds
+            model_seconds = time.perf_counter() - started
             state.tracker.max_age_seconds = max(
                 2.4,
-                min(6.0, state.processing_seconds_ema * 2.0 + 1.0),
+                min(
+                    6.0,
+                    max(
+                        state.processing_seconds_ema,
+                        model_seconds,
+                    ) * 2.0 + 1.0,
+                ),
             )
             state.processed_frames += 1
             state.detected_candidates += len(rows)
@@ -978,12 +1141,11 @@ class LiveANPRWorker:
             # screen until a wall-clock timeout.
             state.detection_revision += 1
             state.last_processed_at = time.time()
-            state.last_processing_ms = processing_seconds * 1000.0
             duplicate_seconds = max(
                 0.0,
                 float(config.get("duplicate_seconds", 30)),
             )
-            processing_ms = processing_seconds * 1000.0
+            processing_ms = model_seconds * 1000.0
             for result in stable:
                 if state.cancelled:
                     return
@@ -1053,35 +1215,81 @@ class LiveANPRWorker:
         except Exception as exc:
             state.last_error = f"{type(exc).__name__}: {exc}"
         finally:
-            with self._lock:
-                # Always leave real idle time after an expensive transaction.
-                # Previously a queued frame was submitted immediately here,
-                # which kept detector/OCR threads continuously busy even when
-                # every inference returned no plate.
-                state.next_inference_at = time.monotonic() + (
-                    self._burst_interval(
+            remove_state = False
+            finished_at = time.monotonic()
+            # Capture-to-finish latency includes shared-executor waiting,
+            # tracking, image copies and persistence. Capacity warnings must
+            # reflect the time a camera is really busy, not model time alone.
+            end_to_end_seconds = max(
+                0.0,
+                (
+                    finished_at - float(timestamp)
+                    if has_dispatch_timestamp
+                    else (
+                        model_seconds
+                        if model_seconds is not None
+                        else time.perf_counter() - started
+                    )
+                ),
+            )
+            with state.lock:
+                state.processing_samples.append(end_to_end_seconds)
+                if state.processing_seconds_ema:
+                    state.processing_seconds_ema = (
+                        state.processing_seconds_ema * 0.70
+                        + end_to_end_seconds * 0.30
+                    )
+                else:
+                    state.processing_seconds_ema = end_to_end_seconds
+                state.last_processing_ms = end_to_end_seconds * 1000.0
+                burst_active = bool(
+                    state.burst_frames_remaining
+                    or (
+                        activity is not None
+                        and activity.wake_inference
+                    )
+                )
+                if burst_active:
+                    interval = self._burst_interval(
                         state,
                         state.config or {},
                     )
-                    if (
-                        state.burst_frames_remaining
-                        or (
-                            activity is not None
-                            and activity.wake_inference
-                        )
+                    # Deadline is start-to-start. If inference already took
+                    # longer than the interval, the latest pending frame may
+                    # run immediately instead of paying the interval twice.
+                    state.next_inference_at = max(
+                        finished_at,
+                        state.last_submitted_at + interval,
                     )
-                    else self._post_inference_delay(
+                else:
+                    state.next_inference_at = (
+                        finished_at
+                        + self._post_inference_delay(
                             state.processing_seconds_ema,
                             state.no_plate_streak,
                         )
-                )
+                    )
                 state.busy = False
                 state.processing_done.set()
                 if (
-                    state.cancelled
-                    and self._states.get(int(camera_id)) is state
+                    not state.cancelled
+                    and state.pending is not None
+                    and burst_active
                 ):
-                    self._states.pop(int(camera_id),None)
+                    self._schedule_pending_locked(
+                        int(camera_id),
+                        state,
+                        state.next_inference_at,
+                    )
+                else:
+                    self._cancel_pending_timer_locked(state)
+                    if not burst_active:
+                        state.pending = None
+                remove_state = state.cancelled
+            if remove_state:
+                with self._lock:
+                    if self._states.get(int(camera_id)) is state:
+                        self._states.pop(int(camera_id), None)
 
     def status(self, camera_id: int) -> dict:
         with self._lock:
@@ -1104,7 +1312,10 @@ class LiveANPRWorker:
                     },
                     "threads_per_camera": threads_per_camera(),
                     "parallel_camera_limit": self._worker_capacity,
-                    "sampling": calculate_frame_budget().as_dict(),
+                    "sampling": calculate_frame_budget(
+                        geometry_calibrated=False,
+                        telemetry_required=True,
+                    ).as_dict(),
                 }
             sampling = self._frame_budget(
                 state,
@@ -1136,6 +1347,7 @@ class LiveANPRWorker:
                 ),
                 "pending_replacements": state.pending_replacements,
                 "admission_drops": state.admission_drops,
+                "expired_frames": state.expired_frames,
                 "queue_depth": int(state.pending is not None),
                 "sampling": sampling,
                 "motion_score": round(state.motion_score, 5),
@@ -1218,14 +1430,16 @@ class LiveANPRWorker:
         with self._lock:
             state = self._states.get(int(camera_id))
             if state is not None:
-                state.cancelled = True
-                state.config_generation += 1
-                state.pending = None
-                state.latest_detections = []
-                state.latest_detection_frame = None
-                state.latest_detections_at = time.time()
-                state.detection_revision += 1
-                busy = bool(state.busy)
+                with state.lock:
+                    state.cancelled = True
+                    state.config_generation += 1
+                    state.pending = None
+                    self._cancel_pending_timer_locked(state)
+                    state.latest_detections = []
+                    state.latest_detection_frame = None
+                    state.latest_detections_at = time.time()
+                    state.detection_revision += 1
+                    busy = bool(state.busy)
                 if not busy:
                     self._states.pop(int(camera_id),None)
             else:
@@ -1247,25 +1461,33 @@ class LiveANPRWorker:
             state = self._states.get(int(camera_id))
             if not state:
                 return
-            state.config_generation += 1
-            state.config = None
-            state.config_loaded_at = 0.0
-            state.pending = None
-            state.tracker = PlateConsensusTracker(
-                min_votes=2,
-                max_age_seconds=2.2,
-                emit_cooldown=5.0,
-                emit_unreadable=True,
-            )
-            state.seen.clear()
-            state.track_event_ids.clear()
-            state.latest_detections = []
-            state.latest_detection_frame = None
-            state.latest_detections_at = time.time()
-            state.detection_revision += 1
+            with state.lock:
+                state.config_generation += 1
+                state.config = None
+                state.config_loaded_at = 0.0
+                state.pending = None
+                self._cancel_pending_timer_locked(state)
+                state.tracker = PlateConsensusTracker(
+                    min_votes=2,
+                    max_age_seconds=2.2,
+                    emit_cooldown=5.0,
+                    emit_unreadable=True,
+                )
+                state.seen.clear()
+                state.track_event_ids.clear()
+                state.latest_detections = []
+                state.latest_detection_frame = None
+                state.latest_detections_at = time.time()
+                state.detection_revision += 1
 
     def shutdown(self):
         self._stopped = True
+        with self._lock:
+            states = list(self._states.values())
+        for state in states:
+            with state.lock:
+                state.pending = None
+                self._cancel_pending_timer_locked(state)
         self._executor.shutdown(
             wait=False,
             cancel_futures=True,
