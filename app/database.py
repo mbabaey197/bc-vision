@@ -73,21 +73,144 @@ def _add_missing_columns(con, table, migrations):
 
 def _backfill_plate_norm(con):
     try:
-        from app.ai.plate_rules import normalize_plate
+        from app.ai.plate_rules import (
+            PLATE_NORMALIZATION_VERSION,
+            normalize_plate,
+        )
     except Exception:
         return
-    rows = con.execute(
-        "SELECT id,plate_text FROM plate_events "
-        "WHERE plate_text IS NOT NULL AND plate_text<>'' "
-        "AND (plate_norm IS NULL OR plate_norm='')"
-    ).fetchall()
-    for row in rows:
-        normalized = normalize_plate(row["plate_text"])
-        if normalized:
-            con.execute(
-                "UPDATE plate_events SET plate_norm=? WHERE id=?",
-                (normalized, row["id"]),
+
+    marker = "plate_normalization_version"
+    stored = con.execute(
+        "SELECT value FROM settings WHERE key=?",
+        (marker,),
+    ).fetchone()
+    try:
+        stored_version = int(stored["value"]) if stored else 0
+    except (TypeError, ValueError):
+        stored_version = 0
+    recanonicalize_all = stored_version < PLATE_NORMALIZATION_VERSION
+
+    columns = {
+        row[1]
+        for row in con.execute("PRAGMA table_info(plate_events)").fetchall()
+    }
+    has_raw_guess = {"raw_guess_text", "raw_guess_norm"} <= columns
+    select_columns = "id,plate_text,plate_norm"
+    if has_raw_guess:
+        select_columns += ",raw_guess_text,raw_guess_norm"
+    where = ""
+    if not recanonicalize_all:
+        where = (
+            " WHERE (plate_text IS NOT NULL AND plate_text<>'' "
+            "AND (plate_norm IS NULL OR plate_norm=''))"
+        )
+        if has_raw_guess:
+            where += (
+                " OR (raw_guess_text IS NOT NULL AND raw_guess_text<>'' "
+                "AND (raw_guess_norm IS NULL OR raw_guess_norm=''))"
             )
+
+    cursor = con.execute(
+        f"SELECT {select_columns} FROM plate_events{where} ORDER BY id"
+    )
+    while True:
+        rows = cursor.fetchmany(500)
+        if not rows:
+            break
+        for row in rows:
+            plate_norm = normalize_plate(row["plate_text"])
+            raw_guess_norm = (
+                normalize_plate(row["raw_guess_text"])
+                if has_raw_guess
+                else ""
+            )
+            if has_raw_guess:
+                if (
+                    plate_norm != str(row["plate_norm"] or "")
+                    or raw_guess_norm
+                    != str(row["raw_guess_norm"] or "")
+                ):
+                    con.execute(
+                        "UPDATE plate_events SET plate_norm=?,"
+                        "raw_guess_norm=? WHERE id=?",
+                        (plate_norm, raw_guess_norm, row["id"]),
+                    )
+            elif plate_norm != str(row["plate_norm"] or ""):
+                con.execute(
+                    "UPDATE plate_events SET plate_norm=? WHERE id=?",
+                    (plate_norm, row["id"]),
+                )
+        # A bounded transaction prevents a large historical database from
+        # holding the write lock for the entire application startup.  The
+        # version marker is written only after every batch succeeds, so an
+        # interrupted migration safely resumes on the next launch.
+        con.commit()
+
+    if recanonicalize_all:
+        feedback_columns = {
+            row[1]
+            for row in con.execute(
+                "PRAGMA table_info(anpr_feedback)"
+            ).fetchall()
+        }
+        if {
+            "id",
+            "observed_text",
+            "observed_norm",
+            "corrected_text",
+            "corrected_norm",
+        } <= feedback_columns:
+            cursor = con.execute(
+                "SELECT id,observed_text,observed_norm,corrected_text,"
+                "corrected_norm FROM anpr_feedback ORDER BY id"
+            )
+            while True:
+                rows = cursor.fetchmany(500)
+                if not rows:
+                    break
+                for row in rows:
+                    observed = normalize_plate(row["observed_text"])
+                    corrected = normalize_plate(row["corrected_text"])
+                    if (
+                        observed != str(row["observed_norm"] or "")
+                        or corrected != str(row["corrected_norm"] or "")
+                    ):
+                        con.execute(
+                            "UPDATE anpr_feedback SET observed_norm=?,"
+                            "corrected_norm=? WHERE id=?",
+                            (observed, corrected, row["id"]),
+                        )
+                con.commit()
+
+        # Watch-list keys are unique. Re-key non-conflicting rows while
+        # preserving any pre-existing duplicate record rather than deleting
+        # user data during startup.
+        watch_columns = {
+            row[1]
+            for row in con.execute(
+                "PRAGMA table_info(plate_watchlist)"
+            ).fetchall()
+        }
+        if {"id", "plate_text", "plate_norm"} <= watch_columns:
+            for row in con.execute(
+                "SELECT id,plate_text,plate_norm FROM plate_watchlist "
+                "ORDER BY id"
+            ).fetchall():
+                normalized = normalize_plate(row["plate_text"])
+                if normalized and normalized != str(row["plate_norm"] or ""):
+                    con.execute(
+                        "UPDATE OR IGNORE plate_watchlist SET plate_norm=? "
+                        "WHERE id=?",
+                        (normalized, row["id"]),
+                    )
+            con.commit()
+
+        con.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (marker, str(PLATE_NORMALIZATION_VERSION)),
+        )
 
 
 def _backfill_event_metadata(con):

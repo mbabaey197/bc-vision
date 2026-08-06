@@ -10,6 +10,7 @@ on:
     branches:
       - main
       - agent/anpr-rescue-plate-search-rc19
+      - agent/anpr-native-ingest-rc24
     paths:
       - "app/**"
       - "installer/**"

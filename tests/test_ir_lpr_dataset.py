@@ -50,6 +50,21 @@ def _write_fixture(root: Path, name: str, labels: list[str]) -> None:
     )
 
 
+def _write_negative_fixture(root: Path, name: str, value: int) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    image_path = root / f"{name}.jpg"
+    image = np.full((100, 320, 3), value, dtype=np.uint8)
+    cv2.rectangle(image, (12, 12), (80, 70), (value + 5,) * 3, -1)
+    assert cv2.imwrite(str(image_path), image)
+    annotation = ET.Element("annotation")
+    ET.SubElement(annotation, "filename").text = image_path.name
+    ET.ElementTree(annotation).write(
+        root / f"{name}.xml",
+        encoding="utf-8",
+        xml_declaration=True,
+    )
+
+
 def _sources(tmp_path: Path) -> dict[str, Path]:
     values = {
         "train": ["3", "1", "T", "5", "5", "6", "7", "4"],
@@ -124,6 +139,39 @@ def test_ir_lpr_excludes_plate_identity_leak_from_later_split(tmp_path):
     assert result["ocr"]["split_samples"]["validation"] == 1
 
 
+def test_ir_lpr_excludes_near_duplicate_scene_across_splits(tmp_path):
+    sources = _sources(tmp_path)
+    _write_fixture(
+        sources["validation"],
+        "validation-scene-leak",
+        ["5", "5", "T", "6", "3", "9", "7", "4"],
+    )
+    train_image = cv2.imread(
+        str(sources["train"] / "train-plate.jpg"),
+        cv2.IMREAD_COLOR,
+    )
+    assert train_image is not None
+    # Different bytes/label, same visual scene: SHA and identity checks alone
+    # cannot catch this leakage.
+    train_image = np.clip(train_image.astype(np.int16) + 1, 0, 255).astype(
+        np.uint8
+    )
+    assert cv2.imwrite(
+        str(sources["validation"] / "validation-scene-leak.jpg"),
+        train_image,
+    )
+
+    result = prepare_ir_lpr(
+        plate_sources=sources,
+        car_sources=None,
+        output=tmp_path / "prepared",
+        accept_gpl_research_only=True,
+    )
+
+    assert result["ocr"]["excluded"]["validation"]["scene_overlap"] == 1
+    assert result["ocr"]["split_samples"]["validation"] == 1
+
+
 def test_ir_lpr_keeps_distinct_views_of_identity_within_train(tmp_path):
     sources = _sources(tmp_path)
     _write_fixture(
@@ -169,6 +217,39 @@ def test_ir_lpr_accepts_official_split_zip_archives(tmp_path):
     )
 
     assert result["ocr"]["split_samples"]["test"] == 1
+
+
+def test_ir_lpr_detector_keeps_bounded_confirmed_negatives(tmp_path):
+    sources = _sources(tmp_path)
+    for index, split in enumerate(("train", "validation", "test")):
+        _write_negative_fixture(
+            sources[split],
+            f"{split}-background",
+            25 + index * 35,
+        )
+
+    result = prepare_ir_lpr(
+        plate_sources=sources,
+        car_sources=sources,
+        output=tmp_path / "prepared",
+        accept_gpl_research_only=True,
+        detector_negative_ratio=1.0,
+    )
+
+    for split in ("train", "validation", "test"):
+        counts = result["detector"]["splits"][split]
+        assert counts == {"images": 2, "plates": 1, "negatives": 1}
+        payload = json.loads(
+            (
+                tmp_path
+                / "prepared"
+                / "detector"
+                / split
+                / "annotations.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert len(payload["images"]) == 2
+        assert len(payload["annotations"]) == 1
 
 
 def test_ir_lpr_cli_accepts_research_only_flag(tmp_path, capsys):

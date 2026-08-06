@@ -31,6 +31,8 @@ class StreamState:
     last_frame_at: float = 0.0
     decoded_frames: int = 0
     ai_submitted_frames: int = 0
+    ai_submit_errors: int = 0
+    last_ai_error: str = ""
     preview_frames: int = 0
     source_fps: float = 0.0
 
@@ -577,10 +579,14 @@ class CameraStream:
                 frame,
             )
             self.state.ai_submitted_frames += 1
-        except Exception:
+            self.state.last_ai_error = ""
+        except Exception as exc:
             # ANPR failures are reported through its own status and must never
             # interrupt or mark a healthy camera stream as offline.
-            pass
+            self.state.ai_submit_errors += 1
+            self.state.last_ai_error = (
+                f"{type(exc).__name__}: {exc}"
+            )
         if not self._preview_due(captured_at):
             return
         data = self._encode(frame)
@@ -939,6 +945,8 @@ class StreamManager:
             "last_frame_at": 0.0,
             "decoded_frames": 0,
             "ai_submitted_frames": 0,
+            "ai_submit_errors": 0,
+            "last_ai_error": "",
             "preview_frames": 0,
             "source_fps": 0.0,
             "preview_fps": 0,
@@ -954,6 +962,8 @@ class StreamManager:
                 "ai_submitted_frames": (
                     stream.state.ai_submitted_frames
                 ),
+                "ai_submit_errors": stream.state.ai_submit_errors,
+                "last_ai_error": stream.state.last_ai_error,
                 "preview_frames": stream.state.preview_frames,
                 "source_fps": round(stream.state.source_fps, 2),
                 "preview_fps": stream.preview_fps,
@@ -962,8 +972,22 @@ class StreamManager:
         try:
             from app.ai.live_worker import live_anpr_status
             base["anpr"] = live_anpr_status(camera_id)
-        except Exception:
-            base["anpr"] = {"active": False}
+            base["anpr"]["dispatch_errors"] = base[
+                "ai_submit_errors"
+            ]
+            if (
+                base["last_ai_error"]
+                and not base["anpr"].get("last_error")
+            ):
+                base["anpr"]["last_error"] = (
+                    "frame-dispatch: " + base["last_ai_error"]
+                )
+        except Exception as exc:
+            base["anpr"] = {
+                "active": False,
+                "last_error": f"status-channel: {type(exc).__name__}: {exc}",
+                "dispatch_errors": base["ai_submit_errors"],
+            }
         return base
 
     def set_playback(self, camera_id, action):

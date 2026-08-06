@@ -1,6 +1,7 @@
 """Canonical normalization and validation rules for Iranian license plates."""
 
 import re
+import unicodedata
 
 
 PERSIAN_DIGITS = "\u06f0\u06f1\u06f2\u06f3\u06f4\u06f5\u06f6\u06f7\u06f8\u06f9"
@@ -26,6 +27,11 @@ CHAR_TRANS = str.maketrans({
     "\u0625": "\u0627",
     "\u0622": "\u0627",
 })
+
+# Increment this whenever canonical normalization semantics change. Database
+# migrations use the value to re-key historical rows instead of only filling
+# empty keys once.
+PLATE_NORMALIZATION_VERSION = 2
 
 IRAN_WORD = "\u0627\u06cc\u0631\u0627\u0646"
 ALEF_WORD = "\u0627\u0644\u0641"
@@ -78,7 +84,14 @@ IRAN_PLATE_PATTERN = re.compile(
 def normalize_plate(text):
     """Return a stable key using ASCII digits and a normalized plate letter."""
 
-    value = str(text or "").translate(DIGIT_TRANS).translate(CHAR_TRANS).upper()
+    # NFKC folds Arabic presentation forms before the explicit Persian/Arabic
+    # character mapping.  Applying the mapping before removing ``ایران`` also
+    # makes Persian and Arabic yeh spellings of that word equivalent.
+    value = unicodedata.normalize("NFKC", str(text or ""))
+    value = value.translate(DIGIT_TRANS).translate(CHAR_TRANS).upper()
+    value = "".join(
+        char for char in value if not unicodedata.combining(char)
+    )
 
     value = value.replace(ALEF_WORD, "\u0627")
     value = value.replace(IRAN_WORD, "")
@@ -86,13 +99,21 @@ def normalize_plate(text):
     value = value.replace("IRI", "")
     value = value.replace("IR", "")
 
-    return "".join(
-        char
-        for char in value
-        if char.isdigit()
-        or "A" <= char <= "Z"
-        or "\u0600" <= char <= "\u06ff"
-    )
+    normalized = []
+    for char in value:
+        # Combining marks, Arabic punctuation, zero-width controls and other
+        # symbols must never become part of the database/search identity.
+        if unicodedata.combining(char):
+            continue
+        if "0" <= char <= "9" or "A" <= char <= "Z":
+            normalized.append(char)
+            continue
+        if (
+            "\u0600" <= char <= "\u06ff"
+            and unicodedata.category(char).startswith("L")
+        ):
+            normalized.append(char)
+    return "".join(normalized)
 
 
 def split_iran_plate(text):

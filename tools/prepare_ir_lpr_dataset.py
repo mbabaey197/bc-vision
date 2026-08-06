@@ -40,6 +40,8 @@ SOURCE_LICENSE_GIT_BLOB_SHA = (
 )
 SPLIT_ORDER = ("train", "validation", "test")
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+SCENE_HAMMING_DISTANCE = 5
+DEFAULT_DETECTOR_NEGATIVE_RATIO = 0.10
 PLATE_OBJECTS = {
     "carplate",
     "iranplate",
@@ -147,6 +149,75 @@ def _sha256(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest().upper()
+
+
+def _scene_fingerprint(path: Path) -> tuple[int, float, float] | None:
+    """Return a compact perceptual signature for split-leak detection.
+
+    SHA-256 catches byte-identical files only. Consecutive frames of one car
+    are normally JPEG-encoded differently, so a 64-bit difference hash is
+    paired with basic luminance statistics. The low-texture guard prevents
+    unrelated blank/synthetic images from all collapsing to the same dHash.
+    """
+
+    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if image is None or image.size == 0:
+        return None
+    resized = cv2.resize(image, (9, 8), interpolation=cv2.INTER_AREA)
+    differences = resized[:, 1:] > resized[:, :-1]
+    value = 0
+    for bit in differences.reshape(-1):
+        value = (value << 1) | int(bit)
+    return value, float(image.mean()), float(image.std())
+
+
+def _same_scene(
+    left: tuple[int, float, float],
+    right: tuple[int, float, float],
+) -> bool:
+    if (left[0] ^ right[0]).bit_count() > SCENE_HAMMING_DISTANCE:
+        return False
+    # dHash contains no absolute brightness information. On nearly uniform
+    # images require similar luma too, avoiding a pathological all-zero hash.
+    if min(left[2], right[2]) < 3.0:
+        return abs(left[1] - right[1]) <= 8.0
+    return True
+
+
+class _SceneIndex:
+    """Multi-index lookup for near 64-bit hashes without an O(n²) scan."""
+
+    def __init__(self):
+        self._entries: list[tuple[int, float, float]] = []
+        self._buckets: dict[tuple[int, int], set[int]] = {}
+
+    @staticmethod
+    def _keys(fingerprint: tuple[int, float, float]):
+        value = fingerprint[0]
+        for band in range(4):
+            part = (value >> (band * 16)) & 0xFFFF
+            yield band, part
+            # With distance <= 5 across four bands, at least one 16-bit band
+            # differs by no more than one bit (pigeonhole principle).
+            for bit in range(16):
+                yield band, part ^ (1 << bit)
+
+    def contains_near(self, fingerprint: tuple[int, float, float]) -> bool:
+        candidates = set()
+        for key in self._keys(fingerprint):
+            candidates.update(self._buckets.get(key, ()))
+        return any(
+            _same_scene(fingerprint, self._entries[index])
+            for index in candidates
+        )
+
+    def add(self, fingerprint: tuple[int, float, float]) -> None:
+        index = len(self._entries)
+        self._entries.append(fingerprint)
+        value = fingerprint[0]
+        for band in range(4):
+            part = (value >> (band * 16)) & 0xFFFF
+            self._buckets.setdefault((band, part), set()).add(index)
 
 
 def _ascii_token(value: str) -> str:
@@ -349,14 +420,20 @@ def _copy_image(source: Path, target: Path) -> tuple[int, int]:
 def _deduplicate_splits(rows_by_split: dict[str, list[dict]]) -> tuple[dict, dict]:
     earlier_digests: dict[str, str] = {}
     earlier_identities: dict[str, str] = {}
+    earlier_scenes = _SceneIndex()
     selected = {split: [] for split in SPLIT_ORDER}
     excluded = {
-        split: {"duplicate_image": 0, "plate_identity_overlap": 0}
+        split: {
+            "duplicate_image": 0,
+            "plate_identity_overlap": 0,
+            "scene_overlap": 0,
+        }
         for split in SPLIT_ORDER
     }
     for split in SPLIT_ORDER:
         split_digests = set()
         split_identities = set()
+        split_scenes = []
         for row in rows_by_split[split]:
             digest = _sha256(row["image"])
             plate = row["plate_text"]
@@ -366,9 +443,22 @@ def _deduplicate_splits(rows_by_split: dict[str, list[dict]]) -> tuple[dict, dic
             if plate and plate in earlier_identities:
                 excluded[split]["plate_identity_overlap"] += 1
                 continue
-            row = {**row, "sha256": digest}
+            fingerprint = _scene_fingerprint(row["image"])
+            if (
+                fingerprint is not None
+                and earlier_scenes.contains_near(fingerprint)
+            ):
+                excluded[split]["scene_overlap"] += 1
+                continue
+            row = {
+                **row,
+                "sha256": digest,
+                "scene_fingerprint": fingerprint,
+            }
             selected[split].append(row)
             split_digests.add(digest)
+            if fingerprint is not None:
+                split_scenes.append(fingerprint)
             if plate:
                 split_identities.add(plate)
         earlier_digests.update({
@@ -377,6 +467,8 @@ def _deduplicate_splits(rows_by_split: dict[str, list[dict]]) -> tuple[dict, dic
         earlier_identities.update({
             plate: split for plate in split_identities
         })
+        for fingerprint in split_scenes:
+            earlier_scenes.add(fingerprint)
     return selected, excluded
 
 
@@ -461,15 +553,29 @@ def _prepare_ocr(
 def _prepare_detector(
     roots: dict[str, Path],
     output: Path,
+    negative_ratio: float = DEFAULT_DETECTOR_NEGATIVE_RATIO,
 ) -> dict:
-    raw = {
-        split: [
+    negative_ratio = max(0.0, float(negative_ratio))
+    raw = {}
+    requested_negatives = {}
+    for split in SPLIT_ORDER:
+        rows = _annotation_rows(roots[split])
+        positives = [row for row in rows if row["plate_box"] is not None]
+        # Only an explicit empty VOC annotation is a trusted background. An
+        # XML containing unknown objects may simply have an unsupported plate
+        # label and must not silently become a false negative.
+        negatives = [
             row
-            for row in _annotation_rows(roots[split])
-            if row["plate_box"] is not None
+            for row in rows
+            if row["plate_box"] is None and not row["objects"]
         ]
-        for split in SPLIT_ORDER
-    }
+        keep = min(len(negatives), int(len(positives) * negative_ratio))
+        negatives = sorted(
+            negatives,
+            key=lambda row: (_sha256(row["image"]), str(row["image"])),
+        )[:keep]
+        requested_negatives[split] = len(negatives)
+        raw[split] = positives + negatives
     selected, excluded = _deduplicate_splits(raw)
     counts = {}
     for split in SPLIT_ORDER:
@@ -477,6 +583,7 @@ def _prepare_detector(
         images_dir = split_dir / "images"
         coco_images = []
         coco_annotations = []
+        negative_count = 0
         for image_id, row in enumerate(selected[split], start=1):
             suffix = row["image"].suffix.lower()
             if suffix not in IMAGE_SUFFIXES:
@@ -486,12 +593,6 @@ def _prepare_detector(
                 row["image"],
                 images_dir / filename,
             )
-            x1, y1, x2, y2 = row["plate_box"]
-            x1 = max(0.0, min(float(width - 1), x1))
-            y1 = max(0.0, min(float(height - 1), y1))
-            x2 = max(x1 + 1.0, min(float(width), x2))
-            y2 = max(y1 + 1.0, min(float(height), y2))
-            polygon = [x1, y1, x2, y1, x2, y2, x1, y2]
             coco_images.append({
                 "id": image_id,
                 "file_name": filename,
@@ -500,8 +601,17 @@ def _prepare_detector(
                 "sha256": row["sha256"],
                 "source_license": SOURCE_LICENSE,
             })
+            if row["plate_box"] is None:
+                negative_count += 1
+                continue
+            x1, y1, x2, y2 = row["plate_box"]
+            x1 = max(0.0, min(float(width - 1), x1))
+            y1 = max(0.0, min(float(height - 1), y1))
+            x2 = max(x1 + 1.0, min(float(width), x2))
+            y2 = max(y1 + 1.0, min(float(height), y2))
+            polygon = [x1, y1, x2, y1, x2, y2, x1, y2]
             coco_annotations.append({
-                "id": image_id,
+                "id": len(coco_annotations) + 1,
                 "image_id": image_id,
                 "segmentation": [polygon],
                 "area": round((x2 - x1) * (y2 - y1), 3),
@@ -527,6 +637,7 @@ def _prepare_detector(
         counts[split] = {
             "images": len(coco_images),
             "plates": len(coco_annotations),
+            "negatives": negative_count,
         }
     if not all(row["plates"] for row in counts.values()):
         raise ValueError(
@@ -548,6 +659,15 @@ def _prepare_detector(
         "annotation_geometry": (
             "axis-aligned VOC boxes represented as zero-rotation polygons"
         ),
+        "scene_split_guard": {
+            "algorithm": "dhash64+luma-low-texture-guard",
+            "max_hamming_distance": SCENE_HAMMING_DISTANCE,
+        },
+        "negative_sampling": {
+            "ratio": negative_ratio,
+            "confirmed_empty_annotations_only": True,
+            "requested": requested_negatives,
+        },
         "splits": counts,
         "excluded": excluded,
     }
@@ -564,6 +684,7 @@ def prepare_ir_lpr(
     car_sources: dict[str, Path] | None,
     output: Path,
     accept_gpl_research_only: bool,
+    detector_negative_ratio: float = DEFAULT_DETECTOR_NEGATIVE_RATIO,
 ) -> dict:
     if not accept_gpl_research_only:
         raise ValueError(
@@ -603,7 +724,11 @@ def prepare_ir_lpr(
         result = {
             "ocr": _prepare_ocr(plates, output / "ocr"),
             "detector": (
-                _prepare_detector(cars, output / "detector")
+                _prepare_detector(
+                    cars,
+                    output / "detector",
+                    negative_ratio=detector_negative_ratio,
+                )
                 if cars is not None
                 else None
             ),
@@ -631,6 +756,15 @@ def main(argv=None) -> int:
             )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
+        "--detector-negative-ratio",
+        type=float,
+        default=DEFAULT_DETECTOR_NEGATIVE_RATIO,
+        help=(
+            "maximum confirmed background images per labelled detector "
+            "image (default: 0.10)"
+        ),
+    )
+    parser.add_argument(
         "--accept-gpl-3.0-research-only",
         dest="accept_gpl_3_0_research_only",
         action="store_true",
@@ -653,6 +787,7 @@ def main(argv=None) -> int:
         accept_gpl_research_only=(
             args.accept_gpl_3_0_research_only
         ),
+        detector_negative_ratio=args.detector_negative_ratio,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
