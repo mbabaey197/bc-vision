@@ -1,0 +1,88 @@
+name: RC27.1 Hosted Fallback Build
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/rc27-hosted-trigger.txt"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: rc27-hosted-fallback
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    env:
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      BCVISION_HEZAR_OCR: "1"
+      BCVISION_EXPERIMENTAL_NO_LICENSE: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build application with bundled Hezar OCR
+        shell: cmd
+        run: |
+          call BUILD_PORTABLE_EXE.bat
+
+      - name: Install Inno Setup
+        shell: powershell
+        run: |
+          $cmd = Get-Command iscc.exe -ErrorAction SilentlyContinue
+          if (-not $cmd) { choco install innosetup --no-progress -y }
+
+      - name: Build installer and updater
+        shell: powershell
+        run: |
+          $candidates = @()
+          $cmd = Get-Command iscc.exe -ErrorAction SilentlyContinue
+          if ($cmd) { $candidates += $cmd.Source }
+          $candidates += "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $candidates += "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          $iscc = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe not found after installation." }
+          New-Item -ItemType Directory -Force -Path setup_output | Out-Null
+          & $iscc installer\BCVision.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $iscc installer\BCVision_Update.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify RC27.1 outputs
+        shell: powershell
+        run: |
+          $required = @(
+            'dist\BCVision\BCVision.exe',
+            'dist\BCVision\hezar-model\model.pt',
+            'setup_output\BCVision_RC27.1_Setup.exe',
+            'setup_output\BCVision_RC27.1_Update.exe'
+          )
+          foreach ($item in $required) { if (-not (Test-Path $item)) { throw "Missing output: $item" } }
+          Get-Item $required | Select-Object Name,Length,LastWriteTime
+
+      - name: Upload RC27.1 bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: BCVision-RC27.1-Hezar-Windows-Hosted
+          path: |
+            setup_output/BCVision_RC27.1_Setup.exe
+            setup_output/BCVision_RC27.1_Update.exe
+            dist/BCVision/**
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
