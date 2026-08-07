@@ -45,8 +45,6 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "bcvision.db"
 LOG_PATH = DATA_DIR / "BCVision.log"
 SECRET_PATH = DATA_DIR / ".secret"
-# Licensing stays in the fixed bootstrap directory. Changing archive/storage
-# drives therefore cannot move, clone, or accidentally delete the binding.
 LICENSE_PATH = BOOTSTRAP_DIR / "license.dat"
 LEGACY_LICENSE_PATH = DATA_DIR / "license.json"
 TRIAL_PATH = BOOTSTRAP_DIR / ".trial.dat"
@@ -58,12 +56,20 @@ VIDEO_DIR = DATA_DIR / "videos"
 for folder in (BACKUP_DIR, SNAPSHOT_DIR, PLATE_DIR, VIDEO_DIR):
     folder.mkdir(parents=True, exist_ok=True)
 
-# Main imports this module before registering HTTP routes. Installing the
-# policy here removes online activation from the web surface while keeping
-# non-web licensing tools independent of FastAPI.
+# Keep the existing offline activation surface available for later restoration.
 try:
     from app.offline_license_policy import install_offline_license_policy
 
     install_offline_license_policy()
+except ImportError:
+    pass
+
+# RC27 experimental builds intentionally bypass license enforcement while the
+# ANPR/OCR engine is being validated. Set BCVISION_EXPERIMENTAL_NO_LICENSE=0
+# to restore the normal licensing path without deleting the original code.
+try:
+    from app.experimental_license import install_experimental_license_override
+
+    install_experimental_license_override()
 except ImportError:
     pass
