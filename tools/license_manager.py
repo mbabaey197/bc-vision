@@ -153,6 +153,66 @@ class LicenseManagerApp(tk.Tk):
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.history.configure(yscrollcommand=scrollbar.set)
         ttk.Button(history_tab, text="به‌روزرسانی", command=self._refresh_history).grid(row=1, column=0, pady=8)
+        self._enable_clipboard_support(self)
+
+    def _enable_clipboard_support(self, root: tk.Misc) -> None:
+        editable_types = (tk.Entry, tk.Text, ttk.Entry, ttk.Spinbox)
+        for widget in root.winfo_children():
+            if isinstance(widget, editable_types):
+                try:
+                    state = str(widget.cget("state"))
+                except tk.TclError:
+                    state = "normal"
+                if state not in {"disabled", "readonly"}:
+                    self._bind_edit_menu(widget)
+            self._enable_clipboard_support(widget)
+
+    def _bind_edit_menu(self, widget: tk.Misc) -> None:
+        menu = tk.Menu(widget, tearoff=False)
+
+        def invoke(virtual_event: str):
+            def handler(_event=None):
+                widget.focus_set()
+                widget.event_generate(virtual_event)
+                return "break"
+
+            return handler
+
+        def select_all(_event=None):
+            widget.focus_set()
+            if isinstance(widget, tk.Text):
+                widget.tag_add("sel", "1.0", "end-1c")
+                widget.mark_set("insert", "end-1c")
+                widget.see("insert")
+            else:
+                widget.selection_range(0, tk.END)
+                widget.icursor(tk.END)
+            return "break"
+
+        menu.add_command(label="برش", command=invoke("<<Cut>>"))
+        menu.add_command(label="کپی", command=invoke("<<Copy>>"))
+        menu.add_command(label="چسباندن", command=invoke("<<Paste>>"))
+        menu.add_separator()
+        menu.add_command(label="انتخاب همه", command=select_all)
+
+        def popup(event):
+            widget.focus_set()
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+            return "break"
+
+        widget.bind("<Button-3>", popup, add="+")
+        for sequence in ("<Control-v>", "<Control-V>", "<Shift-Insert>"):
+            widget.bind(sequence, invoke("<<Paste>>"), add="+")
+        for sequence in ("<Control-c>", "<Control-C>"):
+            widget.bind(sequence, invoke("<<Copy>>"), add="+")
+        for sequence in ("<Control-x>", "<Control-X>"):
+            widget.bind(sequence, invoke("<<Cut>>"), add="+")
+        for sequence in ("<Control-a>", "<Control-A>"):
+            widget.bind(sequence, select_all, add="+")
+        widget._bcvision_edit_menu = menu
 
     def _apply_plan_defaults(self) -> None:
         plan = self.plan_var.get()
@@ -187,6 +247,12 @@ class LicenseManagerApp(tk.Tk):
         text = tk.Text(dialog, width=70, height=10)
         text.pack(padx=12, pady=4)
         text.insert("1.0", "\n".join(self.machine_ids))
+        self._bind_edit_menu(text)
+        text.focus_set()
+
+        def paste() -> None:
+            text.focus_set()
+            text.event_generate("<<Paste>>")
 
         def save() -> None:
             try:
@@ -196,7 +262,10 @@ class LicenseManagerApp(tk.Tk):
             except Exception as exc:
                 messagebox.showerror("خطا", str(exc), parent=dialog)
 
-        ttk.Button(dialog, text="ثبت", command=save).pack(pady=12)
+        buttons = ttk.Frame(dialog)
+        buttons.pack(pady=12)
+        ttk.Button(buttons, text="چسباندن", command=paste).pack(side="right", padx=4)
+        ttk.Button(buttons, text="ثبت", command=save).pack(side="right", padx=4)
 
     def _update_machine_summary(self) -> None:
         first = self.machine_ids[0] if self.machine_ids else ""
