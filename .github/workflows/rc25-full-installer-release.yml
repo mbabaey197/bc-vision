@@ -1,0 +1,272 @@
+name: RC25 full installer release
+
+# One-time RC25 full-installer publisher requested by the repository owner.
+# The guarded reusable full-release workflow remains manual and read-only.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/anpr-detection-recovery-rc25
+    paths:
+      - ".github/workflows/rc25-full-installer-release.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rc25-official-full-installer-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-verify:
+    runs-on: windows-2025
+    timeout-minutes: 120
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Checkout exact candidate commit
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Read candidate version
+        id: version
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $value = (Get-Content VERSION -Raw).Trim()
+          "value=$value" >> $env:GITHUB_OUTPUT
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.0"
+          enable-cache: true
+          cache-python: true
+          cache-dependency-glob: |
+            requirements-lock.txt
+            requirements-ai-lock.txt
+
+      - name: Set up portable Python 3.13
+        shell: cmd
+        run: |
+          if not exist .venv\Scripts\python.exe uv python install 3.13
+          if not exist .venv\Scripts\python.exe uv venv --python 3.13 --seed .venv
+          echo %CD%\.venv\Scripts>>"%GITHUB_PATH%"
+
+      - name: Run source regression
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\release-regression
+        run: |
+          python scripts\build_dependency_stamp.py check `
+            .venv\.bcvision-test-dependencies.sha256 `
+            requirements-test.txt
+          if ($LASTEXITCODE -ne 0) {
+            python -m pip install `
+              --disable-pip-version-check `
+              -r requirements-test.txt `
+              --quiet
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            python scripts\build_dependency_stamp.py write `
+              .venv\.bcvision-test-dependencies.sha256 `
+              requirements-test.txt
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          python -m compileall -q app launcher.py
+          python -m pytest -q tests
+
+      - name: Build portable Windows application
+        shell: cmd
+        run: BUILD_PORTABLE_EXE.bat
+
+      - name: Verify windowless Windows service host
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          python scripts\verify_windows_gui_subsystem.py `
+            dist\BCVision\BCVision.exe
+
+      - name: Reuse verified Inno Setup
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $iscc = & .\scripts\ensure_inno_setup.ps1
+          if (-not $iscc -or -not (Test-Path $iscc)) {
+            throw "ISCC.exe was not prepared"
+          }
+          "INNO_ISCC=$iscc" >> $env:GITHUB_ENV
+
+      - name: Build installer and updater
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $iscc = $env:INNO_ISCC
+          if (-not $iscc -or -not (Test-Path $iscc)) {
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path $iscc)) {
+            $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path $iscc)) {
+            throw "ISCC.exe was not found"
+          }
+          & $iscc installer\BCVision.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $iscc installer\BCVision_Update.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify clean install, update and persistent data
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (Get-Content VERSION -Raw).Trim()
+          $installDir = Join-Path $env:RUNNER_TEMP "bcvision-install"
+          $dataDir = Join-Path $env:RUNNER_TEMP "bcvision-persistent-data"
+          $setup = Resolve-Path "setup_output\BCVision_Setup_v$version.exe"
+          $update = Resolve-Path "setup_output\BCVision_Update_v$version.exe"
+          $firstResult = Join-Path $env:RUNNER_TEMP "self-test-install.json"
+          $updatedResult = Join-Path $env:RUNNER_TEMP "self-test-update.json"
+          $setupLog = Join-Path $env:RUNNER_TEMP "bcvision-setup.log"
+          $updateLog = Join-Path $env:RUNNER_TEMP "bcvision-update.log"
+
+          $install = Start-Process -FilePath $setup -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/CURRENTUSER",
+            "/LOG=$setupLog",
+            "/DIR=$installDir"
+          ) -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            if (Test-Path $setupLog) { Get-Content $setupLog }
+            throw "Installer exited with $($install.ExitCode)"
+          }
+
+          $env:BCVISION_DATA_DIR = $dataDir
+          $env:BCVISION_SKIP_MODEL_PREP = "1"
+          $first = Start-Process -FilePath "$installDir\BCVision.exe" -ArgumentList @(
+            "--self-test",
+            "--verify-anpr",
+            "--self-test-output",
+            $firstResult
+          ) -Wait -PassThru
+          if ($first.ExitCode -ne 0) {
+            throw "Installed executable self-test exited with $($first.ExitCode)"
+          }
+          $firstJson = Get-Content $firstResult -Raw | ConvertFrom-Json
+          if (-not $firstJson.ok -or $firstJson.version -ne $version) {
+            throw "Installed executable self-test failed"
+          }
+
+          $env:BCVISION_TEST_MARKER = "preserve-$([guid]::NewGuid())"
+          python -c "import os,sqlite3; p=os.path.join(os.environ['BCVISION_DATA_DIR'],'bcvision.db'); c=sqlite3.connect(p); c.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',('release_test_marker',os.environ['BCVISION_TEST_MARKER'])); c.commit(); c.close()"
+          $modelDir = Join-Path $dataDir "models\plate"
+          New-Item -ItemType Directory -Path $modelDir -Force | Out-Null
+          Set-Content -Path (Join-Path $modelDir "preserve.marker") -Value $env:BCVISION_TEST_MARKER
+
+          $upgrade = Start-Process -FilePath $update -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/CURRENTUSER",
+            "/LOG=$updateLog",
+            "/DIR=$installDir"
+          ) -Wait -PassThru
+          if ($upgrade.ExitCode -ne 0) {
+            if (Test-Path $updateLog) { Get-Content $updateLog }
+            throw "Updater exited with $($upgrade.ExitCode)"
+          }
+
+          $updated = Start-Process -FilePath "$installDir\BCVision.exe" -ArgumentList @(
+            "--self-test",
+            "--verify-anpr",
+            "--self-test-output",
+            $updatedResult
+          ) -Wait -PassThru
+          if ($updated.ExitCode -ne 0) {
+            throw "Updated executable self-test exited with $($updated.ExitCode)"
+          }
+          $updatedJson = Get-Content $updatedResult -Raw | ConvertFrom-Json
+          if (-not $updatedJson.ok -or $updatedJson.version -ne $version) {
+            throw "Updated executable self-test failed"
+          }
+          if (-not $firstJson.anpr_ready -or -not $updatedJson.anpr_ready) {
+            throw "Packaged ANPR models failed offline inference validation"
+          }
+
+          python -c "import os,sqlite3,sys; p=os.path.join(os.environ['BCVISION_DATA_DIR'],'bcvision.db'); c=sqlite3.connect(p); r=c.execute('SELECT value FROM settings WHERE key=?',('release_test_marker',)).fetchone(); c.close(); sys.exit(0 if r and r[0]==os.environ['BCVISION_TEST_MARKER'] else 1)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Database marker was not preserved by update"
+          }
+          $modelMarker = Get-Content (Join-Path $modelDir "preserve.marker") -Raw
+          if ($modelMarker.Trim() -ne $env:BCVISION_TEST_MARKER) {
+            throw "AI model marker was not preserved by update"
+          }
+
+          $uninstaller = Get-ChildItem $installDir -Filter "unins*.exe" |
+            Select-Object -First 1
+          if (-not $uninstaller) {
+            throw "Standard uninstaller was not created"
+          }
+          $uninstall = Start-Process -FilePath $uninstaller.FullName -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART"
+          ) -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) {
+            throw "Uninstaller exited with $($uninstall.ExitCode)"
+          }
+          if (-not (Test-Path (Join-Path $dataDir "bcvision.db"))) {
+            throw "Persistent database was removed by uninstall"
+          }
+          if (-not (Test-Path (Join-Path $modelDir "preserve.marker"))) {
+            throw "Persistent AI model data was removed by uninstall"
+          }
+
+      - name: Create installer checksum
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ($version -ne "2.2.0-rc25") {
+            throw "Refusing to publish unexpected version $version"
+          }
+          $releaseDir = Join-Path $PWD "release"
+          if (Test-Path $releaseDir) {
+            Remove-Item $releaseDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $releaseDir | Out-Null
+          Copy-Item "setup_output\BCVision_Setup_v$version.exe" $releaseDir
+          $setup = Get-Item "$releaseDir\BCVision_Setup_v$version.exe"
+          $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path "$releaseDir\SHA256SUMS.txt" -Value "$hash  $($setup.Name)" -Encoding ascii
+          Get-ChildItem $releaseDir | Select-Object Name,Length
+
+      - name: Upload verified candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: BCVision-${{ steps.version.outputs.value }}-full-installer
+          path: release/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Publish installer to GitHub prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "v$env:RELEASE_VERSION"
+          $setup = "release\BCVision_Setup_v$env:RELEASE_VERSION.exe"
+          $checksums = "release\SHA256SUMS.txt"
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $setup $checksums --clobber --repo $env:GITHUB_REPOSITORY
+          }
+          else {
+            gh release create $tag $setup $checksums --prerelease --target $env:GITHUB_SHA --title "BC Vision $env:RELEASE_VERSION" --notes "Verified full Windows installer for BC Vision RC25. Source regression, Windows build, clean install, in-place update, offline ANPR inference, windowless service host, and persistent-data checks passed." --repo $env:GITHUB_REPOSITORY
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release view $tag --repo $env:GITHUB_REPOSITORY --json url --jq .url
