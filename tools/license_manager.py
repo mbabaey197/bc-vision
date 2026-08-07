@@ -29,7 +29,7 @@ from tools.license_service import (
 APP_DIR = Path.home() / "BCVisionLicenseManager"
 KEY_DIR = SOURCE_ROOT / "tools" / "keys"
 DEFAULT_PRIVATE = (
-    EXECUTABLE_DIR / "BCVision_license_private_key_rc25.pem"
+    EXECUTABLE_DIR / "BCVision_PRIVATE_KEY_467084FA_RC25.pem"
     if FROZEN
     else KEY_DIR / "license_private_key.pem"
 )
