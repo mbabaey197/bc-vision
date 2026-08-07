@@ -5,9 +5,14 @@ name: Windows release candidate
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - agent/anpr-detection-recovery-rc25
+    paths:
+      - ".github/workflows/windows-release-candidate.yml"
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: windows-full-release-${{ github.ref }}
@@ -247,3 +252,56 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
+
+      - name: Publish verified RC25 installer to GitHub Release
+        if: github.ref == 'refs/heads/agent/anpr-detection-recovery-rc25'
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ($version -ne "2.2.0-rc25") {
+            throw "Refusing to publish unexpected version $version"
+          }
+
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
+          $tag = "v$version"
+          try {
+            $release = Invoke-RestMethod -Method Get -Uri "$api/releases/tags/$tag" -Headers $headers
+          }
+          catch {
+            $status = $_.Exception.Response.StatusCode.value__
+            if ($status -ne 404) { throw }
+            $payload = @{
+              tag_name = $tag
+              target_commitish = $env:GITHUB_SHA
+              name = "BC Vision $version"
+              body = "Verified full Windows installer for BC Vision RC25. Clean install, in-place update, offline ANPR inference, windowless service host, and persistent-data checks passed."
+              draft = $false
+              prerelease = $true
+            } | ConvertTo-Json
+            $release = Invoke-RestMethod -Method Post -Uri "$api/releases" -Headers $headers -Body $payload -ContentType "application/json"
+          }
+
+          $assets = @(
+            (Resolve-Path "release\BCVision_Setup_v$version.exe").Path,
+            (Resolve-Path "release\SHA256SUMS.txt").Path
+          )
+          $uploadUrl = $release.upload_url -replace '\{\?name,label\}$', ''
+          foreach ($assetPath in $assets) {
+            $asset = Get-Item $assetPath
+            $existing = $release.assets | Where-Object { $_.name -eq $asset.Name } | Select-Object -First 1
+            if ($existing) {
+              Invoke-RestMethod -Method Delete -Uri "$api/releases/assets/$($existing.id)" -Headers $headers
+            }
+            $encodedName = [uri]::EscapeDataString($asset.Name)
+            Invoke-RestMethod -Method Post -Uri "${uploadUrl}?name=$encodedName" -Headers $headers -InFile $asset.FullName -ContentType "application/octet-stream"
+          }
+
+          "Installer release: $($release.html_url)"
