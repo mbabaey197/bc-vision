@@ -1,2 +1,2 @@
 Trigger RC27.1 Hezar EXE build on self-hosted Windows runner.
-Build generation: 2026-08-08-02
+Build generation: 2026-08-08-03
