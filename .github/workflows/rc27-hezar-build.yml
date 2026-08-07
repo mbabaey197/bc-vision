@@ -2,6 +2,11 @@ name: RC27 Hezar EXE Build
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - agent/rc27-final-build
+    paths:
+      - ".github/rc27-build-trigger.txt"
   pull_request:
     branches:
       - main

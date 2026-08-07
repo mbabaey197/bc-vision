@@ -44,6 +44,13 @@ set "BUILD_PY=%CD%\.buildvenv\Scripts\python.exe"
     -r requirements-ai-lock.txt
 if errorlevel 1 goto :error
 
+rem RC27: install the Persian Hezar OCR runtime in the actual build venv.
+"%BUILD_PY%" -m pip install ^
+    --disable-pip-version-check ^
+    hezar==1.0.0 ^
+    requests
+if errorlevel 1 goto :error
+
 "%BUILD_PY%" -m pip check
 if errorlevel 1 goto :error
 
@@ -51,10 +58,22 @@ rmdir /s /q .model-seed 2>nul
 "%BUILD_PY%" -m app.ai.model_manager --seed-dir ".model-seed"
 if errorlevel 1 goto :error
 
+rem Download the official Hezar V2 Persian license-plate model into the build.
+rmdir /s /q .hezar-model 2>nul
+"%BUILD_PY%" -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='hezarai/crnn-fa-license-plate-recognition-v2', local_dir=r'.hezar-model')"
+if errorlevel 1 goto :error
+
+rem Verify the published model SHA256 before packaging it.
+"%BUILD_PY%" -c "from pathlib import Path; import hashlib,sys; p=Path(r'.hezar-model\model.pt'); h=hashlib.sha256(p.read_bytes()).hexdigest(); print('HEZAR_SHA256='+h); sys.exit(0 if h.lower()=='c20ad7be2b1fe383da6f22cbc7bdf8a9a37119f0b20235d736faa59b731f6620' else 1)"
+if errorlevel 1 goto :error
+
+rem Verify that Hezar can load the bundled model fully offline from disk.
+"%BUILD_PY%" -c "from hezar.models import Model; Model.load(r'.hezar-model', load_locally=True); print('HEZAR_LOCAL_MODEL_READY')"
+if errorlevel 1 goto :error
+
 rmdir /s /q build 2>nul
 rmdir /s /q dist 2>nul
 
-rem RC15 operator-assisted ANPR modules are packaged explicitly.
 "%BUILD_PY%" -m PyInstaller ^
     --noconfirm ^
     --clean ^
@@ -67,8 +86,10 @@ rem RC15 operator-assisted ANPR modules are packaged explicitly.
     --hidden-import app.config ^
     --hidden-import app.streams ^
     --hidden-import app.license ^
+    --hidden-import app.experimental_license ^
     --hidden-import app.ai.detector ^
     --hidden-import app.ai.ocr ^
+    --hidden-import app.ai.hezar_ocr ^
     --hidden-import app.ai.onnx_crnn ^
     --hidden-import app.ai.onnx_cnn ^
     --hidden-import app.ai.onnx_detector ^
@@ -90,6 +111,7 @@ rem RC15 operator-assisted ANPR modules are packaged explicitly.
     --hidden-import app.ai.training ^
     --hidden-import app.ai.training_worker ^
     --add-data ".model-seed;model-seed" ^
+    --add-data ".hezar-model;hezar-model" ^
     --collect-all av ^
     --collect-all fastapi ^
     --collect-all starlette ^
@@ -98,6 +120,12 @@ rem RC15 operator-assisted ANPR modules are packaged explicitly.
     --collect-all onnx ^
     --collect-all onnxruntime ^
     --collect-all torch ^
+    --collect-all hezar ^
+    --collect-all omegaconf ^
+    --collect-all transformers ^
+    --collect-all tokenizers ^
+    --collect-all huggingface_hub ^
+    --collect-all safetensors ^
     launcher.py
 if errorlevel 1 goto :error
 
@@ -121,10 +149,10 @@ if errorlevel 1 goto :error
 copy /Y "THIRD_PARTY_NOTICES.md" "dist\BCVision\THIRD_PARTY_NOTICES.md" >nul
 if errorlevel 1 goto :error
 
-echo Portable AI build completed successfully.
+echo Portable RC27 Hezar AI build completed successfully.
 echo %CD%\dist\BCVision\BCVision.exe
 exit /b 0
 
 :error
-echo Portable AI build failed.
+echo Portable RC27 Hezar AI build failed.
 exit /b 1
