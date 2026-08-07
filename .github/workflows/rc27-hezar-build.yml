@@ -13,22 +13,28 @@ permissions:
   actions: write
 
 concurrency:
-  group: rc27-hezar-build
+  group: rc27-hezar-selfhosted
   cancel-in-progress: true
 
 jobs:
   build:
-    runs-on: self-hosted
-    timeout-minutes: 120
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 180
 
     env:
       PYTHONUTF8: "1"
       PYTHONDONTWRITEBYTECODE: "1"
       BCVISION_HEZAR_OCR: "1"
+      BCVISION_EXPERIMENTAL_NO_LICENSE: "1"
+      SRC_DIR: rc27-${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
-      - name: Checkout
+      - name: Checkout isolated workspace
         uses: actions/checkout@v4
+        with:
+          path: ${{ env.SRC_DIR }}
+          clean: false
+          fetch-depth: 1
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -37,30 +43,47 @@ jobs:
 
       - name: Build application with bundled Hezar OCR
         shell: cmd
+        working-directory: ${{ github.workspace }}\${{ env.SRC_DIR }}
         run: |
           call BUILD_PORTABLE_EXE.bat
 
       - name: Build installer and updater
-        shell: cmd
+        shell: powershell
+        working-directory: ${{ github.workspace }}\${{ env.SRC_DIR }}
         run: |
-          set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
-          if not exist "%ISCC%" set "ISCC=%ProgramFiles%\Inno Setup 6\ISCC.exe"
-          if not exist "%ISCC%" (
-            echo Inno Setup 6 is required on the self-hosted runner.
-            exit /b 1
-          )
-          "%ISCC%" installer\BCVision.iss
-          if errorlevel 1 exit /b 1
-          "%ISCC%" installer\BCVision_Update.iss
-          if errorlevel 1 exit /b 1
+          $candidates = @()
+          $cmd = Get-Command iscc.exe -ErrorAction SilentlyContinue
+          if ($cmd) { $candidates += $cmd.Source }
+          $candidates += "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $candidates += "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          $iscc = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $iscc) { throw "Inno Setup 6 (ISCC.exe) is not installed on the self-hosted runner." }
+          New-Item -ItemType Directory -Force -Path setup_output | Out-Null
+          & $iscc installer\BCVision.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $iscc installer\BCVision_Update.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path setup_output\BCVision_RC27.1_Setup.exe)) { throw "Full installer was not created." }
+          if (-not (Test-Path setup_output\BCVision_RC27.1_Update.exe)) { throw "Updater was not created." }
 
-      - name: Upload RC27 bundle
+      - name: Verify RC27 output
+        shell: powershell
+        working-directory: ${{ github.workspace }}\${{ env.SRC_DIR }}
+        run: |
+          if (-not (Test-Path dist\BCVision\BCVision.exe)) { throw "BCVision.exe missing" }
+          if (-not (Test-Path dist\BCVision\hezar-model\model.pt)) { throw "Bundled Hezar model missing" }
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ($version -ne "2.2.0-rc27.1") { throw "Unexpected VERSION: $version" }
+          Get-Item dist\BCVision\BCVision.exe, setup_output\BCVision_RC27.1_Setup.exe, setup_output\BCVision_RC27.1_Update.exe | Select-Object Name,Length,LastWriteTime
+
+      - name: Upload RC27.1 bundle
         uses: actions/upload-artifact@v4
         with:
-          name: BCVision-RC27-Hezar-Windows
+          name: BCVision-RC27.1-Hezar-Windows
           path: |
-            setup_output/*.exe
-            dist/BCVision/**
+            ${{ env.SRC_DIR }}/setup_output/BCVision_RC27.1_Setup.exe
+            ${{ env.SRC_DIR }}/setup_output/BCVision_RC27.1_Update.exe
+            ${{ env.SRC_DIR }}/dist/BCVision/**
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
