@@ -262,13 +262,7 @@ jobs:
           $tag = "v$env:RELEASE_VERSION"
           $setup = "release\BCVision_Setup_v$env:RELEASE_VERSION.exe"
           $checksums = "release\SHA256SUMS.txt"
-          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $setup $checksums --clobber --repo $env:GITHUB_REPOSITORY
-          }
-          else {
-            gh release create $tag $setup $checksums --prerelease --target $env:GITHUB_SHA --title "BC Vision $env:RELEASE_VERSION" --notes "Verified full Windows installer for BC Vision RC25. Source regression, Windows build, clean install, in-place update, offline ANPR inference, windowless service host, and persistent-data checks passed." --repo $env:GITHUB_REPOSITORY
-          }
+          gh release create $tag $setup $checksums --prerelease --target $env:GITHUB_SHA --title "BC Vision $env:RELEASE_VERSION" --notes "Verified full Windows installer for BC Vision RC25. Source regression, Windows build, clean install, in-place update, offline ANPR inference, windowless service host, and persistent-data checks passed." --repo $env:GITHUB_REPOSITORY
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           gh release view $tag --repo $env:GITHUB_REPOSITORY --json url --jq .url
 
