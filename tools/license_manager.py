@@ -6,9 +6,14 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+SOURCE_ROOT = Path(__file__).resolve().parent.parent
+FROZEN = bool(getattr(sys, "frozen", False))
+BUNDLE_ROOT = Path(getattr(sys, "_MEIPASS", SOURCE_ROOT))
+EXECUTABLE_DIR = (
+    Path(sys.executable).resolve().parent if FROZEN else SOURCE_ROOT
+)
+if not FROZEN and str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
 
 from tools.license_service import (
     ALL_FEATURES,
@@ -22,9 +27,13 @@ from tools.license_service import (
 )
 
 APP_DIR = Path.home() / "BCVisionLicenseManager"
-KEY_DIR = Path(__file__).resolve().parent / "keys"
-DEFAULT_PRIVATE = KEY_DIR / "license_private_key.pem"
-DEFAULT_PUBLIC = ROOT / "license_public_key.pem"
+KEY_DIR = SOURCE_ROOT / "tools" / "keys"
+DEFAULT_PRIVATE = (
+    EXECUTABLE_DIR / "BCVision_license_private_key_rc25.pem"
+    if FROZEN
+    else KEY_DIR / "license_private_key.pem"
+)
+DEFAULT_PUBLIC = BUNDLE_ROOT / "license_public_key.pem"
 DEFAULT_LEDGER = APP_DIR / "license_manager.db"
 DEFAULT_OUTPUT = APP_DIR / "issued"
 
@@ -334,7 +343,19 @@ class LicenseManagerApp(tk.Tk):
             )
 
 
+def _resource_self_test() -> bool:
+    try:
+        from cryptography.hazmat.primitives import serialization
+
+        serialization.load_pem_public_key(DEFAULT_PUBLIC.read_bytes())
+        return True
+    except Exception:
+        return False
+
+
 def main() -> None:
+    if "--self-test" in sys.argv:
+        raise SystemExit(0 if _resource_self_test() else 2)
     DEFAULT_OUTPUT.mkdir(parents=True, exist_ok=True)
     LicenseManagerApp().mainloop()
 
