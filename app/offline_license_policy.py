@@ -53,8 +53,6 @@ def _patch_router_type(router_type) -> None:
             for method in (kwargs.get("methods") or [])
         }
         if path == "/license/online":
-            # The compatibility function remains importable for old callers,
-            # but no HTTP route is exposed and no network activation exists.
             return None
         if path == "/license" and (not methods or "GET" in methods):
             endpoint = _offline_page(endpoint)
@@ -70,3 +68,12 @@ def install_offline_license_policy() -> None:
 
 
 install_offline_license_policy()
+
+# RC27 experimental builds deliberately bypass activation while preserving the
+# production licensing implementation for later re-enable.
+try:
+    from app.experimental_license import install_experimental_license_override
+
+    install_experimental_license_override()
+except Exception:
+    pass
