@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: [self-hosted, Windows, X64, bc-vision-build]
+    runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 120
 
     env:
