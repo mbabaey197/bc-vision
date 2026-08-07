@@ -1,0 +1,59 @@
+name: RC27 Hezar EXE Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: [self-hosted, Windows, X64, bc-vision-build]
+    timeout-minutes: 120
+
+    env:
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      BCVISION_HEZAR_OCR: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install build dependencies
+        shell: cmd
+        run: |
+          python -m pip install --upgrade pip
+          if exist requirements-lock.txt python -m pip install -r requirements-lock.txt
+          python -m pip install hezar requests pyinstaller
+
+      - name: Cache Hezar model
+        shell: cmd
+        run: |
+          python -c "from hezar.models import Model; Model.load('hezarai/crnn-fa-license-plate-recognition-v2'); print('HEZAR_READY')"
+
+      - name: Build application
+        shell: cmd
+        run: |
+          call BUILD_PORTABLE_EXE.bat
+
+      - name: Build installers
+        shell: cmd
+        run: |
+          if exist installer\BCVision.iss iscc installer\BCVision.iss
+          if exist installer\BCVision_Update.iss iscc installer\BCVision_Update.iss
+
+      - name: Upload RC27 bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: BCVision-RC27-Hezar-Windows
+          path: |
+            dist/**
+            setup_output/**
+          retention-days: 14
