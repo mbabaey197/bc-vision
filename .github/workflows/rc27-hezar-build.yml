@@ -71,10 +71,15 @@ jobs:
         working-directory: ${{ github.workspace }}\${{ env.SRC_DIR }}
         run: |
           if (-not (Test-Path dist\BCVision\BCVision.exe)) { throw "BCVision.exe missing" }
-          if (-not (Test-Path dist\BCVision\hezar-model\model.pt)) { throw "Bundled Hezar model missing" }
+          $hezarCandidates = @(
+            'dist\BCVision\hezar-model\model.pt',
+            'dist\BCVision\_internal\hezar-model\model.pt'
+          )
+          $hezarModel = $hezarCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $hezarModel) { throw "Bundled Hezar model missing" }
           $version = (Get-Content VERSION -Raw).Trim()
           if ($version -ne "2.2.0-rc27.1") { throw "Unexpected VERSION: $version" }
-          Get-Item dist\BCVision\BCVision.exe, setup_output\BCVision_RC27.1_Setup.exe, setup_output\BCVision_RC27.1_Update.exe | Select-Object Name,Length,LastWriteTime
+          Get-Item dist\BCVision\BCVision.exe, $hezarModel, setup_output\BCVision_RC27.1_Setup.exe, setup_output\BCVision_RC27.1_Update.exe | Select-Object FullName,Length,LastWriteTime
 
       - name: Upload RC27.1 bundle
         uses: actions/upload-artifact@v4
