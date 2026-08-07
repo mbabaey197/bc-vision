@@ -252,15 +252,6 @@ jobs:
           Set-Content -Path "$releaseDir\SHA256SUMS.txt" -Value "$hash  $($setup.Name)" -Encoding ascii
           Get-ChildItem $releaseDir | Select-Object Name,Length
 
-      - name: Upload verified candidate
-        uses: actions/upload-artifact@v4
-        with:
-          name: BCVision-${{ steps.version.outputs.value }}-full-installer
-          path: release/*
-          if-no-files-found: error
-          retention-days: 30
-          compression-level: 0
-
       - name: Publish installer to GitHub prerelease
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
