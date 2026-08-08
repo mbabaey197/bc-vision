@@ -58,8 +58,12 @@ jobs:
           if (Test-Path "tools\keys\license_private_key.pem") {
             throw "Private licensing key must never enter GitHub Actions"
           }
-          if (Get-ChildItem -Recurse -File | Select-String -Quiet -SimpleMatch "BEGIN PRIVATE KEY") {
-            throw "A private key was found in the checkout"
+          $privatePem = Get-ChildItem -Recurse -File -Filter "*.pem" | Where-Object {
+            $_.Name -match "(?i)private" -or
+            (Select-String -Path $_.FullName -Quiet -SimpleMatch "BEGIN PRIVATE KEY")
+          }
+          if ($privatePem) {
+            throw "A private PEM key was found in the checkout: $($privatePem.FullName -join ', ')"
           }
 
       - name: Build standalone Windows GUI
