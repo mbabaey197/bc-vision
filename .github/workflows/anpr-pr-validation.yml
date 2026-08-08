@@ -29,8 +29,8 @@ concurrency:
 
 jobs:
   regression:
-    runs-on: [self-hosted, Windows, X64]
-    timeout-minutes: 20
+    runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
@@ -62,7 +62,7 @@ jobs:
 
   ai-runtime:
     needs: regression
-    runs-on: [self-hosted, Windows, X64]
+    runs-on: windows-latest
     timeout-minutes: 45
     env:
       BCVISION_RUN_AI_INTEGRATION: "1"
@@ -85,7 +85,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}\bcvision-models
-          key: bcvision-anpr-models-v2-onnx
+          key: bcvision-anpr-models-v3-yolo11n-hezar
       - name: Install AI runtime
         shell: cmd
         run: |
@@ -97,10 +97,11 @@ jobs:
         shell: cmd
         env:
           BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\ai-runtime
-          BCVISION_PLATE_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo.onnx
+          BCVISION_PLATE_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo11n.onnx
           BCVISION_PLATE_FALLBACK_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo_fallback.onnx
           BCVISION_CRNN_MODEL: ${{ runner.temp }}\bcvision-models\crnn\ocr_crnn.onnx
           BCVISION_CNN_MODEL: ${{ runner.temp }}\bcvision-models\cnn\ocr_cnn.onnx
+          BCVISION_HEZAR_MODEL: ${{ runner.temp }}\bcvision-models\hezar\crnn_fa_v2.onnx
         run: |
           python -m compileall -q app/ai
           python -m pytest -q tests/test_ai_runtime.py
