@@ -72,6 +72,7 @@ rem RC15 operator-assisted ANPR modules are packaged explicitly.
     --hidden-import app.ai.onnx_crnn ^
     --hidden-import app.ai.onnx_cnn ^
     --hidden-import app.ai.onnx_detector ^
+    --hidden-import app.ai.onnx_hezar ^
     --hidden-import app.ai.pipeline ^
     --hidden-import app.ai.plate_recovery ^
     --hidden-import app.ai.plate_rules ^
@@ -98,6 +99,8 @@ rem RC15 operator-assisted ANPR modules are packaged explicitly.
     --collect-all onnx ^
     --collect-all onnxruntime ^
     --collect-all torch ^
+    --exclude-module hezar ^
+    --exclude-module huggingface_hub ^
     launcher.py
 if errorlevel 1 goto :error
 
