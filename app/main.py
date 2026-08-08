@@ -23,7 +23,6 @@ from app.security import (
     verify_password,
 )
 from app.streams import manager, CV_OK
-from app.license import status as license_status, install_license, activate_online, deactivate_local, machine_id
 from html import escape
 import time, csv, shutil, os, json, secrets, math
 import threading
@@ -508,7 +507,7 @@ BOOTSTRAP = ""
 
 NAV_ITEMS = [
     ('/dashboard','⌂','داشبورد و نمایش زنده'),('/cameras','▣','دوربین‌ها'),('/events','▤','ترددها و گزارش‌ها'),
-    ('/license','◆','لایسنس'),('/users','👥','کاربران'),('/audit','☷','لاگ فعالیت‌ها'),('/settings','⚙','تنظیمات')
+    ('/users','👥','کاربران'),('/audit','☷','لاگ فعالیت‌ها'),('/settings','⚙','تنظیمات')
 ]
 
 def page(title, body, username=None, request=None):
@@ -558,8 +557,8 @@ def require_admin(request):
     return bool(u and (u['role']=='admin' or u['is_admin']))
 
 ROLE_PERMISSIONS = {
-    'admin': {'system.manage', 'camera.manage', 'license.manage', 'watchlist.manage', 'video.process'},
-    'system': {'system.manage', 'camera.manage', 'license.manage', 'watchlist.manage', 'video.process'},
+    'admin': {'system.manage', 'camera.manage', 'watchlist.manage', 'video.process'},
+    'system': {'system.manage', 'camera.manage', 'watchlist.manage', 'video.process'},
     'operator': {'watchlist.manage', 'video.process'},
     'guard': set(),
 }
@@ -800,7 +799,6 @@ def dashboard(
                 (events_page-1)*event_page_size,
             ),
         ).fetchall()
-    lic=license_status()
     can_edit_roi=has_permission(request,'camera.manage')
     def camera_tile(c):
         camera_id=int(c['id'])
@@ -912,13 +910,12 @@ function setGrid(n){{document.getElementById('liveGrid').style.setProperty('--co
 function showImage(src){{const modal=document.getElementById('imgModal'),image=document.getElementById('modalImage');if(!modal||!image)return;image.src=src;modal.classList.add('open')}}
 const savedGrid=Number(localStorage.getItem('bc-grid')||{cols});setGrid(savedGrid);cameraStatus();setInterval(cameraStatus,4000);setInterval(refreshRecentEvents,1500);
 </script>"""
-    valid_class='ok' if lic['valid'] else 'bad'
     body=f"""<div class='wrap'><div class='toolbar'><div style='margin-left:auto'><h1 class='page-title'>داشبورد</h1><p class='page-sub'>نمای کلی وضعیت سامانه و تصاویر زنده</p></div><a class='btn' href='/cameras/new'>＋ افزودن دوربین</a></div>
     <div class='stats-grid'>
-      <div class='card stat-card'><div class='stat-head'><span class='muted'>دوربین‌های فعال</span><span class='stat-icon'>📷</span></div><div class='stat'>{len(cams)}</div><div class='trend'>از ظرفیت {lic['camera_limit']} دوربین</div></div>
+      <div class='card stat-card'><div class='stat-head'><span class='muted'>دوربین‌های فعال</span><span class='stat-icon'>📷</span></div><div class='stat'>{len(cams)}</div><div class='trend'>بدون محدودیت نرم‌افزاری</div></div>
       <div class='card stat-card'><div class='stat-head'><span class='muted'>تردد امروز</span><span class='stat-icon'>🚘</span></div><div class='stat'>{today}</div><div class='trend'>ثبت‌شده از ابتدای امروز</div></div>
       <div class='card stat-card'><div class='stat-head'><span class='muted'>هشدارهای امروز</span><span class='stat-icon'>⚠</span></div><div class='stat'>{alerts}</div><div class='trend'>پلاک‌های با اطمینان پایین</div></div>
-      <div class='card stat-card'><div class='stat-head'><span class='muted'>وضعیت لایسنس</span><span class='stat-icon'>◆</span></div><div class='{valid_class}' style='font-size:20px;font-weight:900;margin-top:10px'>{escape(lic['plan'])}</div><div class='trend'>{escape(lic['message'])}</div></div>
+      <div class='card stat-card'><div class='stat-head'><span class='muted'>حالت اجرا</span><span class='stat-icon'>◆</span></div><div class='ok' style='font-size:20px;font-weight:900;margin-top:10px'>بدون لایسنس</div><div class='trend'>تمام قابلیت‌ها فعال هستند</div></div>
     </div>
     <div class='card'><div class='toolbar'><div style='margin-left:auto'><h3 style='margin:0'>نمایش زنده</h3><span class='muted'>تصاویر دوربین‌های فعال</span></div><div class='grid-switch'><button data-n='1' onclick='setGrid(1)'>۱</button><button data-n='2' onclick='setGrid(2)'>۴</button><button data-n='3' onclick='setGrid(3)'>۹</button><button data-n='4' onclick='setGrid(4)'>۱۶</button></div><button class='secondary' onclick='document.documentElement.requestFullscreen?.()'>تمام‌صفحه</button></div><div class='live-grid' id='liveGrid' style='--cols:{cols}'>{tiles}</div></div>
     <div class='card'><h3>آخرین تشخیص‌های پلاک و خودرو</h3><p class='feedback-note'>حدس کاملِ چندفریمی با نشان «تأیید خودکار مدل» در ترددها ثبت می‌شود. با زدن دکمهٔ تأیید/اصلاح، نتیجهٔ انسانی قطعی می‌شود، همان رویداد تصحیح می‌گردد و تصویر پلاک برای آموزش کنترل‌شده نگه‌داری می‌شود.</p><a id='newEventsNotice' class='new-events-notice' href='/dashboard'>رویداد جدید ثبت شد — نمایش صفحهٔ اول</a><div class='table-wrap'><table><thead><tr><th>تصویر خودرو</th><th>تصویر پلاک / پلاک خوانده‌شده</th><th>دوربین / شهر</th><th>اطمینان</th><th>زمان</th><th>تأیید، اصلاح و آموزش</th></tr></thead><tbody id='recentEventsBody'>{recent_rows}</tbody></table></div><div id='recentEventsPagination'>{recent_pagination}</div><div style='margin-top:12px'><a class='btn secondary' href='/events'>مشاهده همه گزارش‌ها</a> <a class='btn secondary' href='/settings'>وضعیت فنی سامانه</a></div></div><div id='imgModal' class='modal-img' onclick='this.classList.remove("open")'><button>بستن</button><img id='modalImage' alt='نمایش تمام‌صفحه'></div>{js}</div>"""
@@ -1147,11 +1144,6 @@ def new_cam_form(request:Request):
 def new_cam(request:Request,name:str=Form(...),rtsp_url:str=Form(''),location:str=Form(''),city:str=Form(''),enabled:str|None=Form(None),is_demo:int=Form(0),sort_order:int=Form(0),lpr_enabled:str|None=Form(None),lpr_confidence:int=Form(60),frame_step:int=Form(1),max_vehicle_speed_kmh:float=Form(150),recognition_zone_m:float=Form(10),recognition_zone_calibrated:str|None=Form(None),duplicate_seconds:float=Form(30),roi_x:float=Form(0),roi_y:float=Form(0),roi_w:float=Form(100),roi_h:float=Form(100),line_y:int=Form(50)):
     if not auth(request):return RedirectResponse('/login',302)
     if not has_permission(request,'camera.manage'):return access_denied()
-    lic=license_status()
-    with connect() as con:
-        count=con.execute('SELECT COUNT(*) c FROM cameras').fetchone()['c']
-    if count >= lic['camera_limit']:
-        return page('محدودیت لایسنس',f"<div class='wrap'><div class='card alert'>حداکثر تعداد دوربین در پلن {escape(lic['plan'])} برابر {lic['camera_limit']} است. برای افزایش ظرفیت، لایسنس را ارتقا دهید.</div><a class='btn' href='/license'>مدیریت لایسنس</a></div>",auth(request),request)
     url='demo://camera' if is_demo else rtsp_url.strip()
     with connect() as con:con.execute('INSERT INTO cameras(name,rtsp_url,location,city,enabled,is_demo,sort_order,lpr_enabled,lpr_confidence,frame_step,max_vehicle_speed_kmh,recognition_zone_m,recognition_zone_calibrated,duplicate_seconds,roi_x,roi_y,roi_w,roi_h,line_y) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(name.strip(),url,location.strip(),city.strip(),1 if enabled else 0,is_demo,sort_order,1 if lpr_enabled else 0,max(1,min(99,lpr_confidence)),1,max(5,min(300,max_vehicle_speed_kmh)),max(1,min(100,recognition_zone_m)),1 if recognition_zone_calibrated else 0,max(0,min(3600,duplicate_seconds)),max(0,min(99,roi_x)),max(0,min(99,roi_y)),max(1,min(100-roi_x,roi_w)),max(1,min(100-roi_y,roi_h)),max(0,min(100,line_y))))
     return RedirectResponse('/cameras?msg=1',303)
@@ -2128,52 +2120,6 @@ def legacy_health():
     })
 
 
-@app.get('/license')
-def license_page(request:Request,ok:int=0,error:str='',message:str=''):
-    u=auth(request)
-    if not u:return RedirectResponse('/login',302)
-    if not has_permission(request,'license.manage'):return access_denied()
-    s=license_status(); badge="ok" if s['valid'] else "bad"
-    notice=(f"<div class='card ok'>{escape(message or 'لایسنس فعال شد.')}</div>" if ok else (f"<div class='alert'>{escape(error)}</div>" if error else ""))
-    labels={'trial':'آزمایشی','basic':'پایه','professional':'حرفه‌ای','enterprise':'سازمانی'}
-    feature_labels={'anpr':'پلاک‌خوان','events':'رویدادها','reports':'گزارش‌ها','vehicle_ai':'هوش خودرو','watchlist':'فهرست مراقبت','api':'API','gate':'کنترل راهبند','multi_site':'چند شعبه','priority_support':'پشتیبانی ویژه'}
-    chips=''.join(f"<span class='status-pill ok'>{escape(feature_labels.get(x,x))}</span> " for x in s.get('features',[]))
-    body=f"""<div class='wrap'><h1>مدیریت لایسنس</h1><p class='page-sub'>فعال‌سازی امن آنلاین یا آفلاین BC Vision</p>{notice}
-    <div class='grid'><div class='card'><span class='muted'>وضعیت</span><div class='{badge}' style='font-size:20px;margin-top:10px'>{escape(s['message'])}</div></div>
-    <div class='card'><span class='muted'>پلن</span><div class='stat'>{escape(labels.get(s['plan'],s['plan']))}</div></div>
-    <div class='card'><span class='muted'>ظرفیت دوربین</span><div class='stat'>{s['camera_limit']}</div></div>
-    <div class='card'><span class='muted'>تاریخ انقضا</span><div style='font-weight:900;font-size:18px'>{escape(display_expiration(s['expires_at']))}</div></div></div>
-    <div class='card'><b>امکانات فعال</b><div style='margin-top:12px'>{chips or '—'}</div></div>
-    <div class='card'><b>شناسه دستگاه</b><input class='code' readonly value='{machine_id()}' onclick='this.select()'><p class='muted'>برای صدور لایسنس آفلاین، این شناسه را برای مدیر فروش ارسال کنید.</p></div>
-    <div class='grid'>
-      <div class='card'><h3>فعال‌سازی آنلاین</h3><form method='post' action='/license/online'><label>آدرس سرور لایسنس</label><input name='server_url' placeholder='https://license.example.com' required><label>کد فعال‌سازی</label><input name='activation_code' style='direction:ltr' required><button>فعال‌سازی آنلاین</button></form></div>
-      <div class='card'><h3>فعال‌سازی آفلاین</h3><form method='post' action='/license/offline'><label>محتوای فایل license.json</label><textarea name='license_text' rows='8' style='width:100%;direction:ltr;border:1px solid var(--bc-border);border-radius:9px;padding:10px;background:var(--bc-surface);color:var(--bc-text)' required></textarea><br><br><button>فعال‌سازی آفلاین</button></form></div>
-    </div>
-    <div class='card'><form method='post' action='/license/deactivate' onsubmit="return confirm('لایسنس از این دستگاه حذف شود؟')"><button class='danger'>حذف لایسنس از دستگاه</button></form></div></div>"""
-    return page('لایسنس',body,u,request)
-
-@app.post('/license')
-@app.post('/license/offline')
-def activate_license(request:Request,license_text:str=Form(...)):
-    if not auth(request):return RedirectResponse('/login',302)
-    if not has_permission(request,'license.manage'):return access_denied()
-    ok,msg=install_license(license_text)
-    return RedirectResponse('/license?ok=1&message='+quote(msg) if ok else '/license?error='+quote(msg),303)
-
-@app.post('/license/online')
-def activate_license_online(request:Request,server_url:str=Form(...),activation_code:str=Form(...)):
-    if not auth(request):return RedirectResponse('/login',302)
-    if not has_permission(request,'license.manage'):return access_denied()
-    ok,msg=activate_online(server_url,activation_code)
-    return RedirectResponse('/license?ok=1&message='+quote(msg) if ok else '/license?error='+quote(msg),303)
-
-@app.post('/license/deactivate')
-def deactivate_license(request:Request):
-    if not auth(request):return RedirectResponse('/login',302)
-    if not has_permission(request,'license.manage'):return access_denied()
-    ok,msg=deactivate_local()
-    return RedirectResponse('/license?ok=1&message='+quote(msg) if ok else '/license?error='+quote(msg),303)
-
 @app.get('/events/export.csv')
 def export_events(request:Request):
     if not auth(request):return RedirectResponse('/login',302)
@@ -2897,3 +2843,4 @@ async def ai_video_test_upload(request: Request, video: UploadFile = File(...)):
         """,u,request)
     except Exception as e:
         return page('خطای ویدئو',f"<div class='wrap'><div class='alert'>خطا: {escape(str(e))}</div></div>",u,request)
+
