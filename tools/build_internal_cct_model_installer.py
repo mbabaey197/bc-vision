@@ -23,10 +23,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 
 
 BASELINE_DETECTOR_SHA256 = (
-    "A54E475C402E6036BB5C70F1A6FF7517"
-    "9E76098A5C8039BB5D148C0B6421F5C6"
+    "693133A1DB97A3BA1E90068986F80AFB"
+    "72C3FCDDB681E57181A89A9A3DC351D6"
 )
-BASELINE_DETECTOR_SIZE = 12_608_775
+BASELINE_DETECTOR_SIZE = 10_481_682
 
 
 def sha256_file(path: Path) -> str:
@@ -135,7 +135,7 @@ def _powershell_installer(
         $stage = Join-Path $env:TEMP ("BCVision-RC15-Model-" + $PID)
         New-Item -ItemType Directory -Path $stage -Force | Out-Null
         try {{
-            $detectorStage = Join-Path $stage "plate_yolo.onnx"
+            $detectorStage = Join-Path $stage "plate_yolo11n.onnx"
             $ocrStage = Join-Path $stage "rc15-cct-xs-ir-lpr-stage4.onnx"
             $manifestStage = Join-Path $stage "active-models.json"
             $keyStage = Join-Path $stage "model_public_key.pem"
@@ -154,7 +154,7 @@ def _powershell_installer(
 
             $plateRoot = Join-Path $dataRoot "models\plate"
             $nextRoot = Join-Path $dataRoot "models\next"
-            $detectorTarget = Join-Path $plateRoot "plate_yolo.onnx"
+            $detectorTarget = Join-Path $plateRoot "plate_yolo11n.onnx"
             $detectorReady = $false
             if (Test-Path -LiteralPath $detectorTarget) {{
                 try {{
@@ -267,10 +267,10 @@ def build(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "models": {
             "detector": {
-                "filename": "plate_yolo.onnx",
+                "filename": "plate_yolo11n.onnx",
                 "sha256": detector_sha256,
                 "size": detector_size,
-                "runtime": "baseline-yolov8-onnx",
+                "runtime": "baseline-yolo11n-onnx",
                 "reuse_verified_baseline": True,
             },
             "ocr": {
