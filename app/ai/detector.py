@@ -29,8 +29,8 @@ from .plate_rules import (
     plausible_plate,
 )
 
-# RC12 no longer loads Ultralytics in the production path.  This compatibility
-# name remains for old imports while the dedicated detector is ONNX-only.
+# The production detector runs YOLO11n through ONNX Runtime, without importing
+# Ultralytics. This compatibility name remains for older extensions.
 YOLO = None
 
 _models: dict[int, object] = {}
@@ -124,7 +124,7 @@ def detector_status() -> dict:
         verified_path = None
         model_exists = False
     return {
-        "engine": "yolov8-onnx-light",
+        "engine": "yolo11n-plate-onnx",
         "onnx_model_loaded": bool(light.get("model_loaded")),
         "onnx_model_path": light.get("primary_path", ""),
         "onnx_fallback_loaded": bool(
