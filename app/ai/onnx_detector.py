@@ -1,9 +1,9 @@
-"""Lightweight Iranian plate localization with YOLOv8 and ONNX Runtime.
+"""Iranian plate localization with a fine-tuned YOLO11n ONNX model.
 
-The model and post-processing contract are based on the MIT-licensed Platrix
-reference implementation by AliAkrami1375, adapted for BC Vision's verified
-model store, per-camera sessions, two-thread CPU ceiling and fail-closed model
-loading.  The secondary detector runs only when the primary finds no plate.
+The primary model is a single-class Ultralytics YOLO11n graph. BC Vision keeps
+the previous Platrix detector as a secondary fail-safe which runs only when
+the primary finds no plate. Both files are loaded from the verified model
+store with per-camera sessions and the configured CPU ceiling.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import numpy as np
 from app.cpu_budget import parallel_camera_limit, threads_per_camera
 
 
-PRIMARY_SIZE = 416
+PRIMARY_SIZE = 640
 FALLBACK_SIZE = 640
 MIN_CAMERA_SESSION_CACHE = 3
 
@@ -38,7 +38,7 @@ _sessions: OrderedDict[tuple[str, str, str], _SessionEntry] = (
     OrderedDict()
 )
 _last_status = {
-    "engine": "yolov8-onnx-light",
+    "engine": "yolo11n-plate-onnx",
     "attempted": False,
     "model_loaded": False,
     "primary_path": "",
@@ -105,7 +105,7 @@ def _verified_paths() -> tuple[Path, Path | None]:
     primary = detector_path()
     if not verify_file(primary, DETECTOR_SHA256, DETECTOR_SIZE):
         raise FileNotFoundError(
-            f"Verified lightweight detector not found: {primary}"
+            f"Verified YOLO11n plate detector not found: {primary}"
         )
     fallback = detector_fallback_path()
     if not verify_file(
@@ -346,7 +346,7 @@ def detect_plates_onnx(
                 primary_size,
                 min_confidence,
                 max_results,
-                "yolov8-onnx-light",
+                "yolo11n-plate-onnx",
             )
             fallback_used = False
             if not detections and entry.fallback is not None:
