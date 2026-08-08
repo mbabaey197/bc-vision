@@ -1,145 +1,219 @@
 name: Windows Hosted Build and Release
 
-# Trusted main/manual release trigger.
+# Trusted main/manual release: test, build, install, update and publish.
+
 on:
   workflow_dispatch:
   push:
     branches:
       - main
     paths:
+      - "app/**"
+      - "installer/**"
+      - "tests/**"
+      - "launcher.py"
       - "VERSION"
       - "BUILD_PORTABLE_EXE.bat"
       - "requirements-lock.txt"
       - "requirements-ai-lock.txt"
-      - "installer/BCVision.iss"
-      - "installer/BCVision_Update.iss"
+      - "requirements-test.txt"
+      - "README_FA.txt"
+      - "THIRD_PARTY_NOTICES.md"
       - ".github/workflows/rc27-hosted-fallback.yml"
-      - "app/**"
 
 permissions:
   contents: write
 
 concurrency:
-  group: rc27-hosted-release-${{ github.event_name }}
+  group: windows-release-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
+  build-and-verify:
     runs-on: windows-latest
     timeout-minutes: 120
-
     env:
-      PYTHONUTF8: "1"
       PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUTF8: "1"
 
     steps:
-      - name: Checkout
+      - name: Checkout exact candidate commit
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Read candidate version
+        id: version
+        shell: pwsh
+        run: |
+          $value = (Get-Content VERSION -Raw).Trim()
+          if ($value -notmatch '^\d+\.\d+\.\d+-rc(?<rc>\d+(?:\.\d+)*)$') {
+            throw "Unsupported candidate version: $value"
+          }
+          "value=$value" >> $env:GITHUB_OUTPUT
+          "label=RC$($Matches.rc)" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Python 3.13
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            requirements-lock.txt
+            requirements-ai-lock.txt
 
-      - name: Read source version
-        id: version
-        shell: powershell
+      - name: Run source regression
+        shell: pwsh
         run: |
-          $version = (Get-Content VERSION -Raw).Trim()
-          if ($version -notmatch '^\d+\.\d+\.\d+-rc(?<rc>\d+(?:\.\d+)*)$') {
-            throw "Unsupported VERSION: $version"
-          }
-          "value=$version" >> $env:GITHUB_OUTPUT
-          "label=RC$($Matches.rc)" >> $env:GITHUB_OUTPUT
+          python -m pip install --disable-pip-version-check -r requirements-test.txt --quiet
+          python -m compileall -q app launcher.py
+          python -m pytest -q tests --timeout=120 --timeout-method=thread --durations=20
 
-      - name: Build application with bundled Hezar OCR
+      - name: Build portable Windows application
         shell: cmd
+        run: BUILD_PORTABLE_EXE.bat
+
+      - name: Verify windowless Windows service host
+        shell: pwsh
         run: |
-          call BUILD_PORTABLE_EXE.bat
+          python scripts\verify_windows_gui_subsystem.py `
+            dist\BCVision\BCVision.exe
 
       - name: Install Inno Setup
-        shell: powershell
-        run: |
-          $cmd = Get-Command iscc.exe -ErrorAction SilentlyContinue
-          if (-not $cmd) { choco install innosetup --no-progress -y }
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
 
       - name: Build installer and updater
-        shell: powershell
+        shell: pwsh
         run: |
-          $candidates = @()
-          $cmd = Get-Command iscc.exe -ErrorAction SilentlyContinue
-          if ($cmd) { $candidates += $cmd.Source }
-          $candidates += "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          $candidates += "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
-          $iscc = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-          if (-not $iscc) { throw "ISCC.exe not found after installation." }
-          New-Item -ItemType Directory -Force -Path setup_output | Out-Null
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          }
           & $iscc installer\BCVision.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $iscc installer\BCVision_Update.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Verify release outputs
-        shell: powershell
+      - name: Verify clean install, update and persistent data
+        shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          $version = (Get-Content VERSION -Raw).Trim()
           $releaseLabel = "${{ steps.version.outputs.label }}"
-          $required = @(
-            'dist\BCVision\BCVision.exe',
-            "setup_output\BCVision_${releaseLabel}_Setup.exe",
-            "setup_output\BCVision_${releaseLabel}_Update.exe"
-          )
-          foreach ($item in $required) {
-            if (-not (Test-Path $item)) { throw "Missing output: $item" }
+          $installDir = Join-Path $env:RUNNER_TEMP "bcvision-install"
+          $dataDir = Join-Path $env:RUNNER_TEMP "bcvision-persistent-data"
+          $setup = Resolve-Path "setup_output\BCVision_${releaseLabel}_Setup.exe"
+          $update = Resolve-Path "setup_output\BCVision_${releaseLabel}_Update.exe"
+          $firstResult = Join-Path $env:RUNNER_TEMP "self-test-install.json"
+          $updatedResult = Join-Path $env:RUNNER_TEMP "self-test-update.json"
+
+          $install = Start-Process -FilePath $setup -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/DIR=$installDir"
+          ) -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            throw "Installer exited with $($install.ExitCode)"
           }
 
-          $seedRoots = @(
-            'dist\BCVision\model-seed',
-            'dist\BCVision\_internal\model-seed'
-          )
-          $seedRoot = $seedRoots | Where-Object { Test-Path $_ -PathType Container } | Select-Object -First 1
-          if (-not $seedRoot) {
-            Write-Host 'Packaged model diagnostics:'
-            Get-ChildItem 'dist\BCVision' -Recurse -File -ErrorAction SilentlyContinue |
-              Where-Object { $_.FullName -match 'model-seed|hezar|\.onnx$|model\.pt$' } |
-              Select-Object FullName,Length
-            throw 'Missing bundled model-seed directory'
+          $env:BCVISION_DATA_DIR = $dataDir
+          $env:BCVISION_SKIP_MODEL_PREP = "1"
+          $first = Start-Process -FilePath "$installDir\BCVision.exe" -ArgumentList @(
+            "--self-test",
+            "--verify-anpr",
+            "--self-test-output",
+            $firstResult
+          ) -Wait -PassThru
+          if ($first.ExitCode -ne 0) {
+            throw "Installed executable self-test exited with $($first.ExitCode)"
+          }
+          $firstJson = Get-Content $firstResult -Raw | ConvertFrom-Json
+          if (-not $firstJson.ok -or $firstJson.version -ne $version) {
+            throw "Installed executable self-test failed"
           }
 
-          $seedFiles = Get-ChildItem $seedRoot -Recurse -File
-          $hezarModel = $seedFiles | Where-Object { $_.Name -eq 'crnn_fa_v2.onnx' } | Select-Object -First 1
-          $yoloModel = $seedFiles | Where-Object { $_.Name -eq 'plate_yolo11n.onnx' } | Select-Object -First 1
-          if (-not $hezarModel -or $hezarModel.Length -ne 37146355) {
-            $seedFiles | Select-Object FullName,Length
-            throw 'Bundled Hezar ONNX model is missing or invalid'
-          }
-          if (-not $yoloModel -or $yoloModel.Length -ne 10481682) {
-            $seedFiles | Select-Object FullName,Length
-            throw 'Bundled YOLO11n ONNX model is missing or invalid'
+          $env:BCVISION_TEST_MARKER = "preserve-$([guid]::NewGuid())"
+          python -c "import os,sqlite3; p=os.path.join(os.environ['BCVISION_DATA_DIR'],'bcvision.db'); c=sqlite3.connect(p); c.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',('release_test_marker',os.environ['BCVISION_TEST_MARKER'])); c.commit(); c.close()"
+          $modelDir = Join-Path $dataDir "models\plate"
+          New-Item -ItemType Directory -Path $modelDir -Force | Out-Null
+          Set-Content -Path (Join-Path $modelDir "preserve.marker") -Value $env:BCVISION_TEST_MARKER
+
+          $upgrade = Start-Process -FilePath $update -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/DIR=$installDir"
+          ) -Wait -PassThru
+          if ($upgrade.ExitCode -ne 0) {
+            throw "Updater exited with $($upgrade.ExitCode)"
           }
 
-          Get-Item $required | Select-Object FullName,Length,LastWriteTime
-          $seedFiles | Select-Object FullName,Length,LastWriteTime
+          $updated = Start-Process -FilePath "$installDir\BCVision.exe" -ArgumentList @(
+            "--self-test",
+            "--verify-anpr",
+            "--self-test-output",
+            $updatedResult
+          ) -Wait -PassThru
+          if ($updated.ExitCode -ne 0) {
+            throw "Updated executable self-test exited with $($updated.ExitCode)"
+          }
+          $updatedJson = Get-Content $updatedResult -Raw | ConvertFrom-Json
+          if (-not $updatedJson.ok -or $updatedJson.version -ne $version) {
+            throw "Updated executable self-test failed"
+          }
+          if (-not $firstJson.anpr_ready -or -not $updatedJson.anpr_ready) {
+            throw "Packaged ANPR models failed offline inference validation"
+          }
 
-      - name: Create source archive and checksums
-        shell: powershell
+          python -c "import os,sqlite3,sys; p=os.path.join(os.environ['BCVISION_DATA_DIR'],'bcvision.db'); c=sqlite3.connect(p); r=c.execute('SELECT value FROM settings WHERE key=?',('release_test_marker',)).fetchone(); c.close(); sys.exit(0 if r and r[0]==os.environ['BCVISION_TEST_MARKER'] else 1)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Database marker was not preserved by update"
+          }
+          $modelMarker = Get-Content (Join-Path $modelDir "preserve.marker") -Raw
+          if ($modelMarker.Trim() -ne $env:BCVISION_TEST_MARKER) {
+            throw "AI model marker was not preserved by update"
+          }
+
+          $uninstaller = Get-ChildItem $installDir -Filter "unins*.exe" |
+            Select-Object -First 1
+          if (-not $uninstaller) {
+            throw "Standard uninstaller was not created"
+          }
+          $uninstall = Start-Process -FilePath $uninstaller.FullName -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART"
+          ) -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) {
+            throw "Uninstaller exited with $($uninstall.ExitCode)"
+          }
+          if (-not (Test-Path (Join-Path $dataDir "bcvision.db"))) {
+            throw "Persistent database was removed by uninstall"
+          }
+          if (-not (Test-Path (Join-Path $modelDir "preserve.marker"))) {
+            throw "Persistent AI model data was removed by uninstall"
+          }
+
+      - name: Create release bundle and checksums
+        shell: pwsh
         run: |
-          $version = "${{ steps.version.outputs.value }}"
+          $ErrorActionPreference = "Stop"
+          $version = (Get-Content VERSION -Raw).Trim()
           $releaseLabel = "${{ steps.version.outputs.label }}"
-          $source = "setup_output\BC_Vision_v${version}_Source.zip"
-          git archive --format=zip --output=$source HEAD
-          $files = @(
-            "setup_output\BCVision_${releaseLabel}_Setup.exe",
-            "setup_output\BCVision_${releaseLabel}_Update.exe",
-            $source
-          )
-          $checksums = foreach ($file in $files) {
-            $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
-            "$hash  $([IO.Path]::GetFileName($file))"
+          $releaseDir = Join-Path $PWD "release"
+          New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
+          Copy-Item "setup_output\BCVision_${releaseLabel}_Setup.exe" $releaseDir
+          Copy-Item "setup_output\BCVision_${releaseLabel}_Update.exe" $releaseDir
+          git archive --format=zip --output="$releaseDir\BC_Vision_v${version}_Source.zip" HEAD
+          $files = Get-ChildItem $releaseDir -File | Sort-Object Name
+          $lines = foreach ($file in $files) {
+            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash
+            "$hash  $($file.Name)"
           }
-          Set-Content -LiteralPath 'setup_output\SHA256SUMS.txt' -Value $checksums -Encoding ascii
-          Get-Content -LiteralPath 'setup_output\SHA256SUMS.txt'
+          Set-Content -Path "$releaseDir\SHA256SUMS.txt" -Value $lines -Encoding ascii
+          Get-ChildItem $releaseDir | Select-Object Name,Length
 
-      - name: Publish GitHub Release
+      - name: Publish verified GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.value }}
@@ -147,8 +221,11 @@ jobs:
           name: BC Vision ${{ steps.version.outputs.value }}
           prerelease: true
           generate_release_notes: true
-          files: |
-            setup_output/BCVision_${{ steps.version.outputs.label }}_Setup.exe
-            setup_output/BCVision_${{ steps.version.outputs.label }}_Update.exe
-            setup_output/BC_Vision_v${{ steps.version.outputs.value }}_Source.zip
-            setup_output/SHA256SUMS.txt
+          files: release/*
+
+      - name: Report verified release
+        shell: pwsh
+        run: |
+          Write-Host "Release files were built, installed, updated, verified and published."
+          Get-Content release\SHA256SUMS.txt
+
