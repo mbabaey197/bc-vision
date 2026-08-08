@@ -15,23 +15,9 @@ on:
       - "installer/BCVision_Update.iss"
       - ".github/workflows/rc27-hosted-fallback.yml"
       - "app/**"
-  pull_request:
-    branches:
-      - main
-    paths:
-      - ".github/rc27-pr-trigger.txt"
-      - ".github/workflows/rc27-hosted-fallback.yml"
-      - "VERSION"
-      - "BUILD_PORTABLE_EXE.bat"
-      - "requirements-lock.txt"
-      - "requirements-ai-lock.txt"
-      - "installer/BCVision.iss"
-      - "installer/BCVision_Update.iss"
-      - "app/**"
 
 permissions:
   contents: write
-  actions: write
 
 concurrency:
   group: rc27-hosted-release-${{ github.event_name }}
@@ -116,28 +102,38 @@ jobs:
           }
 
           $seedFiles = Get-ChildItem $seedRoot -Recurse -File
-          if (-not ($seedFiles | Where-Object { $_.Extension -eq '.onnx' })) {
+          $hezarModel = $seedFiles | Where-Object { $_.Name -eq 'crnn_fa_v2.onnx' } | Select-Object -First 1
+          $yoloModel = $seedFiles | Where-Object { $_.Name -eq 'plate_yolo11n.onnx' } | Select-Object -First 1
+          if (-not $hezarModel -or $hezarModel.Length -ne 37146355) {
             $seedFiles | Select-Object FullName,Length
-            throw 'Bundled model-seed contains no ONNX models'
+            throw 'Bundled Hezar ONNX model is missing or invalid'
+          }
+          if (-not $yoloModel -or $yoloModel.Length -ne 10481682) {
+            $seedFiles | Select-Object FullName,Length
+            throw 'Bundled YOLO11n ONNX model is missing or invalid'
           }
 
           Get-Item $required | Select-Object FullName,Length,LastWriteTime
           $seedFiles | Select-Object FullName,Length,LastWriteTime
 
-      - name: Upload RC27.1 bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: BCVision-RC27.1-Hezar-Windows-Hosted
-          path: |
-            setup_output/BCVision_RC27.1_Setup.exe
-            setup_output/BCVision_RC27.1_Update.exe
-            dist/BCVision/**
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
+      - name: Create source archive and checksums
+        shell: powershell
+        run: |
+          $source = 'setup_output\BC_Vision_v2.2.0-rc27.1_Source.zip'
+          git archive --format=zip --output=$source HEAD
+          $files = @(
+            'setup_output\BCVision_RC27.1_Setup.exe',
+            'setup_output\BCVision_RC27.1_Update.exe',
+            $source
+          )
+          $checksums = foreach ($file in $files) {
+            $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+            "$hash  $([IO.Path]::GetFileName($file))"
+          }
+          Set-Content -LiteralPath 'setup_output\SHA256SUMS.txt' -Value $checksums -Encoding ascii
+          Get-Content -LiteralPath 'setup_output\SHA256SUMS.txt'
 
       - name: Publish RC27.1 GitHub Release
-        if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v2.2.0-rc27.1
@@ -147,3 +143,5 @@ jobs:
           files: |
             setup_output/BCVision_RC27.1_Setup.exe
             setup_output/BCVision_RC27.1_Update.exe
+            setup_output/BC_Vision_v2.2.0-rc27.1_Source.zip
+            setup_output/SHA256SUMS.txt
