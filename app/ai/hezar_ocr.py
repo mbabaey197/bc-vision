@@ -13,6 +13,7 @@ from .plate_rules import format_iran_plate, normalize_plate, plausible_plate
 _MODEL = None
 _MODEL_ERROR = ""
 _MODEL_LOCK = threading.Lock()
+_PRIMARY_INSTALLED = False
 
 
 def _bundled_model_dir() -> Path:
@@ -54,6 +55,7 @@ def status() -> dict:
         "model_loaded": _MODEL is not None,
         "model_path": str(_bundled_model_dir()),
         "error": _MODEL_ERROR,
+        "primary_installed": _PRIMARY_INSTALLED,
     }
 
 
@@ -106,3 +108,54 @@ def read_plate_hezar(image, engine_key=None) -> tuple[str, float]:
         return "", 0.0
     finally:
         path.unlink(missing_ok=True)
+
+
+def install_hezar_primary() -> None:
+    """Install Hezar V2 ahead of the existing ONNX OCR readers.
+
+    The original BC Vision CRNN/CNN adapter is retained as a fallback.  This
+    function is intentionally installed before ``app.ai.pipeline`` imports
+    ``read_plate_candidate`` so every live/video path gets the same primary
+    OCR engine in the packaged application.
+    """
+    global _PRIMARY_INSTALLED
+    if os.environ.get("BCVISION_HEZAR_OCR", "1") == "0":
+        return
+    if _PRIMARY_INSTALLED:
+        return
+
+    from . import ocr as ocr_module
+
+    if getattr(ocr_module, "_bcvision_hezar_primary", False):
+        _PRIMARY_INSTALLED = True
+        return
+
+    original_reader = ocr_module.read_plate_candidate
+
+    def read_plate_candidate_with_hezar(
+        image,
+        engine_key=None,
+        allow_legacy=True,
+    ):
+        text, confidence = read_plate_hezar(
+            image,
+            engine_key=engine_key,
+        )
+        if plausible_plate(text):
+            try:
+                ocr_module._last_status.update(
+                    engine="hezar-crnn-v2",
+                    candidate_count=1,
+                )
+            except Exception:
+                pass
+            return text, float(confidence), "hezar-crnn-v2"
+        return original_reader(
+            image,
+            engine_key=engine_key,
+            allow_legacy=allow_legacy,
+        )
+
+    ocr_module.read_plate_candidate = read_plate_candidate_with_hezar
+    ocr_module._bcvision_hezar_primary = True
+    _PRIMARY_INSTALLED = True
