@@ -1,8 +1,9 @@
-"""Constrained multi-hypothesis CTC reader for the RC13 Iranian OCR model."""
+"""Constrained CTC runtime for Hezar's Persian plate CRNN."""
 from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 import threading
 
 import cv2
@@ -17,6 +18,30 @@ from .next_models import verified_next_manifest
 
 MIN_CAMERA_SESSION_CACHE = 3
 DIGIT_POSITIONS = {0, 1, 3, 4, 5, 6, 7}
+PRIMARY_ENGINE = "hezar-crnn-fa-v2-onnx"
+HEZAR_V2_LABELS = [
+    "", "آ", "ا", "ب", "پ", "ت", "ث", "ج", "چ", "ه", "خ",
+    "د", "ذ", "ر", "ز", "ژ", "س", "ش", "ص", "ض", "ط", "ظ",
+    "ع", "غ", "ف", "ق", "ک", "گ", "ل", "م", "ن", "و", "ه",
+    "ی", " ", "۱", "۲", "۳", "۴", "۵", "۶", "۷", "۸", "۹",
+    "۰",
+]
+HEZAR_V2_SPEC = {
+    "runtime": PRIMARY_ENGINE,
+    "input_height": 32,
+    "input_width": 384,
+    "channels": 1,
+    "mean": 0.6595,
+    "std": 0.1501,
+    "mirror": True,
+    "labels": HEZAR_V2_LABELS,
+    "blank_index": 0,
+    "reverse_output_digits": True,
+    "beam_width": 10,
+    "top_k": 5,
+    "min_confidence": 0.56,
+    "min_position_margin": 0.12,
+}
 
 
 @dataclass
@@ -29,7 +54,7 @@ class _SessionEntry:
 _cache_lock = threading.RLock()
 _sessions: OrderedDict[tuple[str, str], _SessionEntry] = OrderedDict()
 _last_status = {
-    "engine": "hezar-ctc-onnx",
+    "engine": PRIMARY_ENGINE,
     "attempted": False,
     "model_loaded": False,
     "model_path": "",
@@ -49,6 +74,7 @@ def clear_hezar_sessions() -> None:
     with _cache_lock:
         _sessions.clear()
         _last_status.update(
+            engine=PRIMARY_ENGINE,
             attempted=False,
             model_loaded=False,
             model_path="",
@@ -313,16 +339,15 @@ def _session_options(ort):
     return options
 
 
-def _load_session(engine_key=None):
-    manifest = verified_next_manifest()
-    path = manifest["models"]["ocr"]["path"]
+def _load_path_session(path, engine_key=None):
+    path = str(Path(path).resolve())
     camera_key = str(engine_key if engine_key is not None else "default")
     cache_key = (camera_key, path)
     with _cache_lock:
         cached = _sessions.get(cache_key)
         if cached is not None:
             _sessions.move_to_end(cache_key)
-            return cached, manifest
+            return cached
 
         import onnxruntime as ort
 
@@ -342,14 +367,30 @@ def _load_session(engine_key=None):
             parallel_camera_limit(),
         ):
             _sessions.popitem(last=False)
-        return entry, manifest
+        return entry
 
 
-def read_plate_hezar(image, engine_key=None) -> dict:
+def _failure_result(exc: Exception) -> dict:
+    return {
+        "accepted": False,
+        "plate": "ناخوانا",
+        "plate_norm": "",
+        "confidence": 0.0,
+        "position_details": [],
+        "hypotheses": [],
+        "error": f"{type(exc).__name__}: {exc}",
+    }
+
+
+def _read_plate_with_spec(
+    image,
+    spec: dict,
+    engine_key=None,
+    runtime=PRIMARY_ENGINE,
+) -> dict:
     camera_key = str(engine_key if engine_key is not None else "default")
     try:
-        entry, manifest = _load_session(engine_key)
-        spec = manifest["models"]["ocr"]
+        entry = _load_path_session(spec["path"], engine_key)
         tensor = prepare_hezar_input(image, spec)
         if tensor is None:
             raise ValueError("Empty OCR crop")
@@ -387,6 +428,7 @@ def read_plate_hezar(image, engine_key=None) -> dict:
         )
         with _cache_lock:
             _last_status.update(
+                engine=runtime,
                 attempted=True,
                 model_loaded=True,
                 model_path=spec["path"],
@@ -399,19 +441,80 @@ def read_plate_hezar(image, engine_key=None) -> dict:
     except Exception as exc:
         with _cache_lock:
             _last_status.update(
+                engine=runtime,
                 attempted=True,
                 model_loaded=False,
+                model_path=str(spec.get("path", "")),
                 engine_key=camera_key,
                 hypotheses=0,
                 accepted=False,
                 error=f"{type(exc).__name__}: {exc}",
             )
-        return {
-            "accepted": False,
-            "plate": "ناخوانا",
-            "plate_norm": "",
-            "confidence": 0.0,
-            "position_details": [],
-            "hypotheses": [],
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+        return _failure_result(exc)
+
+
+def read_plate_hezar_primary(image, engine_key=None) -> dict:
+    """Read a cropped plate with the fixed, verified Hezar v2 model."""
+
+    from .model_manager import (
+        HEZAR_ONNX_SHA256,
+        HEZAR_ONNX_SIZE,
+        hezar_path,
+        verify_file,
+    )
+
+    path = hezar_path()
+    spec = {**HEZAR_V2_SPEC, "path": str(path)}
+    if not verify_file(path, HEZAR_ONNX_SHA256, HEZAR_ONNX_SIZE):
+        exc = FileNotFoundError(
+            f"Verified Hezar CRNN model not found: {path}"
+        )
+        with _cache_lock:
+            _last_status.update(
+                engine=PRIMARY_ENGINE,
+                attempted=True,
+                model_loaded=False,
+                model_path=str(path),
+                engine_key=str(
+                    engine_key if engine_key is not None else "default"
+                ),
+                hypotheses=0,
+                accepted=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        return _failure_result(exc)
+    return _read_plate_with_spec(
+        image,
+        spec,
+        engine_key=engine_key,
+        runtime=PRIMARY_ENGINE,
+    )
+
+
+def read_plate_hezar(image, engine_key=None) -> dict:
+    """Read with a signed candidate Hezar model used by the next engine."""
+
+    try:
+        manifest = verified_next_manifest()
+        spec = manifest["models"]["ocr"]
+    except Exception as exc:
+        with _cache_lock:
+            _last_status.update(
+                engine="hezar-ctc-onnx",
+                attempted=True,
+                model_loaded=False,
+                model_path="",
+                engine_key=str(
+                    engine_key if engine_key is not None else "default"
+                ),
+                hypotheses=0,
+                accepted=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        return _failure_result(exc)
+    return _read_plate_with_spec(
+        image,
+        spec,
+        engine_key=engine_key,
+        runtime="hezar-ctc-onnx",
+    )
