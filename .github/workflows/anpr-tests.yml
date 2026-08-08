@@ -47,7 +47,7 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
-          python -m pytest -q tests *>&1 | Tee-Object -FilePath pytest-output.txt
+          python -m pytest -q tests --timeout=120 --timeout-method=thread --durations=20 *>&1 | Tee-Object -FilePath pytest-output.txt
           exit $LASTEXITCODE
 
       - name: Enforce test result
