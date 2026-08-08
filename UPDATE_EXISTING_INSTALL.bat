@@ -4,7 +4,7 @@ setlocal
 cd /d "%~dp0"
 echo.
 echo ==========================================
-echo   BC Vision 2.2.0-rc5 - One Click Update
+echo   BC Vision 2.2.0-rc28 - One Click Update
 echo ==========================================
 echo.
 set "TARGET=%ProgramFiles%\BC Vision"
@@ -20,8 +20,11 @@ xcopy "%~dp0app" "%TARGET%\app\" /E /I /Y >nul
 copy /Y "%~dp0launcher.py" "%TARGET%\launcher.py" >nul
 copy /Y "%~dp0VERSION" "%TARGET%\VERSION" >nul
 copy /Y "%~dp0requirements.txt" "%TARGET%\requirements.txt" >nul
-copy /Y "%~dp0license_public_key.pem" "%TARGET%\license_public_key.pem" >nul
+del /Q "%TARGET%\license_public_key.pem" 2>nul
+del /Q "%TARGET%\app\license.py" 2>nul
+del /Q "%TARGET%\app\license_format.py" 2>nul
+del /Q "%TARGET%\app\offline_license_policy.py" 2>nul
 echo.
 echo بروزرسانی با موفقیت انجام شد.
-echo اطلاعات دیتابیس و تنظیمات حذف نشده‌اند.
+echo اطلاعات دیتابیس، تنظیمات، تصاویر و مدل‌ها حذف نشده‌اند.
 pause
