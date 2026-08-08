@@ -10,8 +10,6 @@ setup_output/
 *.spec
 .idea/
 .vscode/
-tools/keys/
-license.json
 .buildvenv/
 .coverage
 training-data/
