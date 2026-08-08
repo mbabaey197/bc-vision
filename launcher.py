@@ -122,6 +122,7 @@ def prepare_anpr_models():
         if (
             before["detector_ready"]
             and before["detector_fallback_ready"]
+            and before["hezar_ready"]
             and before["crnn_ready"]
             and before["cnn_ready"]
         ):
@@ -242,10 +243,18 @@ def run_self_test() -> int:
                 detect_plates_onnx,
                 detector_status,
             )
+            from app.ai.onnx_hezar import (
+                hezar_status,
+                read_plate_hezar_primary,
+            )
 
             models = prepare_models(download=False)
             detect_plates_onnx(
                 np.zeros((96, 160, 3), dtype=np.uint8),
+                engine_key="packaged-self-test",
+            )
+            read_plate_hezar_primary(
+                np.zeros((32, 384, 3), dtype=np.uint8),
                 engine_key="packaged-self-test",
             )
             read_plate_crnn(
@@ -257,9 +266,11 @@ def run_self_test() -> int:
                 onnxruntime.__version__
                 and models["detector"]
                 and models["detector_fallback"]
+                and models["hezar"]
                 and models["crnn"]
                 and models["cnn"]
                 and detector_status()["model_loaded"]
+                and hezar_status()["model_loaded"]
                 and get_crnn_status()["model_loaded"]
                 and cnn["model_loaded"]
             )
