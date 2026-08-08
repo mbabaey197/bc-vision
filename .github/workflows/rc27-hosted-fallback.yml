@@ -1,5 +1,6 @@
 name: RC27.1 Hosted Build and Release
 
+# RC27.1 release trigger
 on:
   workflow_dispatch:
   push:
