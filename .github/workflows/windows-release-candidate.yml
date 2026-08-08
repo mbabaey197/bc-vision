@@ -59,7 +59,7 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check -r requirements-test.txt --quiet
           python -m compileall -q app launcher.py
-          python -m pytest -q tests
+          python -m pytest -q tests --timeout=120 --timeout-method=thread --durations=20
 
       - name: Build portable Windows application
         shell: cmd
