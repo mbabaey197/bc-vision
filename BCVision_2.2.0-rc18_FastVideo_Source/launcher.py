@@ -201,7 +201,6 @@ def run_self_test() -> int:
         "data_dir": "",
         "database_path": "",
         "database_ready": False,
-        "public_key_ready": False,
         "web_app_ready": False,
         "anpr_ready": False,
     }
@@ -210,7 +209,6 @@ def run_self_test() -> int:
             APP_VERSION,
             DATA_DIR,
             DB_PATH,
-            PUBLIC_KEY_PATH,
         )
         from app.database import connect, init_db
 
@@ -267,7 +265,6 @@ def run_self_test() -> int:
         result.update({
             "ok": (
                 DB_PATH.is_file()
-                and PUBLIC_KEY_PATH.is_file()
                 and table_count >= 6
                 and user_count >= 1
                 and app is not None
@@ -277,7 +274,6 @@ def run_self_test() -> int:
             "data_dir": str(DATA_DIR),
             "database_path": str(DB_PATH),
             "database_ready": DB_PATH.is_file() and table_count >= 6,
-            "public_key_ready": PUBLIC_KEY_PATH.is_file(),
             "web_app_ready": app is not None,
             "anpr_ready": anpr_ready,
             "user_count": user_count,
