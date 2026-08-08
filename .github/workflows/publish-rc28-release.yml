@@ -91,6 +91,7 @@ jobs:
           }
 
           $uploadBase = $release.upload_url -replace '\{\?name,label\}$', ''
+          $publishedAssets = @{}
           foreach ($file in @(Get-Item $exe, Get-Item $checksum)) {
             $existing = @($release.assets) | Where-Object { $_.name -eq $file.Name }
             foreach ($asset in $existing) {
@@ -106,8 +107,57 @@ jobs:
               -Headers $headers `
               -ContentType "application/octet-stream" `
               -InFile $file.FullName
+            $publishedAssets[$file.Name] = $asset
             Write-Host "PUBLISHED=$($asset.browser_download_url) SIZE=$($asset.size)"
           }
+
+          $manifestPath = "release/RC28_RELEASE.json"
+          $manifestUri = "$repoApi/contents/$manifestPath"
+          $branch = $env:GITHUB_REF_NAME
+          $installerName = (Get-Item $exe).Name
+          $checksumName = (Get-Item $checksum).Name
+          $manifest = [ordered]@{
+            version = $version
+            tag = $tag
+            release_url = $release.html_url
+            installer_url = $publishedAssets[$installerName].browser_download_url
+            checksum_url = $publishedAssets[$checksumName].browser_download_url
+            sha256 = $actual
+            size_bytes = $publishedAssets[$installerName].size
+            source_commit = $release.target_commitish
+            workflow_run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            published_at = (Get-Date).ToUniversalTime().ToString("o")
+          }
+          $manifestJson = $manifest | ConvertTo-Json
+          $manifestContent = [Convert]::ToBase64String(
+            [Text.Encoding]::UTF8.GetBytes("$manifestJson`n")
+          )
+          $existingManifestSha = $null
+          try {
+            $encodedBranch = [uri]::EscapeDataString($branch)
+            $existingManifest = Invoke-RestMethod `
+              -Method Get `
+              -Uri "${manifestUri}?ref=$encodedBranch" `
+              -Headers $headers
+            $existingManifestSha = $existingManifest.sha
+          } catch {
+            $status = $_.Exception.Response.StatusCode.value__
+            if ($status -ne 404) { throw }
+          }
+          $manifestCommit = [ordered]@{
+            message = "chore(release): record RC28 published assets"
+            content = $manifestContent
+            branch = $branch
+          }
+          if ($existingManifestSha) {
+            $manifestCommit["sha"] = $existingManifestSha
+          }
+          Invoke-RestMethod `
+            -Method Put `
+            -Uri $manifestUri `
+            -Headers $headers `
+            -ContentType "application/json" `
+            -Body ($manifestCommit | ConvertTo-Json)
 
           Write-Host "RC28_SHA256=$actual"
           Write-Host "RELEASE=$($release.html_url)"
