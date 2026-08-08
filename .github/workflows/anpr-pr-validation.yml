@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: anpr-pr-${{ github.event.pull_request.number }}
+  group: anpr-pr-hosted-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
