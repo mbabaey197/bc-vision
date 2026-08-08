@@ -286,6 +286,10 @@ def test_uploaded_video_uses_ffmpeg_fallback_when_opencv_has_no_frames(
             return np.full((24, 32, 3), 90, dtype=np.uint8)
 
     class Container:
+        streams = SimpleNamespace(
+            video=[SimpleNamespace(average_rate=30)],
+        )
+
         def __enter__(self):
             return self
 

@@ -5,6 +5,7 @@ torch==2.13.0
 onnx==1.22.0
 onnxruntime==1.28.0
 opencv-python-headless==5.0.0.93
+pillow==12.3.0
 hezar==1.0.0
 huggingface-hub==1.7.1
 requests==2.32.5

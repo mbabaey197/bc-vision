@@ -913,7 +913,7 @@ def test_two_cameras_receive_independent_worker_slots(monkeypatch):
     engine_keys = []
     active_lock = threading.Lock()
 
-    def process(_frame, _confidence, engine_key=None):
+    def process(_frame, _confidence, engine_key=None, **_kwargs):
         nonlocal active, maximum_active
         with active_lock:
             active += 1
@@ -929,9 +929,18 @@ def test_two_cameras_receive_independent_worker_slots(monkeypatch):
 
     worker.submit(1, "gate one", frame)
     worker.submit(2, "gate two", frame)
-    time.sleep(0.14)
-    first = worker.status(1)
-    second = worker.status(2)
+    deadline = time.monotonic() + 2.0
+    while True:
+        first = worker.status(1)
+        second = worker.status(2)
+        if (
+            first["processed_frames"] == 1
+            and second["processed_frames"] == 1
+        ):
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.01)
     worker.shutdown()
 
     assert maximum_active == 2
