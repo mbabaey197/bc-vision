@@ -146,7 +146,8 @@ class LiveANPRWorker:
             self._model_state_at = now
         status = dict(self._model_state)
         status["ocr_ready"] = bool(
-            status.get("crnn_ready")
+            status.get("hezar_ready")
+            or status.get("crnn_ready")
             or status.get("cnn_ready")
         )
         status["ready"] = bool(
@@ -1002,7 +1003,10 @@ class LiveANPRWorker:
                     bool(row.get("ocr_disagreement"))
                 )
                 state.crnn_selected += int(
-                    row.get("ocr_engine") == "crnn-onnx"
+                    row.get("ocr_engine") in {
+                        "hezar-crnn-fa-v2-onnx",
+                        "crnn-onnx",
+                    }
                 )
                 state.character_reader_selected += int(
                     row.get("ocr_engine") in {
