@@ -1,19 +1,26 @@
-name: RC27.1 Hosted Fallback Build
+name: RC27.1 Hosted Build and Release
 
 on:
   workflow_dispatch:
-  pull_request:
+  push:
     branches:
       - main
     paths:
-      - ".github/rc27-hosted-trigger.txt"
+      - "VERSION"
+      - "BUILD_PORTABLE_EXE.bat"
+      - "requirements-lock.txt"
+      - "requirements-ai-lock.txt"
+      - "installer/BCVision.iss"
+      - "installer/BCVision_Update.iss"
+      - ".github/workflows/rc27-hosted-fallback.yml"
+      - "app/**"
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 concurrency:
-  group: rc27-hosted-fallback
+  group: rc27-hosted-release
   cancel-in-progress: true
 
 jobs:
@@ -35,6 +42,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
+      - name: Verify source version
+        shell: powershell
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ($version -ne "2.2.0-rc27.1") { throw "Unexpected VERSION: $version" }
 
       - name: Build application with bundled Hezar OCR
         shell: cmd
@@ -91,3 +104,14 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+
+      - name: Publish RC27.1 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v2.2.0-rc27.1
+          name: BC Vision 2.2.0 RC27.1
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            setup_output/BCVision_RC27.1_Setup.exe
+            setup_output/BCVision_RC27.1_Update.exe
