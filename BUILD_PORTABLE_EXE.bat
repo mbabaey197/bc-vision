@@ -3,14 +3,14 @@ setlocal EnableExtensions
 chcp 65001 >nul
 cd /d "%~dp0"
 set "PYTHONUTF8=1"
+set "BCVISION_HEZAR_OCR=1"
+set "BCVISION_EXPERIMENTAL_NO_LICENSE=1"
 
 set "PY="
 py -3.13 --version >nul 2>&1 && set "PY=py -3.13"
-
 if not defined PY (
     python --version >nul 2>&1 && set "PY=python"
 )
-
 if not defined PY (
     echo Python 3.13 is required.
     exit /b 1
@@ -20,12 +20,10 @@ if not exist "requirements-lock.txt" (
     echo requirements-lock.txt was not found.
     exit /b 1
 )
-
 if not exist "requirements-ai-lock.txt" (
     echo requirements-ai-lock.txt was not found.
     exit /b 1
 )
-
 if not exist "license_public_key.pem" (
     echo license_public_key.pem was not found.
     exit /b 1
@@ -35,13 +33,22 @@ if not exist ".buildvenv\Scripts\python.exe" (
     %PY% -m venv ".buildvenv"
     if errorlevel 1 goto :error
 )
-
 set "BUILD_PY=%CD%\.buildvenv\Scripts\python.exe"
+
+"%BUILD_PY%" -m pip install --disable-pip-version-check --upgrade pip
+if errorlevel 1 goto :error
 
 "%BUILD_PY%" -m pip install ^
     --disable-pip-version-check ^
     -r requirements-lock.txt ^
     -r requirements-ai-lock.txt
+if errorlevel 1 goto :error
+
+rem RC27.1 Persian OCR runtime. Hezar 1.0.0 supports Python 3.11+.
+"%BUILD_PY%" -m pip install ^
+    --disable-pip-version-check ^
+    hezar==1.0.0 ^
+    requests
 if errorlevel 1 goto :error
 
 "%BUILD_PY%" -m pip check
@@ -51,10 +58,22 @@ rmdir /s /q .model-seed 2>nul
 "%BUILD_PY%" -m app.ai.model_manager --seed-dir ".model-seed"
 if errorlevel 1 goto :error
 
+rem Bundle the official Hezar CRNN Persian license-plate V2 model locally.
+rmdir /s /q .hezar-model 2>nul
+"%BUILD_PY%" -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='hezarai/crnn-fa-license-plate-recognition-v2', local_dir=r'.hezar-model')"
+if errorlevel 1 goto :error
+
+rem Verify the official model.pt SHA256 before packaging.
+"%BUILD_PY%" -c "from pathlib import Path; import hashlib,sys; p=Path(r'.hezar-model\model.pt'); h=hashlib.sha256(p.read_bytes()).hexdigest(); print('HEZAR_SHA256='+h); sys.exit(0 if h.lower()=='c20ad7be2b1fe383da6f22cbc7bdf8a9a37119f0b20235d736faa59b731f6620' else 1)"
+if errorlevel 1 goto :error
+
+rem Load from disk before packaging so a broken model/runtime fails the build.
+"%BUILD_PY%" -c "from hezar.models import Model; m=Model.load(r'.hezar-model', load_locally=True); print('HEZAR_LOCAL_MODEL_READY', type(m).__name__)"
+if errorlevel 1 goto :error
+
 rmdir /s /q build 2>nul
 rmdir /s /q dist 2>nul
 
-rem RC15 operator-assisted ANPR modules are packaged explicitly.
 "%BUILD_PY%" -m PyInstaller ^
     --noconfirm ^
     --clean ^
@@ -67,8 +86,10 @@ rem RC15 operator-assisted ANPR modules are packaged explicitly.
     --hidden-import app.config ^
     --hidden-import app.streams ^
     --hidden-import app.license ^
+    --hidden-import app.experimental_license ^
     --hidden-import app.ai.detector ^
     --hidden-import app.ai.ocr ^
+    --hidden-import app.ai.hezar_ocr ^
     --hidden-import app.ai.onnx_crnn ^
     --hidden-import app.ai.onnx_cnn ^
     --hidden-import app.ai.onnx_detector ^
@@ -90,6 +111,7 @@ rem RC15 operator-assisted ANPR modules are packaged explicitly.
     --hidden-import app.ai.training ^
     --hidden-import app.ai.training_worker ^
     --add-data ".model-seed;model-seed" ^
+    --add-data ".hezar-model;hezar-model" ^
     --collect-all av ^
     --collect-all fastapi ^
     --collect-all starlette ^
@@ -98,6 +120,11 @@ rem RC15 operator-assisted ANPR modules are packaged explicitly.
     --collect-all onnx ^
     --collect-all onnxruntime ^
     --collect-all torch ^
+    --collect-all hezar ^
+    --collect-all omegaconf ^
+    --collect-all transformers ^
+    --collect-all tokenizers ^
+    --collect-all huggingface_hub ^
     launcher.py
 if errorlevel 1 goto :error
 
@@ -108,23 +135,19 @@ if not exist "dist\BCVision\BCVision.exe" (
 
 copy /Y "license_public_key.pem" "dist\BCVision\license_public_key.pem" >nul
 if errorlevel 1 goto :error
-
 copy /Y "VERSION" "dist\BCVision\VERSION" >nul
 if errorlevel 1 goto :error
-
 copy /Y "README_FA.txt" "dist\BCVision\README_FA.txt" >nul
 if errorlevel 1 goto :error
-
 copy /Y "requirements-ai-lock.txt" "dist\BCVision\requirements-ai-lock.txt" >nul
 if errorlevel 1 goto :error
-
 copy /Y "THIRD_PARTY_NOTICES.md" "dist\BCVision\THIRD_PARTY_NOTICES.md" >nul
 if errorlevel 1 goto :error
 
-echo Portable AI build completed successfully.
+echo Portable RC27.1 Hezar AI build completed successfully.
 echo %CD%\dist\BCVision\BCVision.exe
 exit /b 0
 
 :error
-echo Portable AI build failed.
+echo Portable RC27.1 Hezar AI build failed.
 exit /b 1

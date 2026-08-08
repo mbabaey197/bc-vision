@@ -26,6 +26,21 @@ from app.cpu_budget import configure_process_cpu_budget
 
 configure_process_cpu_budget()
 
+# RC27.1 is an experimental build. Keep the production licensing subsystem in
+# the source tree, but install the temporary unrestricted runtime adapter before
+# any module binds license helpers locally. This can later be disabled with
+# BCVISION_EXPERIMENTAL_NO_LICENSE=0 without removing the original code.
+from app.experimental_license import install_experimental_license_override
+
+install_experimental_license_override()
+
+# Install the proven Hezar Persian CRNN V2 reader before app.ai.pipeline imports
+# read_plate_candidate. Existing BC Vision ONNX CRNN/CNN readers remain the
+# fallback whenever Hezar cannot produce a valid Iranian plate.
+from app.ai.hezar_ocr import install_hezar_primary
+
+install_hezar_primary()
+
 from app.config import LOG_PATH
 
 LOG = LOG_PATH
