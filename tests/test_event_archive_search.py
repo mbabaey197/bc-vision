@@ -22,16 +22,6 @@ def isolated_archive(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "DB_PATH", db_path)
     database.init_db()
     _as_operator(monkeypatch)
-    monkeypatch.setattr(
-        main,
-        "license_status",
-        lambda: {
-            "valid": True,
-            "plan": "test",
-            "camera_limit": 64,
-            "message": "test license",
-        },
-    )
     return db_path
 
 
