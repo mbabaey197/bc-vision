@@ -25,7 +25,7 @@ def _as_role(monkeypatch, role):
     )
 
 
-def test_operator_cannot_change_system_or_license_settings(monkeypatch):
+def test_operator_cannot_change_system_or_camera_settings(monkeypatch):
     _as_role(monkeypatch, "operator")
     writes = []
     monkeypatch.setattr(main, "set_setting", lambda key, value: writes.append((key, value)))
@@ -41,19 +41,59 @@ def test_operator_cannot_change_system_or_license_settings(monkeypatch):
             },
             follow_redirects=False,
         )
-        license_response = client.post(
-            "/license/deactivate",
-            follow_redirects=False,
-        )
         camera_response = client.post(
             "/cameras/1/delete",
             follow_redirects=False,
         )
 
     assert ai_response.status_code == 403
-    assert license_response.status_code == 403
     assert camera_response.status_code == 403
     assert writes == []
+
+
+def test_product_activation_routes_are_absent():
+    paths = {route.path for route in main.app.routes}
+    assert "/license" not in paths
+    assert "/license/offline" not in paths
+    assert "/license/online" not in paths
+    assert "/license/deactivate" not in paths
+
+
+def test_camera_creation_is_not_limited_by_product_plan(tmp_path, monkeypatch):
+    db_path = tmp_path / "unlimited-cameras.db"
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    database.init_db()
+    _as_role(monkeypatch, "system")
+    with database.connect() as con:
+        con.executemany(
+            "INSERT INTO cameras(name,rtsp_url,location,enabled,is_demo) "
+            "VALUES(?,?,?,?,?)",
+            [
+                (f"Camera {index}", f"rtsp://camera/{index}", "Gate", 1, 0)
+                for index in range(64)
+            ],
+        )
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/cameras/new",
+            data={
+                "name": "Camera 65",
+                "rtsp_url": "rtsp://camera/65",
+                "location": "Gate",
+                "city": "",
+                "enabled": "1",
+                "is_demo": "0",
+                "sort_order": "65",
+                "lpr_enabled": "1",
+            },
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    with database.connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM cameras").fetchone()[0] == 65
 
 
 def test_system_role_can_change_ai_settings(monkeypatch):
