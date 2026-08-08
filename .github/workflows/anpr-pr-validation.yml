@@ -58,7 +58,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
           python -m compileall -q app
-          python -m pytest -q tests
+          python -m pytest -q tests --timeout=120 --timeout-method=thread --durations=20
 
   ai-runtime:
     needs: regression
