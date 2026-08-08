@@ -46,8 +46,8 @@ def test_launcher_self_test_uses_isolated_data_directory(tmp_path):
     assert Path(result["data_dir"]).resolve() == data_dir.resolve()
     assert Path(result["database_path"]).is_file()
     assert result["database_ready"] is True
-    assert result["public_key_ready"] is True
     assert result["web_app_ready"] is True
+    assert "public_key_ready" not in result
 
 
 def test_release_version_metadata_stays_consistent():
