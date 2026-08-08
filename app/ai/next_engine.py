@@ -73,7 +73,10 @@ def process_frame_next(
         )
     ).strip().lower()
     results = []
-    if detector_runtime == "baseline-yolov8-onnx":
+    if detector_runtime in {
+        "baseline-yolov8-onnx",
+        "baseline-yolo11n-onnx",
+    }:
         if detections is None:
             detections = detect_plates_onnx(
                 frame,

@@ -146,7 +146,8 @@ class LiveANPRWorker:
             self._model_state_at = now
         status = dict(self._model_state)
         status["ocr_ready"] = bool(
-            status.get("crnn_ready")
+            status.get("hezar_ready")
+            or status.get("crnn_ready")
             or status.get("cnn_ready")
         )
         status["ready"] = bool(
@@ -579,8 +580,8 @@ class LiveANPRWorker:
         )
         empty_gap = (
             min(
-                1.10,
-                0.30 * (2 ** min(3, int(no_plate_streak) - 1)),
+                3.20,
+                0.40 * (2 ** min(3, int(no_plate_streak) - 1)),
             )
             if no_plate_streak
             else 0.0
@@ -718,8 +719,6 @@ class LiveANPRWorker:
             state.busy = True
         self._executor.submit(self._process, state, payload)
 
-
-    @staticmethod
     @staticmethod
     def _local_motion_score(previous_frame, current_frame, bbox) -> float:
         if (
@@ -773,15 +772,15 @@ class LiveANPRWorker:
     def _overlay_candidates(
         self,
         state,
-        stable_rows,
+        display_rows,
         min_confidence,
         frame,
     ) -> list[dict]:
-        # Publish only multi-frame confirmed plates on the live image.
-        # Yellow/raw guesses remain available in review data but never draw
-        # a rectangle. Repeated low-motion detections at one camera coordinate
-        # are remembered as static hard negatives for 25 seconds. Strong OCR
-        # can still keep a genuinely parked vehicle visible, including at night.
+        # Publish strong, complete reads immediately on the live image while
+        # keeping review/experimental guesses hidden. Repeated low-motion
+        # detections at one coordinate are remembered as static hard negatives
+        # for 25 seconds. Strong OCR can still keep a genuinely parked vehicle
+        # visible, including at night.
         selected = []
         now = time.monotonic()
         for key, until in list(state.static_overlay_blocked_until.items()):
@@ -789,7 +788,7 @@ class LiveANPRWorker:
                 state.static_overlay_blocked_until.pop(key, None)
                 state.static_overlay_hits.pop(key, None)
 
-        for source in stable_rows:
+        for source in display_rows:
             row = dict(source)
             bbox = row.get("tracking_bbox") or row.get("bbox")
             if not bbox:
@@ -808,9 +807,21 @@ class LiveANPRWorker:
                 continue
 
             votes = max(3, int(row.get("consensus_votes", 0)))
-            detector_confidence = float(row.get("detector_confidence", 0.0))
-            ocr_confidence = float(row.get("ocr_confidence", 0.0))
             combined_confidence = float(row.get("confidence", 0.0))
+            raw_detector_confidence = row.get("detector_confidence")
+            detector_confidence = (
+                combined_confidence
+                if raw_detector_confidence is None
+                else float(raw_detector_confidence)
+            )
+            raw_ocr_confidence = row.get("ocr_confidence")
+            if raw_ocr_confidence is None:
+                raw_ocr_confidence = row.get("raw_guess_confidence")
+            ocr_confidence = (
+                combined_confidence
+                if raw_ocr_confidence is None
+                else float(raw_ocr_confidence)
+            )
             method = str(row.get("method", "")).lower()
             if method.startswith("opencv"):
                 continue
@@ -862,9 +873,9 @@ class LiveANPRWorker:
         started = time.perf_counter()
         try:
             config = state.config or {}
-            is_uploaded_video = str(
-                config.get("rtsp_url", "")
-            ).startswith("video://")
+            stream_url = str(config.get("rtsp_url") or "")
+            is_uploaded_video = stream_url.startswith("video://")
+            use_candidate_router = bool(stream_url) and not is_uploaded_video
             source, offset_x, offset_y = self._roi_frame(
                 frame,
                 config,
@@ -887,37 +898,12 @@ class LiveANPRWorker:
                 min(0.70, min_confidence * 0.68),
             )
 
-            live_detection_threshold = max(
-                0.22,
-                min(0.70, min_confidence * 0.68),
-            )
-
-            live_detection_threshold = max(
-                0.22,
-                min(0.70, min_confidence * 0.68),
-            )
-
-            live_detection_threshold = max(
-                0.22,
-                min(0.70, min_confidence * 0.68),
-            )
-
-            live_detection_threshold = max(
-                0.22,
-                min(0.70, min_confidence * 0.68),
-            )
-
-            live_detection_threshold = max(
-                0.22,
-                min(0.70, min_confidence * 0.68),
-            )
-
             def baseline_process():
                 kwargs = {"engine_key": camera_id}
                 if exclusion_mask is not None:
                     kwargs["exclusion_mask"] = exclusion_mask
                 # Limit expensive OCR work without changing process_frame's
-                # signature. Only the strongest three candidates continue.
+                # signature. Only the strongest two candidates continue.
                 return process_frame(
                     source,
                     live_detection_threshold,
@@ -925,7 +911,7 @@ class LiveANPRWorker:
                     **kwargs,
                 )
 
-            if is_uploaded_video:
+            if not use_candidate_router:
                 class _BaselineOnlyOutcome:
                     mode = "baseline"
                     shadow = []
@@ -1002,7 +988,10 @@ class LiveANPRWorker:
                     bool(row.get("ocr_disagreement"))
                 )
                 state.crnn_selected += int(
-                    row.get("ocr_engine") == "crnn-onnx"
+                    row.get("ocr_engine") in {
+                        "hezar-crnn-fa-v2-onnx",
+                        "crnn-onnx",
+                    }
                 )
                 state.character_reader_selected += int(
                     row.get("ocr_engine") in {
@@ -1044,7 +1033,7 @@ class LiveANPRWorker:
             ]
             overlay_rows = self._overlay_candidates(
                 state,
-                stable,
+                display_rows,
                 min_confidence,
                 frame,
             )

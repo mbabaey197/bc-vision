@@ -26,11 +26,6 @@ if not exist "requirements-ai-lock.txt" (
     exit /b 1
 )
 
-if not exist "license_public_key.pem" (
-    echo license_public_key.pem was not found.
-    exit /b 1
-)
-
 if not exist ".buildvenv\Scripts\python.exe" (
     %PY% -m venv ".buildvenv"
     if errorlevel 1 goto :error
@@ -66,12 +61,12 @@ rem RC15 operator-assisted ANPR modules are packaged explicitly.
     --hidden-import app.security ^
     --hidden-import app.config ^
     --hidden-import app.streams ^
-    --hidden-import app.license ^
     --hidden-import app.ai.detector ^
     --hidden-import app.ai.ocr ^
     --hidden-import app.ai.onnx_crnn ^
     --hidden-import app.ai.onnx_cnn ^
     --hidden-import app.ai.onnx_detector ^
+    --hidden-import app.ai.onnx_hezar ^
     --hidden-import app.ai.pipeline ^
     --hidden-import app.ai.plate_recovery ^
     --hidden-import app.ai.plate_rules ^
@@ -98,6 +93,8 @@ rem RC15 operator-assisted ANPR modules are packaged explicitly.
     --collect-all onnx ^
     --collect-all onnxruntime ^
     --collect-all torch ^
+    --exclude-module hezar ^
+    --exclude-module huggingface_hub ^
     launcher.py
 if errorlevel 1 goto :error
 
@@ -105,9 +102,6 @@ if not exist "dist\BCVision\BCVision.exe" (
     echo BCVision.exe was not created.
     goto :error
 )
-
-copy /Y "license_public_key.pem" "dist\BCVision\license_public_key.pem" >nul
-if errorlevel 1 goto :error
 
 copy /Y "VERSION" "dist\BCVision\VERSION" >nul
 if errorlevel 1 goto :error

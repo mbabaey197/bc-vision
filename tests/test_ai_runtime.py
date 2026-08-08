@@ -29,11 +29,16 @@ def test_verified_models_and_real_engines_load(tmp_path):
         detect_plates_onnx,
         detector_status,
     )
+    from app.ai.onnx_hezar import (
+        hezar_status,
+        read_plate_hezar_primary,
+    )
 
     prepared = prepare_models(download=True)
     status = model_status()
     assert status["detector_ready"]
     assert status["detector_fallback_ready"]
+    assert status["hezar_ready"]
     assert status["crnn_ready"]
     assert status["cnn_ready"]
     assert prepared["detector"] == status["detector_path"]
@@ -41,6 +46,7 @@ def test_verified_models_and_real_engines_load(tmp_path):
         prepared["detector_fallback"]
         == status["detector_fallback_path"]
     )
+    assert prepared["hezar"] == status["hezar_path"]
     assert prepared["crnn"] == status["crnn_path"]
     assert prepared["cnn"] == status["cnn_path"]
 
@@ -59,6 +65,12 @@ def test_verified_models_and_real_engines_load(tmp_path):
     )
     assert isinstance(output, list)
     assert detector_status()["model_loaded"] is True
+
+    read_plate_hezar_primary(
+        np.zeros((32, 384, 3), dtype=np.uint8),
+        engine_key="integration-test",
+    )
+    assert hezar_status()["model_loaded"] is True
 
     read_plate_crnn(
         np.zeros((32, 128, 3), dtype=np.uint8),

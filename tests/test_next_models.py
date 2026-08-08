@@ -329,7 +329,7 @@ def test_signed_cct_can_reuse_verified_baseline_detector(
 ):
     from app.ai import model_manager
 
-    baseline = tmp_path / "data" / "models" / "plate" / "plate_yolo.onnx"
+    baseline = tmp_path / "data" / "models" / "plate" / "plate_yolo11n.onnx"
     baseline.parent.mkdir(parents=True)
     baseline.write_bytes(b"verified-baseline-detector")
     digest = hashlib.sha256(baseline.read_bytes()).hexdigest()
@@ -341,9 +341,9 @@ def test_signed_cct_can_reuse_verified_baseline_detector(
         monkeypatch,
         engine="bcvision-rc15",
         detector_overrides={
-            "runtime": "baseline-yolov8-onnx",
+            "runtime": "baseline-yolo11n-onnx",
             "reuse_verified_baseline": True,
-            "filename": "plate_yolo.onnx",
+            "filename": "plate_yolo11n.onnx",
             "sha256": digest,
             "size": baseline.stat().st_size,
         },
@@ -371,7 +371,7 @@ def test_signed_cct_can_reuse_verified_baseline_detector(
     status = next_models.next_models_status()
 
     assert status["ready"] is True
-    assert status["detector_runtime"] == "baseline-yolov8-onnx"
+    assert status["detector_runtime"] == "baseline-yolo11n-onnx"
     assert status["detector_path"] == str(baseline)
 
 

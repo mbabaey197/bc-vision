@@ -47,23 +47,14 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
-          python -m pytest -q tests *>&1 | Tee-Object -FilePath pytest-output.txt
+          python -m pytest -q tests --timeout=120 --timeout-method=thread --durations=20 *>&1 | Tee-Object -FilePath pytest-output.txt
           exit $LASTEXITCODE
-
-      - name: Upload test output
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: anpr-pytest-output
-          path: pytest-output.txt
-          if-no-files-found: error
-          retention-days: 7
 
       - name: Enforce test result
         if: steps.pytest.outcome == 'failure'
         shell: pwsh
         run: |
-          Write-Error "ANPR tests failed. See the anpr-pytest-output artifact."
+          Write-Error "ANPR tests failed. See the Run ANPR test suite step log."
           exit 1
 
   ai-runtime:
@@ -89,7 +80,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}\bcvision-models
-          key: bcvision-anpr-models-v2-onnx
+          key: bcvision-anpr-models-v3-yolo11n-hezar
 
       - name: Install AI runtime
         shell: pwsh
@@ -109,26 +100,18 @@ jobs:
         continue-on-error: true
         shell: pwsh
         env:
-          BCVISION_PLATE_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo.onnx
+          BCVISION_PLATE_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo11n.onnx
           BCVISION_PLATE_FALLBACK_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo_fallback.onnx
           BCVISION_CRNN_MODEL: ${{ runner.temp }}\bcvision-models\crnn\ocr_crnn.onnx
           BCVISION_CNN_MODEL: ${{ runner.temp }}\bcvision-models\cnn\ocr_cnn.onnx
+          BCVISION_HEZAR_MODEL: ${{ runner.temp }}\bcvision-models\hezar\crnn_fa_v2.onnx
         run: |
           python -m pytest -q tests/test_ai_runtime.py *>&1 | Tee-Object -FilePath ai-test-output.txt
           exit $LASTEXITCODE
-
-      - name: Upload AI test output
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: anpr-ai-test-output
-          path: ai-test-output.txt
-          if-no-files-found: warn
-          retention-days: 7
 
       - name: Enforce AI result
         if: steps.ai_test.outcome == 'failure'
         shell: pwsh
         run: |
-          Write-Error "ANPR AI integration failed. See the anpr-ai-test-output artifact."
+          Write-Error "ANPR AI integration failed. See the model smoke-test step log."
           exit 1

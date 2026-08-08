@@ -43,7 +43,11 @@ jobs:
         shell: pwsh
         run: |
           $value = (Get-Content VERSION -Raw).Trim()
+          if ($value -notmatch '^\d+\.\d+\.\d+-rc(?<rc>\d+(?:\.\d+)*)$') {
+            throw "Unsupported candidate version: $value"
+          }
           "value=$value" >> $env:GITHUB_OUTPUT
+          "label=RC$($Matches.rc)" >> $env:GITHUB_OUTPUT
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
@@ -59,7 +63,7 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check -r requirements-test.txt --quiet
           python -m compileall -q app launcher.py
-          python -m pytest -q tests
+          python -m pytest -q tests --timeout=120 --timeout-method=thread --durations=20
 
       - name: Build portable Windows application
         shell: cmd
@@ -92,10 +96,11 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $version = (Get-Content VERSION -Raw).Trim()
+          $releaseLabel = "${{ steps.version.outputs.label }}"
           $installDir = Join-Path $env:RUNNER_TEMP "bcvision-install"
           $dataDir = Join-Path $env:RUNNER_TEMP "bcvision-persistent-data"
-          $setup = Resolve-Path "setup_output\BCVision_Setup_v$version.exe"
-          $update = Resolve-Path "setup_output\BCVision_Update_v$version.exe"
+          $setup = Resolve-Path "setup_output\BCVision_${releaseLabel}_Setup.exe"
+          $update = Resolve-Path "setup_output\BCVision_${releaseLabel}_Update.exe"
           $firstResult = Join-Path $env:RUNNER_TEMP "self-test-install.json"
           $updatedResult = Join-Path $env:RUNNER_TEMP "self-test-update.json"
 
@@ -192,10 +197,11 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $version = (Get-Content VERSION -Raw).Trim()
+          $releaseLabel = "${{ steps.version.outputs.label }}"
           $releaseDir = Join-Path $PWD "release"
           New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
-          Copy-Item "setup_output\BCVision_Setup_v$version.exe" $releaseDir
-          Copy-Item "setup_output\BCVision_Update_v$version.exe" $releaseDir
+          Copy-Item "setup_output\BCVision_${releaseLabel}_Setup.exe" $releaseDir
+          Copy-Item "setup_output\BCVision_${releaseLabel}_Update.exe" $releaseDir
           git archive --format=zip --output="$releaseDir\BC_Vision_v${version}_Source.zip" HEAD
           $files = Get-ChildItem $releaseDir -File | Sort-Object Name
           $lines = foreach ($file in $files) {
@@ -205,11 +211,8 @@ jobs:
           Set-Content -Path "$releaseDir\SHA256SUMS.txt" -Value $lines -Encoding ascii
           Get-ChildItem $releaseDir | Select-Object Name,Length
 
-      - name: Upload verified candidate
-        uses: actions/upload-artifact@v4
-        with:
-          name: BCVision-${{ steps.version.outputs.value }}-windows
-          path: release/*
-          if-no-files-found: error
-          retention-days: 30
-          compression-level: 0
+      - name: Report verified candidate
+        shell: pwsh
+        run: |
+          Write-Host "Candidate files were built and verified on the GitHub-hosted runner."
+          Get-Content release\SHA256SUMS.txt

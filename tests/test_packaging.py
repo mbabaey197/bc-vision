@@ -46,8 +46,8 @@ def test_launcher_self_test_uses_isolated_data_directory(tmp_path):
     assert Path(result["data_dir"]).resolve() == data_dir.resolve()
     assert Path(result["database_path"]).is_file()
     assert result["database_ready"] is True
-    assert result["public_key_ready"] is True
     assert result["web_app_ready"] is True
+    assert "public_key_ready" not in result
 
 
 def test_release_version_metadata_stays_consistent():
@@ -57,16 +57,22 @@ def test_release_version_metadata_stays_consistent():
     config = (root / "app" / "config.py").read_text(encoding="utf-8")
     assert f'APP_VERSION = "{version}"' in config
 
-    for filename, prefix in (
-        ("BCVision.iss", "BCVision_Setup_v"),
-        ("BCVision_Update.iss", "BCVision_Update_v"),
+    base_version, rc_version = version.split("-rc", 1)
+    version_info = f"{base_version}.{rc_version.replace('.', '')}"
+    release_label = f"RC{rc_version}"
+    for filename, suffix in (
+        ("BCVision.iss", "Setup"),
+        ("BCVision_Update.iss", "Update"),
     ):
         source = (
             root / "installer" / filename
         ).read_text(encoding="utf-8")
         assert f'#define MyAppVersion "{version}"' in source
-        assert f"OutputBaseFilename={prefix}{version}" in source
-        assert "VersionInfoVersion=2.2.0.17" in source
+        assert (
+            f"OutputBaseFilename=BCVision_{release_label}_{suffix}"
+            in source
+        )
+        assert f"VersionInfoVersion={version_info}" in source
 
 
 def test_windows_build_and_source_launch_are_windowless():
@@ -111,6 +117,7 @@ def test_packaged_self_test_can_require_offline_anpr_models():
     assert '"--verify-anpr" in sys.argv' in launcher
     assert "prepare_models(download=False)" in launcher
     assert "detect_plates_onnx(" in launcher
+    assert "read_plate_hezar_primary(" in launcher
     assert "read_plate_crnn(" in launcher
     assert "warmup_cnn(" in launcher
     assert '--add-data ".model-seed;model-seed"' in build
@@ -120,9 +127,11 @@ def test_packaged_self_test_can_require_offline_anpr_models():
     assert "--hidden-import app.ai.next_engine" in build
     assert "--hidden-import app.ai.next_models" in build
     assert "--hidden-import app.ai.onnx_cct" in build
+    assert "--hidden-import app.ai.onnx_hezar" in build
     assert "--hidden-import app.ai.review_policy" in build
     assert "--collect-all easyocr" not in build
     assert "--collect-all ultralytics" not in build
+    assert "--exclude-module hezar" in build
     assert 'copy /Y "THIRD_PARTY_NOTICES.md"' in build
 
 

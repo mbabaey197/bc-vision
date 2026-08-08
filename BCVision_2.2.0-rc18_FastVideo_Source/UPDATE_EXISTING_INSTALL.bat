@@ -20,7 +20,10 @@ xcopy "%~dp0app" "%TARGET%\app\" /E /I /Y >nul
 copy /Y "%~dp0launcher.py" "%TARGET%\launcher.py" >nul
 copy /Y "%~dp0VERSION" "%TARGET%\VERSION" >nul
 copy /Y "%~dp0requirements.txt" "%TARGET%\requirements.txt" >nul
-copy /Y "%~dp0license_public_key.pem" "%TARGET%\license_public_key.pem" >nul
+del /Q "%TARGET%\license_public_key.pem" 2>nul
+del /Q "%TARGET%\app\license.py" 2>nul
+del /Q "%TARGET%\app\license_format.py" 2>nul
+del /Q "%TARGET%\app\offline_license_policy.py" 2>nul
 echo.
 echo بروزرسانی با موفقیت انجام شد.
 echo اطلاعات دیتابیس و تنظیمات حذف نشده‌اند.

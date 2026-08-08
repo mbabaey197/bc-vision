@@ -14,7 +14,7 @@ Every production release must deliver all three outputs together:
 
 1. Complete source archive
 2. Windows installer
-3. One-click updater that preserves the previous database, settings, license data, snapshots, videos and AI models
+3. One-click updater that preserves the previous database, settings, snapshots, videos and AI models
 
 Application data and AI models must remain outside the replaceable application directory.
 
@@ -206,7 +206,7 @@ Phase 1 security hardening is included in the current optimization branch:
 - snapshot, plate, video and backup folders must be distinct children of the
   configured storage root
 - retention cleanup refuses any folder outside the configured storage root
-- camera, system, license, watchlist and video operations enforce server-side
+- camera, system, watchlist and video operations enforce server-side
   role permissions
 - administrators and system managers can manage technical configuration
 - operators can manage watchlists and process videos
@@ -247,7 +247,7 @@ one-click update.
 New databases no longer receive an enabled synthetic demo camera. A one-time,
 exact-match migration removes only the historical built-in sample camera from
 existing databases while preserving real cameras, user-created demo cameras,
-events, settings and license data. The empty dashboard contains instructions
+events and settings. The empty dashboard contains instructions
 and an add-camera action without a placeholder image or animation.
 
 ## Operational truth
@@ -473,7 +473,7 @@ atomically updates the active manifest. Existing vendor and custom models,
 events and feedback rows remain recoverable.
 
 Visible application dates remain Jalali and every visible date/time digit is
-Persian, including license expiration, event time, replay timing and the demo
+Persian, including event time, replay timing and the demo
 overlay. Database timestamps, filenames, API contracts and JavaScript numeric
 control values remain machine-stable ASCII.
 

@@ -10,8 +10,11 @@ setup_output/
 *.spec
 .idea/
 .vscode/
+# Never publish stale product-activation secrets or local artifacts.
 tools/keys/
+**/license_private_key.pem
 license.json
+license.dat
 .buildvenv/
 .coverage
 training-data/

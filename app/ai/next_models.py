@@ -31,8 +31,13 @@ SUPPORTED_ENGINE_IDS = {
 }
 DETECTOR_RUNTIMES = {
     "baseline-yolov8-onnx",
+    "baseline-yolo11n-onnx",
     "yolo26-obb-onnx",
     "ppyoloe-r-onnx",
+}
+BASELINE_DETECTOR_RUNTIMES = {
+    "baseline-yolov8-onnx",
+    "baseline-yolo11n-onnx",
 }
 OCR_RUNTIMES = {
     "hezar-ctc-onnx",
@@ -260,7 +265,7 @@ def _validate_detector_runtime(spec: dict, engine_id: str) -> str:
         raise ValueError(
             f"Unsupported next-model detector runtime: {runtime}"
         )
-    if runtime == "baseline-yolov8-onnx":
+    if runtime in BASELINE_DETECTOR_RUNTIMES:
         if (
             engine_id != "bcvision-rc15"
             or spec.get("reuse_verified_baseline") is not True
@@ -407,7 +412,7 @@ def verified_next_manifest() -> dict:
             or size <= 0
         ):
             raise ValueError(f"Invalid next-model entry: {name}")
-        if name == "detector" and runtime == "baseline-yolov8-onnx":
+        if name == "detector" and runtime in BASELINE_DETECTOR_RUNTIMES:
             from .model_manager import (
                 DETECTOR_SHA256,
                 DETECTOR_SIZE,
@@ -415,7 +420,7 @@ def verified_next_manifest() -> dict:
             )
 
             if (
-                filename != "plate_yolo.onnx"
+                filename != "plate_yolo11n.onnx"
                 or digest != DETECTOR_SHA256
                 or size != DETECTOR_SIZE
             ):

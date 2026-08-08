@@ -1,5 +1,5 @@
 #define MyAppName "BC Vision"
-#define MyAppVersion "2.2.0-rc27.1"
+#define MyAppVersion "2.2.0-rc28"
 #define MyAppPublisher "Gilas Abi Alborz"
 #define MyAppExeName "BCVision.exe"
 
@@ -7,14 +7,14 @@
 AppId={{12FC1F39-4F29-4D61-A81D-66BD900AA4E8}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-VersionInfoVersion=2.2.0.271
+VersionInfoVersion=2.2.0.28
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\BC Vision
 DefaultGroupName=BC Vision
 DisableProgramGroupPage=yes
 UsePreviousAppDir=yes
 OutputDir=..\setup_output
-OutputBaseFilename=BCVision_RC27.1_Setup
+OutputBaseFilename=BCVision_RC28_Setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -28,6 +28,12 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 
 [Files]
 Source: "..\dist\BCVision\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[InstallDelete]
+Type: files; Name: "{app}\license_public_key.pem"
+Type: files; Name: "{app}\app\license.py"
+Type: files; Name: "{app}\app\license_format.py"
+Type: files; Name: "{app}\app\offline_license_policy.py"
 
 [Icons]
 Name: "{autoprograms}\BC Vision"; Filename: "{app}\{#MyAppExeName}"
