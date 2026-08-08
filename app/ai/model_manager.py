@@ -20,15 +20,19 @@ import time
 import urllib.error
 import urllib.request
 
+from .hezar_export import HEZAR_ONNX_SHA256, HEZAR_ONNX_SIZE
+
 DETECTOR_URL = (
-    "https://huggingface.co/Dibachain/Platrix/resolve/main/"
-    "plate_yolo.onnx?download=true"
+    "https://huggingface.co/morsetechlab/"
+    "yolov11-license-plate-detection/resolve/"
+    "0f8dc030388b3660418ac7d8c37d3a40148064c1/"
+    "license-plate-finetune-v1n.onnx?download=true"
 )
 DETECTOR_SHA256 = (
-    "A54E475C402E6036BB5C70F1A6FF7517"
-    "9E76098A5C8039BB5D148C0B6421F5C6"
+    "693133A1DB97A3BA1E90068986F80AFB"
+    "72C3FCDDB681E57181A89A9A3DC351D6"
 )
-DETECTOR_SIZE = 12_608_775
+DETECTOR_SIZE = 10_481_682
 DETECTOR_FALLBACK_URL = (
     "https://huggingface.co/Dibachain/Platrix/resolve/main/"
     "plate_yolo_fallback.onnx?download=true"
@@ -73,7 +77,7 @@ def detector_path() -> Path:
     ).strip()
     if configured:
         return Path(configured).expanduser()
-    return _data_dir() / "models" / "plate" / "plate_yolo.onnx"
+    return _data_dir() / "models" / "plate" / "plate_yolo11n.onnx"
 
 
 def detector_fallback_path() -> Path:
@@ -109,6 +113,16 @@ def cnn_path() -> Path:
     if configured:
         return Path(configured).expanduser()
     return _data_dir() / "models" / "cnn" / "ocr_cnn.onnx"
+
+
+def hezar_path() -> Path:
+    configured = os.environ.get(
+        "BCVISION_HEZAR_MODEL",
+        "",
+    ).strip()
+    if configured:
+        return Path(configured).expanduser()
+    return _data_dir() / "models" / "hezar" / "crnn_fa_v2.onnx"
 
 
 def _active_crnn_manifest_path() -> Path:
@@ -447,7 +461,7 @@ def ensure_detector_model(download=True) -> Path:
         "",
     ).strip()
     if source_dir:
-        source = Path(source_dir) / "plate_yolo.onnx"
+        source = Path(source_dir) / "plate_yolo11n.onnx"
         if _copy_verified(
             source,
             target,
@@ -457,7 +471,7 @@ def ensure_detector_model(download=True) -> Path:
             return target
     seed = packaged_seed_dir()
     if seed and _copy_verified(
-        seed / "plate" / "plate_yolo.onnx",
+        seed / "plate" / "plate_yolo11n.onnx",
         target,
         DETECTOR_SHA256,
         DETECTOR_SIZE,
@@ -597,6 +611,58 @@ def ensure_cnn_model(download=True) -> Path:
     )
 
 
+def ensure_hezar_model(download=True) -> Path:
+    target = hezar_path()
+    if verify_file(target, HEZAR_ONNX_SHA256, HEZAR_ONNX_SIZE):
+        return target
+    source_dir = os.environ.get(
+        "BCVISION_HEZAR_SOURCE_DIR",
+        os.environ.get("BCVISION_MODEL_SOURCE_DIR", ""),
+    ).strip()
+    if source_dir:
+        source = Path(source_dir) / "crnn_fa_v2.onnx"
+        if _copy_verified(
+            source,
+            target,
+            HEZAR_ONNX_SHA256,
+            HEZAR_ONNX_SIZE,
+        ):
+            return target
+    seed = packaged_seed_dir()
+    if seed and _copy_verified(
+        seed / "hezar" / "crnn_fa_v2.onnx",
+        target,
+        HEZAR_ONNX_SHA256,
+        HEZAR_ONNX_SIZE,
+    ):
+        return target
+    if not download:
+        raise FileNotFoundError(
+            f"Verified Hezar CRNN ONNX model not found: {target}"
+        )
+    from .hezar_export import export_pinned_model
+
+    cache_dir = Path(os.environ.get(
+        "BCVISION_HEZAR_CACHE_DIR",
+        str(target.parent / "source-cache"),
+    )).expanduser()
+    export_pinned_model(target, cache_dir)
+    if not verify_file(
+        target,
+        HEZAR_ONNX_SHA256,
+        HEZAR_ONNX_SIZE,
+    ):
+        target.unlink(missing_ok=True)
+        raise ValueError("Exported Hezar model verification failed")
+    try:
+        from .onnx_hezar import clear_hezar_sessions
+
+        clear_hezar_sessions()
+    except Exception:
+        pass
+    return target
+
+
 def prepare_models(download=True) -> dict:
     detector = ensure_detector_model(download=download)
     detector_fallback = ensure_detector_fallback_model(
@@ -604,11 +670,13 @@ def prepare_models(download=True) -> dict:
     )
     crnn = ensure_crnn_model(download=download)
     cnn = ensure_cnn_model(download=download)
+    hezar = ensure_hezar_model(download=download)
     return {
         "detector": str(detector),
         "detector_fallback": str(detector_fallback),
         "crnn": str(crnn),
         "cnn": str(cnn),
+        "hezar": str(hezar),
     }
 
 
@@ -619,8 +687,9 @@ def prepare_seed(seed_dir: Path, download=True) -> dict:
     )
     crnn = ensure_crnn_model(download=download)
     cnn = ensure_cnn_model(download=download)
+    hezar = ensure_hezar_model(download=download)
     seed = Path(seed_dir)
-    detector_target = seed / "plate" / "plate_yolo.onnx"
+    detector_target = seed / "plate" / "plate_yolo11n.onnx"
     if not _copy_verified(
         detector,
         detector_target,
@@ -654,11 +723,20 @@ def prepare_seed(seed_dir: Path, download=True) -> dict:
         CNN_SIZE,
     ):
         raise ValueError("CNN seed verification failed")
+    hezar_target = seed / "hezar" / "crnn_fa_v2.onnx"
+    if not _copy_verified(
+        hezar,
+        hezar_target,
+        HEZAR_ONNX_SHA256,
+        HEZAR_ONNX_SIZE,
+    ):
+        raise ValueError("Hezar seed verification failed")
     return {
         "detector": str(detector_target),
         "detector_fallback": str(detector_fallback_target),
         "crnn": str(crnn_target),
         "cnn": str(cnn_target),
+        "hezar": str(hezar_target),
     }
 
 
@@ -667,6 +745,7 @@ def model_status() -> dict:
     detector_fallback = detector_fallback_path()
     crnn = crnn_path()
     cnn = cnn_path()
+    hezar = hezar_path()
     active_crnn, active_crnn_sha, active_crnn_size = (
         active_crnn_model()
     )
@@ -702,6 +781,12 @@ def model_status() -> dict:
             cnn,
             CNN_SHA256,
             CNN_SIZE,
+        ),
+        "hezar_path": str(hezar),
+        "hezar_ready": verify_file(
+            hezar,
+            HEZAR_ONNX_SHA256,
+            HEZAR_ONNX_SIZE,
         ),
         "easyocr_ready": False,
     }
@@ -754,6 +839,7 @@ def main(argv=None):
         and status["detector_fallback_ready"]
         and status["crnn_ready"]
         and status["cnn_ready"]
+        and status["hezar_ready"]
     ) else 1
 
 
