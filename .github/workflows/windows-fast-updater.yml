@@ -1,8 +1,8 @@
 name: Windows fast updater
 
-# Recovery updates run on an isolated GitHub-hosted Windows runner and publish
-# only the verified one-click updater. The complete clean release workflow
-# remains a separate, manually triggered final gate.
+# Recovery updates run on the connected Windows runner and copy only the
+# verified one-click updater to a stable runner-local delivery folder. Artifact
+# upload is best-effort so a full quota cannot invalidate a successful build.
 
 on:
   workflow_dispatch:
@@ -11,6 +11,7 @@ on:
       - main
       - agent/anpr-rescue-plate-search-rc19
       - agent/anpr-native-ingest-rc24
+      - agent/anpr-detection-recovery-rc25
     paths:
       - "app/**"
       - "installer/**"
@@ -35,10 +36,10 @@ concurrency:
 
 jobs:
   build-test-update:
-    runs-on: windows-latest
-    timeout-minutes: 60
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 90
     env:
-      BCVISION_INCREMENTAL_BUILD: "1"
+      BCVISION_INCREMENTAL_BUILD: "0"
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUTF8: "1"
 
@@ -48,6 +49,13 @@ jobs:
         with:
           clean: false
 
+      - name: Remove only stale build outputs
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          foreach ($path in @("build", "dist", "setup_output", "fast-update")) {
+            if (Test-Path $path) { Remove-Item $path -Recurse -Force }
+          }
+
       - name: Read candidate version
         id: version
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
@@ -55,28 +63,31 @@ jobs:
           $value = (Get-Content VERSION -Raw).Trim()
           "value=$value" >> $env:GITHUB_OUTPUT
 
-      - name: Set up Python 3.13
-        uses: actions/setup-python@v6
+      - name: Install portable uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
-          python-version: "3.13"
-          cache: pip
-          cache-dependency-path: requirements-test.txt
+          version: "0.12.0"
+          enable-cache: true
+          cache-python: true
+          cache-dependency-glob: requirements-test.txt
 
-      - name: Create Python 3.13 test environment
+      - name: Create portable Python 3.13 test environment
         shell: cmd
         run: |
-          python -m venv .venv
-          echo %CD%\.venv\Scripts>>"%GITHUB_PATH%"
+          if not exist .venv-rc28\Scripts\python.exe uv python install 3.13
+          if not exist .venv-rc28\Scripts\python.exe uv venv --python 3.13 --seed .venv-rc28
+          echo %CD%\.venv-rc28\Scripts>>"%GITHUB_PATH%"
 
       - name: Run source regression
         shell: cmd
         env:
           BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\fast-regression
+          BCVISION_LICENSE_REGRESSION: "1"
         run: |
-          python scripts\build_dependency_stamp.py check .venv\.bcvision-test-dependencies.sha256 requirements-test.txt
+          python scripts\build_dependency_stamp.py check .venv-rc28\.bcvision-test-dependencies.sha256 requirements-test.txt
           if errorlevel 1 python -m pip install --disable-pip-version-check -r requirements-test.txt --quiet
           if errorlevel 1 exit /b 1
-          python scripts\build_dependency_stamp.py write .venv\.bcvision-test-dependencies.sha256 requirements-test.txt
+          python scripts\build_dependency_stamp.py write .venv-rc28\.bcvision-test-dependencies.sha256 requirements-test.txt
           python -m compileall -q app launcher.py
           python -m pytest -q tests
 
@@ -133,11 +144,23 @@ jobs:
             -Value "$hash  $(Split-Path $target -Leaf)" `
             -Encoding ascii
 
-      - name: Upload verified fast updater
+      - name: Copy verified updater to runner delivery folder
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $delivery = Join-Path $env:USERPROFILE "BCVision-Deliveries\RC28"
+          New-Item -ItemType Directory -Path $delivery -Force | Out-Null
+          Copy-Item fast-update\* $delivery -Force
+          Write-Host "DELIVERY_PATH=$delivery"
+          Get-ChildItem $delivery -File | ForEach-Object {
+            Write-Host "DELIVERED=$($_.FullName) SIZE=$($_.Length)"
+          }
+
+      - name: Upload verified fast updater when quota is available
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: BCVision-${{ steps.version.outputs.value }}-fast-updater-${{ github.run_number }}
           path: fast-update/*
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 1
           compression-level: 0

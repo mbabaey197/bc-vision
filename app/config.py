@@ -3,7 +3,7 @@ import json, os, sys
 
 COMPANY_NAME = "گیلاس آبی البرز"
 APP_NAME = "BC Vision"
-APP_VERSION = "2.2.0-rc25"
+APP_VERSION = "2.2.0-rc28"
 HOST = "127.0.0.1"
 PORT = 8000
 
@@ -45,8 +45,8 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "bcvision.db"
 LOG_PATH = DATA_DIR / "BCVision.log"
 SECRET_PATH = DATA_DIR / ".secret"
-# Licensing remains in the fixed bootstrap directory. Changing archive or
-# storage drives cannot move, clone, or accidentally delete the binding.
+# Legacy paths remain defined only so the preserved rollback implementation and
+# its regression tests can import safely. RC28 does not require or create them.
 LICENSE_PATH = BOOTSTRAP_DIR / "license.dat"
 LEGACY_LICENSE_PATH = DATA_DIR / "license.json"
 TRIAL_PATH = BOOTSTRAP_DIR / ".trial.dat"
@@ -57,12 +57,3 @@ PLATE_DIR = DATA_DIR / "plates"
 VIDEO_DIR = DATA_DIR / "videos"
 for folder in (BACKUP_DIR, SNAPSHOT_DIR, PLATE_DIR, VIDEO_DIR):
     folder.mkdir(parents=True, exist_ok=True)
-
-# Main imports config before registering HTTP routes. Install the offline-only
-# policy here so online activation is never exposed by the web application.
-try:
-    from app.offline_license_policy import install_offline_license_policy
-
-    install_offline_license_policy()
-except ImportError:
-    pass

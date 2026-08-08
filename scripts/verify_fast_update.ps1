@@ -35,6 +35,7 @@ $env:BCVISION_SKIP_MODEL_PREP = "1"
 $first = Start-Process -FilePath $executable -ArgumentList @(
     "--self-test",
     "--verify-anpr",
+    "--verify-no-license",
     "--self-test-output",
     $firstResult
 ) -Wait -PassThru
@@ -45,6 +46,7 @@ $firstJson = Get-Content $firstResult -Raw | ConvertFrom-Json
 if (
     -not $firstJson.ok -or
     -not $firstJson.anpr_ready -or
+    -not $firstJson.no_license_ready -or
     $firstJson.version -ne $Version
 ) {
     throw "Pre-update executable self-test failed"
@@ -79,6 +81,7 @@ if ($update.ExitCode -ne 0) {
 $updated = Start-Process -FilePath $executable -ArgumentList @(
     "--self-test",
     "--verify-anpr",
+    "--verify-no-license",
     "--self-test-output",
     $updatedResult
 ) -Wait -PassThru
@@ -89,6 +92,7 @@ $updatedJson = Get-Content $updatedResult -Raw | ConvertFrom-Json
 if (
     -not $updatedJson.ok -or
     -not $updatedJson.anpr_ready -or
+    -not $updatedJson.no_license_ready -or
     $updatedJson.version -ne $Version
 ) {
     throw "Updated executable self-test failed"

@@ -144,7 +144,7 @@ def test_windows_gate_runs_detector_and_ocr_inside_installed_executable():
     assert "updatedJson.anpr_ready" in workflow
 
 
-def test_fast_updater_reuses_build_cache_and_skips_full_installer():
+def test_rc28_fast_updater_uses_clean_build_and_skips_full_installer():
     root = Path(__file__).resolve().parents[1]
     build = (root / "BUILD_PORTABLE_EXE.bat").read_text(
         encoding="utf-8",
@@ -158,7 +158,7 @@ def test_fast_updater_reuses_build_cache_and_skips_full_installer():
     assert 'set "BCVISION_PYINSTALLER_CLEAN=--clean"' in build
     assert 'set "BCVISION_PYINSTALLER_CLEAN="' in build
     assert "clean: false" in workflow
-    assert 'BCVISION_INCREMENTAL_BUILD: "1"' in workflow
+    assert 'BCVISION_INCREMENTAL_BUILD: "0"' in workflow
     assert "Build only the one-click updater" in workflow
     assert "installer\\BCVision_Update.iss" in workflow
     assert "installer\\BCVision.iss" not in workflow

@@ -7,6 +7,7 @@ on:
     branches:
       - main
       - agent/anpr-rescue-plate-search-rc19
+      - agent/anpr-detection-recovery-rc25
     paths:
       - "app/**"
       - "installer/**"
@@ -61,6 +62,7 @@ jobs:
         shell: cmd
         env:
           BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\regression
+          BCVISION_LICENSE_REGRESSION: "1"
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
           python -m compileall -q app/ai app/database.py app/streams.py

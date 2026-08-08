@@ -26,7 +26,7 @@ def _as_role(monkeypatch, role):
     )
 
 
-def test_operator_cannot_change_system_or_license_settings(monkeypatch):
+def test_operator_cannot_change_system_settings_and_license_route_is_absent(monkeypatch):
     _as_role(monkeypatch, "operator")
     writes = []
     monkeypatch.setattr(main, "set_setting", lambda key, value: writes.append((key, value)))
@@ -52,7 +52,7 @@ def test_operator_cannot_change_system_or_license_settings(monkeypatch):
         )
 
     assert ai_response.status_code == 403
-    assert license_response.status_code == 403
+    assert license_response.status_code == 404
     assert camera_response.status_code == 403
     assert writes == []
 
@@ -169,17 +169,6 @@ def test_dashboard_renders_resizable_roi_control_for_camera_manager(
             "VALUES(?,?,?,?,?,?)",
             ("Gate", "rtsp://gate", 11.5, 22.5, 70.0, 60.0),
         )
-    monkeypatch.setattr(
-        main,
-        "license_status",
-        lambda: {
-            "valid": True,
-            "plan": "test",
-            "camera_limit": 8,
-            "message": "ok",
-        },
-    )
-
     with TestClient(main.app) as client:
         response = client.get("/dashboard")
 
