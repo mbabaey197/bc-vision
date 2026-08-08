@@ -205,6 +205,8 @@ def run_self_test() -> int:
         "web_app_ready": False,
         "anpr_ready": False,
         "setup_required": False,
+        "no_license_ready": False,
+        "license_file_present": False,
     }
     try:
         from app.config import (
@@ -212,6 +214,7 @@ def run_self_test() -> int:
             DATA_DIR,
             DB_PATH,
             PUBLIC_KEY_PATH,
+            LICENSE_PATH,
         )
         from app.database import connect, init_db
 
@@ -265,21 +268,44 @@ def run_self_test() -> int:
                 and cnn["model_loaded"]
             )
 
+        verify_no_license = "--verify-no-license" in sys.argv
+        no_license_ready = not verify_no_license
+        license_info = {}
+        if verify_no_license:
+            from app import license as license_module
+
+            license_info = license_module.status()
+            capacity_ok, _ = license_module.camera_capacity(4095, 1)
+            no_license_ready = bool(
+                not LICENSE_PATH.exists()
+                and license_info.get("valid")
+                and license_info.get("mode") == "no-license"
+                and int(license_info.get("camera_limit", 0)) >= 4096
+                and "anpr" in license_info.get("features", [])
+                and capacity_ok
+                and license_module.runtime_camera_allowed(999999)
+                and license_module.has_feature("anpr")
+            )
+
         result.update({
             "ok": (
                 DB_PATH.is_file()
-                and PUBLIC_KEY_PATH.is_file()
                 and table_count >= 6
                 and app is not None
                 and anpr_ready
+                and no_license_ready
             ),
             "version": APP_VERSION,
             "data_dir": str(DATA_DIR),
             "database_path": str(DB_PATH),
             "database_ready": DB_PATH.is_file() and table_count >= 6,
             "public_key_ready": PUBLIC_KEY_PATH.is_file(),
+            "public_key_required": False,
             "web_app_ready": app is not None,
             "anpr_ready": anpr_ready,
+            "no_license_ready": no_license_ready,
+            "license_file_present": LICENSE_PATH.exists(),
+            "license_mode": str(license_info.get("mode", "")),
             "setup_required": user_count == 0,
             "user_count": user_count,
             "table_count": table_count,
