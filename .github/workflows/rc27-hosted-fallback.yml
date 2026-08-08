@@ -14,13 +14,26 @@ on:
       - "installer/BCVision_Update.iss"
       - ".github/workflows/rc27-hosted-fallback.yml"
       - "app/**"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/rc27-pr-trigger.txt"
+      - ".github/workflows/rc27-hosted-fallback.yml"
+      - "VERSION"
+      - "BUILD_PORTABLE_EXE.bat"
+      - "requirements-lock.txt"
+      - "requirements-ai-lock.txt"
+      - "installer/BCVision.iss"
+      - "installer/BCVision_Update.iss"
+      - "app/**"
 
 permissions:
   contents: write
   actions: write
 
 concurrency:
-  group: rc27-hosted-release
+  group: rc27-hosted-release-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -106,6 +119,7 @@ jobs:
           compression-level: 0
 
       - name: Publish RC27.1 GitHub Release
+        if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v2.2.0-rc27.1
