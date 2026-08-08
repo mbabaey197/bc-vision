@@ -13,7 +13,7 @@ def test_light_detector_uses_fallback_and_two_thread_sessions(
 ):
     primary_payload = b"primary-detector"
     fallback_payload = b"fallback-detector"
-    primary_path = tmp_path / "plate_yolo.onnx"
+    primary_path = tmp_path / "plate_yolo11n.onnx"
     fallback_path = tmp_path / "plate_yolo_fallback.onnx"
     primary_path.write_bytes(primary_payload)
     fallback_path.write_bytes(fallback_payload)
