@@ -120,9 +120,9 @@ def process_frame(
         )
         whole_plate_ocr_attempted = False
         generic_ocr_attempted = False
-        # CRNN is the preferred whole-plate reader.  The lightweight Iranian
-        # character CNN is attempted only for a credible crop when CRNN has
-        # no valid full-plate result.
+        # Hezar CRNN is the preferred whole-plate reader. The prior CRNN and
+        # lightweight character CNN remain fail-safe readers for credible
+        # crops when Hezar has no accepted full-plate result.
         generic_fallback_eligible = bool(
             not direct_valid
             and (
@@ -135,7 +135,7 @@ def process_frame(
                 )
             )
         )
-        crnn_eligible = bool(
+        whole_plate_ocr_eligible = bool(
             float(item.get("confidence", 0.0)) >= 0.25
             and quality["score"] >= 0.12
             and crop.shape[0] >= 12
@@ -144,7 +144,7 @@ def process_frame(
         fallback_text = ""
         fallback_confidence = 0.0
         fallback_engine = "none"
-        if crnn_eligible or generic_fallback_eligible:
+        if whole_plate_ocr_eligible or generic_fallback_eligible:
             whole_plate_ocr_attempted = True
             (
                 fallback_text,
@@ -312,7 +312,10 @@ def process_frame(
                     + fallback_engine
                 )
             elif (
-                fallback_engine == "crnn-onnx"
+                fallback_engine in {
+                    "hezar-crnn-fa-v2-onnx",
+                    "crnn-onnx",
+                }
                 and float(fallback_confidence)
                 >= float(ocr_confidence) + 0.08
             ):
@@ -1536,6 +1539,7 @@ class PlateConsensusTracker:
         engine_names = set(engine_support)
         crnn_supported = any(
             "crnn-onnx" in name
+            or "hezar-crnn-fa" in name
             for name in engine_names
         )
         character_supported = any(
