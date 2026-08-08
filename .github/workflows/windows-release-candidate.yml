@@ -43,7 +43,11 @@ jobs:
         shell: pwsh
         run: |
           $value = (Get-Content VERSION -Raw).Trim()
+          if ($value -notmatch '^\d+\.\d+\.\d+-rc(?<rc>\d+(?:\.\d+)*)$') {
+            throw "Unsupported candidate version: $value"
+          }
           "value=$value" >> $env:GITHUB_OUTPUT
+          "label=RC$($Matches.rc)" >> $env:GITHUB_OUTPUT
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
@@ -92,10 +96,11 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $version = (Get-Content VERSION -Raw).Trim()
+          $releaseLabel = "${{ steps.version.outputs.label }}"
           $installDir = Join-Path $env:RUNNER_TEMP "bcvision-install"
           $dataDir = Join-Path $env:RUNNER_TEMP "bcvision-persistent-data"
-          $setup = Resolve-Path "setup_output\BCVision_Setup_v$version.exe"
-          $update = Resolve-Path "setup_output\BCVision_Update_v$version.exe"
+          $setup = Resolve-Path "setup_output\BCVision_${releaseLabel}_Setup.exe"
+          $update = Resolve-Path "setup_output\BCVision_${releaseLabel}_Update.exe"
           $firstResult = Join-Path $env:RUNNER_TEMP "self-test-install.json"
           $updatedResult = Join-Path $env:RUNNER_TEMP "self-test-update.json"
 
@@ -192,10 +197,11 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $version = (Get-Content VERSION -Raw).Trim()
+          $releaseLabel = "${{ steps.version.outputs.label }}"
           $releaseDir = Join-Path $PWD "release"
           New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
-          Copy-Item "setup_output\BCVision_Setup_v$version.exe" $releaseDir
-          Copy-Item "setup_output\BCVision_Update_v$version.exe" $releaseDir
+          Copy-Item "setup_output\BCVision_${releaseLabel}_Setup.exe" $releaseDir
+          Copy-Item "setup_output\BCVision_${releaseLabel}_Update.exe" $releaseDir
           git archive --format=zip --output="$releaseDir\BC_Vision_v${version}_Source.zip" HEAD
           $files = Get-ChildItem $releaseDir -File | Sort-Object Name
           $lines = foreach ($file in $files) {
