@@ -1,0 +1,163 @@
+name: Publish RC28 release
+
+# This workflow never runs for untrusted pull-request code. After PR validation
+# and merge into the verified RC25 recovery branch, it publishes the updater
+# that the Windows build gate already copied to the runner delivery folder.
+on:
+  push:
+    branches:
+      - agent/anpr-detection-recovery-rc25
+    paths:
+      - "app/**"
+      - "installer/**"
+      - "scripts/verify_fast_update.ps1"
+      - "tests/**"
+      - "launcher.py"
+      - "VERSION"
+      - "BUILD_PORTABLE_EXE.bat"
+      - ".github/workflows/publish-rc28-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-bcvision-rc28
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify and publish the tested RC28 updater
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "2.2.0-rc28"
+          $tag = "v$version"
+          $delivery = Join-Path $env:USERPROFILE "BCVision-Deliveries\RC28"
+          $exe = Join-Path $delivery "BCVision_Update_v$version.exe"
+          $checksum = "$exe.sha256"
+
+          foreach ($path in @($exe, $checksum)) {
+            if (-not (Test-Path $path -PathType Leaf)) {
+              throw "Verified RC28 delivery file is missing: $path"
+            }
+          }
+
+          $expected = ((Get-Content $checksum -Raw).Trim() -split '\s+')[0].ToUpperInvariant()
+          $actual = (Get-FileHash $exe -Algorithm SHA256).Hash.ToUpperInvariant()
+          if ($expected -ne $actual) {
+            throw "RC28 checksum mismatch: expected $expected, got $actual"
+          }
+
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $repoApi = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY"
+          $releaseUri = "$repoApi/releases/tags/$tag"
+
+          try {
+            $release = Invoke-RestMethod -Method Get -Uri $releaseUri -Headers $headers
+          } catch {
+            $status = $_.Exception.Response.StatusCode.value__
+            if ($status -ne 404) { throw }
+            $releaseBody = @{
+              tag_name = $tag
+              target_commitish = $env:GITHUB_SHA
+              name = "BC Vision $version"
+              body = @"
+          RC28 recovery updater with runtime license enforcement removed.
+
+          Validated on the self-hosted Windows runner with full regression,
+          real ANPR model loading, installed-EXE no-license verification, and
+          database/model preservation checks.
+          "@
+              draft = $false
+              prerelease = $true
+              make_latest = "false"
+            } | ConvertTo-Json
+            $release = Invoke-RestMethod `
+              -Method Post `
+              -Uri "$repoApi/releases" `
+              -Headers $headers `
+              -ContentType "application/json" `
+              -Body $releaseBody
+          }
+
+          $uploadBase = $release.upload_url -replace '\{\?name,label\}$', ''
+          $publishedAssets = @{}
+          foreach ($file in @(Get-Item $exe, Get-Item $checksum)) {
+            $existing = @($release.assets) | Where-Object { $_.name -eq $file.Name }
+            foreach ($asset in $existing) {
+              Invoke-RestMethod `
+                -Method Delete `
+                -Uri "$repoApi/releases/assets/$($asset.id)" `
+                -Headers $headers
+            }
+            $encodedName = [uri]::EscapeDataString($file.Name)
+            $asset = Invoke-RestMethod `
+              -Method Post `
+              -Uri "${uploadBase}?name=$encodedName" `
+              -Headers $headers `
+              -ContentType "application/octet-stream" `
+              -InFile $file.FullName
+            $publishedAssets[$file.Name] = $asset
+            Write-Host "PUBLISHED=$($asset.browser_download_url) SIZE=$($asset.size)"
+          }
+
+          $manifestPath = "release/RC28_RELEASE.json"
+          $manifestUri = "$repoApi/contents/$manifestPath"
+          $branch = $env:GITHUB_REF_NAME
+          $installerName = (Get-Item $exe).Name
+          $checksumName = (Get-Item $checksum).Name
+          $manifest = [ordered]@{
+            version = $version
+            tag = $tag
+            release_url = $release.html_url
+            installer_url = $publishedAssets[$installerName].browser_download_url
+            checksum_url = $publishedAssets[$checksumName].browser_download_url
+            sha256 = $actual
+            size_bytes = $publishedAssets[$installerName].size
+            source_commit = $release.target_commitish
+            workflow_run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            published_at = (Get-Date).ToUniversalTime().ToString("o")
+          }
+          $manifestJson = $manifest | ConvertTo-Json
+          $manifestContent = [Convert]::ToBase64String(
+            [Text.Encoding]::UTF8.GetBytes("$manifestJson`n")
+          )
+          $existingManifestSha = $null
+          try {
+            $encodedBranch = [uri]::EscapeDataString($branch)
+            $existingManifest = Invoke-RestMethod `
+              -Method Get `
+              -Uri "${manifestUri}?ref=$encodedBranch" `
+              -Headers $headers
+            $existingManifestSha = $existingManifest.sha
+          } catch {
+            $status = $_.Exception.Response.StatusCode.value__
+            if ($status -ne 404) { throw }
+          }
+          $manifestCommit = [ordered]@{
+            message = "chore(release): record RC28 published assets"
+            content = $manifestContent
+            branch = $branch
+          }
+          if ($existingManifestSha) {
+            $manifestCommit["sha"] = $existingManifestSha
+          }
+          Invoke-RestMethod `
+            -Method Put `
+            -Uri $manifestUri `
+            -Headers $headers `
+            -ContentType "application/json" `
+            -Body ($manifestCommit | ConvertTo-Json)
+
+          Write-Host "RC28_SHA256=$actual"
+          Write-Host "RELEASE=$($release.html_url)"

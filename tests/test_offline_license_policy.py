@@ -20,12 +20,17 @@ def test_offline_license_page_removes_online_form():
     assert "کاملاً آفلاین" in text
 
 
-def test_online_activation_route_is_not_exposed():
+def test_license_activation_routes_are_not_exposed():
     import app.main as main
 
     paths = {
         route.path
         for route in main.app.routes
     }
-    assert "/license/online" not in paths
-    assert "/license/offline" in paths
+    for path in (
+        "/license",
+        "/license/online",
+        "/license/offline",
+        "/license/deactivate",
+    ):
+        assert path not in paths

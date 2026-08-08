@@ -1258,6 +1258,102 @@ def test_motion_wakes_camera_during_long_empty_scene_backoff(
     worker.shutdown()
 
 
+def test_uploaded_video_ignores_motion_backoff(monkeypatch):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    now = time.monotonic()
+    state = live_worker._CameraState(
+        config={
+            "id": 28,
+            "enabled": 1,
+            "lpr_enabled": 1,
+            "rtsp_url": "video://C:/uploads/road.mp4",
+            # Deliberately wrong for the uploaded file.  It must be ignored.
+            "roi_x": 90,
+            "roi_y": 90,
+            "roi_w": 10,
+            "roi_h": 10,
+            "max_vehicle_speed_kmh": 150,
+            "recognition_zone_m": 10,
+            "recognition_zone_calibrated": 1,
+        },
+        config_loaded_at=now,
+        next_inference_at=now + 30.0,
+    )
+    worker._states[28] = state
+    frame = np.zeros((80, 160, 3), dtype=np.uint8)
+    # Warm the analyzer so the submitted identical frame has no motion wake.
+    state.activity.observe(frame)
+    submitted = []
+    monkeypatch.setattr(
+        worker._executor,
+        "submit",
+        lambda _function, _state, payload: submitted.append(payload),
+    )
+
+    worker.submit(28, "uploaded", frame)
+    worker.shutdown()
+
+    assert len(submitted) == 1
+    assert submitted[0][5].wake_inference is False
+    assert submitted[0][7] is True
+    assert state.motion_wakeups == 0
+    assert state.busy is True
+
+
+def test_uploaded_video_inference_is_full_frame_without_overlay_mask(
+    monkeypatch,
+):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState(
+        config={
+            "id": 29,
+            "enabled": 1,
+            "lpr_enabled": 1,
+            "rtsp_url": "video://C:/uploads/road.mp4",
+            "lpr_confidence": 50,
+            "duplicate_seconds": 0,
+            "roi_x": 90,
+            "roi_y": 90,
+            "roi_w": 10,
+            "roi_h": 10,
+        },
+        busy=True,
+    )
+    worker._states[29] = state
+    frame = np.zeros((80, 160, 3), dtype=np.uint8)
+    captured = {}
+
+    def record_process(source, **kwargs):
+        captured["shape"] = source.shape
+        captured["exclusion_mask"] = kwargs.get("exclusion_mask")
+        return SimpleNamespace(
+            primary=[],
+            shadow=[],
+            mode="baseline",
+            error="",
+        )
+
+    monkeypatch.setattr(live_worker.engine_router, "process", record_process)
+    activity = SimpleNamespace(
+        wake_inference=False,
+        exclusion_mask=np.full((8, 16), 255, dtype=np.uint8),
+    )
+
+    worker._process(
+        state,
+        (29, "uploaded", frame, time.monotonic(), 0.0, activity, 0, True),
+    )
+    status = worker.status(29)
+    worker.shutdown()
+
+    assert captured == {
+        "shape": frame.shape,
+        "exclusion_mask": None,
+    }
+    assert state.no_plate_streak == 0
+    assert status["uploaded_video_mode"] is True
+
+
 def test_two_cameras_receive_independent_worker_slots(monkeypatch):
     monkeypatch.setattr(
         live_worker,

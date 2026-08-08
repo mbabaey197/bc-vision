@@ -1,0 +1,41 @@
+{
+  "base_ref": "agent/anpr-detection-recovery-rc25",
+  "base_head": "c91f4afa8efa51435aefbff8334d7b44a9244a1d",
+  "target_version": "2.2.0-rc28",
+  "source_sha": {
+    "app/__init__.py": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+    "app/config.py": "dd4f109cea92cdb584de6314d398816f94f41541",
+    "app/main.py": "2b6c3e6621dacc5dc395c30d5b2d5faecf7af60a",
+    "app/license.py": "d5da4ab8840e89f2406b2a09dd65bdb3dbfd9a05",
+    "app/license_format.py": "a2a6cad58e53107f9a392dec4062029ed5fec0f9",
+    "launcher.py": "8e5ff3213d50f6db14514795a632de7847681024",
+    "BUILD_PORTABLE_EXE.bat": "fdbb38618bc576e990214e5e85541c88b84e9c89",
+    "installer/BCVision.iss": "8693ca190e33df6867eec249d613c8fd9b0a9e86",
+    "installer/BCVision_Update.iss": "db2ad0ab94743eeb94745a326bf34a48ce9450f4",
+    "scripts/verify_fast_update.ps1": "e415a227ff002012d69a1540f376b626cfef7156",
+    ".github/workflows/anpr-pr-validation.yml": "045d328af955efebc9162d3d32bbc54dfff24120",
+    ".github/workflows/windows-fast-updater.yml": "66967aed763bc079034922f3d93223e46f2f28d2"
+  },
+  "generated_at": "2026-08-08",
+  "files": [
+    "app/__init__.py",
+    "app/no_license.py",
+    "app/license.py",
+    "app/license_format.py",
+    "app/config.py",
+    "app/main.py",
+    "launcher.py",
+    "BUILD_PORTABLE_EXE.bat",
+    "installer/BCVision.iss",
+    "installer/BCVision_Update.iss",
+    "scripts/verify_fast_update.ps1",
+    "tests/test_no_license_mode.py",
+    "tests/test_no_license_packaging_contract.py",
+    "tests/test_no_license_ui.py",
+    ".github/workflows/anpr-pr-validation.yml",
+    ".github/workflows/windows-fast-updater.yml",
+    "VERSION",
+    "RELEASE_NOTES_RC28.md",
+    "VALIDATION.md"
+  ]
+}

@@ -235,6 +235,20 @@ class LiveANPRWorker:
         return frame[y1:y2, x1:x2], x1, y1
 
     @staticmethod
+    def _is_uploaded_video(config) -> bool:
+        """Return whether a camera is backed by a user-uploaded video.
+
+        Uploaded files are an offline verification source, not a calibrated
+        copy of the camera whose confidence settings were selected at upload
+        time.  In particular, that camera's ROI and motion history must never
+        make an unrelated file invisible to ANPR.
+        """
+
+        return str((config or {}).get("rtsp_url", "")).startswith(
+            "video://"
+        )
+
+    @staticmethod
     def _translate(result, offset_x, offset_y):
         if not (offset_x or offset_y):
             return result
@@ -864,8 +878,13 @@ class LiveANPRWorker:
         # Activity analysis is per camera and intentionally runs outside the
         # worker-wide mapping lock. Four camera decoder threads must not be
         # serialized through resize/blur/morphology/Canny work.
+        uploaded_video = self._is_uploaded_video(config)
         try:
-            activity_source, _, _ = self._roi_frame(frame, config)
+            activity_source = (
+                frame
+                if uploaded_video
+                else self._roi_frame(frame, config)[0]
+            )
             activity = state.activity.observe(activity_source)
         except Exception as exc:
             with state.lock:
@@ -885,8 +904,9 @@ class LiveANPRWorker:
                 if activity.exclusion_mask is not None
                 else 0
             )
-            if activity.wake_inference:
-                state.motion_wakeups += 1
+            if activity.wake_inference or uploaded_video:
+                if activity.wake_inference:
+                    state.motion_wakeups += 1
                 plan = self._frame_budget(state, config, now=now)
                 planned_observations = max(
                     5,
@@ -909,6 +929,7 @@ class LiveANPRWorker:
             burst_active = bool(
                 activity.wake_inference
                 or state.burst_frames_remaining
+                or uploaded_video
             )
             payload = (
                 int(camera_id),
@@ -918,6 +939,7 @@ class LiveANPRWorker:
                 0.0,
                 activity,
                 config_generation,
+                uploaded_video,
             )
             if state.busy:
                 if state.pending is not None:
@@ -936,6 +958,7 @@ class LiveANPRWorker:
                 if (
                     activity.wake_inference
                     or state.burst_frames_remaining
+                    or uploaded_video
                 )
                 else (
                     max(
@@ -994,6 +1017,7 @@ class LiveANPRWorker:
         )
         activity = payload[5] if len(payload) > 5 else None
         config_generation = payload[6] if len(payload) > 6 else 0
+        uploaded_video = bool(payload[7]) if len(payload) > 7 else False
         started = time.perf_counter()
         model_seconds = None
         positive_path = False
@@ -1010,10 +1034,17 @@ class LiveANPRWorker:
                 with state.lock:
                     state.expired_frames += 1
                 return
-            source, offset_x, offset_y = self._roi_frame(
-                frame,
-                config,
-            )
+            if uploaded_video or self._is_uploaded_video(config):
+                # A file selected for verification is always examined in its
+                # own full coordinate space.  It must not inherit a gate ROI
+                # or fixed-overlay mask learned from another camera.
+                uploaded_video = True
+                source, offset_x, offset_y = frame, 0, 0
+            else:
+                source, offset_x, offset_y = self._roi_frame(
+                    frame,
+                    config,
+                )
             min_confidence = max(
                 0.01,
                 min(
@@ -1023,7 +1054,7 @@ class LiveANPRWorker:
             )
             exclusion_mask = (
                 activity.exclusion_mask
-                if activity is not None
+                if activity is not None and not uploaded_video
                 else None
             )
 
@@ -1132,7 +1163,11 @@ class LiveANPRWorker:
                 state.plate_visible = False
                 if state.burst_frames_remaining:
                     state.burst_frames_remaining -= 1
-                if activity is not None and activity.wake_inference:
+                if uploaded_video:
+                    # Empty frames in a file never enter motion backoff.  The
+                    # newest decoded frame remains eligible until EOF.
+                    state.no_plate_streak = 0
+                elif activity is not None and activity.wake_inference:
                     state.no_plate_streak = 0
                 else:
                     state.no_plate_streak = min(
@@ -1326,6 +1361,7 @@ class LiveANPRWorker:
                 state.last_processing_ms = end_to_end_seconds * 1000.0
                 burst_active = bool(
                     state.burst_frames_remaining
+                    or uploaded_video
                     or (
                         activity is not None
                         and activity.wake_inference
@@ -1417,6 +1453,9 @@ class LiveANPRWorker:
                     1,
                 ),
                 "idle_mode": bool(state.no_plate_streak >= 2),
+                "uploaded_video_mode": self._is_uploaded_video(
+                    state.config or {}
+                ),
                 "no_plate_streak": state.no_plate_streak,
                 "next_inference_seconds": round(
                     max(0.0, state.next_inference_at - time.monotonic()),
