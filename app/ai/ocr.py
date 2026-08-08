@@ -24,9 +24,15 @@ from .plate_rules import (
 )
 from .onnx_crnn import get_crnn_status, read_plate_crnn
 from .onnx_cnn import get_cnn_status, read_plate_cnn
+from .onnx_hezar import (
+    PRIMARY_ENGINE as HEZAR_ENGINE,
+    hezar_status,
+    read_plate_hezar_primary,
+)
 
 _last_status = {
     "engine": "none",
+    "hezar_error": "",
     "crnn_error": "",
     "cnn_error": "",
     "candidate_count": 0,
@@ -63,6 +69,15 @@ class OCRToken:
 
 def get_ocr_status():
     status = dict(_last_status)
+    hezar = hezar_status()
+    status.update({
+        "hezar_attempted": bool(hezar.get("attempted")),
+        "hezar_model_loaded": bool(hezar.get("model_loaded")),
+        "hezar_model_path": hezar.get("model_path", ""),
+        "hezar_hypotheses": int(hezar.get("hypotheses", 0)),
+        "hezar_accepted": bool(hezar.get("accepted")),
+        "hezar_error": hezar.get("error", ""),
+    })
     crnn = get_crnn_status()
     status.update({
         "crnn_attempted": bool(crnn.get("attempted")),
@@ -514,12 +529,43 @@ def read_plate_candidate(
 
     mode = os.environ.get(
         "BCVISION_OCR_ENGINE",
-        "hybrid",
+        "hezar",
     ).strip().lower()
-    if mode not in {"hybrid", "crnn", "cnn"}:
-        mode = "hybrid"
+    if mode not in {
+        "hezar",
+        "hezar-only",
+        "hybrid",
+        "crnn",
+        "cnn",
+    }:
+        mode = "hezar"
 
-    if mode != "cnn":
+    if mode in {"hezar", "hezar-only", "hybrid"}:
+        hezar = read_plate_hezar_primary(
+            image,
+            engine_key=engine_key,
+        )
+        if hezar.get("accepted") and plausible_plate(
+            hezar.get("plate_norm", "")
+        ):
+            _last_status.update(
+                engine=HEZAR_ENGINE,
+                hezar_error="",
+                candidate_count=len(hezar.get("hypotheses", [])),
+            )
+            return (
+                format_iran_plate(hezar["plate_norm"]),
+                float(hezar.get("confidence", 0.0)),
+                HEZAR_ENGINE,
+            )
+        _last_status["hezar_error"] = hezar_status().get(
+            "error",
+            "",
+        )
+        if mode == "hezar-only":
+            return "", 0.0, HEZAR_ENGINE
+
+    if mode not in {"cnn", "hezar-only"}:
         crnn_text, crnn_confidence = read_plate_crnn(
             image,
             engine_key=engine_key,
