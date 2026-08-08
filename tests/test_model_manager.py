@@ -108,8 +108,8 @@ def test_detector_is_bootstrapped_from_packaged_seed(tmp_path, monkeypatch):
     digest = __import__("hashlib").sha256(payload).hexdigest()
     seed = tmp_path / "seed"
     (seed / "plate").mkdir(parents=True)
-    (seed / "plate" / "plate_yolo.onnx").write_bytes(payload)
-    target = tmp_path / "data" / "plate_yolo.onnx"
+    (seed / "plate" / "plate_yolo11n.onnx").write_bytes(payload)
+    target = tmp_path / "data" / "plate_yolo11n.onnx"
 
     monkeypatch.setattr(model_manager, "DETECTOR_SHA256", digest)
     monkeypatch.setattr(model_manager, "DETECTOR_SIZE", len(payload))
