@@ -63,31 +63,65 @@ jobs:
           & $iscc installer\BCVision_Update.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Verify RC27.1 outputs
+      - name: Verify and normalize RC27.1 outputs
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host '--- Executables produced by build ---'
+          Get-ChildItem -Path dist,setup_output -Recurse -File -Filter *.exe -ErrorAction SilentlyContinue |
+            Select-Object FullName,Length,LastWriteTime | Format-Table -AutoSize
+
+          $appExe = Get-Item 'dist\BCVision\BCVision.exe' -ErrorAction Stop
+          if ($appExe.Length -le 0) { throw 'BCVision.exe is empty.' }
+
+          $setupCandidates = @(Get-ChildItem 'setup_output' -File -Filter '*.exe' | Where-Object { $_.BaseName -match '(?i)setup' })
+          $updateCandidates = @(Get-ChildItem 'setup_output' -File -Filter '*.exe' | Where-Object { $_.BaseName -match '(?i)update|updater' })
+          if ($setupCandidates.Count -lt 1) { throw 'No setup EXE was produced by Inno Setup.' }
+          if ($updateCandidates.Count -lt 1) { throw 'No update EXE was produced by Inno Setup.' }
+
+          $setup = $setupCandidates | Sort-Object Length -Descending | Select-Object -First 1
+          $update = $updateCandidates | Sort-Object Length -Descending | Select-Object -First 1
+          if ($setup.Length -le 0) { throw 'Setup EXE is empty.' }
+          if ($update.Length -le 0) { throw 'Update EXE is empty.' }
+
+          $hezarModel = Get-ChildItem 'dist\BCVision' -Recurse -File -Filter 'model.pt' |
+            Where-Object { $_.FullName -match '(?i)hezar-model' } |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+          if (-not $hezarModel) {
+            Write-Host '--- model.pt files found ---'
+            Get-ChildItem 'dist\BCVision' -Recurse -File -Filter 'model.pt' -ErrorAction SilentlyContinue |
+              Select-Object FullName,Length | Format-Table -AutoSize
+            throw 'Bundled Hezar model.pt was not found anywhere in the packaged application.'
+          }
+          if ($hezarModel.Length -le 1000000) { throw "Bundled Hezar model is unexpectedly small: $($hezarModel.Length) bytes" }
+
+          $releaseDir = 'release_rc27_1'
+          Remove-Item $releaseDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+          Copy-Item $setup.FullName "$releaseDir\BCVision_RC27.1_Setup.exe" -Force
+          Copy-Item $update.FullName "$releaseDir\BCVision_RC27.1_Update.exe" -Force
+
           $required = @(
-            'dist\BCVision\BCVision.exe',
-            'setup_output\BCVision_RC27.1_Setup.exe',
-            'setup_output\BCVision_RC27.1_Update.exe'
+            "$releaseDir\BCVision_RC27.1_Setup.exe",
+            "$releaseDir\BCVision_RC27.1_Update.exe"
           )
-          foreach ($item in $required) { if (-not (Test-Path $item)) { throw "Missing output: $item" } }
-          $hezarCandidates = @(
-            'dist\BCVision\hezar-model\model.pt',
-            'dist\BCVision\_internal\hezar-model\model.pt'
-          )
-          $hezarModel = $hezarCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $hezarModel) { throw "Missing bundled Hezar model" }
-          Get-Item $required, $hezarModel | Select-Object FullName,Length,LastWriteTime
+          foreach ($item in $required) {
+            $file = Get-Item $item -ErrorAction Stop
+            if ($file.Length -le 0) { throw "Empty normalized output: $item" }
+          }
+
+          Write-Host '--- Verified RC27.1 outputs ---'
+          Get-Item $required | Select-Object FullName,Length,LastWriteTime | Format-Table -AutoSize
+          Write-Host "Hezar model: $($hezarModel.FullName) ($($hezarModel.Length) bytes)"
 
       - name: Upload RC27.1 bundle
         uses: actions/upload-artifact@v4
         with:
           name: BCVision-RC27.1-Hezar-Windows-Hosted
           path: |
-            setup_output/BCVision_RC27.1_Setup.exe
-            setup_output/BCVision_RC27.1_Update.exe
-            dist/BCVision/**
+            release_rc27_1/BCVision_RC27.1_Setup.exe
+            release_rc27_1/BCVision_RC27.1_Update.exe
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
