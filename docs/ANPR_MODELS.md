@@ -4,50 +4,76 @@ BC Vision stores AI models in the persistent data directory. Installer and
 one-click updates therefore preserve models, promoted custom CRNNs, training
 samples, settings, events, snapshots and the SQLite database.
 
-## Lightweight Iranian plate detectors
+## Active Iranian plate detectors
 
-Both detector models come from the MIT-licensed Platrix model repository:
-`https://huggingface.co/Dibachain/Platrix`.
+The primary detector is the single-class YOLO11n plate model exported to ONNX:
 
-- `plate_yolo.onnx`
-  - Input size: `416`
-  - Expected size: `12608775` bytes
+- `plate_yolo11n.onnx`
+  - Source: `morsetechlab/yolov11-license-plate-detection`
+  - Pinned revision: `0f8dc030388b3660418ac7d8c37d3a40148064c1`
+  - Input: dynamic NCHW; BC Vision uses `1 x 3 x 640 x 640`
+  - Output: `1 x 5 x 8400` at 640 pixels
+  - Expected size: `10481682` bytes
   - SHA-256:
-    `A54E475C402E6036BB5C70F1A6FF75179E76098A5C8039BB5D148C0B6421F5C6`
-- `plate_yolo_fallback.onnx`
-  - Input size: `640`
-  - Expected size: `12265080` bytes
+    `693133A1DB97A3BA1E90068986F80AFB72C3FCDDB681E57181A89A9A3DC351D6`
+  - Upstream license: AGPL-3.0
+
+The verified Platrix `plate_yolo_fallback.onnx` remains a fail-safe and runs
+only after a zero-result YOLO11n pass:
+
+- Input size: `640`
+- Expected size: `12265080` bytes
+- SHA-256:
+  `A6974FCB0A79755C270D50F1EBEFD4D96D765C879A29051A19AAC00DFDA8B5AF`
+
+Hardened OpenCV geometry is the final localization fallback. Ultralytics is
+not imported by the camera runtime; ONNX Runtime executes both graphs. The
+YOLO11n model card reports possible train/test contamination in its source
+dataset, so it must be measured on BC Vision's independent field/Golden data
+before accuracy claims are made. AGPL and model-weight licensing must also be
+reviewed before commercial distribution.
+
+## Active Iranian OCR models
+
+The official Hezar v2 CRNN is the first whole-plate OCR reader:
+
+- `crnn_fa_v2.onnx`
+  - Source: `hezarai/crnn-fa-license-plate-recognition-v2`
+  - Pinned revision: `0c48a86abe5bfb140ceeb160c028701028d236b9`
+  - Input: mirrored grayscale `1 x 1 x 32 x 384`
+  - Output: CTC logits `1 x 96 x 45`
+  - Expected size: `37146355` bytes
   - SHA-256:
-    `A6974FCB0A79755C270D50F1EBEFD4D96D765C879A29051A19AAC00DFDA8B5AF`
+    `57CB02BC10BDEBD14BE2AC50CD7C25D657BDCDEE6EFE77A37A561B832206B0C8`
+  - Blank label index: `0`; Persian output digits are normalized to ASCII
+    internally before the Iranian plate-layout gate.
 
-The primary detector runs first. The second ONNX detector runs only after a
-zero-result primary pass. Hardened OpenCV geometry is the final localization
-fallback. The retired 119 MB combined `best.pt` model and Ultralytics are not
-loaded or packaged by RC12.
+The build downloads the immutable Hezar revision, verifies all three source
+files, exports opset-18 ONNX, checks PyTorch/ONNX Runtime numerical parity and
+accepts only the fixed ONNX hash above. Portable builds ship that ONNX file in
+`model-seed`; the live camera path does not load PyTorch or the Hezar Python
+package.
 
-## Iranian OCR models
+The previous verified readers remain fail-safe engines:
 
-- `ocr_crnn.onnx`
-  - Segmentation-free whole-plate CRNN+CTC reader
-  - Expected size: `10452525` bytes
-  - SHA-256:
-    `45F8C45F29EB1EE91F6274CB8D9C328DA1A2050EA7D8596BAE61F4A6B9F9FB1E`
-- `ocr_cnn.onnx`
-  - Eight-glyph Iranian character fallback
-  - Expected size: `2226402` bytes
-  - SHA-256:
-    `7D573C51CC855A8E080F1F88597477F4FB5A2B9CAFA1BB125BD6038E441F5BCA`
+- `ocr_crnn.onnx`: full-plate CRNN, 10452525 bytes,
+  SHA-256
+  `45F8C45F29EB1EE91F6274CB8D9C328DA1A2050EA7D8596BAE61F4A6B9F9FB1E`
+- `ocr_cnn.onnx`: eight-glyph Iranian CNN, 2226402 bytes,
+  SHA-256
+  `7D573C51CC855A8E080F1F88597477F4FB5A2B9CAFA1BB125BD6038E441F5BCA`
 
-CRNN reads the full crop first. The CNN is attempted only if CRNN has no valid
-complete Iranian plate and exactly eight real glyph regions can be segmented.
-Missing characters are never invented. EasyOCR and Tesseract are no longer in
-the RC12 production path or Windows package.
+OCR order is Hezar v2, previous CRNN, then character CNN. Every candidate must
+still satisfy the eight-position Iranian plate layout. Missing characters are
+never invented. `BCVISION_OCR_ENGINE=hezar-only` disables the fallback
+readers; `crnn` and `cnn` explicitly select the old readers.
 
 ## Persistent Windows paths
 
 ```text
-C:\ProgramData\BCVision\data\models\plate\plate_yolo.onnx
+C:\ProgramData\BCVision\data\models\plate\plate_yolo11n.onnx
 C:\ProgramData\BCVision\data\models\plate\plate_yolo_fallback.onnx
+C:\ProgramData\BCVision\data\models\hezar\crnn_fa_v2.onnx
 C:\ProgramData\BCVision\data\models\crnn\ocr_crnn.onnx
 C:\ProgramData\BCVision\data\models\cnn\ocr_cnn.onnx
 C:\ProgramData\BCVision\data\models\crnn\custom\...
@@ -59,12 +85,16 @@ Environment variables can override vendor model locations:
 ```text
 BCVISION_PLATE_MODEL
 BCVISION_PLATE_FALLBACK_MODEL
+BCVISION_HEZAR_MODEL
 BCVISION_CRNN_MODEL
 BCVISION_CNN_MODEL
 BCVISION_MODEL_SOURCE_DIR
+BCVISION_HEZAR_SOURCE_DIR
+BCVISION_HEZAR_CACHE_DIR
 BCVISION_CRNN_SOURCE_DIR
 BCVISION_CNN_SOURCE_DIR
 BCVISION_ONNX_DETECTOR_SIZE
+BCVISION_OCR_ENGINE=hezar|hezar-only|hybrid|crnn|cnn
 BCVISION_CPU_THREADS
 ```
 
@@ -241,10 +271,12 @@ export whose ONNX Runtime output differs materially from PyTorch.
 detector for an isolated OCR comparison before an OBB weight exists. Truth
 plates must be supplied explicitly; other outputs remain unverified.
 
-The historical `01.mp4` benchmark on 2026-07-28 processed all 546 frames. Baseline
-and ready-made Hezar v2 each matched only 1 of the 3 known plates, while Hezar
-was 37.3% slower. The checkpoint was therefore not promoted. See
-`agent-results/latest/ANPR_HEZAR_VIDEO_BENCHMARK_RC13.md`.
+The historical `01.mp4` benchmark on 2026-07-28 processed all 546 frames.
+Baseline and ready-made Hezar v2 each matched only 1 of the 3 known plates,
+while Hezar was 37.3% slower. It was not auto-promoted at that checkpoint. The
+current Hezar-first path is an explicit experimental selection and still must
+be re-evaluated with the new YOLO11n crops and independent field/Golden data.
+See `agent-results/latest/ANPR_HEZAR_VIDEO_BENCHMARK_RC13.md`.
 
 ## Operator training and promotion
 
