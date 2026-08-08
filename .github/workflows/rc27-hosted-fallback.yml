@@ -68,12 +68,25 @@ jobs:
         run: |
           $required = @(
             'dist\BCVision\BCVision.exe',
-            'dist\BCVision\hezar-model\model.pt',
             'setup_output\BCVision_RC27.1_Setup.exe',
             'setup_output\BCVision_RC27.1_Update.exe'
           )
-          foreach ($item in $required) { if (-not (Test-Path $item)) { throw "Missing output: $item" } }
-          Get-Item $required | Select-Object Name,Length,LastWriteTime
+          foreach ($item in $required) {
+            if (-not (Test-Path $item)) { throw "Missing output: $item" }
+          }
+
+          # PyInstaller 6 onedir stores bundled data under _internal by default.
+          # Keep compatibility with older layouts that placed data beside BCVision.exe.
+          $modelCandidates = @(
+            'dist\BCVision\_internal\hezar-model\model.pt',
+            'dist\BCVision\hezar-model\model.pt'
+          )
+          $modelPath = $modelCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $modelPath) {
+            throw "Missing bundled Hezar model.pt. Checked: $($modelCandidates -join ', ')"
+          }
+
+          Get-Item ($required + $modelPath) | Select-Object FullName,Length,LastWriteTime
 
       - name: Upload RC27.1 bundle
         uses: actions/upload-artifact@v4
