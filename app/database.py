@@ -168,6 +168,33 @@ def _backfill_event_metadata(con):
     )
 
 
+def _mark_pre_rc29_uploaded_videos_completed(con):
+    """Prevent legacy uploaded files from being ANPR-processed again."""
+
+    migration_key = "migration_video_anpr_markers_rc29_v1"
+    if con.execute(
+        "SELECT 1 FROM settings WHERE key=?",
+        (migration_key,),
+    ).fetchone() is not None:
+        return
+    # Before RC29 uploaded videos had no durable pass marker. They were already
+    # processed when originally uploaded, so the only safe upgrade behavior is
+    # preview-only. The migration key is written even on a fresh empty database;
+    # videos added later can therefore remain started-but-incomplete after a
+    # decoder/app interruption without a later init incorrectly completing them.
+    con.execute(
+        "UPDATE cameras SET video_anpr_started=1,"
+        "video_anpr_completed=1,"
+        "video_anpr_completed_at="
+        "COALESCE(NULLIF(video_anpr_completed_at,''),CURRENT_TIMESTAMP) "
+        "WHERE rtsp_url LIKE 'video://%'"
+    )
+    con.execute(
+        "INSERT INTO settings(key,value) VALUES(?,?)",
+        (migration_key, "1"),
+    )
+
+
 def init_db():
     with connect() as con:
         con.execute("PRAGMA journal_mode=WAL")
@@ -207,6 +234,9 @@ def init_db():
             enabled INTEGER NOT NULL DEFAULT 1,
             is_demo INTEGER NOT NULL DEFAULT 0,
             sort_order INTEGER NOT NULL DEFAULT 0,
+            video_anpr_started INTEGER NOT NULL DEFAULT 0,
+            video_anpr_completed INTEGER NOT NULL DEFAULT 0,
+            video_anpr_completed_at TEXT NOT NULL DEFAULT '',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS plate_events(
@@ -383,12 +413,16 @@ def init_db():
             "lpr_confidence": "INTEGER NOT NULL DEFAULT 60",
             "frame_step": "INTEGER NOT NULL DEFAULT 5",
             "duplicate_seconds": "REAL NOT NULL DEFAULT 30",
+            "video_anpr_started": "INTEGER NOT NULL DEFAULT 0",
+            "video_anpr_completed": "INTEGER NOT NULL DEFAULT 0",
+            "video_anpr_completed_at": "TEXT NOT NULL DEFAULT ''",
             "roi_x": "INTEGER NOT NULL DEFAULT 0",
             "roi_y": "INTEGER NOT NULL DEFAULT 0",
             "roi_w": "INTEGER NOT NULL DEFAULT 100",
             "roi_h": "INTEGER NOT NULL DEFAULT 100",
             "line_y": "INTEGER NOT NULL DEFAULT 50",
         })
+        _mark_pre_rc29_uploaded_videos_completed(con)
         _backfill_event_metadata(con)
 
         if con.execute(
@@ -429,6 +463,7 @@ def init_db():
             "retention_videos_days": "7",
             "retention_events_days": "0",
             "anpr_auto_confirm_guesses": "1",
+            "anpr_detector_model": "yolo11n",
         }
         for key, value in defaults.items():
             con.execute(

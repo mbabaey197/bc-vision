@@ -1,9 +1,10 @@
-"""Iranian plate localization with a fine-tuned YOLO11n ONNX model.
+"""Exclusive YOLO11n/YOLOv8n Iranian plate localization with ONNX Runtime.
 
-The primary model is a single-class Ultralytics YOLO11n graph. BC Vision keeps
-the previous Platrix detector as a secondary fail-safe which runs only when
-the primary finds no plate. Both files are loaded from the verified model
-store with per-camera sessions and the configured CPU ceiling.
+The operator-selected graph is hash verified and owns an isolated per-camera
+session. Selectable inference never cascades into the other primary or the
+retired secondary detector, so field-video counts remain attributable to one
+model. Both graphs use the same single-class ``cx,cy,w,h,confidence`` output
+contract and the configured CPU ceiling.
 """
 from __future__ import annotations
 
@@ -19,6 +20,8 @@ import numpy as np
 from app.cpu_budget import parallel_camera_limit, threads_per_camera
 
 
+# Compatibility constants. Runtime input size comes from the selected model
+# contract: YOLO11n uses 640 and Platrix YOLOv8n uses 416.
 PRIMARY_SIZE = 640
 FALLBACK_SIZE = 640
 MIN_CAMERA_SESSION_CACHE = 3
@@ -39,6 +42,7 @@ _sessions: OrderedDict[tuple[str, str, str], _SessionEntry] = (
 )
 _last_status = {
     "engine": "yolo11n-plate-onnx",
+    "selected_variant": "yolo11n",
     "attempted": False,
     "model_loaded": False,
     "primary_path": "",
@@ -61,6 +65,8 @@ def clear_detector_sessions() -> None:
     with _cache_lock:
         _sessions.clear()
         _last_status.update(
+            engine="yolo11n-plate-onnx",
+            selected_variant="yolo11n",
             attempted=False,
             model_loaded=False,
             primary_path="",
@@ -91,40 +97,41 @@ def _session_options(ort):
     return options
 
 
-def _verified_paths() -> tuple[Path, Path | None]:
+def _verified_paths(
+    detector_variant=None,
+) -> tuple[Path, Path | None]:
     from .model_manager import (
-        DETECTOR_FALLBACK_SHA256,
-        DETECTOR_FALLBACK_SIZE,
-        DETECTOR_SHA256,
-        DETECTOR_SIZE,
-        detector_fallback_path,
-        detector_path,
+        detector_variant_spec,
         verify_file,
     )
 
-    primary = detector_path()
-    if not verify_file(primary, DETECTOR_SHA256, DETECTOR_SIZE):
+    spec = detector_variant_spec(detector_variant)
+    primary = Path(spec["path"])
+    if not verify_file(primary, spec["sha256"], spec["size"]):
         raise FileNotFoundError(
-            f"Verified YOLO11n plate detector not found: {primary}"
+            "Verified "
+            + str(spec["variant"])
+            + f" plate detector not found: {primary}"
         )
-    fallback = detector_fallback_path()
-    if not verify_file(
-        fallback,
-        DETECTOR_FALLBACK_SHA256,
-        DETECTOR_FALLBACK_SIZE,
-    ):
-        fallback = None
-    return primary, fallback
+    # The historical recovery model remains installable for backward
+    # compatibility but is deliberately excluded from selectable inference.
+    return primary, None
 
 
-def _load_session(engine_key=None) -> _SessionEntry:
-    primary_path, fallback_path = _verified_paths()
+def _load_session(
+    engine_key=None,
+    detector_variant=None,
+) -> _SessionEntry:
+    from .model_manager import normalize_detector_variant
+
+    selected_variant = normalize_detector_variant(detector_variant)
+    primary_path, fallback_path = _verified_paths(selected_variant)
     camera_key = str(
         engine_key if engine_key is not None else "default"
     )
     cache_key = (
         camera_key,
-        str(primary_path.resolve()),
+        selected_variant + ":" + str(primary_path.resolve()),
         str(fallback_path.resolve()) if fallback_path else "",
     )
     with _cache_lock:
@@ -141,26 +148,20 @@ def _load_session(engine_key=None) -> _SessionEntry:
             sess_options=options,
             providers=["CPUExecutionProvider"],
         )
-        fallback = None
-        fallback_input = ""
-        if fallback_path is not None:
-            fallback = ort.InferenceSession(
-                str(fallback_path),
-                sess_options=_session_options(ort),
-                providers=["CPUExecutionProvider"],
-            )
-            fallback_input = fallback.get_inputs()[0].name
         entry = _SessionEntry(
             primary=primary,
             primary_input=primary.get_inputs()[0].name,
-            fallback=fallback,
-            fallback_input=fallback_input,
+            fallback=None,
+            fallback_input="",
             run_lock=threading.Lock(),
         )
         _sessions[cache_key] = entry
+        # A camera can legitimately own the operator-selected graph and a
+        # differently signed Shadow graph. Keep both isolated sessions warm
+        # while retaining the existing bounded LRU behavior.
         cache_limit = max(
             MIN_CAMERA_SESSION_CACHE,
-            parallel_camera_limit(),
+            parallel_camera_limit() * 2,
         )
         while len(_sessions) > cache_limit:
             _sessions.popitem(last=False)
@@ -319,22 +320,34 @@ def detect_plates_onnx(
     min_confidence=0.25,
     max_results=4,
     engine_key=None,
+    detector_variant=None,
+    raise_on_error=False,
 ) -> list[dict]:
     if frame is None or getattr(frame, "size", 0) == 0:
         return []
+    from .model_manager import (
+        detector_variant_spec,
+        normalize_detector_variant,
+    )
+
+    selected_variant = normalize_detector_variant(detector_variant)
+    spec = detector_variant_spec(selected_variant)
     camera_key = str(
         engine_key if engine_key is not None else "default"
     )
     try:
-        primary_path, fallback_path = _verified_paths()
-        entry = _load_session(engine_key=engine_key)
+        primary_path, _ = _verified_paths(selected_variant)
+        entry = _load_session(
+            engine_key=engine_key,
+            detector_variant=selected_variant,
+        )
         primary_size = max(
             320,
             min(
                 640,
                 int(os.environ.get(
                     "BCVISION_ONNX_DETECTOR_SIZE",
-                    str(PRIMARY_SIZE),
+                    str(spec["input_size"]),
                 )),
             ),
         )
@@ -346,33 +359,18 @@ def detect_plates_onnx(
                 primary_size,
                 min_confidence,
                 max_results,
-                "yolo11n-plate-onnx",
+                str(spec["method"]),
             )
-            fallback_used = False
-            if not detections and entry.fallback is not None:
-                fallback_used = True
-                detections = _run(
-                    frame,
-                    entry.fallback,
-                    entry.fallback_input,
-                    FALLBACK_SIZE,
-                    min(
-                        0.45,
-                        max(0.12, float(min_confidence) * 0.78),
-                    ),
-                    max_results,
-                    "yolov8-onnx-light-fallback",
-                )
         with _cache_lock:
             _last_status.update(
+                engine=str(spec["method"]),
+                selected_variant=selected_variant,
                 attempted=True,
                 model_loaded=True,
                 primary_path=str(primary_path),
-                fallback_path=(
-                    str(fallback_path) if fallback_path else ""
-                ),
-                fallback_loaded=entry.fallback is not None,
-                fallback_used=fallback_used,
+                fallback_path="",
+                fallback_loaded=False,
+                fallback_used=False,
                 engine_key=camera_key,
                 detections=len(detections),
                 error="",
@@ -382,12 +380,19 @@ def detect_plates_onnx(
     except Exception as exc:
         with _cache_lock:
             _last_status.update(
+                engine=str(spec["method"]),
+                selected_variant=selected_variant,
                 attempted=True,
                 model_loaded=False,
+                primary_path=str(spec["path"]),
+                fallback_path="",
+                fallback_loaded=False,
                 fallback_used=False,
                 engine_key=camera_key,
                 detections=0,
                 error=f"{type(exc).__name__}: {exc}",
                 threads=threads_per_camera(),
             )
+        if raise_on_error:
+            raise
         return []

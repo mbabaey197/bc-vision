@@ -22,17 +22,36 @@ import urllib.request
 
 from .hezar_export import HEZAR_ONNX_SHA256, HEZAR_ONNX_SIZE
 
-DETECTOR_URL = (
+YOLO11N_DETECTOR_URL = (
     "https://huggingface.co/morsetechlab/"
     "yolov11-license-plate-detection/resolve/"
     "0f8dc030388b3660418ac7d8c37d3a40148064c1/"
     "license-plate-finetune-v1n.onnx?download=true"
 )
-DETECTOR_SHA256 = (
+YOLO11N_DETECTOR_SHA256 = (
     "693133A1DB97A3BA1E90068986F80AFB"
     "72C3FCDDB681E57181A89A9A3DC351D6"
 )
-DETECTOR_SIZE = 10_481_682
+YOLO11N_DETECTOR_SIZE = 10_481_682
+YOLOV8N_DETECTOR_URL = (
+    "https://huggingface.co/Dibachain/Platrix/resolve/"
+    "4f5a43eae683e0b6ad977d4001e3967dcb96e295/"
+    "plate_yolo.onnx?download=true"
+)
+YOLOV8N_DETECTOR_SHA256 = (
+    "A54E475C402E6036BB5C70F1A6FF7517"
+    "9E76098A5C8039BB5D148C0B6421F5C6"
+)
+YOLOV8N_DETECTOR_SIZE = 12_608_775
+MODEL_PREPARATION_STATE_ENV = "BCVISION_MODEL_PREPARATION_STATE"
+MODEL_PREPARATION_ERROR_ENV = "BCVISION_MODEL_PREPARATION_ERROR"
+MODEL_PREPARATION_ATTEMPT_ENV = "BCVISION_MODEL_PREPARATION_ATTEMPT"
+
+# Backward-compatible aliases describe the default YOLO11n detector. Older
+# integrations and signed baseline manifests import these names directly.
+DETECTOR_URL = YOLO11N_DETECTOR_URL
+DETECTOR_SHA256 = YOLO11N_DETECTOR_SHA256
+DETECTOR_SIZE = YOLO11N_DETECTOR_SIZE
 DETECTOR_FALLBACK_URL = (
     "https://huggingface.co/Dibachain/Platrix/resolve/main/"
     "plate_yolo_fallback.onnx?download=true"
@@ -78,6 +97,57 @@ def detector_path() -> Path:
     if configured:
         return Path(configured).expanduser()
     return _data_dir() / "models" / "plate" / "plate_yolo11n.onnx"
+
+
+def yolov8n_detector_path() -> Path:
+    configured = os.environ.get(
+        "BCVISION_PLATE_YOLOV8N_MODEL",
+        os.environ.get("BCVISION_PLATE_YOLO8N_MODEL", ""),
+    ).strip()
+    if configured:
+        return Path(configured).expanduser()
+    return _data_dir() / "models" / "plate" / "plate_yolov8n.onnx"
+
+
+def normalize_detector_variant(value, default="yolo11n") -> str:
+    aliases = {
+        "yolo11": "yolo11n",
+        "yolo11n": "yolo11n",
+        "yolov11n": "yolo11n",
+        "yolo8": "yolov8n",
+        "yolo8n": "yolov8n",
+        "yolov8": "yolov8n",
+        "yolov8n": "yolov8n",
+    }
+    normalized_default = aliases.get(
+        str(default or "").strip().lower(),
+        "yolo11n",
+    )
+    return aliases.get(
+        str(value or "").strip().lower(),
+        normalized_default,
+    )
+
+
+def detector_variant_spec(variant=None) -> dict:
+    selected = normalize_detector_variant(variant)
+    if selected == "yolov8n":
+        return {
+            "variant": selected,
+            "path": yolov8n_detector_path(),
+            "sha256": YOLOV8N_DETECTOR_SHA256,
+            "size": YOLOV8N_DETECTOR_SIZE,
+            "input_size": 416,
+            "method": "yolov8n-plate-onnx",
+        }
+    return {
+        "variant": "yolo11n",
+        "path": detector_path(),
+        "sha256": DETECTOR_SHA256,
+        "size": DETECTOR_SIZE,
+        "input_size": 640,
+        "method": "yolo11n-plate-onnx",
+    }
 
 
 def detector_fallback_path() -> Path:
@@ -489,6 +559,71 @@ def ensure_detector_model(download=True) -> Path:
     )
 
 
+def ensure_yolov8n_detector_model(download=True) -> Path:
+    target = yolov8n_detector_path()
+    if verify_file(
+        target,
+        YOLOV8N_DETECTOR_SHA256,
+        YOLOV8N_DETECTOR_SIZE,
+    ):
+        return target
+
+    source_dir = os.environ.get(
+        "BCVISION_MODEL_SOURCE_DIR",
+        "",
+    ).strip()
+    if source_dir:
+        for filename in (
+            "plate_yolov8n.onnx",
+            "plate_yolo.onnx",
+        ):
+            source = Path(source_dir) / filename
+            if _copy_verified(
+                source,
+                target,
+                YOLOV8N_DETECTOR_SHA256,
+                YOLOV8N_DETECTOR_SIZE,
+            ):
+                return target
+
+    # RC12-RC18 stored the same verified YOLOv8n graph under its upstream
+    # filename. Reuse it atomically so an existing installation does not need
+    # network access merely because the model now has an explicit name.
+    legacy = _data_dir() / "models" / "plate" / "plate_yolo.onnx"
+    if legacy.resolve() != target.resolve() and _copy_verified(
+        legacy,
+        target,
+        YOLOV8N_DETECTOR_SHA256,
+        YOLOV8N_DETECTOR_SIZE,
+    ):
+        return target
+
+    seed = packaged_seed_dir()
+    if seed:
+        for filename in (
+            "plate_yolov8n.onnx",
+            "plate_yolo.onnx",
+        ):
+            if _copy_verified(
+                seed / "plate" / filename,
+                target,
+                YOLOV8N_DETECTOR_SHA256,
+                YOLOV8N_DETECTOR_SIZE,
+            ):
+                return target
+
+    if not download:
+        raise FileNotFoundError(
+            f"Verified YOLOv8n detector model not found: {target}"
+        )
+    return _download_verified(
+        YOLOV8N_DETECTOR_URL,
+        target,
+        YOLOV8N_DETECTOR_SHA256,
+        YOLOV8N_DETECTOR_SIZE,
+    )
+
+
 def ensure_detector_fallback_model(download=True) -> Path:
     target = detector_fallback_path()
     if verify_file(
@@ -665,6 +800,9 @@ def ensure_hezar_model(download=True) -> Path:
 
 def prepare_models(download=True) -> dict:
     detector = ensure_detector_model(download=download)
+    detector_yolov8n = ensure_yolov8n_detector_model(
+        download=download,
+    )
     detector_fallback = ensure_detector_fallback_model(
         download=download,
     )
@@ -673,6 +811,8 @@ def prepare_models(download=True) -> dict:
     hezar = ensure_hezar_model(download=download)
     return {
         "detector": str(detector),
+        "detector_yolo11n": str(detector),
+        "detector_yolov8n": str(detector_yolov8n),
         "detector_fallback": str(detector_fallback),
         "crnn": str(crnn),
         "cnn": str(cnn),
@@ -682,6 +822,9 @@ def prepare_models(download=True) -> dict:
 
 def prepare_seed(seed_dir: Path, download=True) -> dict:
     detector = ensure_detector_model(download=download)
+    detector_yolov8n = ensure_yolov8n_detector_model(
+        download=download,
+    )
     detector_fallback = ensure_detector_fallback_model(
         download=download,
     )
@@ -697,6 +840,16 @@ def prepare_seed(seed_dir: Path, download=True) -> dict:
         DETECTOR_SIZE,
     ):
         raise ValueError("Detector seed verification failed")
+    detector_yolov8n_target = (
+        seed / "plate" / "plate_yolov8n.onnx"
+    )
+    if not _copy_verified(
+        detector_yolov8n,
+        detector_yolov8n_target,
+        YOLOV8N_DETECTOR_SHA256,
+        YOLOV8N_DETECTOR_SIZE,
+    ):
+        raise ValueError("YOLOv8n detector seed verification failed")
     detector_fallback_target = (
         seed / "plate" / "plate_yolo_fallback.onnx"
     )
@@ -733,6 +886,8 @@ def prepare_seed(seed_dir: Path, download=True) -> dict:
         raise ValueError("Hezar seed verification failed")
     return {
         "detector": str(detector_target),
+        "detector_yolo11n": str(detector_target),
+        "detector_yolov8n": str(detector_yolov8n_target),
         "detector_fallback": str(detector_fallback_target),
         "crnn": str(crnn_target),
         "cnn": str(cnn_target),
@@ -740,8 +895,11 @@ def prepare_seed(seed_dir: Path, download=True) -> dict:
     }
 
 
-def model_status() -> dict:
+def model_status(selected_detector=None) -> dict:
+    selected_variant = normalize_detector_variant(selected_detector)
+    selected_spec = detector_variant_spec(selected_variant)
     detector = detector_path()
+    detector_yolov8n = yolov8n_detector_path()
     detector_fallback = detector_fallback_path()
     crnn = crnn_path()
     cnn = cnn_path()
@@ -749,13 +907,51 @@ def model_status() -> dict:
     active_crnn, active_crnn_sha, active_crnn_size = (
         active_crnn_model()
     )
+    detector_yolo11n_ready = verify_file(
+        detector,
+        DETECTOR_SHA256,
+        DETECTOR_SIZE,
+    )
+    detector_yolov8n_ready = verify_file(
+        detector_yolov8n,
+        YOLOV8N_DETECTOR_SHA256,
+        YOLOV8N_DETECTOR_SIZE,
+    )
+    selected_ready = (
+        detector_yolov8n_ready
+        if selected_variant == "yolov8n"
+        else detector_yolo11n_ready
+    )
+    preparation_state = os.environ.get(
+        MODEL_PREPARATION_STATE_ENV,
+        "",
+    ).strip().lower()
+    preparation_error = os.environ.get(
+        MODEL_PREPARATION_ERROR_ENV,
+        "",
+    ).strip()
+    try:
+        preparation_attempt = max(
+            0,
+            int(os.environ.get(MODEL_PREPARATION_ATTEMPT_ENV, "0")),
+        )
+    except (TypeError, ValueError):
+        preparation_attempt = 0
     status = {
-        "detector_path": str(detector),
-        "detector_ready": verify_file(
-            detector,
-            DETECTOR_SHA256,
-            DETECTOR_SIZE,
-        ),
+        "selected_detector": selected_variant,
+        "selected_detector_method": selected_spec["method"],
+        "selected_detector_input_size": selected_spec["input_size"],
+        "preparation_state": preparation_state,
+        "preparation_error": preparation_error,
+        "preparation_attempt": preparation_attempt,
+        # Backward-compatible fields describe the selected primary. With no
+        # argument they retain their historical YOLO11n meaning.
+        "detector_path": str(selected_spec["path"]),
+        "detector_ready": selected_ready,
+        "detector_yolo11n_path": str(detector),
+        "detector_yolo11n_ready": detector_yolo11n_ready,
+        "detector_yolov8n_path": str(detector_yolov8n),
+        "detector_yolov8n_ready": detector_yolov8n_ready,
         "detector_fallback_path": str(detector_fallback),
         "detector_fallback_ready": verify_file(
             detector_fallback,
@@ -836,6 +1032,8 @@ def main(argv=None):
         print(f"{key.upper()}={value}")
     return 0 if (
         status["detector_ready"]
+        and status["detector_yolo11n_ready"]
+        and status["detector_yolov8n_ready"]
         and status["detector_fallback_ready"]
         and status["crnn_ready"]
         and status["cnn_ready"]

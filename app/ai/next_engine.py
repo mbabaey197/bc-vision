@@ -77,11 +77,34 @@ def process_frame_next(
         "baseline-yolov8-onnx",
         "baseline-yolo11n-onnx",
     }:
-        if detections is None:
+        detector_variant = (
+            "yolov8n"
+            if detector_runtime == "baseline-yolov8-onnx"
+            else "yolo11n"
+        )
+        expected_method = (
+            "yolov8n-plate-onnx"
+            if detector_variant == "yolov8n"
+            else "yolo11n-plate-onnx"
+        )
+        detector_state = detector_status()
+        reusable = (
+            bool(detections)
+            and detector_state.get("model_loaded")
+            and detector_state.get("selected_variant")
+            == detector_variant
+            and all(
+                row.get("method") == expected_method
+                for row in detections
+            )
+        )
+        if not reusable:
             detections = detect_plates_onnx(
                 frame,
                 min_confidence=min_detection_confidence,
                 engine_key=engine_key,
+                detector_variant=detector_variant,
+                raise_on_error=True,
             )
         detector_state = detector_status()
     else:

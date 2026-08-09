@@ -126,6 +126,247 @@ def test_dashboard_defaults_to_twelve_rows_and_pages_twenty_seven_events(
     assert "نمایش ۲۵ تا ۲۷ از ۲۷ رکورد" in third.text
 
 
+def test_dashboard_places_camera_left_and_content_right_then_stacks_mobile(
+    isolated_archive,
+):
+    with database.connect() as con:
+        con.execute(
+            "INSERT INTO cameras(name,rtsp_url,enabled,is_demo) "
+            "VALUES('Layout camera','demo://layout',1,1)"
+        )
+
+    with TestClient(main.app) as client:
+        response = client.get("/dashboard")
+
+    assert response.status_code == 200
+    text = response.text
+    camera_start = text.index(
+        "<section class='dashboard-camera-column'"
+    )
+    camera_end = text.index("</section>", camera_start)
+    main_start = text.index(
+        "<section class='dashboard-main-column'"
+    )
+    main_end = text.index("</section>", main_start)
+    camera_column = text[camera_start:camera_end]
+    main_column = text[main_start:main_end]
+
+    assert camera_start < main_start
+    assert "نمایش زنده" in camera_column
+    assert "id='liveGrid'" in camera_column
+    assert "stats-grid" not in camera_column
+    assert "stats-grid" in main_column
+    assert "آخرین تشخیص‌های پلاک و خودرو" in main_column
+    assert "افزودن دوربین" in main_column
+    assert (
+        ".dashboard-layout{display:grid;grid-template-columns:"
+        "minmax(360px,.82fr) minmax(0,1.58fr);gap:18px;"
+        "direction:ltr;align-items:start}"
+    ) in text
+    assert (
+        ".dashboard-camera-column{grid-column:1;direction:rtl;"
+        "min-width:0}"
+    ) in text
+    assert (
+        ".dashboard-main-column{grid-column:2;direction:rtl;"
+        "min-width:0}"
+    ) in text
+    assert (
+        "@media(max-width:1180px){.dashboard-layout{"
+        "grid-template-columns:1fr;direction:rtl}"
+    ) in text
+    assert (
+        ".dashboard-camera-column{order:1}"
+        ".dashboard-main-column{order:2}"
+    ) in text
+
+
+def test_dashboard_prioritizes_exact_anpr_errors_over_preview_status(
+    isolated_archive,
+):
+    with database.connect() as con:
+        con.execute(
+            "INSERT INTO cameras(name,rtsp_url,enabled,is_demo) "
+            "VALUES('Failed video','video:///tmp/failed.avi',1,1)"
+        )
+
+    with TestClient(main.app) as client:
+        response = client.get("/dashboard")
+
+    assert response.status_code == 200
+    text = response.text
+    process_error = text.index("if(p.last_error)")
+    marker_error = text.index("else if(s.anpr_marker_error)")
+    preview = text.index("else if(s.anpr_preview_only)")
+    assert process_error < marker_error < preview
+
+
+def test_dashboard_display_reset_is_safe_and_scoped_to_uploaded_video(
+    isolated_archive,
+):
+    with database.connect() as con:
+        video_camera = int(con.execute(
+            "INSERT INTO cameras(name,rtsp_url,enabled,is_demo) "
+            "VALUES(?,?,1,1)",
+            ("Video camera", "video:///tmp/test.avi"),
+        ).lastrowid)
+        other_camera = int(con.execute(
+            "INSERT INTO cameras(name,rtsp_url,enabled,is_demo) "
+            "VALUES(?,?,1,0)",
+            ("Other camera", "rtsp://other"),
+        ).lastrowid)
+        _insert_event(
+            con,
+            camera_id=video_camera,
+            camera_name="VIDEO-OLD",
+        )
+        _insert_event(
+            con,
+            camera_id=other_camera,
+            camera_name="OTHER-OLD",
+        )
+        boundary = int(con.execute(
+            "SELECT MAX(id) FROM plate_events"
+        ).fetchone()[0])
+        first_video = _insert_event(
+            con,
+            camera_id=video_camera,
+            camera_name="VIDEO-NEW-ONE",
+        )
+        _insert_event(
+            con,
+            camera_id=other_camera,
+            camera_name="OTHER-NEW",
+        )
+        second_video = _insert_event(
+            con,
+            camera_id=video_camera,
+            camera_name="VIDEO-NEW-TWO",
+        )
+
+    with TestClient(main.app) as client:
+        response = client.get(
+            "/dashboard",
+            params={
+                "video": 1,
+                "events_after": boundary,
+                "events_camera": video_camera,
+            },
+        )
+
+    assert response.status_code == 200
+    assert _dashboard_event_ids(response.text) == [
+        second_video,
+        first_video,
+    ]
+    assert "VIDEO-NEW-ONE" in response.text
+    assert "VIDEO-NEW-TWO" in response.text
+    assert "VIDEO-OLD" not in response.text
+    assert "OTHER-NEW" not in response.text
+    assert "پلاک‌های این ویدئو" in response.text
+    assert ">۲</b>" in response.text
+    assert "پاک‌کردن نمایش" in response.text
+    assert "آرشیو و تصاویر حذف نمی‌شوند" in response.text
+    assert "justify-content:end" in response.text
+    assert f"events_after={boundary}" in response.text
+    assert f"events_camera={video_camera}" in response.text
+    decoded = html.unescape(response.text)
+    scoped_dashboard = (
+        f"/dashboard?video=1&events_camera={video_camera}"
+        f"&events_after={boundary}"
+    )
+    assert f"href='{scoped_dashboard}'" in decoded
+    assert "const dashboardVideo=1" in response.text
+    assert (
+        "name='return_to' value='"
+        f"{scoped_dashboard}&events_snapshot={second_video}'"
+    ) in decoded
+    with database.connect() as con:
+        assert con.execute(
+            "SELECT COUNT(*) FROM plate_events"
+        ).fetchone()[0] == 5
+
+
+def test_dashboard_scoped_polling_counts_only_new_video_events(
+    isolated_archive,
+):
+    with database.connect() as con:
+        video_camera = int(con.execute(
+            "INSERT INTO cameras(name,rtsp_url,enabled,is_demo) "
+            "VALUES(?,?,1,1)",
+            ("Video camera", "video:///tmp/poll.avi"),
+        ).lastrowid)
+        other_camera = int(con.execute(
+            "INSERT INTO cameras(name,rtsp_url,enabled,is_demo) "
+            "VALUES(?,?,1,0)",
+            ("Other camera", "rtsp://poll-other"),
+        ).lastrowid)
+        boundary = _insert_event(
+            con,
+            camera_id=video_camera,
+            camera_name="VIDEO-BEFORE-CLEAR",
+        )
+
+    params = {
+        "after": boundary,
+        "video": 1,
+        "events_after": boundary,
+        "events_camera": video_camera,
+    }
+    with TestClient(main.app) as client:
+        unchanged = client.get(
+            "/api/dashboard/recent-events",
+            params=params,
+        )
+        with database.connect() as con:
+            first_video = _insert_event(
+                con,
+                camera_id=video_camera,
+                camera_name="SCOPED-VIDEO-ONE",
+            )
+            _insert_event(
+                con,
+                camera_id=other_camera,
+                camera_name="SCOPED-OTHER",
+            )
+            second_video = _insert_event(
+                con,
+                camera_id=video_camera,
+                camera_name="SCOPED-VIDEO-TWO",
+            )
+        changed = client.get(
+            "/api/dashboard/recent-events",
+            params=params,
+        )
+
+    assert unchanged.status_code == 200
+    assert unchanged.json() == {
+        "latest_id": boundary,
+        "rows_html": "",
+    }
+    payload = changed.json()
+    assert changed.status_code == 200
+    assert payload["latest_id"] == second_video
+    assert payload["visible_count"] == 2
+    assert _dashboard_event_ids(payload["rows_html"]) == [
+        second_video,
+        first_video,
+    ]
+    assert "SCOPED-OTHER" not in payload["rows_html"]
+    assert f"events_after={boundary}" in payload["pagination_html"]
+    assert (
+        f"events_camera={video_camera}"
+        in payload["pagination_html"]
+    )
+    assert "video=1" in payload["pagination_html"]
+    decoded_rows = html.unescape(payload["rows_html"])
+    assert (
+        "name='return_to' value='/dashboard?video=1"
+        f"&events_camera={video_camera}&events_after={boundary}"
+        f"&events_snapshot={second_video}'"
+    ) in decoded_rows
+
+
 def test_dashboard_polling_returns_only_after_a_new_event(
     isolated_archive,
 ):

@@ -895,9 +895,17 @@ def test_two_cameras_receive_independent_worker_slots(monkeypatch):
     worker = live_worker.LiveANPRWorker()
     monkeypatch.setattr(
         worker,
+        "_setting",
+        lambda key, default="": (
+            "yolo8n" if key == "anpr_detector_model" else default
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
         "_load_config",
         lambda camera_id: {
             "id": camera_id,
+            "rtsp_url": f"rtsp://camera/{camera_id}",
             "enabled": 1,
             "lpr_enabled": 1,
             "lpr_confidence": 50,
@@ -911,14 +919,16 @@ def test_two_cameras_receive_independent_worker_slots(monkeypatch):
     active = 0
     maximum_active = 0
     engine_keys = []
+    detector_variants = []
     active_lock = threading.Lock()
 
-    def process(_frame, _confidence, engine_key=None, **_kwargs):
+    def process(_frame, _confidence, engine_key=None, **kwargs):
         nonlocal active, maximum_active
         with active_lock:
             active += 1
             maximum_active = max(maximum_active, active)
             engine_keys.append(engine_key)
+            detector_variants.append(kwargs.get("detector_variant"))
         time.sleep(0.05)
         with active_lock:
             active -= 1
@@ -945,6 +955,302 @@ def test_two_cameras_receive_independent_worker_slots(monkeypatch):
 
     assert maximum_active == 2
     assert sorted(engine_keys) == [1, 2]
+    assert detector_variants == ["yolov8n", "yolov8n"]
     assert first["threads_per_camera"] == 2
     assert first["parallel_camera_limit"] == 2
+    assert first["anpr_engine"] == {
+        "mode": "baseline",
+        "detector_variant": "yolov8n",
+        "exclusive_detector": True,
+        "candidate_inference": False,
+    }
+    assert first["shadow"]["enabled"] is False
     assert second["processed_frames"] == 1
+
+
+def test_detector_selection_cache_can_be_invalidated(monkeypatch):
+    from app.ai import onnx_detector
+
+    cleared = []
+    monkeypatch.setattr(
+        onnx_detector,
+        "clear_detector_sessions",
+        lambda: cleared.append(True),
+    )
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState()
+    state.config = {"duplicate_seconds": 27}
+    observation = {
+        "plate": "31-ط-556-74",
+        "plate_norm": "31ط55674",
+        "valid": True,
+        "confidence": 0.91,
+        "quality_score": 0.82,
+        "bbox": (20, 20, 140, 55),
+        "crop": np.zeros((35, 120, 3), dtype=np.uint8),
+    }
+    state.tracker.update([observation], timestamp=0.0)
+    state.tracker.update([observation], timestamp=0.2)
+    old_tracker = state.tracker
+    state.seen["31ط55674"] = 10.0
+    state.track_event_ids[3] = 41
+    state.latest_detections = [{"plate": "31-ط-556-74"}]
+    state.processed_frames = 12
+    state.detected_candidates = 5
+    state.emitted_events = 2
+    state.frame_counter = 40
+    worker._states[7] = state
+    worker._model_state = {"detector_ready": True}
+    worker._model_state_at = 123.0
+    worker._model_state_variant = "yolov8n"
+
+    worker.invalidate_model_cache()
+    worker.shutdown()
+
+    assert worker._model_state == {}
+    assert worker._model_state_at == 0.0
+    assert worker._model_state_variant == ""
+    assert cleared == [True]
+    assert state.tracker is not old_tracker
+    assert state.tracker.emit_cooldown == 27
+    assert state.tracker.update([observation], timestamp=0.4) == []
+    assert state.seen == {}
+    assert state.track_event_ids == {}
+    assert state.latest_detections == []
+    assert state.processed_frames == 0
+    assert state.detected_candidates == 0
+    assert state.emitted_events == 0
+    assert state.frame_counter == 0
+
+
+def test_inflight_old_detector_result_is_discarded_on_switch(monkeypatch):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState()
+    state.config = {
+        "enabled": 1,
+        "lpr_enabled": 1,
+        "lpr_confidence": 50,
+        "duplicate_seconds": 20,
+        "roi_x": 0,
+        "roi_y": 0,
+        "roi_w": 100,
+        "roi_h": 100,
+    }
+    state.busy = True
+    worker._states[9] = state
+    frame = np.zeros((100, 180, 3), dtype=np.uint8)
+    stale = {
+        "plate": "31-ط-556-74",
+        "plate_norm": "31ط55674",
+        "valid": True,
+        "confidence": 0.91,
+        "quality_score": 0.82,
+        "bbox": (20, 20, 140, 55),
+        "crop": frame[20:55, 20:140].copy(),
+    }
+
+    def switch_during_inference(*_args, **_kwargs):
+        worker.invalidate_model_cache()
+        return [stale]
+
+    monkeypatch.setattr(live_worker, "process_frame", switch_during_inference)
+    monkeypatch.setattr(
+        worker,
+        "_persist",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stale detector result must not be persisted")
+        ),
+    )
+
+    worker._process(
+        state,
+        (9, "gate", frame, 1.0, 1.0, None, 0),
+    )
+    worker.shutdown()
+
+    assert state.busy is False
+    assert state.processed_frames == 0
+    assert state.detected_candidates == 0
+    assert state.tracker.active_track_ids() == set()
+    assert state.seen == {}
+    assert state.latest_detections == []
+
+
+def test_selected_inference_failure_reaches_camera_last_error(monkeypatch):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState()
+    state.config = {
+        "enabled": 1,
+        "lpr_enabled": 1,
+        "lpr_confidence": 50,
+        "duplicate_seconds": 20,
+        "roi_x": 0,
+        "roi_y": 0,
+        "roi_w": 100,
+        "roi_h": 100,
+    }
+    state.busy = True
+    worker._states[12] = state
+    monkeypatch.setattr(
+        worker,
+        "_selected_detector_variant",
+        lambda: "yolov8n",
+    )
+
+    def fail(*_args, **kwargs):
+        assert kwargs["engine_key"] == 12
+        assert kwargs["detector_variant"] == "yolov8n"
+        raise RuntimeError("selected YOLO inference failed")
+
+    monkeypatch.setattr(live_worker, "process_frame", fail)
+
+    worker._process(
+        state,
+        (12, "gate", np.zeros((100, 180, 3), dtype=np.uint8), 1.0),
+    )
+    worker.shutdown()
+
+    assert state.busy is False
+    assert state.processed_frames == 0
+    assert state.detected_candidates == 0
+    assert state.last_error == "RuntimeError: selected YOLO inference failed"
+
+
+def test_launcher_preparation_transition_invalidates_model_status_cache(
+    monkeypatch,
+):
+    from app.ai import model_manager
+
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    worker._model_state = {
+        "selected_detector": "yolo11n",
+        "detector_ready": True,
+        "hezar_ready": True,
+        "preparation_state": "",
+        "preparation_error": "",
+    }
+    worker._model_state_at = time.monotonic()
+    worker._model_state_variant = "yolo11n"
+    monkeypatch.setattr(
+        worker,
+        "_selected_detector_variant",
+        lambda: "yolo11n",
+    )
+    monkeypatch.setenv(
+        model_manager.MODEL_PREPARATION_STATE_ENV,
+        "error",
+    )
+    monkeypatch.setenv(
+        model_manager.MODEL_PREPARATION_ERROR_ENV,
+        "ValueError: model hash mismatch",
+    )
+    calls = []
+
+    def status(selected_detector=None):
+        calls.append(selected_detector)
+        return {
+            "selected_detector": selected_detector,
+            "detector_ready": True,
+            "hezar_ready": True,
+            "preparation_state": "error",
+            "preparation_error": "ValueError: model hash mismatch",
+        }
+
+    monkeypatch.setattr(model_manager, "model_status", status)
+
+    current = worker._models()
+    worker.shutdown()
+
+    assert calls == ["yolo11n"]
+    assert current["ready"] is True
+    assert current["preparation_state"] == "error"
+    assert current["preparation_error"] == "ValueError: model hash mismatch"
+
+
+def test_video_pass_drain_promotes_worker_pending_frame(monkeypatch):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState()
+    state.config = {
+        "enabled": 1,
+        "lpr_enabled": 1,
+        "lpr_confidence": 50,
+        "duplicate_seconds": 20,
+        "roi_x": 0,
+        "roi_y": 0,
+        "roi_w": 100,
+        "roi_h": 100,
+    }
+    worker._states[31] = state
+    token = worker.begin_video_pass(31)
+    frame = np.zeros((80, 160, 3), dtype=np.uint8)
+    state.pending = (
+        31,
+        "uploaded video",
+        frame,
+        1.0,
+        1.0,
+        None,
+        token["detector_generation"],
+    )
+    monkeypatch.setattr(
+        worker,
+        "_selected_detector_variant",
+        lambda: "yolov8n",
+    )
+    monkeypatch.setattr(live_worker, "process_frame", lambda *_a, **_k: [])
+
+    drained = worker.drain_video_pass(31, token, timeout=1.0)
+    worker.shutdown()
+
+    assert drained["ok"] is True
+    assert drained["error"] == ""
+    assert drained["processed_frames"] == 1
+    assert state.pending is None
+    assert state.busy is False
+
+
+def test_video_pass_drain_remembers_error_cleared_by_later_success(
+    monkeypatch,
+):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState()
+    state.config = {
+        "enabled": 1,
+        "lpr_enabled": 1,
+        "lpr_confidence": 50,
+        "duplicate_seconds": 20,
+        "roi_x": 0,
+        "roi_y": 0,
+        "roi_w": 100,
+        "roi_h": 100,
+    }
+    worker._states[32] = state
+    token = worker.begin_video_pass(32)
+    frame = np.zeros((80, 160, 3), dtype=np.uint8)
+    monkeypatch.setattr(
+        worker,
+        "_selected_detector_variant",
+        lambda: "yolov8n",
+    )
+    monkeypatch.setattr(
+        live_worker,
+        "process_frame",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("selected YOLO failed once")
+        ),
+    )
+    state.busy = True
+    worker._process(state, (32, "video", frame, 1.0))
+    assert state.processing_errors == 1
+    assert state.last_error == "RuntimeError: selected YOLO failed once"
+
+    monkeypatch.setattr(live_worker, "process_frame", lambda *_a, **_k: [])
+    state.busy = True
+    worker._process(state, (32, "video", frame, 2.0))
+    assert state.last_error == ""
+
+    drained = worker.drain_video_pass(32, token, timeout=1.0)
+    worker.shutdown()
+
+    assert drained["ok"] is False
+    assert drained["error"] == "RuntimeError: selected YOLO failed once"

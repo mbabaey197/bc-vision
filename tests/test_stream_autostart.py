@@ -21,16 +21,30 @@ def test_start_enabled_cameras_uses_persistent_settings(
             name TEXT,
             rtsp_url TEXT,
             enabled INTEGER,
-            sort_order INTEGER
+            sort_order INTEGER,
+            video_anpr_started INTEGER NOT NULL DEFAULT 0,
+            video_anpr_completed INTEGER NOT NULL DEFAULT 0
         );
-        INSERT INTO cameras VALUES(
+        INSERT INTO cameras(id,name,rtsp_url,enabled,sort_order) VALUES(
             1,'Gate','rtsp://gate',1,2
         );
-        INSERT INTO cameras VALUES(
+        INSERT INTO cameras(id,name,rtsp_url,enabled,sort_order) VALUES(
             2,'Disabled','rtsp://off',0,1
         );
-        INSERT INTO cameras VALUES(
+        INSERT INTO cameras(id,name,rtsp_url,enabled,sort_order) VALUES(
             3,'Demo','demo://camera',1,1
+        );
+        INSERT INTO cameras(
+            id,name,rtsp_url,enabled,sort_order,
+            video_anpr_started,video_anpr_completed
+        ) VALUES(
+            4,'Completed upload','video:///tmp/completed.avi',1,3,1,1
+        );
+        INSERT INTO cameras(
+            id,name,rtsp_url,enabled,sort_order,
+            video_anpr_started,video_anpr_completed
+        ) VALUES(
+            5,'Interrupted upload','video:///tmp/interrupted.avi',1,4,1,0
         );
         """)
 
@@ -64,10 +78,30 @@ def test_start_enabled_cameras_uses_persistent_settings(
         lambda *args: calls.append(args),
     )
 
-    assert manager.start_enabled_cameras() == 2
+    assert manager.start_enabled_cameras() == 4
     assert calls == [
-        (3, "demo://camera", "Demo", 960, 7, 82),
-        (1, "rtsp://gate", "Gate", 960, 7, 82),
+        (3, "demo://camera", "Demo", 960, 7, 82, False, False),
+        (1, "rtsp://gate", "Gate", 960, 7, 82, False, False),
+        (
+            4,
+            "video:///tmp/completed.avi",
+            "Completed upload",
+            960,
+            7,
+            82,
+            True,
+            True,
+        ),
+        (
+            5,
+            "video:///tmp/interrupted.avi",
+            "Interrupted upload",
+            960,
+            7,
+            82,
+            True,
+            False,
+        ),
     ]
 
 

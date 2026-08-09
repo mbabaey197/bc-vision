@@ -13,9 +13,6 @@ from .pipeline import (
     process_frame,
 )
 from .plate_rules import normalize_plate
-from .next_engine import engine_router
-from .next_models import next_models_status
-from .review_policy import auto_confirm_guess
 
 
 class VideoTester:
@@ -136,24 +133,34 @@ def process_video(
     duplicate_seconds=2.5,
     roi=None,
     include_candidate_shadow=False,
+    detector_variant=None,
 ):
+    from .model_manager import normalize_detector_variant
+
+    if detector_variant is None:
+        try:
+            from app.database import get_setting
+
+            detector_variant = get_setting(
+                "anpr_detector_model",
+                "yolo11n",
+            )
+        except Exception:
+            detector_variant = "yolo11n"
+    detector_variant = normalize_detector_variant(detector_variant)
     tester = VideoTester(video_path)
     info = tester.info()
-    candidate_status = (
-        next_models_status()
-        if include_candidate_shadow
-        else {"ready": False, "error": ""}
-    )
-    shadow_enabled = bool(
-        include_candidate_shadow and candidate_status.get("ready")
-    )
+    info["detector_variant"] = detector_variant
+    info["detector_execution_mode"] = "exclusive-baseline"
+    info["exclusive_detector"] = True
     info["candidate_shadow_requested"] = bool(
         include_candidate_shadow
     )
+    info["candidate_shadow_enabled"] = False
     info["candidate_shadow_error"] = (
-        ""
-        if shadow_enabled
-        else str(candidate_status.get("error") or "")
+        "موتور Shadow برای حفظ اجرای انحصاری مدل انتخاب‌شده غیرفعال است."
+        if include_candidate_shadow
+        else ""
     )
     fps = max(info["fps"], 1.0)
     plate_dir = Path(plate_dir)
@@ -170,31 +177,19 @@ def process_video(
             emit_cooldown=max(0.0, float(duplicate_seconds)),
             emit_unreadable=True,
         )
-        for lane in (
-            ("baseline", "candidate-shadow")
-            if shadow_enabled
-            else ("baseline",)
-        )
+        for lane in ("baseline",)
     }
     events = []
     events_by_track: dict[tuple[str, int], int] = {}
     seen: dict[tuple[str, str], float] = {}
     frame_no = 0
     last_frame = None
-    shadow_error = info["candidate_shadow_error"]
 
     def accept(rows, frame, lane="baseline"):
         for result in rows:
             result = dict(result)
             result["engine_lane"] = lane
             capture_only = bool(result.get("capture_only"))
-            if lane == "candidate-shadow":
-                result["experimental"] = True
-                result["needs_review"] = True
-                if not capture_only:
-                    result = auto_confirm_guess(result)
-                elif result.get("valid"):
-                    result["read_status"] = "experimental-guess"
             if (
                 not capture_only
                 and result["confidence"] < float(min_confidence)
@@ -256,23 +251,20 @@ def process_video(
             if frame_no % max(1, int(frame_step)) != 0:
                 continue
             source, offset_x, offset_y = _roi_frame(frame, roi)
-            if shadow_enabled:
-                outcome = engine_router.process(
-                    source,
-                    baseline=lambda: process_frame(
-                        source,
-                        min_confidence,
-                    ),
-                    min_detection_confidence=min_confidence,
-                    mode="shadow",
-                )
-                primary = outcome.primary
-                shadow = outcome.shadow
-                if outcome.error:
-                    shadow_error = outcome.error
-            else:
-                primary = process_frame(source, min_confidence)
-                shadow = []
+            primary = process_frame(
+                source,
+                min_confidence,
+                detector_variant=detector_variant,
+            )
+            primary = [
+                {
+                    **result,
+                    "engine_lane": "baseline",
+                    "detector_variant": detector_variant,
+                    "detector_selection_exclusive": True,
+                }
+                for result in primary
+            ]
             primary = [
                 _translate_result(result, offset_x, offset_y)
                 for result in primary
@@ -284,38 +276,12 @@ def process_video(
             )
             if accept(stable, frame, "baseline"):
                 return info, events
-            if shadow_enabled:
-                shadow = [
-                    _translate_result(result, offset_x, offset_y)
-                    for result in shadow
-                ]
-                stable_shadow = trackers["candidate-shadow"].update(
-                    shadow,
-                    timestamp=frame_no / fps,
-                    frame=frame,
-                )
-                if accept(
-                    stable_shadow,
-                    frame,
-                    "candidate-shadow",
-                ):
-                    return info, events
         if last_frame is not None:
             accept(
                 trackers["baseline"].flush(),
                 last_frame,
                 "baseline",
             )
-            if shadow_enabled:
-                accept(
-                    trackers["candidate-shadow"].flush(),
-                    last_frame,
-                    "candidate-shadow",
-                )
     finally:
         tester.close()
-    info["candidate_shadow_requested"] = bool(
-        include_candidate_shadow
-    )
-    info["candidate_shadow_error"] = shadow_error
     return info, events

@@ -51,8 +51,9 @@ model:
 
 The model card says its Roboflow-derived data has train/test contamination and
 reported metrics may be inflated. BC Vision therefore treats those metrics as
-unverified and requires independent field/Golden evaluation. The AGPL-3.0
-license text is available at:
+unverified and requires independent field/Golden evaluation. Model-weight,
+runtime, redistribution and commercial-use licensing require legal review
+before distribution. The AGPL-3.0 license text is available at:
 https://www.gnu.org/licenses/agpl-3.0.html
 
 ## Hezar Persian license-plate CRNN v2
@@ -77,11 +78,15 @@ is not a legal opinion.
 
 ## Platrix Iranian ANPR models
 
-BC Vision retains these Platrix ONNX assets as detector/OCR fallbacks:
+BC Vision can select the Platrix YOLOv8n ONNX plate detector and retains
+additional Platrix assets for compatibility/OCR fallback:
 
 - Model: https://huggingface.co/Dibachain/Platrix
 - Reference project: https://github.com/AliAkrami1375/Platrix
-- Retired `plate_yolo.onnx` SHA-256 (provenance only; no longer active):
+- Pinned model revision:
+  `4f5a43eae683e0b6ad977d4001e3967dcb96e295`
+- Active selectable `plate_yolov8n.onnx` (upstream filename
+  `plate_yolo.onnx`), size `12608775` bytes, SHA-256:
   `a54e475c402e6036bb5c70f1a6ff75179e76098a5c8039bb5d148c0b6421f5c6`
 - `plate_yolo_fallback.onnx` SHA-256:
   `a6974fcb0a79755c270d50f1ebefd4d96d765c879a29051a19aac00dfda8b5af`
@@ -89,6 +94,22 @@ BC Vision retains these Platrix ONNX assets as detector/OCR fallbacks:
   `45f8c45f29eb1ee91f6274cb8d9c328da1a2050ea7d8596bae61f4a6b9f9fb1e`
 - `ocr_cnn.onnx` SHA-256:
   `7d573c51cc855a8e080f1f88597477f4fb5a2b9cafa1bb125bd6038e441f5bca`
+
+The upstream Platrix training script initializes `yolov8n.pt`, establishing
+the active detector's architecture provenance. The exact verified ONNX file
+also embeds this exporter metadata:
+
+- Author: Ultralytics
+- Ultralytics version: `8.4.104`
+- License: `AGPL-3.0 License (https://ultralytics.com/license)`
+
+The MIT notice below applies to the Platrix repository code. It does not
+override the AGPL-3.0 metadata embedded in the model, establish that the model
+weight is MIT-licensed, or by itself grant commercial redistribution rights.
+As with the selectable YOLO11n graph, model-weight, runtime, redistribution
+and commercial-use licensing require legal review before distribution. The
+separately named `plate_yolo_fallback.onnx` remains installed for compatibility
+but is not executed by normal selectable YOLO11n/YOLOv8n inference.
 
 MIT License
 

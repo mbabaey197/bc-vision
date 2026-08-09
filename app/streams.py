@@ -26,6 +26,11 @@ except Exception:
 class StreamState:
     online: bool = False
     paused: bool = False
+    ended: bool = False
+    anpr_preview_only: bool = False
+    anpr_completed: bool = False
+    anpr_interrupted: bool = False
+    anpr_marker_error: str = ""
     last_error: str = ""
     last_frame_at: float = 0.0
 
@@ -39,6 +44,9 @@ class CameraStream:
         width=640,
         fps=5,
         quality=70,
+        video_anpr_started=False,
+        video_anpr_completed=False,
+        video_anpr_state_callback=None,
     ):
         self.camera_id, self.url, self.name = camera_id, url, name
         self.width, self.fps, self.quality = (
@@ -46,7 +54,24 @@ class CameraStream:
             max(1, fps),
             quality,
         )
-        self.state = StreamState()
+        self._is_video_file = self.url.startswith("video://")
+        self._video_anpr_completed = bool(video_anpr_completed)
+        self._video_anpr_started = bool(
+            video_anpr_started or video_anpr_completed
+        )
+        self._video_anpr_preview_only = bool(
+            self._is_video_file and self._video_anpr_started
+        )
+        self._video_anpr_state_callback = video_anpr_state_callback
+        self._video_anpr_pass_token = None
+        self.state = StreamState(
+            anpr_preview_only=self._video_anpr_preview_only,
+            anpr_completed=self._video_anpr_completed,
+            anpr_interrupted=bool(
+                self._video_anpr_preview_only
+                and not self._video_anpr_completed
+            ),
+        )
         self.latest: bytes | None = None
         self.latest_frame = None
         self.stop_event = threading.Event()
@@ -60,8 +85,12 @@ class CameraStream:
         self._overlay_max_age = 1.6
         self._last_display_publish_at = 0.0
         self._anpr_lock = threading.Lock()
+        self._anpr_condition = threading.Condition(self._anpr_lock)
         self._anpr_event = threading.Event()
         self._anpr_pending_frame = None
+        self._anpr_submitting = False
+        self._anpr_submit_error = ""
+        self._anpr_aborted = False
         self._anpr_thread = None
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -89,10 +118,15 @@ class CameraStream:
         self.thread.start()
 
     def stop(self):
-        self.stop_event.set()
-        self._anpr_event.set()
-        with self._anpr_lock:
+        with self._anpr_condition:
+            # Abort is latched before pending work is discarded. EOF may be
+            # waiting on this same handoff condition, and must never mistake a
+            # stop-induced empty queue for a successfully drained video pass.
+            self._anpr_aborted = True
+            self.stop_event.set()
             self._anpr_pending_frame = None
+            self._anpr_condition.notify_all()
+        self._anpr_event.set()
         try:
             from app.ai.live_worker import stop_live_camera
             stop_live_camera(self.camera_id)
@@ -108,10 +142,176 @@ class CameraStream:
 
     def resume(self):
         if self.url.startswith("video://"):
+            # End-of-file pauses are deliberate: an uploaded video is
+            # submitted to ANPR exactly once. Pressing Play after EOF starts a
+            # preview-only pass and cannot add duplicate dashboard events.
+            self.state.ended = False
             self.pause_event.clear()
             self.state.paused = False
             return True
         return False
+
+    def _ensure_video_anpr_started(self) -> bool:
+        if not self._is_video_file:
+            return True
+        if self._video_anpr_preview_only:
+            return False
+        try:
+            if not self._video_anpr_started:
+                if self._video_anpr_state_callback is not None:
+                    self._video_anpr_state_callback(
+                        self.camera_id,
+                        "started",
+                    )
+                self._video_anpr_started = True
+            if self._video_anpr_pass_token is None:
+                from app.ai.live_worker import begin_live_video_pass
+
+                self._video_anpr_pass_token = begin_live_video_pass(
+                    self.camera_id
+                )
+            return True
+        except Exception as exc:
+            # Fail closed: without a durable started marker, a restart could
+            # submit the same file again and duplicate archived events.
+            self._video_anpr_preview_only = True
+            self.state.anpr_preview_only = True
+            self.state.anpr_interrupted = True
+            self.state.anpr_marker_error = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+
+    def _wait_for_anpr_handoff(self, timeout=10.0) -> bool:
+        deadline = time.monotonic() + max(
+            0.1,
+            min(60.0, float(timeout)),
+        )
+        self._anpr_event.set()
+        with self._anpr_condition:
+            if self._anpr_aborted or self.stop_event.is_set():
+                return False
+            while (
+                self._anpr_pending_frame is not None
+                or self._anpr_submitting
+            ):
+                if self._anpr_aborted or self.stop_event.is_set():
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._anpr_condition.wait(min(0.10, remaining))
+            return not (
+                self._anpr_aborted or self.stop_event.is_set()
+            )
+
+    def _video_anpr_abort_error(self) -> str:
+        with self._anpr_condition:
+            if self._anpr_aborted or self.stop_event.is_set():
+                return (
+                    "RuntimeError: uploaded-video ANPR pass was aborted "
+                    "by stream stop"
+                )
+            return ""
+
+    def _complete_video_anpr_pass(self) -> None:
+        if (
+            not self._is_video_file
+            or self._video_anpr_completed
+            or self._video_anpr_preview_only
+            or not self._video_anpr_started
+        ):
+            return
+        abort_error = self._video_anpr_abort_error()
+        if abort_error:
+            self._interrupt_video_anpr_pass(abort_error)
+            return
+        if not self._wait_for_anpr_handoff():
+            self._interrupt_video_anpr_pass(
+                self._video_anpr_abort_error()
+                or "TimeoutError: video-to-ANPR handoff did not drain"
+            )
+            return
+        abort_error = self._video_anpr_abort_error()
+        if abort_error:
+            self._interrupt_video_anpr_pass(abort_error)
+            return
+        try:
+            from app.ai.live_worker import drain_live_video_pass
+
+            drained = drain_live_video_pass(
+                self.camera_id,
+                pass_token=self._video_anpr_pass_token,
+                timeout=60.0,
+            )
+        except Exception as exc:
+            drained = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        abort_error = self._video_anpr_abort_error()
+        if abort_error:
+            self._interrupt_video_anpr_pass(abort_error)
+            return
+        processing_error = (
+            self._anpr_submit_error
+            or str(drained.get("error") or "")
+        )
+        if not drained.get("ok") or processing_error:
+            self._interrupt_video_anpr_pass(
+                processing_error
+                or "RuntimeError: uploaded-video ANPR did not complete"
+            )
+            return
+        marker_error = ""
+        abort_error = ""
+        with self._anpr_condition:
+            # This is the completion claim. The abort check, durable marker
+            # callback, and matching in-memory state commit are serialized
+            # against stop(), which latches its abort under the same lock.
+            # Whichever side acquires the lock first logically wins.
+            if self._anpr_aborted or self.stop_event.is_set():
+                abort_error = (
+                    "RuntimeError: uploaded-video ANPR pass was aborted "
+                    "by stream stop"
+                )
+            else:
+                try:
+                    if self._video_anpr_state_callback is not None:
+                        self._video_anpr_state_callback(
+                            self.camera_id,
+                            "completed",
+                        )
+                except Exception as exc:
+                    marker_error = f"{type(exc).__name__}: {exc}"
+                # Even if the completion write fails, the durable started
+                # marker makes a future process treat this run as interrupted
+                # and preview-only.
+                self._video_anpr_completed = not bool(marker_error)
+                self._video_anpr_preview_only = True
+                self.state.anpr_preview_only = True
+                self.state.anpr_completed = self._video_anpr_completed
+                self.state.anpr_interrupted = not self._video_anpr_completed
+                self.state.anpr_marker_error = marker_error
+        if abort_error:
+            self._interrupt_video_anpr_pass(abort_error)
+
+    def _interrupt_video_anpr_pass(self, error="") -> None:
+        if (
+            not self._is_video_file
+            or not self._video_anpr_started
+            or self._video_anpr_completed
+        ):
+            return
+        # The durable started marker remains incomplete. Reopening from frame
+        # zero is allowed for preview, but ANPR must fail closed or the decoded
+        # prefix would be archived a second time.
+        self._video_anpr_preview_only = True
+        self.state.anpr_preview_only = True
+        self.state.anpr_completed = False
+        self.state.anpr_interrupted = True
+        if error:
+            self.state.anpr_marker_error = str(error)
 
     def _wait_while_paused(self):
         while (
@@ -497,8 +697,11 @@ class CameraStream:
     def _queue_anpr(self, frame):
         # Keep only the newest decoded frame. No copy is needed here: OpenCV
         # and PyAV return a new ndarray for the next decoded frame.
-        with self._anpr_lock:
+        if not self._ensure_video_anpr_started():
+            return
+        with self._anpr_condition:
             self._anpr_pending_frame = frame
+            self._anpr_condition.notify_all()
         self._anpr_event.set()
 
     def _anpr_loop(self):
@@ -508,19 +711,29 @@ class CameraStream:
             if self.stop_event.is_set():
                 break
             while not self.stop_event.is_set():
-                with self._anpr_lock:
+                with self._anpr_condition:
                     frame = self._anpr_pending_frame
                     self._anpr_pending_frame = None
+                    self._anpr_submitting = frame is not None
+                    self._anpr_condition.notify_all()
                 if frame is None:
                     break
                 try:
                     from app.ai.live_worker import submit_live_frame
                     submit_live_frame(self.camera_id, self.name, frame)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    with self._anpr_condition:
+                        if not self._anpr_submit_error:
+                            self._anpr_submit_error = (
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                finally:
+                    with self._anpr_condition:
+                        self._anpr_submitting = False
+                        self._anpr_condition.notify_all()
                 # If decoding produced more frames while submit_live_frame was
                 # selecting/analysing, immediately consume only the newest one.
-                with self._anpr_lock:
+                with self._anpr_condition:
                     has_newer = self._anpr_pending_frame is not None
                 if not has_newer:
                     break
@@ -645,6 +858,12 @@ class CameraStream:
                 raise RuntimeError(
                     "FFmpeg could not decode any frame from the video"
                 )
+            self._complete_video_anpr_pass()
+            self.state.ended = True
+            self.pause_event.set()
+            self._wait_while_paused()
+            if self.stop_event.is_set():
+                return
 
     def _run(self):
         if not CV_OK:
@@ -690,6 +909,12 @@ class CameraStream:
                     if not ok or frame is None:
                         if is_video_file:
                             capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            self._complete_video_anpr_pass()
+                            self.state.ended = True
+                            self.pause_event.set()
+                            self._wait_while_paused()
+                            if self.stop_event.is_set():
+                                break
                             deadline = time.monotonic()
                             continue
                         raise RuntimeError("Camera stopped sending frames")
@@ -713,6 +938,8 @@ class CameraStream:
                         continue
                     except Exception as fallback_exc:
                         exc = fallback_exc
+                if is_video_file:
+                    self._interrupt_video_anpr_pass()
                 self.state.online = False
                 self.state.last_error = str(exc)
                 self.stop_event.wait(1 if is_video_file else 3)
@@ -745,7 +972,41 @@ class StreamManager:
         self.streams = {}
         self.lock = threading.Lock()
 
-    def get(self, camera_id, url, name, width, fps, quality):
+    @staticmethod
+    def _persist_video_anpr_state(camera_id, state):
+        from app.database import connect
+
+        with connect() as con:
+            if state == "started":
+                cursor = con.execute(
+                    "UPDATE cameras SET video_anpr_started=1 "
+                    "WHERE id=? AND rtsp_url LIKE 'video://%'",
+                    (int(camera_id),),
+                )
+            elif state == "completed":
+                cursor = con.execute(
+                    "UPDATE cameras SET video_anpr_started=1,"
+                    "video_anpr_completed=1,"
+                    "video_anpr_completed_at=CURRENT_TIMESTAMP "
+                    "WHERE id=? AND rtsp_url LIKE 'video://%'",
+                    (int(camera_id),),
+                )
+            else:
+                raise ValueError("invalid uploaded-video ANPR state")
+            if cursor.rowcount != 1:
+                raise RuntimeError("uploaded-video camera marker was not saved")
+
+    def get(
+        self,
+        camera_id,
+        url,
+        name,
+        width,
+        fps,
+        quality,
+        video_anpr_started=False,
+        video_anpr_completed=False,
+    ):
         key = (url, name, width, fps, quality)
         with self.lock:
             old = self.streams.get(camera_id)
@@ -761,6 +1022,13 @@ class StreamManager:
                     width,
                     fps,
                     quality,
+                    video_anpr_started=video_anpr_started,
+                    video_anpr_completed=video_anpr_completed,
+                    video_anpr_state_callback=(
+                        self._persist_video_anpr_state
+                        if str(url).startswith("video://")
+                        else None
+                    ),
                 )
                 old._key = key
                 self.streams[camera_id] = old
@@ -776,7 +1044,8 @@ class StreamManager:
         quality = int(get_setting("jpeg_quality", "70"))
         with connect() as con:
             rows = con.execute(
-                "SELECT id,name,rtsp_url FROM cameras "
+                "SELECT id,name,rtsp_url,video_anpr_started,"
+                "video_anpr_completed FROM cameras "
                 "WHERE enabled=1 AND rtsp_url<>'' "
                 "ORDER BY sort_order,id"
             ).fetchall()
@@ -790,6 +1059,8 @@ class StreamManager:
                 width,
                 fps,
                 quality,
+                bool(row["video_anpr_started"]),
+                bool(row["video_anpr_completed"]),
             )
             started += 1
         return started
@@ -812,6 +1083,11 @@ class StreamManager:
         base = {
             "online": False,
             "paused": False,
+            "ended": False,
+            "anpr_preview_only": False,
+            "anpr_completed": False,
+            "anpr_interrupted": False,
+            "anpr_marker_error": "",
             "error": "stream not started",
             "last_frame_at": 0.0,
         }
@@ -819,6 +1095,11 @@ class StreamManager:
             base = {
                 "online": stream.state.online,
                 "paused": stream.state.paused,
+                "ended": stream.state.ended,
+                "anpr_preview_only": stream.state.anpr_preview_only,
+                "anpr_completed": stream.state.anpr_completed,
+                "anpr_interrupted": stream.state.anpr_interrupted,
+                "anpr_marker_error": stream.state.anpr_marker_error,
                 "error": stream.state.last_error,
                 "last_frame_at": stream.state.last_frame_at,
             }

@@ -97,9 +97,28 @@ def test_camera_creation_is_not_limited_by_product_plan(tmp_path, monkeypatch):
 
 
 def test_system_role_can_change_ai_settings(monkeypatch):
+    from app.ai import live_worker
+
     _as_role(monkeypatch, "system")
     writes = []
+    switches = []
+    audits = []
     monkeypatch.setattr(main, "set_setting", lambda key, value: writes.append((key, value)))
+    monkeypatch.setattr(
+        live_worker,
+        "switch_live_anpr_detector",
+        lambda variant, persist_setting=None: (
+            switches.append(variant),
+            persist_setting("anpr_detector_model", variant),
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "audit",
+        lambda _request, action, details="": audits.append(
+            (action, details)
+        ),
+    )
 
     with TestClient(main.app) as client:
         response = client.post(
@@ -109,6 +128,7 @@ def test_system_role_can_change_ai_settings(monkeypatch):
                 "ai_quality": "balanced",
                 "ai_confidence": "80",
                 "ai_frames": "7",
+                "anpr_detector_model": "yolov8n",
             },
             follow_redirects=False,
         )
@@ -116,6 +136,39 @@ def test_system_role_can_change_ai_settings(monkeypatch):
     assert response.status_code == 302
     assert ("ai_accelerator", "cpu") in writes
     assert ("ai_confidence", 80) in writes
+    assert ("anpr_detector_model", "yolov8n") in writes
+    assert switches == ["yolov8n"]
+    assert audits == [(
+        "anpr_detector_switch",
+        "yolov8n; execution=exclusive-baseline",
+    )]
+
+
+def test_ai_settings_reject_unknown_detector_model(monkeypatch):
+    _as_role(monkeypatch, "system")
+    writes = []
+    monkeypatch.setattr(
+        main,
+        "set_setting",
+        lambda key, value: writes.append((key, value)),
+    )
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/settings/ai",
+            data={
+                "ai_accelerator": "cpu",
+                "ai_quality": "balanced",
+                "ai_confidence": "80",
+                "ai_frames": "7",
+                "anpr_detector_model": "unverified-model",
+            },
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/settings?error=")
+    assert writes == []
 
 
 def test_uploaded_video_playback_endpoint(monkeypatch):
@@ -143,6 +196,73 @@ def test_uploaded_video_playback_endpoint(monkeypatch):
     assert pause.status_code == 200
     assert play.status_code == 200
     assert calls == [(12, "pause"), (12, "play")]
+
+
+@pytest.mark.parametrize(
+    "return_to",
+    [
+        "https://evil.invalid/dashboard?events_camera=7",
+        "//evil.invalid/dashboard?events_camera=7",
+        "/dashboard/../dashboard?events_camera=7",
+        "/dashboard#https://evil.invalid",
+        "/dashboard\\evil?events_camera=7",
+    ],
+)
+def test_dashboard_return_target_rejects_nonlocal_or_noncanonical_urls(
+    return_to,
+):
+    assert main._safe_dashboard_return_to(return_to) == "/dashboard"
+    assert main._safe_dashboard_return_to(
+        return_to,
+        corrected=True,
+    ) == "/dashboard?corrected=1"
+
+
+def test_dashboard_return_target_keeps_only_valid_scope_fields():
+    assert main._safe_dashboard_return_to(
+        "/dashboard?video=2&events_camera=0007&events_after=-5"
+        "&events_snapshot=9&events_page=2&next=https://evil.invalid"
+    ) == (
+        "/dashboard?video=1&events_camera=7"
+        "&events_snapshot=9&events_page=2"
+    )
+
+
+def test_live_route_passes_persisted_video_markers_to_stream_manager(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "live-marker.db"
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    database.init_db()
+    _as_role(monkeypatch, "operator")
+    with database.connect() as con:
+        camera_id = int(con.execute(
+            "INSERT INTO cameras("
+            "name,rtsp_url,enabled,video_anpr_started,"
+            "video_anpr_completed"
+            ") VALUES('Completed video','video:///tmp/done.avi',1,1,1)"
+        ).lastrowid)
+    calls = []
+    fake_stream = SimpleNamespace(frames=lambda: iter(()))
+    monkeypatch.setattr(
+        main.manager,
+        "get",
+        lambda *args: calls.append(args) or fake_stream,
+    )
+
+    with TestClient(main.app) as client:
+        response = client.get(f"/live/{camera_id}")
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0][0:3] == (
+        camera_id,
+        "video:///tmp/done.avi",
+        "Completed video",
+    )
+    assert calls[0][-2:] == (True, True)
 
 
 def test_storage_children_must_be_distinct_and_below_root(tmp_path):
@@ -292,7 +412,7 @@ def test_video_test_displays_plate_crop_and_text_on_one_row(
     def fake_process(video_path, plate_dir, snapshot_dir, **kwargs):
         assert Path(video_path).is_file()
         assert kwargs["frame_step"] == 1
-        assert kwargs["include_candidate_shadow"] is True
+        assert kwargs["include_candidate_shadow"] is False
         Path(plate_dir).mkdir(parents=True)
         Path(snapshot_dir).mkdir(parents=True)
         crop = Path(plate_dir) / "plate-1.jpg"
@@ -306,6 +426,8 @@ def test_video_test_displays_plate_crop_and_text_on_one_row(
                 "width": 1920,
                 "height": 1080,
                 "duration": 1.5,
+                "detector_variant": "yolov8n",
+                "detector_execution_mode": "exclusive-baseline",
             },
             [{
                 "plate": "31-ط-556-74",
@@ -315,24 +437,11 @@ def test_video_test_displays_plate_crop_and_text_on_one_row(
                 "media_status": "complete",
                 "confidence": 0.91,
                 "video_second": 0.75,
-                "ocr_engine": "fast-plate-ocr-cct",
+                "ocr_engine": "hezar-crnn-fa-v2-onnx",
+                "method": "yolov8n-plate-onnx",
+                "engine_lane": "baseline",
                 "valid": True,
                 "needs_review": False,
-            }, {
-                "plate": "ناخوانا",
-                "raw_guess_text": "84-ب-579-32",
-                "raw_guess_norm": "84ب57932",
-                "raw_guess_reason": "position-margin",
-                "plate_path": str(crop),
-                "image_path": str(vehicle),
-                "media_status": "complete",
-                "confidence": 0.43,
-                "video_second": 1.0,
-                "ocr_engine": "fast-plate-ocr-cct",
-                "valid": False,
-                "needs_review": True,
-                "experimental": True,
-                "engine_lane": "candidate-shadow",
             }],
         )
 
@@ -350,10 +459,9 @@ def test_video_test_displays_plate_crop_and_text_on_one_row(
     assert response.status_code == 200
     assert "تصویر پلاک / متن تشخیص‌داده‌شده" in response.text
     assert "31-ط-556-74" in response.text
-    assert "84-ب-579-32" in response.text
-    assert "حدس خام مدل آزمایشی" in response.text
-    assert "position-margin" in response.text
-    assert "fast-plate-ocr-cct" in response.text
+    assert "YOLOv8n" in response.text
+    assert "Shadow/Next اجرا نشدند" in response.text
+    assert "hezar-crnn-fa-v2-onnx" in response.text
     assert "/media?path=" in response.text
     assert "تصویر خودرو" in response.text
     with database.connect() as con:
@@ -361,7 +469,7 @@ def test_video_test_displays_plate_crop_and_text_on_one_row(
             "SELECT plate_norm,plate_image_path,image_path,video_path,"
             "source,plate_region FROM plate_events ORDER BY id"
         ).fetchall()
-    assert len(archived) == 2
+    assert len(archived) == 1
     assert archived[0]["plate_norm"] == "31ط55674"
     assert archived[0]["plate_region"] == "74"
     assert Path(archived[0]["plate_image_path"]).is_file()
@@ -370,6 +478,35 @@ def test_video_test_displays_plate_crop_and_text_on_one_row(
     assert Path(archived[0]["image_path"]).is_relative_to(snapshots)
     assert Path(archived[0]["video_path"]).is_file()
     assert archived[0]["source"] == "video-test"
+
+
+def test_video_test_displays_selected_detector_inference_error(
+    tmp_path,
+    monkeypatch,
+):
+    _as_role(monkeypatch, "operator")
+    video_dir = tmp_path / "videos"
+    monkeypatch.setattr(
+        main,
+        "_configured_storage_child",
+        lambda _setting_key, _default: video_dir,
+    )
+    monkeypatch.setattr(
+        "app.ai.video_test.process_video",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("YOLOv8n inference failed: invalid tensor")
+        ),
+    )
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/ai/video-test/upload",
+            files={"video": ("failure.mp4", b"fixture", "video/mp4")},
+        )
+
+    assert response.status_code == 200
+    assert "خطا: YOLOv8n inference failed: invalid tensor" in response.text
+    assert "هیچ پلاکی در این ویدئو تشخیص داده نشد" not in response.text
 
 
 def test_auto_confirmed_event_requires_operator_action_before_training(
@@ -417,15 +554,24 @@ def test_auto_confirmed_event_requires_operator_action_before_training(
             "FROM plate_events WHERE id=?",
             (event_id,),
         ).fetchone()
-    dashboard_html = main.dashboard_event_row(dashboard_row)
+    return_to = (
+        "/dashboard?video=1&events_camera=7&events_after=3"
+        "&events_snapshot=9&events_page=2&ignored=https://evil.invalid"
+    )
+    dashboard_html = main.dashboard_event_row(dashboard_row, return_to)
     response = main.correct_event_plate(
         event_id,
         SimpleNamespace(client=None),
         "31 ط 556 ایران 74",
+        return_to,
     )
 
     assert "تأیید خودکار مدل" in dashboard_html
     assert response.status_code == 303
+    assert response.headers["location"] == (
+        "/dashboard?video=1&events_camera=7&events_after=3"
+        "&events_snapshot=9&events_page=2&corrected=1"
+    )
     with database.connect() as con:
         event = con.execute(
             "SELECT review_status,confirmation_source,"
@@ -508,7 +654,10 @@ def test_camera_video_upload_registers_live_source_without_batch_processing(
     assert response.status_code == 200
     payload = response.json()
     assert payload["ok"] is True
-    assert payload["redirect"] == "/dashboard?video=1"
+    assert payload["redirect"] == (
+        "/dashboard?video=1&events_camera="
+        f"{payload['camera_id']}"
+    )
     assert elapsed < 3
     with database.connect() as con:
         uploaded = con.execute(
@@ -708,7 +857,14 @@ def test_uploaded_video_flows_through_worker_to_sqlite_and_dashboard(
                     break
                 time.sleep(0.02)
 
-            dashboard = client.get("/dashboard")
+            stream = main.manager.streams.get(virtual_id)
+            for _ in range(250):
+                if stream and stream.state.ended:
+                    break
+                time.sleep(0.02)
+            assert stream is not None
+            assert stream.state.ended is True
+            dashboard = client.get(response.json()["redirect"])
 
             assert event is not None
             assert event["plate_norm"] == "12ب34567"
@@ -737,10 +893,144 @@ def test_uploaded_video_flows_through_worker_to_sqlite_and_dashboard(
                 ).fetchone()[0]
             assert count == 1
             assert "تصویر پلاک / پلاک خوانده‌شده" in dashboard.text
+            assert "پلاک‌های این ویدئو" in dashboard.text
+            assert "پاک‌کردن نمایش" in dashboard.text
+            assert ">۱</b>" in dashboard.text
+            assert "بازپخش فقط نمایشی است" in dashboard.text
+
+            with database.connect() as con:
+                marker = con.execute(
+                    "SELECT video_anpr_started,video_anpr_completed,"
+                    "video_anpr_completed_at FROM cameras WHERE id=?",
+                    (virtual_id,),
+                ).fetchone()
+            assert marker[0:2] == (1, 1)
+            assert marker[2]
+            first_pass_last_frame_at = stream.state.last_frame_at
+
+            replay = client.post(
+                f"/api/cameras/{virtual_id}/playback",
+                json={"action": "play"},
+            )
+            assert replay.status_code == 200
+            for _ in range(250):
+                if (
+                    stream.state.ended
+                    and stream.state.last_frame_at
+                    > first_pass_last_frame_at
+                ):
+                    break
+                time.sleep(0.02)
+            assert stream.state.ended is True
+            assert stream.state.last_frame_at > first_pass_last_frame_at
+            time.sleep(0.50)
+
+            status = client.get(
+                f"/api/cameras/{virtual_id}/status"
+            ).json()
+            assert status["anpr_preview_only"] is True
+            assert status["anpr_completed"] is True
+            assert status["anpr_interrupted"] is False
+            with database.connect() as con:
+                replay_count = con.execute(
+                    "SELECT COUNT(*) FROM plate_events WHERE camera_id=?",
+                    (virtual_id,),
+                ).fetchone()[0]
+            assert replay_count == 1
         assert dashboard.status_code == 200
         assert f"id='anpr-{virtual_id}'" in dashboard.text
         assert "ویدئو: traffic" in dashboard.text
         assert main.manager.streams[virtual_id].latest.startswith(b"\xff\xd8")
+    finally:
+        if virtual_id is not None:
+            main.manager.remove(virtual_id)
+            live_worker.stop_live_camera(virtual_id)
+
+
+def test_uploaded_video_model_failure_at_eof_remains_incomplete(
+    tmp_path,
+    monkeypatch,
+):
+    import app.ai.live_worker as live_worker
+
+    _as_role(monkeypatch, "operator")
+    db_path = tmp_path / "failed-video.db"
+    video_dir = tmp_path / "videos"
+    source_path = tmp_path / "failure.avi"
+    writer = cv2.VideoWriter(
+        str(source_path),
+        cv2.VideoWriter_fourcc(*"MJPG"),
+        10.0,
+        (160, 90),
+    )
+    assert writer.isOpened()
+    for value in (30, 90, 150):
+        writer.write(np.full((90, 160, 3), value, dtype=np.uint8))
+    writer.release()
+
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    database.init_db()
+    with database.connect() as con:
+        source_camera_id = int(con.execute(
+            "INSERT INTO cameras("
+            "name,rtsp_url,enabled,is_demo,lpr_enabled,lpr_confidence,"
+            "frame_step,duplicate_seconds"
+            ") VALUES('Gate','rtsp://gate',1,0,1,50,1,0)"
+        ).lastrowid)
+    monkeypatch.setattr(
+        main,
+        "_configured_storage_child",
+        lambda _setting_key, _default: video_dir,
+    )
+    monkeypatch.setattr(
+        live_worker,
+        "process_frame",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("selected YOLO inference failed at EOF")
+        ),
+    )
+
+    virtual_id = None
+    try:
+        with TestClient(main.app) as client, source_path.open("rb") as source:
+            response = client.post(
+                "/cameras/video-upload",
+                data={"camera_id": str(source_camera_id)},
+                files={"video": ("failure.avi", source, "video/x-msvideo")},
+                headers={"X-Requested-With": "XMLHttpRequest"},
+            )
+            assert response.status_code == 200
+            virtual_id = int(response.json()["camera_id"])
+            stream = main.manager.streams[virtual_id]
+            for _ in range(300):
+                if stream.state.ended:
+                    break
+                time.sleep(0.01)
+
+            assert stream.state.ended is True
+            status = client.get(
+                f"/api/cameras/{virtual_id}/status"
+            ).json()
+            with database.connect() as con:
+                marker = con.execute(
+                    "SELECT video_anpr_started,video_anpr_completed,"
+                    "video_anpr_completed_at FROM cameras WHERE id=?",
+                    (virtual_id,),
+                ).fetchone()
+
+        assert tuple(marker) == (1, 0, "")
+        assert status["anpr_preview_only"] is True
+        assert status["anpr_completed"] is False
+        assert status["anpr_interrupted"] is True
+        assert (
+            status["anpr"]["last_error"]
+            == "RuntimeError: selected YOLO inference failed at EOF"
+        )
+        assert (
+            status["anpr_marker_error"]
+            == "RuntimeError: selected YOLO inference failed at EOF"
+        )
     finally:
         if virtual_id is not None:
             main.manager.remove(virtual_id)

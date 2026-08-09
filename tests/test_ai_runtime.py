@@ -35,13 +35,23 @@ def test_verified_models_and_real_engines_load(tmp_path):
     )
 
     prepared = prepare_models(download=True)
-    status = model_status()
+    status = model_status(selected_detector="yolo11n")
     assert status["detector_ready"]
+    assert status["detector_yolo11n_ready"]
+    assert status["detector_yolov8n_ready"]
     assert status["detector_fallback_ready"]
     assert status["hezar_ready"]
     assert status["crnn_ready"]
     assert status["cnn_ready"]
     assert prepared["detector"] == status["detector_path"]
+    assert (
+        prepared["detector_yolo11n"]
+        == status["detector_yolo11n_path"]
+    )
+    assert (
+        prepared["detector_yolov8n"]
+        == status["detector_yolov8n_path"]
+    )
     assert (
         prepared["detector_fallback"]
         == status["detector_fallback_path"]
@@ -61,10 +71,25 @@ def test_verified_models_and_real_engines_load(tmp_path):
         blank,
         min_confidence=0.05,
         max_results=2,
-        engine_key="integration-test",
+        engine_key="integration-yolo11n",
+        detector_variant="yolo11n",
     )
     assert isinstance(output, list)
-    assert detector_status()["model_loaded"] is True
+    detector_state = detector_status()
+    assert detector_state["model_loaded"] is True
+    assert detector_state["selected_variant"] == "yolo11n"
+
+    output = detect_plates_onnx(
+        blank,
+        min_confidence=0.05,
+        max_results=2,
+        engine_key="integration-yolov8n",
+        detector_variant="yolov8n",
+    )
+    assert isinstance(output, list)
+    detector_state = detector_status()
+    assert detector_state["model_loaded"] is True
+    assert detector_state["selected_variant"] == "yolov8n"
 
     read_plate_hezar_primary(
         np.zeros((32, 384, 3), dtype=np.uint8),

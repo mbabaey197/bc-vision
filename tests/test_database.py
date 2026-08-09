@@ -164,14 +164,24 @@ def test_old_database_migrates_without_data_loss(
             item[1]
             for item in con.execute("PRAGMA table_info(cameras)")
         }
-        assert "city" in camera_columns
-        assert con.execute(
-            "SELECT city FROM cameras WHERE id=7"
-        ).fetchone()[0] == ""
+        assert {
+            "city",
+            "video_anpr_started",
+            "video_anpr_completed",
+            "video_anpr_completed_at",
+        } <= camera_columns
+        assert tuple(con.execute(
+            "SELECT city,video_anpr_started,video_anpr_completed,"
+            "video_anpr_completed_at FROM cameras WHERE id=7"
+        ).fetchone()) == ("", 0, 0, "")
         assert con.execute(
             "SELECT COUNT(*) FROM users "
             "WHERE username='existing'"
         ).fetchone()[0] == 1
+        assert con.execute(
+            "SELECT value FROM settings "
+            "WHERE key='anpr_detector_model'"
+        ).fetchone()[0] == "yolo11n"
         indexes = {
             row[1]
             for row in con.execute(
@@ -203,6 +213,78 @@ def test_new_database_has_no_automatic_demo_camera(
             "SELECT value FROM settings "
             "WHERE key='migration_remove_builtin_demo_camera_v1'"
         ).fetchone()[0] == "1"
+        assert con.execute(
+            "SELECT value FROM settings "
+            "WHERE key='migration_video_anpr_markers_rc29_v1'"
+        ).fetchone()[0] == "1"
+
+
+def test_legacy_video_marker_backfill_is_one_time_and_preserves_interrupts(
+    tmp_path,
+    monkeypatch,
+):
+    import app.database
+
+    db_path = tmp_path / "legacy-video.db"
+    with sqlite3.connect(db_path) as con:
+        con.executescript("""
+        CREATE TABLE settings(
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE cameras(
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            rtsp_url TEXT NOT NULL DEFAULT '',
+            location TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            is_demo INTEGER NOT NULL DEFAULT 0,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        INSERT INTO cameras(id,name,rtsp_url)
+        VALUES(7,'Legacy upload','video:///archive/already-seen.avi');
+        INSERT INTO cameras(id,name,rtsp_url)
+        VALUES(8,'Gate','rtsp://gate');
+        """)
+
+    monkeypatch.setattr(app.database, "DB_PATH", db_path)
+    app.database.init_db()
+
+    with sqlite3.connect(db_path) as con:
+        legacy = con.execute(
+            "SELECT video_anpr_started,video_anpr_completed,"
+            "video_anpr_completed_at FROM cameras WHERE id=7"
+        ).fetchone()
+        live = con.execute(
+            "SELECT video_anpr_started,video_anpr_completed,"
+            "video_anpr_completed_at FROM cameras WHERE id=8"
+        ).fetchone()
+        marker = con.execute(
+            "SELECT value FROM settings "
+            "WHERE key='migration_video_anpr_markers_rc29_v1'"
+        ).fetchone()
+        con.execute(
+            "INSERT INTO cameras("
+            "id,name,rtsp_url,video_anpr_started,video_anpr_completed"
+            ") VALUES(9,'Interrupted RC29 upload',"
+            "'video:///archive/interrupted.avi',1,0)"
+        )
+
+    assert legacy[0:2] == (1, 1)
+    assert legacy[2]
+    assert live == (0, 0, "")
+    assert marker == ("1",)
+
+    # A later startup must not turn an interrupted RC29 pass into a completed
+    # one merely because its durable started marker is already present.
+    app.database.init_db()
+    with sqlite3.connect(db_path) as con:
+        interrupted = con.execute(
+            "SELECT video_anpr_started,video_anpr_completed,"
+            "video_anpr_completed_at FROM cameras WHERE id=9"
+        ).fetchone()
+        assert interrupted == (1, 0, "")
 
 
 def test_media_migration_checks_real_files_before_marking_complete(

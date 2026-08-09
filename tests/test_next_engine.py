@@ -59,7 +59,7 @@ def test_shadow_cct_reuses_baseline_detector_crop(monkeypatch):
         "bbox": (10, 12, 106, 44),
         "confidence": 0.81,
         "detector_confidence": 0.73,
-        "method": "yolov8-onnx-light",
+        "method": "yolov8n-plate-onnx",
     }
     monkeypatch.setattr(
         next_engine,
@@ -83,8 +83,16 @@ def test_shadow_cct_reuses_baseline_detector_crop(monkeypatch):
         lambda: {
             "attempted": True,
             "model_loaded": True,
+            "selected_variant": "yolov8n",
             "error": "",
         },
+    )
+    monkeypatch.setattr(
+        next_engine,
+        "detect_plates_onnx",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("matching YOLOv8n detections must be reused")
+        ),
     )
     monkeypatch.setattr(
         next_engine,
@@ -135,3 +143,41 @@ def test_shadow_cct_reuses_baseline_detector_crop(monkeypatch):
     assert result[0]["detector_confidence"] == 0.73
     assert result[0]["detector_runtime"] == "baseline-yolov8-onnx"
     assert result[0]["crop"] is crop
+
+
+def test_signed_baseline_runtime_selects_matching_detector(monkeypatch):
+    selected = []
+    runtime = {"value": "baseline-yolov8-onnx"}
+    monkeypatch.setattr(
+        next_engine,
+        "verified_next_manifest",
+        lambda: {
+            "engine": "bcvision-rc15",
+            "models": {
+                "detector": {"runtime": runtime["value"]},
+                "ocr": {"runtime": "hezar-ctc-onnx"},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        next_engine,
+        "detect_plates_onnx",
+        lambda *_args, **kwargs: selected.append(
+            kwargs.get("detector_variant")
+        ) or [],
+    )
+    monkeypatch.setattr(
+        next_engine,
+        "detector_status",
+        lambda: {"attempted": True, "model_loaded": True, "error": ""},
+    )
+    frame = np.zeros((64, 128, 3), dtype=np.uint8)
+
+    assert next_engine.process_frame_next(
+        frame,
+        detections=[{"method": "yolo11n-plate-onnx"}],
+    ) == []
+    runtime["value"] = "baseline-yolo11n-onnx"
+    assert next_engine.process_frame_next(frame) == []
+
+    assert selected == ["yolov8n", "yolo11n"]

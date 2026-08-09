@@ -413,22 +413,30 @@ def verified_next_manifest() -> dict:
         ):
             raise ValueError(f"Invalid next-model entry: {name}")
         if name == "detector" and runtime in BASELINE_DETECTOR_RUNTIMES:
-            from .model_manager import (
-                DETECTOR_SHA256,
-                DETECTOR_SIZE,
-                detector_path,
+            from .model_manager import detector_variant_spec
+
+            baseline_variant = (
+                "yolov8n"
+                if runtime == "baseline-yolov8-onnx"
+                else "yolo11n"
+            )
+            baseline = detector_variant_spec(baseline_variant)
+            expected_filename = (
+                "plate_yolov8n.onnx"
+                if baseline_variant == "yolov8n"
+                else "plate_yolo11n.onnx"
             )
 
             if (
-                filename != "plate_yolo11n.onnx"
-                or digest != DETECTOR_SHA256
-                or size != DETECTOR_SIZE
+                filename != expected_filename
+                or digest != baseline["sha256"]
+                or size != baseline["size"]
             ):
                 raise ValueError(
                     "Baseline detector reuse must bind the verified "
                     "BC Vision detector"
                 )
-            model_path = detector_path()
+            model_path = Path(baseline["path"])
         else:
             model_path = _safe_model_path(root, filename)
         if not verify_file(model_path, digest, size):

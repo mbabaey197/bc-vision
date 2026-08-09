@@ -5,6 +5,7 @@ import time
 
 import cv2
 import numpy as np
+import pytest
 
 from app.ai.detector import (
     _EXPECTED_CHARACTER_CENTERS,
@@ -342,12 +343,12 @@ def test_parallel_detector_calls_are_serialized(monkeypatch):
     monkeypatch.setattr(
         onnx_detector,
         "_verified_paths",
-        lambda: (Path("plate_yolo.onnx"), None),
+        lambda detector_variant=None: (Path("plate_yolo.onnx"), None),
     )
     monkeypatch.setattr(
         onnx_detector,
         "_load_session",
-        lambda engine_key=None: entry,
+        lambda engine_key=None, detector_variant=None: entry,
     )
     frame = np.zeros((180, 320, 3), dtype=np.uint8)
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -391,12 +392,12 @@ def test_different_camera_slots_can_run_in_parallel(monkeypatch):
     monkeypatch.setattr(
         onnx_detector,
         "_verified_paths",
-        lambda: (Path("plate_yolo.onnx"), None),
+        lambda detector_variant=None: (Path("plate_yolo.onnx"), None),
     )
     monkeypatch.setattr(
         onnx_detector,
         "_load_session",
-        lambda engine_key=None: entries[engine_key],
+        lambda engine_key=None, detector_variant=None: entries[engine_key],
     )
     frame = np.zeros((180, 320, 3), dtype=np.uint8)
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -450,3 +451,64 @@ def test_successful_empty_yolo_result_uses_geometry_fallback(
 
     frame = np.zeros((180, 320, 3), dtype=np.uint8)
     assert detect_plates(frame) == [candidate]
+
+
+@pytest.mark.parametrize(
+    "selection_kwargs",
+    [
+        {"detector_variant": "yolov8n"},
+        {"engine_key": 42},
+    ],
+)
+def test_selected_detector_never_cascades_after_status_reset(
+    monkeypatch,
+    selection_kwargs,
+):
+    monkeypatch.setattr(
+        "app.ai.detector.detect_plates_onnx",
+        lambda *_args, **kwargs: (
+            []
+            if kwargs["raise_on_error"] is True
+            else (_ for _ in ()).throw(AssertionError("strict mode required"))
+        ),
+    )
+    monkeypatch.setattr(
+        "app.ai.detector.onnx_detector_status",
+        lambda: {
+            # Simulate clear_detector_sessions racing immediately after the
+            # selected inference returned an authoritative empty result.
+            "attempted": False,
+            "model_loaded": False,
+            "selected_variant": "yolo11n",
+        },
+    )
+    monkeypatch.setattr(
+        "app.ai.detector._opencv_candidates",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("selected inference must remain exclusive")
+        ),
+    )
+
+    frame = np.zeros((180, 320, 3), dtype=np.uint8)
+    assert detect_plates(frame, **selection_kwargs) == []
+
+
+def test_selected_detector_propagates_onnx_failure(monkeypatch):
+    def fail(*_args, **kwargs):
+        assert kwargs["raise_on_error"] is True
+        raise RuntimeError("selected YOLO session failed")
+
+    monkeypatch.setattr("app.ai.detector.detect_plates_onnx", fail)
+    monkeypatch.setattr(
+        "app.ai.detector._opencv_candidates",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("failure must not invoke geometry fallback")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="selected YOLO session failed"):
+        detect_plates(
+            np.zeros((180, 320, 3), dtype=np.uint8),
+            engine_key=4,
+            detector_variant="yolov8n",
+        )

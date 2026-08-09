@@ -1,4 +1,5 @@
 from pathlib import Path
+import threading
 import time
 from types import SimpleNamespace
 
@@ -37,9 +38,11 @@ def test_video_emits_one_consensus_event(tmp_path, monkeypatch):
     video_path = tmp_path / "sample.avi"
     _write_video(video_path)
     calls = {"count": 0}
+    variants = []
 
-    def fake_process(frame, threshold):
+    def fake_process(frame, threshold, detector_variant=None):
         calls["count"] += 1
+        variants.append(detector_variant)
         plate = (
             "12-ب-345-67"
             if calls["count"] != 2
@@ -76,8 +79,11 @@ def test_video_emits_one_consensus_event(tmp_path, monkeypatch):
         frame_step=1,
         duplicate_seconds=20,
         min_confidence=0.5,
+        detector_variant="yolo8n",
     )
     assert info["frames"] >= 8
+    assert info["detector_variant"] == "yolov8n"
+    assert set(variants) == {"yolov8n"}
     assert len(events) == 1
     assert events[0]["plate"] == "12-ب-345-67"
     assert events[0]["consensus_votes"] >= 2
@@ -132,27 +138,12 @@ def test_video_media_failure_keeps_result_and_reports_error(
     assert "vehicle: JPEG encoder returned no data" in event["media_error"]
 
 
-def test_video_shadow_fails_closed_once_when_bundle_is_missing(
+def test_video_shadow_request_is_disabled_for_exclusive_selection(
     tmp_path,
     monkeypatch,
 ):
     video_path = tmp_path / "sample.avi"
     _write_video(video_path, frames=3)
-    monkeypatch.setattr(
-        video_test,
-        "next_models_status",
-        lambda: {
-            "ready": False,
-            "error": "signed candidate bundle is missing",
-        },
-    )
-    monkeypatch.setattr(
-        video_test.engine_router,
-        "process",
-        lambda *_args, **_kwargs: pytest.fail(
-            "router must not run without a verified bundle"
-        ),
-    )
     monkeypatch.setattr(
         video_test,
         "process_frame",
@@ -169,24 +160,43 @@ def test_video_shadow_fails_closed_once_when_bundle_is_missing(
 
     assert events == []
     assert info["candidate_shadow_requested"] is True
-    assert "signed candidate bundle is missing" in (
-        info["candidate_shadow_error"]
-    )
+    assert info["candidate_shadow_enabled"] is False
+    assert info["exclusive_detector"] is True
+    assert info["detector_execution_mode"] == "exclusive-baseline"
+    assert "انحصاری" in info["candidate_shadow_error"]
 
 
-def test_video_shadow_complete_consensus_is_auto_confirmed(
+def test_video_selected_inference_failure_is_not_treated_as_no_plate(
+    tmp_path,
+    monkeypatch,
+):
+    video_path = tmp_path / "failure.avi"
+    _write_video(video_path, frames=2)
+
+    def fail(*_args, **kwargs):
+        assert kwargs["detector_variant"] == "yolov8n"
+        raise RuntimeError("YOLOv8n inference failed")
+
+    monkeypatch.setattr(video_test, "process_frame", fail)
+
+    with pytest.raises(RuntimeError, match="YOLOv8n inference failed"):
+        video_test.process_video(
+            video_path,
+            tmp_path / "plates",
+            tmp_path / "snapshots",
+            frame_step=1,
+            detector_variant="yolov8n",
+        )
+
+
+def test_video_shadow_request_cannot_affect_selected_baseline_events(
     tmp_path,
     monkeypatch,
 ):
     video_path = tmp_path / "sample.avi"
     _write_video(video_path, frames=6)
-    monkeypatch.setattr(
-        video_test,
-        "next_models_status",
-        lambda: {"ready": True, "error": ""},
-    )
 
-    def candidate(frame):
+    def selected_baseline(frame, *_args, **_kwargs):
         return {
             "plate": "31-ط-556-74",
             "plate_norm": "31ط55674",
@@ -199,40 +209,40 @@ def test_video_shadow_complete_consensus_is_auto_confirmed(
             "quality_score": 0.80,
             "bbox": (80, 80, 240, 120),
             "crop": frame[80:120, 80:240].copy(),
-            "method": "candidate-test",
-            "ocr_engine": "fast-plate-ocr-cct",
+            "method": "yolov8n-plate-onnx",
+            "ocr_engine": "hezar-crnn-fa-v2-onnx",
         }
 
     monkeypatch.setattr(
-        video_test.engine_router,
-        "process",
-        lambda frame, **_kwargs: SimpleNamespace(
-            primary=[],
-            shadow=[candidate(frame)],
-            error="",
-        ),
+        video_test,
+        "process_frame",
+        lambda frame, *_args, **kwargs: [
+            selected_baseline(frame, **kwargs)
+        ],
     )
 
-    _, events = video_test.process_video(
+    info, events = video_test.process_video(
         video_path,
         tmp_path / "plates",
         tmp_path / "snapshots",
         frame_step=1,
         include_candidate_shadow=True,
+        detector_variant="yolov8n",
     )
 
-    confirmed = [
-        event for event in events
-        if event.get("auto_confirmed")
-    ]
-    assert len(confirmed) == 1
-    assert confirmed[0]["plate_norm"] == "31ط55674"
-    assert confirmed[0]["read_status"] == "auto-confirmed"
-    assert confirmed[0]["needs_review"] is True
-    assert confirmed[0]["experimental"] is True
+    assert len(events) == 1
+    assert events[0]["plate_norm"] == "31ط55674"
+    assert events[0]["engine_lane"] == "baseline"
+    assert events[0]["detector_variant"] == "yolov8n"
+    assert events[0]["detector_selection_exclusive"] is True
+    assert not events[0].get("experimental")
+    assert info["candidate_shadow_enabled"] is False
 
 
-def test_uploaded_video_stream_loops_without_becoming_offline(tmp_path, monkeypatch):
+def test_uploaded_video_stream_pauses_at_end_for_stable_event_count(
+    tmp_path,
+    monkeypatch,
+):
     video_path = tmp_path / "loop.avi"
     _write_video(video_path, frames=3)
     stream = CameraStream(
@@ -246,14 +256,411 @@ def test_uploaded_video_stream_loops_without_becoming_offline(tmp_path, monkeypa
 
     stream.start()
     for _ in range(50):
-        if len(published) >= 5:
+        if stream.state.ended:
+            break
+        time.sleep(0.02)
+
+    assert len(published) == 3
+    assert stream.state.ended is True
+    assert stream.state.paused is True
+
+    # Replaying is explicit and the decoder continues producing preview frames.
+    # ANPR replay suppression is covered separately with the real publish path.
+    assert stream.resume() is True
+    for _ in range(50):
+        if len(published) > 3:
             break
         time.sleep(0.02)
     stream.stop()
     stream.thread.join(timeout=2)
 
-    assert len(published) >= 5
+    assert len(published) > 3
     assert not stream.thread.is_alive()
+
+
+def test_completed_uploaded_video_replays_preview_without_anpr_submission(
+    tmp_path,
+    monkeypatch,
+):
+    video_path = tmp_path / "one-anpr-pass.avi"
+    _write_video(video_path, frames=4)
+    marker_calls = []
+    submitted = []
+    stream = CameraStream(
+        191,
+        f"video://{video_path}",
+        "One ANPR pass",
+        fps=30,
+        video_anpr_state_callback=(
+            lambda camera_id, state: marker_calls.append(
+                (camera_id, state)
+            )
+        ),
+    )
+    published = []
+    original_publish = stream._publish
+
+    def publish(frame):
+        published.append(frame.copy())
+        original_publish(frame)
+
+    monkeypatch.setattr(stream, "_publish", publish)
+    monkeypatch.setattr(stream, "_encode", lambda _frame: b"jpeg")
+    monkeypatch.setattr(
+        "app.ai.live_worker.submit_live_frame",
+        lambda camera_id, name, frame: submitted.append(
+            (camera_id, name, frame.copy())
+        ),
+    )
+    monkeypatch.setattr(
+        "app.ai.live_worker.drain_live_video_pass",
+        lambda *_args, **_kwargs: {"ok": True, "error": ""},
+    )
+
+    try:
+        stream.start()
+        for _ in range(300):
+            if stream.state.ended:
+                break
+            time.sleep(0.01)
+        assert stream.state.ended is True
+        time.sleep(0.15)
+        first_preview_frames = len(published)
+        first_anpr_frames = len(submitted)
+
+        assert first_preview_frames == 4
+        assert first_anpr_frames >= 1
+        assert marker_calls == [
+            (191, "started"),
+            (191, "completed"),
+        ]
+        assert stream.state.anpr_preview_only is True
+        assert stream.state.anpr_completed is True
+        assert stream.state.anpr_interrupted is False
+
+        assert stream.resume() is True
+        for _ in range(300):
+            if (
+                stream.state.ended
+                and len(published) > first_preview_frames
+            ):
+                break
+            time.sleep(0.01)
+        assert stream.state.ended is True
+        time.sleep(0.15)
+
+        assert len(published) == first_preview_frames + 4
+        assert len(submitted) == first_anpr_frames
+        assert marker_calls == [
+            (191, "started"),
+            (191, "completed"),
+        ]
+    finally:
+        stream.stop()
+        if stream.thread:
+            stream.thread.join(timeout=2)
+        if stream._anpr_thread:
+            stream._anpr_thread.join(timeout=2)
+
+
+def test_uploaded_video_failure_at_eof_stays_incomplete_and_fail_closed(
+    tmp_path,
+    monkeypatch,
+):
+    video_path = tmp_path / "failed-anpr-pass.avi"
+    _write_video(video_path, frames=3)
+    marker_calls = []
+    submitted = []
+    stream = CameraStream(
+        193,
+        f"video://{video_path}",
+        "Failed ANPR pass",
+        fps=30,
+        video_anpr_state_callback=(
+            lambda camera_id, state: marker_calls.append(
+                (camera_id, state)
+            )
+        ),
+    )
+    monkeypatch.setattr(stream, "_encode", lambda _frame: b"jpeg")
+    monkeypatch.setattr(
+        "app.ai.live_worker.submit_live_frame",
+        lambda *_args, **_kwargs: submitted.append(True),
+    )
+    monkeypatch.setattr(
+        "app.ai.live_worker.drain_live_video_pass",
+        lambda *_args, **_kwargs: {
+            "ok": False,
+            "error": "RuntimeError: selected YOLO inference failed",
+        },
+    )
+
+    try:
+        stream.start()
+        for _ in range(300):
+            if stream.state.ended:
+                break
+            time.sleep(0.01)
+
+        assert stream.state.ended is True
+        assert submitted
+        assert marker_calls == [(193, "started")]
+        assert stream.state.anpr_completed is False
+        assert stream.state.anpr_preview_only is True
+        assert stream.state.anpr_interrupted is True
+        assert (
+            stream.state.anpr_marker_error
+            == "RuntimeError: selected YOLO inference failed"
+        )
+
+        first_submissions = len(submitted)
+        assert stream.resume() is True
+        for _ in range(300):
+            if stream.state.ended:
+                break
+            time.sleep(0.01)
+        time.sleep(0.05)
+
+        assert len(submitted) == first_submissions
+        assert marker_calls == [(193, "started")]
+    finally:
+        stream.stop()
+        if stream.thread:
+            stream.thread.join(timeout=2)
+        if stream._anpr_thread:
+            stream._anpr_thread.join(timeout=2)
+
+
+def test_stream_stop_with_local_pending_frame_cannot_complete_marker(
+    monkeypatch,
+):
+    marker_calls = []
+    stream = CameraStream(
+        194,
+        "video:///tmp/pending-stop.avi",
+        "Pending stop",
+        video_anpr_state_callback=(
+            lambda camera_id, state: marker_calls.append(
+                (camera_id, state)
+            )
+        ),
+    )
+    assert stream._ensure_video_anpr_started() is True
+    with stream._anpr_condition:
+        stream._anpr_pending_frame = np.zeros(
+            (24, 32, 3),
+            dtype=np.uint8,
+        )
+    monkeypatch.setattr(
+        "app.ai.live_worker.drain_live_video_pass",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("aborted local handoff must not reach worker drain")
+        ),
+    )
+
+    stream.stop()
+    stream._complete_video_anpr_pass()
+
+    assert marker_calls == [(194, "started")]
+    assert stream.state.anpr_completed is False
+    assert stream.state.anpr_preview_only is True
+    assert stream.state.anpr_interrupted is True
+    assert "aborted by stream stop" in stream.state.anpr_marker_error
+
+
+def test_stream_stop_during_worker_drain_cannot_complete_marker(
+    monkeypatch,
+):
+    marker_calls = []
+    drain_entered = threading.Event()
+    allow_drain_return = threading.Event()
+    stream = CameraStream(
+        195,
+        "video:///tmp/drain-stop.avi",
+        "Drain stop",
+        video_anpr_state_callback=(
+            lambda camera_id, state: marker_calls.append(
+                (camera_id, state)
+            )
+        ),
+    )
+    assert stream._ensure_video_anpr_started() is True
+
+    def drain(*_args, **_kwargs):
+        drain_entered.set()
+        assert allow_drain_return.wait(2.0)
+        return {"ok": True, "error": ""}
+
+    monkeypatch.setattr(
+        "app.ai.live_worker.drain_live_video_pass",
+        drain,
+    )
+    completion = threading.Thread(
+        target=stream._complete_video_anpr_pass,
+    )
+    completion.start()
+    assert drain_entered.wait(1.0)
+
+    stream.stop()
+    allow_drain_return.set()
+    completion.join(timeout=2.0)
+
+    assert not completion.is_alive()
+    assert marker_calls == [(195, "started")]
+    assert stream.state.anpr_completed is False
+    assert stream.state.anpr_preview_only is True
+    assert "aborted by stream stop" in stream.state.anpr_marker_error
+
+
+def test_stream_stop_cannot_interleave_with_completion_callback(
+    monkeypatch,
+):
+    marker_calls = []
+    callback_entered = threading.Event()
+    allow_callback_return = threading.Event()
+
+    def marker_callback(camera_id, state):
+        marker_calls.append((camera_id, state))
+        if state == "completed":
+            callback_entered.set()
+            assert allow_callback_return.wait(2.0)
+
+    stream = CameraStream(
+        196,
+        "video:///tmp/callback-stop.avi",
+        "Callback stop",
+        video_anpr_state_callback=marker_callback,
+    )
+    assert stream._ensure_video_anpr_started() is True
+    monkeypatch.setattr(
+        "app.ai.live_worker.drain_live_video_pass",
+        lambda *_args, **_kwargs: {"ok": True, "error": ""},
+    )
+    completion = threading.Thread(
+        target=stream._complete_video_anpr_pass,
+    )
+    completion.start()
+    assert callback_entered.wait(1.0)
+
+    stopped = threading.Event()
+    stopping = threading.Thread(
+        target=lambda: (stream.stop(), stopped.set()),
+    )
+    stopping.start()
+    # Completion already owns the condition lock, so stop cannot latch an
+    # abort between the durable callback and the in-memory state commit.
+    assert not stopped.wait(0.10)
+    allow_callback_return.set()
+    completion.join(timeout=2.0)
+    stopping.join(timeout=2.0)
+
+    assert not completion.is_alive()
+    assert not stopping.is_alive()
+    assert stopped.is_set()
+    assert marker_calls == [(196, "started"), (196, "completed")]
+    assert stream.state.anpr_completed is True
+    assert stream.state.anpr_preview_only is True
+    assert stream.state.anpr_interrupted is False
+    assert stream.state.anpr_marker_error == ""
+
+
+def test_decoder_reopen_after_cooldown_is_preview_only_for_anpr(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "decoder-reopen.avi"
+    source.write_bytes(b"decoder fixture")
+    frame = np.full((24, 32, 3), 90, dtype=np.uint8)
+    captures = []
+
+    class ReopeningCapture:
+        def __init__(self, pass_number):
+            self.pass_number = pass_number
+            self.reads = 0
+            self.released = False
+
+        def isOpened(self):
+            return True
+
+        def set(self, *_args):
+            return True
+
+        def get(self, _property):
+            return 120.0
+
+        def read(self):
+            self.reads += 1
+            if self.pass_number == 1:
+                if self.reads == 1:
+                    return True, frame.copy()
+                raise RuntimeError("decoder crashed after a published frame")
+            if self.reads <= 2:
+                return True, frame.copy()
+            return False, None
+
+        def release(self):
+            self.released = True
+
+    def open_capture(*_args):
+        capture = ReopeningCapture(len(captures) + 1)
+        captures.append(capture)
+        return capture
+
+    monkeypatch.setattr(streams.cv2, "VideoCapture", open_capture)
+    submitted = []
+    marker_calls = []
+    monkeypatch.setattr(
+        "app.ai.live_worker.submit_live_frame",
+        lambda camera_id, name, submitted_frame: submitted.append(
+            (camera_id, name, submitted_frame.copy())
+        ),
+    )
+    stream = CameraStream(
+        192,
+        f"video://{source}",
+        "Decoder reopen",
+        fps=120,
+        video_anpr_state_callback=(
+            lambda camera_id, state: marker_calls.append(
+                (camera_id, state)
+            )
+        ),
+    )
+    published = []
+    original_publish = stream._publish
+
+    def publish(published_frame):
+        published.append(published_frame.copy())
+        original_publish(published_frame)
+
+    monkeypatch.setattr(stream, "_publish", publish)
+    monkeypatch.setattr(stream, "_encode", lambda _frame: b"jpeg")
+
+    try:
+        stream.start()
+        # The production retry path waits one second after the decoder error.
+        # Reaching EOF on capture two proves the reopen happened after it.
+        for _ in range(400):
+            if stream.state.ended and len(captures) >= 2:
+                break
+            time.sleep(0.01)
+        assert stream.state.ended is True
+        time.sleep(0.10)
+    finally:
+        stream.stop()
+        if stream.thread:
+            stream.thread.join(timeout=2)
+        if stream._anpr_thread:
+            stream._anpr_thread.join(timeout=2)
+
+    assert len(captures) == 2
+    assert all(capture.released for capture in captures)
+    assert len(published) == 3
+    assert len(submitted) == 1
+    assert marker_calls == [(192, "started")]
+    assert stream.state.anpr_preview_only is True
+    assert stream.state.anpr_completed is False
+    assert stream.state.anpr_interrupted is True
 
 
 def test_uploaded_video_uses_ffmpeg_fallback_when_opencv_has_no_frames(

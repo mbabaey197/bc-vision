@@ -375,6 +375,70 @@ def test_signed_cct_can_reuse_verified_baseline_detector(
     assert status["detector_path"] == str(baseline)
 
 
+def test_signed_cct_yolov8_runtime_binds_yolov8_detector(
+    tmp_path,
+    monkeypatch,
+):
+    from app.ai import model_manager
+
+    baseline = tmp_path / "data" / "models" / "plate" / "plate_yolov8n.onnx"
+    baseline.parent.mkdir(parents=True)
+    baseline.write_bytes(b"verified-yolov8n-baseline")
+    digest = hashlib.sha256(baseline.read_bytes()).hexdigest()
+    monkeypatch.setattr(
+        model_manager,
+        "YOLOV8N_DETECTOR_SHA256",
+        digest.upper(),
+    )
+    monkeypatch.setattr(
+        model_manager,
+        "YOLOV8N_DETECTOR_SIZE",
+        baseline.stat().st_size,
+    )
+    monkeypatch.setattr(
+        model_manager,
+        "yolov8n_detector_path",
+        lambda: baseline,
+    )
+    _signed_bundle(
+        tmp_path,
+        monkeypatch,
+        engine="bcvision-rc15",
+        detector_overrides={
+            "runtime": "baseline-yolov8-onnx",
+            "reuse_verified_baseline": True,
+            "filename": "plate_yolov8n.onnx",
+            "sha256": digest,
+            "size": baseline.stat().st_size,
+        },
+        ocr_overrides={
+            "runtime": "fast-plate-ocr-cct",
+            "alphabet": "0123456789ابپتثجدزژسشصطعفقکگلمنوهیDS_",
+            "max_plate_slots": 8,
+            "input_width": 128,
+            "input_height": 64,
+            "input_layout": "nhwc",
+            "input_dtype": "uint8",
+            "image_color_mode": "rgb",
+            "keep_aspect_ratio": False,
+            "interpolation": "linear",
+            "padding_color": [114, 114, 114],
+            "min_confidence": 0.58,
+            "min_position_confidence": 0.42,
+            "min_position_margin": 0.06,
+            "min_hypothesis_margin": 0.025,
+            "beam_width": 16,
+            "top_k": 5,
+        },
+    )
+
+    status = next_models.next_models_status()
+
+    assert status["ready"] is True
+    assert status["detector_runtime"] == "baseline-yolov8-onnx"
+    assert status["detector_path"] == str(baseline)
+
+
 def test_incomplete_ppyoloe_r_contract_fails_closed(
     tmp_path,
     monkeypatch,
