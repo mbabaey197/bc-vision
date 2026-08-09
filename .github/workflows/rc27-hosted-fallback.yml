@@ -25,6 +25,7 @@ on:
       - "installer/Runtime_Pointer_Guard.iss"
       - "scripts/verify_runtime_contract.py"
       - "scripts/verify_installed_runtime.py"
+      - ".github/workflows/rc27-hosted-fallback.yml"
 
 permissions:
   contents: read
@@ -424,6 +425,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           $ErrorActionPreference = "Stop"
           function Assert-ReleaseAssetsMatchChecksums(
