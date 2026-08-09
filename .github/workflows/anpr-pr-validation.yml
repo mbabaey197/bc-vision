@@ -9,12 +9,17 @@ on:
       - "app/**"
       - "installer/**"
       - "launcher.py"
+      - "runtime_payload.py"
       - "VERSION"
+      - "FAST_UPDATE_BASE_VERSION"
+      - "RUNTIME_ABI"
+      - "RUNTIME_CONTRACT.json"
       - "requirements-lock.txt"
       - "requirements-ai-lock.txt"
       - "requirements-test.txt"
       - "requirements-cct-training.txt"
       - "tests/**"
+      - "scripts/**"
       - "tools/**"
       - "training/**"
       - "docs/**"
@@ -33,6 +38,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
@@ -69,6 +76,8 @@ jobs:
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
@@ -85,7 +94,9 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}\bcvision-models
-          key: bcvision-anpr-models-v3-yolo11n-hezar
+          key: bcvision-anpr-models-v4-yolo11n-yolov8n-hezar
+          restore-keys: |
+            bcvision-anpr-models-v3-yolo11n-hezar
       - name: Install AI runtime
         shell: cmd
         run: |
@@ -98,6 +109,7 @@ jobs:
         env:
           BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\ai-runtime
           BCVISION_PLATE_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo11n.onnx
+          BCVISION_PLATE_YOLOV8N_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolov8n.onnx
           BCVISION_PLATE_FALLBACK_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo_fallback.onnx
           BCVISION_CRNN_MODEL: ${{ runner.temp }}\bcvision-models\crnn\ocr_crnn.onnx
           BCVISION_CNN_MODEL: ${{ runner.temp }}\bcvision-models\cnn\ocr_cnn.onnx

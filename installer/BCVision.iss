@@ -1,20 +1,21 @@
 #define MyAppName "BC Vision"
-#define MyAppVersion "2.2.0-rc28.1"
+#define MyAppVersion "2.2.0-rc29"
 #define MyAppPublisher "Gilas Abi Alborz"
 #define MyAppExeName "BCVision.exe"
+#define RequireExistingInstall 0
 
 [Setup]
 AppId={{12FC1F39-4F29-4D61-A81D-66BD900AA4E8}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-VersionInfoVersion=2.2.0.281
+VersionInfoVersion=2.2.0.290
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\BC Vision
 DefaultGroupName=BC Vision
 DisableProgramGroupPage=yes
 UsePreviousAppDir=yes
 OutputDir=..\setup_output
-OutputBaseFilename=BCVision_RC28.1_Setup
+OutputBaseFilename=BCVision_RC29_Setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -27,7 +28,7 @@ SetupLogging=yes
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
 [Files]
-Source: "..\dist\BCVision\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\dist\BCVision\*"; DestDir: "{app}"; Excludes: "runtime\current.txt,runtime\last-known-good.txt,runtime\previous.txt,runtime\pending.txt,runtime\failed.txt"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [InstallDelete]
 Type: files; Name: "{app}\license_public_key.pem"
@@ -44,3 +45,6 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Run BC Vision"; Flags: nowait postinstall skipifsilent
+
+[Code]
+#include "Runtime_Pointer_Guard.iss"

@@ -29,8 +29,8 @@ from .plate_rules import (
     plausible_plate,
 )
 
-# The production detector runs YOLO11n through ONNX Runtime, without importing
-# Ultralytics. This compatibility name remains for older extensions.
+# The selectable production detectors run through ONNX Runtime without
+# importing Ultralytics. This compatibility name remains for older extensions.
 YOLO = None
 
 _models: dict[int, object] = {}
@@ -109,22 +109,25 @@ def detector_status() -> dict:
     light = onnx_detector_status()
     try:
         from .model_manager import (
-            DETECTOR_SHA256,
-            DETECTOR_SIZE,
-            detector_path,
+            detector_variant_spec,
             verify_file,
         )
-        verified_path = detector_path()
+        selected_variant = light.get("selected_variant") or "yolo11n"
+        spec = detector_variant_spec(selected_variant)
+        verified_path = Path(spec["path"])
         model_exists = verify_file(
             verified_path,
-            DETECTOR_SHA256,
-            DETECTOR_SIZE,
+            spec["sha256"],
+            spec["size"],
         )
     except Exception:
+        selected_variant = "yolo11n"
+        spec = {"method": "yolo11n-plate-onnx"}
         verified_path = None
         model_exists = False
     return {
-        "engine": "yolo11n-plate-onnx",
+        "engine": light.get("engine") or spec["method"],
+        "selected_variant": selected_variant,
         "onnx_model_loaded": bool(light.get("model_loaded")),
         "onnx_model_path": light.get("primary_path", ""),
         "onnx_fallback_loaded": bool(
@@ -905,14 +908,20 @@ def detect_plates(
     max_results: int = 8,
     engine_key=None,
     exclusion_mask=None,
+    detector_variant=None,
 ):
     if frame is None or getattr(frame, "size", 0) == 0:
         return []
+    selected_inference = bool(
+        engine_key is not None or detector_variant is not None
+    )
     light_rows = detect_plates_onnx(
         frame,
         min_confidence=min_confidence,
         max_results=min(max_results, 4),
         engine_key=engine_key,
+        detector_variant=detector_variant,
+        raise_on_error=selected_inference,
     )
     if light_rows:
         return _exclude_static_overlays(
@@ -920,12 +929,16 @@ def detect_plates(
             exclusion_mask,
         )[:max_results]
 
-    light_status = onnx_detector_status()
-    if light_status.get("model_loaded") and engine_key is not None:
+    if selected_inference:
         # A loaded neural detector returning no plate is authoritative in
-        # live mode. Geometric fallback is CPU-heavy and turns doors,
-        # windows and wall textures into false plate rectangles.
+        # selectable/live mode. A load failure is also surfaced instead of
+        # silently changing the detector being compared. Geometry fallback
+        # remains available only to legacy diagnostic calls. This decision is
+        # based on the per-call contract, never mutable process-global status,
+        # so clearing the session cache during a switch cannot open a fallback
+        # race.
         return []
+    light_status = onnx_detector_status()
     if light_status.get("model_loaded"):
         fallback = _opencv_candidates(
             frame,

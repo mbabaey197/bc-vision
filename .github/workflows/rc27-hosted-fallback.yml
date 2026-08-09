@@ -3,26 +3,31 @@ name: Windows Hosted Build and Release
 # Trusted main/manual release: test, build, install, update and publish.
 
 on:
+  # Full PyInstaller/Setup releases run automatically only when a stable
+  # runtime-contract input changes. Ordinary VERSION/app updates use the fast
+  # workflow; manual dispatch remains a recovery path.
   workflow_dispatch:
   push:
     branches:
       - main
     paths:
-      - "app/**"
-      - "installer/**"
-      - "tests/**"
-      - "launcher.py"
-      - "VERSION"
+      - "FAST_UPDATE_BASE_VERSION"
+      - "RUNTIME_ABI"
+      - "RUNTIME_CONTRACT.json"
       - "BUILD_PORTABLE_EXE.bat"
+      - "launcher.py"
+      - "runtime_payload.py"
+      - "app/database.py"
       - "requirements-lock.txt"
       - "requirements-ai-lock.txt"
-      - "requirements-test.txt"
-      - "README_FA.txt"
-      - "THIRD_PARTY_NOTICES.md"
-      - ".github/workflows/rc27-hosted-fallback.yml"
+      - "installer/BCVision.iss"
+      - "installer/BCVision_Update.iss"
+      - "installer/Runtime_Pointer_Guard.iss"
+      - "scripts/verify_runtime_contract.py"
+      - "scripts/verify_installed_runtime.py"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: windows-release-${{ github.ref }}
@@ -32,21 +37,56 @@ jobs:
   build-and-verify:
     runs-on: windows-latest
     timeout-minutes: 120
+    permissions:
+      contents: read
+      statuses: write
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      release_label: ${{ steps.version.outputs.label }}
     env:
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUTF8: "1"
 
     steps:
+      - name: Publish pending full-release status
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $target = (
+            "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/" +
+            "$env:GITHUB_RUN_ID"
+          )
+          gh api --method POST `
+            "repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" `
+            -f state="pending" `
+            -f context="bcvision/full-release" `
+            -f description="Full release build and verification are running" `
+            -f target_url=$target | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Checkout exact candidate commit
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Read candidate version
         id: version
         shell: pwsh
         run: |
+          if ("${{ github.ref }}" -ne "refs/heads/main") {
+            throw "Full releases are allowed only from main."
+          }
           $value = (Get-Content VERSION -Raw).Trim()
+          $baseVersion = (Get-Content FAST_UPDATE_BASE_VERSION -Raw).Trim()
           if ($value -notmatch '^\d+\.\d+\.\d+-rc(?<rc>\d+(?:\.\d+)*)$') {
             throw "Unsupported candidate version: $value"
+          }
+          if ($value -ne $baseVersion) {
+            throw (
+              "A full release must equal FAST_UPDATE_BASE_VERSION " +
+              "($baseVersion); got $value."
+            )
           }
           "value=$value" >> $env:GITHUB_OUTPUT
           "label=RC$($Matches.rc)" >> $env:GITHUB_OUTPUT
@@ -63,6 +103,8 @@ jobs:
       - name: Run source regression
         shell: pwsh
         run: |
+          python scripts\verify_runtime_contract.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip install --disable-pip-version-check -r requirements-test.txt --quiet
           python -m compileall -q app launcher.py
           python -m pytest -q tests --timeout=120 --timeout-method=thread --durations=20
@@ -93,18 +135,117 @@ jobs:
           & $iscc installer\BCVision_Update.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Verify clean install, update and persistent data
+      - name: Download and authenticate immutable RC28.1 Setup
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $expectedCommit = "5032e5a5801af5368af4c85476cbefbd1cd563e1"
+          $expectedSetupSha = "E64DFCC90D8C9D17742591C7254D7176CB088C60F38C58C5930D42CAA529C2EC"
+          $tagCommit = (
+            gh api `
+              "repos/$env:GITHUB_REPOSITORY/commits/v2.2.0-rc28.1" `
+              --jq '.sha'
+          ).Trim()
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -ne $expectedCommit) {
+            throw (
+              "RC28.1 tag trust check failed. Expected $expectedCommit; " +
+              "resolved $tagCommit."
+            )
+          }
+          New-Item -ItemType Directory previous-release -Force | Out-Null
+          gh release download "v2.2.0-rc28.1" `
+            --pattern "BCVision_RC28.1_Setup.exe" `
+            --pattern "SHA256SUMS.txt" `
+            --dir previous-release
+          if ($LASTEXITCODE -ne 0) {
+            throw "Immutable RC28.1 release assets could not be downloaded."
+          }
+          $setup = Get-Item previous-release\BCVision_RC28.1_Setup.exe
+          $escapedName = [regex]::Escape($setup.Name)
+          $checksumLine = Get-Content previous-release\SHA256SUMS.txt |
+            Where-Object {
+              $_ -match "^(?<hash>[0-9a-fA-F]{64})\s+\*?$escapedName$"
+            } | Select-Object -First 1
+          $checksumMatch = [regex]::Match(
+            [string]$checksumLine,
+            "^(?<hash>[0-9a-fA-F]{64})"
+          )
+          if (-not $checksumMatch.Success) {
+            throw "RC28.1 Setup is absent from its immutable checksum file."
+          }
+          $actual = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash
+          $releasedHash = $checksumMatch.Groups['hash'].Value
+          if ($releasedHash -ne $expectedSetupSha -or
+              $actual -ne $expectedSetupSha) {
+            throw (
+              "RC28.1 Setup pinned SHA-256 verification failed. " +
+              "Expected $expectedSetupSha; release metadata $releasedHash; " +
+              "downloaded file $actual."
+            )
+          }
+
+      - name: Verify clean RC29 Setup and offline ANPR
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (Get-Content VERSION -Raw).Trim()
+          $releaseLabel = "${{ steps.version.outputs.label }}"
+          $installDir = Join-Path $env:RUNNER_TEMP "bcvision-clean-rc29"
+          $dataDir = Join-Path $env:RUNNER_TEMP "bcvision-clean-data"
+          $resultPath = Join-Path $env:RUNNER_TEMP "clean-rc29.json"
+          $setup = Resolve-Path "setup_output\BCVision_${releaseLabel}_Setup.exe"
+          $install = Start-Process -FilePath $setup -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+            "/DIR=$installDir"
+          ) -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            throw "Clean RC29 Setup exited with $($install.ExitCode)"
+          }
+          $test = Start-Process -FilePath "$installDir\BCVision.exe" `
+            -ArgumentList @(
+              "--self-test", "--verify-anpr",
+              "--self-test-data-dir", $dataDir,
+              "--self-test-output", $resultPath
+            ) -Wait -PassThru
+          if ($test.ExitCode -ne 0) { throw "Clean RC29 self-test failed" }
+          $result = Get-Content $resultPath -Raw | ConvertFrom-Json
+          if (-not $result.ok -or -not $result.anpr_ready -or
+              $result.version -ne $version -or
+              $result.runtime_version -ne $version -or
+              $result.runtime_source -ne "external") {
+            throw "Clean RC29 Setup did not activate the packaged runtime"
+          }
+          $uninstaller = Get-ChildItem $installDir -Filter "unins*.exe" |
+            Select-Object -First 1
+          if (-not $uninstaller) { throw "Clean Setup has no uninstaller" }
+          $uninstall = Start-Process $uninstaller.FullName -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+          ) -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Clean uninstall failed" }
+
+      - name: Verify immutable RC28.1 to RC29 upgrade and persistent data
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $version = (Get-Content VERSION -Raw).Trim()
           $releaseLabel = "${{ steps.version.outputs.label }}"
           $installDir = Join-Path $env:RUNNER_TEMP "bcvision-install"
-          $dataDir = Join-Path $env:RUNNER_TEMP "bcvision-persistent-data"
-          $setup = Resolve-Path "setup_output\BCVision_${releaseLabel}_Setup.exe"
+          $bootstrapDir = Join-Path $env:RUNNER_TEMP "bcvision-bootstrap"
+          $dataDir = Join-Path $env:RUNNER_TEMP "bcvision-custom-data"
+          $setup = Resolve-Path "previous-release\BCVision_RC28.1_Setup.exe"
           $update = Resolve-Path "setup_output\BCVision_${releaseLabel}_Update.exe"
           $firstResult = Join-Path $env:RUNNER_TEMP "self-test-install.json"
           $updatedResult = Join-Path $env:RUNNER_TEMP "self-test-update.json"
+          New-Item -ItemType Directory $bootstrapDir,$dataDir -Force |
+            Out-Null
+          @{storage_root=$dataDir} | ConvertTo-Json |
+            Set-Content (Join-Path $bootstrapDir "storage_config.json") `
+              -Encoding utf8
+          $storageConfigHash = (
+            Get-FileHash (Join-Path $bootstrapDir "storage_config.json")
+          ).Hash
 
           $install = Start-Process -FilePath $setup -ArgumentList @(
             "/VERYSILENT",
@@ -116,11 +257,10 @@ jobs:
             throw "Installer exited with $($install.ExitCode)"
           }
 
-          $env:BCVISION_DATA_DIR = $dataDir
+          $env:BCVISION_DATA_DIR = $bootstrapDir
           $env:BCVISION_SKIP_MODEL_PREP = "1"
           $first = Start-Process -FilePath "$installDir\BCVision.exe" -ArgumentList @(
             "--self-test",
-            "--verify-anpr",
             "--self-test-output",
             $firstResult
           ) -Wait -PassThru
@@ -128,15 +268,27 @@ jobs:
             throw "Installed executable self-test exited with $($first.ExitCode)"
           }
           $firstJson = Get-Content $firstResult -Raw | ConvertFrom-Json
-          if (-not $firstJson.ok -or $firstJson.version -ne $version) {
-            throw "Installed executable self-test failed"
+          if (-not $firstJson.ok -or
+              $firstJson.version -ne "2.2.0-rc28.1") {
+            throw "Immutable RC28.1 executable self-test failed"
           }
 
           $env:BCVISION_TEST_MARKER = "preserve-$([guid]::NewGuid())"
-          python -c "import os,sqlite3; p=os.path.join(os.environ['BCVISION_DATA_DIR'],'bcvision.db'); c=sqlite3.connect(p); c.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',('release_test_marker',os.environ['BCVISION_TEST_MARKER'])); c.commit(); c.close()"
-          $modelDir = Join-Path $dataDir "models\plate"
-          New-Item -ItemType Directory -Path $modelDir -Force | Out-Null
-          Set-Content -Path (Join-Path $modelDir "preserve.marker") -Value $env:BCVISION_TEST_MARKER
+          $env:BCVISION_TEST_DB = Join-Path $dataDir "bcvision.db"
+          python -c "import os,sqlite3; c=sqlite3.connect(os.environ['BCVISION_TEST_DB']); c.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',('release_test_marker',os.environ['BCVISION_TEST_MARKER'])); c.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',('release_display_marker','rtl-preserved')); c.commit(); c.close()"
+          $persistentMarkers = @(
+            "videos\preserve.marker",
+            "snapshots\preserve.marker",
+            "plates\preserve.marker",
+            "models\plate\preserve-yolo11n.marker",
+            "models\plate\preserve-yolov8n.marker"
+          )
+          foreach ($relative in $persistentMarkers) {
+            $markerPath = Join-Path $dataDir $relative
+            New-Item -ItemType Directory (Split-Path $markerPath) -Force |
+              Out-Null
+            Set-Content $markerPath $env:BCVISION_TEST_MARKER
+          }
 
           $upgrade = Start-Process -FilePath $update -ArgumentList @(
             "/VERYSILENT",
@@ -161,17 +313,40 @@ jobs:
           if (-not $updatedJson.ok -or $updatedJson.version -ne $version) {
             throw "Updated executable self-test failed"
           }
-          if (-not $firstJson.anpr_ready -or -not $updatedJson.anpr_ready) {
+          if ($updatedJson.runtime_source -ne "external" -or
+              $updatedJson.runtime_version -ne $version) {
+            throw "Updated executable did not activate its versioned runtime"
+          }
+          if (-not $updatedJson.anpr_ready) {
             throw "Packaged ANPR models failed offline inference validation"
           }
 
-          python -c "import os,sqlite3,sys; p=os.path.join(os.environ['BCVISION_DATA_DIR'],'bcvision.db'); c=sqlite3.connect(p); r=c.execute('SELECT value FROM settings WHERE key=?',('release_test_marker',)).fetchone(); c.close(); sys.exit(0 if r and r[0]==os.environ['BCVISION_TEST_MARKER'] else 1)"
+          $runtimeAbi = (Get-Content RUNTIME_ABI -Raw).Trim()
+          python scripts\verify_installed_runtime.py `
+            --install-dir $installDir `
+            --version $version `
+            --abi $runtimeAbi `
+            --last-known-good $version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python -c "import os,sqlite3,sys; c=sqlite3.connect(os.environ['BCVISION_TEST_DB']); rows=dict(c.execute('SELECT key,value FROM settings WHERE key IN (?,?)',('release_test_marker','release_display_marker')).fetchall()); c.close(); sys.exit(0 if rows.get('release_test_marker')==os.environ['BCVISION_TEST_MARKER'] and rows.get('release_display_marker')=='rtl-preserved' else 1)"
           if ($LASTEXITCODE -ne 0) {
-            throw "Database marker was not preserved by update"
+            throw "Database/settings markers were not preserved by update"
           }
-          $modelMarker = Get-Content (Join-Path $modelDir "preserve.marker") -Raw
-          if ($modelMarker.Trim() -ne $env:BCVISION_TEST_MARKER) {
-            throw "AI model marker was not preserved by update"
+          if ((Get-FileHash (
+            Join-Path $bootstrapDir "storage_config.json"
+          )).Hash -ne $storageConfigHash) {
+            throw "Custom storage configuration was not preserved"
+          }
+          foreach ($relative in $persistentMarkers) {
+            $markerPath = Join-Path $dataDir $relative
+            if (
+              -not (Test-Path $markerPath) -or
+              (Get-Content $markerPath -Raw).Trim() -ne
+                $env:BCVISION_TEST_MARKER
+            ) {
+              throw "Persistent media/model marker changed: $relative"
+            }
           }
 
           $uninstaller = Get-ChildItem $installDir -Filter "unins*.exe" |
@@ -190,8 +365,13 @@ jobs:
           if (-not (Test-Path (Join-Path $dataDir "bcvision.db"))) {
             throw "Persistent database was removed by uninstall"
           }
-          if (-not (Test-Path (Join-Path $modelDir "preserve.marker"))) {
-            throw "Persistent AI model data was removed by uninstall"
+          if (-not (Test-Path (Join-Path $bootstrapDir "storage_config.json"))) {
+            throw "Persistent storage configuration was removed by uninstall"
+          }
+          foreach ($relative in $persistentMarkers) {
+            if (-not (Test-Path (Join-Path $dataDir $relative))) {
+              throw "Persistent media/model data was removed: $relative"
+            }
           }
 
       - name: Create release bundle and checksums
@@ -205,6 +385,10 @@ jobs:
           Copy-Item "setup_output\BCVision_${releaseLabel}_Setup.exe" $releaseDir
           Copy-Item "setup_output\BCVision_${releaseLabel}_Update.exe" $releaseDir
           git archive --format=zip --output="$releaseDir\BC_Vision_v${version}_Source.zip" HEAD
+          Copy-Item RUNTIME_CONTRACT.json $releaseDir
+          python scripts\verify_runtime_contract.py `
+            --write-id "$releaseDir\RUNTIME_CONTRACT_ID.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $files = Get-ChildItem $releaseDir -File | Sort-Object Name
           $lines = foreach ($file in $files) {
             $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash
@@ -213,15 +397,155 @@ jobs:
           Set-Content -Path "$releaseDir\SHA256SUMS.txt" -Value $lines -Encoding ascii
           Get-ChildItem $releaseDir | Select-Object Name,Length
 
-      - name: Publish verified GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload verified full-release bundle
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: v${{ steps.version.outputs.value }}
-          target_commitish: ${{ github.sha }}
-          name: BC Vision ${{ steps.version.outputs.value }}
-          prerelease: true
-          generate_release_notes: true
-          files: release/*
+          name: full-release-bundle
+          path: release/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-release:
+    needs: build-and-verify
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Download verified full-release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: full-release-bundle
+          path: release
+
+      - name: Publish or safely resume exact-SHA full release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Assert-ReleaseAssetsMatchChecksums(
+            [string] $ReleaseTag,
+            [string[]] $ExpectedNames
+          ) {
+            $verifyDir = Join-Path $env:RUNNER_TEMP "full-release-verify"
+            Remove-Item $verifyDir -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory $verifyDir -Force | Out-Null
+            gh release download $ReleaseTag --dir $verifyDir
+            if ($LASTEXITCODE -ne 0) {
+              throw "Release $ReleaseTag assets could not be downloaded."
+            }
+            $downloadedNames = @(
+              Get-ChildItem $verifyDir -File | ForEach-Object { $_.Name }
+            )
+            $unexpected = @(
+              $downloadedNames | Where-Object { $_ -notin $ExpectedNames }
+            )
+            $missing = @(
+              $ExpectedNames | Where-Object { $_ -notin $downloadedNames }
+            )
+            if ($unexpected.Count -ne 0 -or $missing.Count -ne 0) {
+              throw "Release $ReleaseTag has an unexpected asset set."
+            }
+            $localChecksums = Resolve-Path "release\SHA256SUMS.txt"
+            $checksumPath = Join-Path $verifyDir "SHA256SUMS.txt"
+            if ((Get-FileHash $localChecksums -Algorithm SHA256).Hash -ne
+                (Get-FileHash $checksumPath -Algorithm SHA256).Hash) {
+              throw "Release $ReleaseTag checksum metadata is not exact-SHA."
+            }
+            foreach ($name in $ExpectedNames) {
+              if ($name -eq "SHA256SUMS.txt") { continue }
+              $escaped = [regex]::Escape($name)
+              $line = Get-Content $checksumPath | Where-Object {
+                $_ -match "^(?<hash>[0-9a-fA-F]{64})\s+\*?$escaped$"
+              } | Select-Object -First 1
+              $checksumMatch = [regex]::Match(
+                [string]$line,
+                "^(?<hash>[0-9a-fA-F]{64})"
+              )
+              if (-not $checksumMatch.Success) {
+                throw "Release checksum is missing $name."
+              }
+              $actual = (
+                Get-FileHash (Join-Path $verifyDir $name) -Algorithm SHA256
+              ).Hash
+              if ($actual -ne $checksumMatch.Groups['hash'].Value) {
+                throw "Release asset $name failed SHA-256 verification."
+              }
+            }
+          }
+
+          $tag = "v${{ needs.build-and-verify.outputs.version }}"
+          $sha = "${{ github.sha }}"
+          $repository = "$env:GITHUB_REPOSITORY"
+          $tagRefJson = gh api `
+            "repos/$repository/git/ref/tags/$tag" 2>$null
+          $tagExists = $LASTEXITCODE -eq 0
+          if ($tagExists) {
+            $commitJson = gh api "repos/$repository/commits/$tag"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $tagSha = ($commitJson | ConvertFrom-Json).sha
+            if ($tagSha -ne $sha) {
+              throw "Existing tag $tag targets $tagSha instead of $sha."
+            }
+          }
+
+          $releaseJson = gh release view $tag --json isDraft,assets 2>$null
+          $releaseExists = $LASTEXITCODE -eq 0
+          if ($releaseExists -and -not $tagExists) {
+            throw (
+              "Existing release $tag has no resolvable exact tag; " +
+              "exact-SHA resume is refused."
+            )
+          }
+          $expected = @(
+            Get-ChildItem release -File | ForEach-Object { $_.Name }
+          )
+          if ($releaseExists) {
+            $release = $releaseJson | ConvertFrom-Json
+            $assetNames = @($release.assets | ForEach-Object { $_.name })
+            $missing = @($expected | Where-Object { $_ -notin $assetNames })
+            if (-not $release.isDraft) {
+              if ($missing.Count -ne 0) {
+                throw (
+                  "Public release $tag is incomplete. Refusing to mutate " +
+                  "a published release; create a new version instead."
+                )
+              }
+              Assert-ReleaseAssetsMatchChecksums $tag $expected
+              Write-Host "Exact-SHA full release is already complete: $tag"
+              exit 0
+            }
+          } else {
+            $arguments = @(
+              "release", "create", $tag,
+              "--title", "BC Vision ${{ needs.build-and-verify.outputs.version }}",
+              "--prerelease", "--draft", "--generate-notes"
+            )
+            if ($tagExists) {
+              $arguments += "--verify-tag"
+            } else {
+              $arguments += @("--target", $sha)
+            }
+            & gh @arguments
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+          foreach ($file in Get-ChildItem release -File) {
+            gh release upload $tag $file.FullName --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $verified = gh release view $tag --json assets | ConvertFrom-Json
+          $verifiedNames = @($verified.assets | ForEach-Object { $_.name })
+          $missing = @($expected | Where-Object { $_ -notin $verifiedNames })
+          if ($missing.Count -ne 0) {
+            throw "Release is incomplete: $($missing -join ', ')"
+          }
+          Assert-ReleaseAssetsMatchChecksums $tag $expected
+          gh release edit $tag --draft=false --prerelease
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Report verified release
         shell: pwsh
@@ -229,3 +553,31 @@ jobs:
           Write-Host "Release files were built, installed, updated, verified and published."
           Get-Content release\SHA256SUMS.txt
 
+  publish-status:
+    needs: publish-release
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      statuses: write
+
+    steps:
+      - name: Publish final full-release status
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${{ needs.publish-release.result }}" == "success" ]]; then
+            state="success"
+            description="Full BC Vision release published and verified"
+          else
+            state="failure"
+            description="Full BC Vision release failed verification or publication"
+          fi
+          target="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" \
+            -f context="bcvision/full-release" \
+            -f description="$description" \
+            -f target_url="$target" >/dev/null

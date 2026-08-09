@@ -26,6 +26,16 @@ if not exist "requirements-ai-lock.txt" (
     exit /b 1
 )
 
+if not exist "RUNTIME_ABI" (
+    echo RUNTIME_ABI was not found.
+    exit /b 1
+)
+
+if not exist "RUNTIME_CONTRACT.json" (
+    echo RUNTIME_CONTRACT.json was not found.
+    exit /b 1
+)
+
 if not exist ".buildvenv\Scripts\python.exe" (
     %PY% -m venv ".buildvenv"
     if errorlevel 1 goto :error
@@ -102,6 +112,40 @@ if not exist "dist\BCVision\BCVision.exe" (
     echo BCVision.exe was not created.
     goto :error
 )
+
+for /f "usebackq delims=" %%V in ("VERSION") do set "APP_VERSION=%%V"
+if not defined APP_VERSION (
+    echo VERSION is empty.
+    goto :error
+)
+
+rmdir /s /q fast_update_payload 2>nul
+"%BUILD_PY%" scripts\build_runtime_payload.py ^
+    --output fast_update_payload
+if errorlevel 1 goto :error
+
+xcopy /E /I /Y ^
+    "fast_update_payload\%APP_VERSION%" ^
+    "dist\BCVision\runtime\%APP_VERSION%" >nul
+if errorlevel 1 goto :error
+
+copy /Y "VERSION" "dist\BCVision\runtime\current.txt" >nul
+if errorlevel 1 goto :error
+
+copy /Y "VERSION" "dist\BCVision\runtime\last-known-good.txt" >nul
+if errorlevel 1 goto :error
+
+copy /Y "RUNTIME_ABI" "dist\BCVision\runtime-abi.txt" >nul
+if errorlevel 1 goto :error
+
+copy /Y ^
+    "RUNTIME_CONTRACT.json" ^
+    "dist\BCVision\runtime-contract.json" >nul
+if errorlevel 1 goto :error
+
+"%BUILD_PY%" scripts\verify_runtime_contract.py ^
+    --write-id "dist\BCVision\runtime-contract.txt"
+if errorlevel 1 goto :error
 
 copy /Y "VERSION" "dist\BCVision\VERSION" >nul
 if errorlevel 1 goto :error

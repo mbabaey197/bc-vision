@@ -2,6 +2,7 @@ import json
 from urllib.error import URLError
 
 import launcher
+from app.ai import model_manager
 
 
 class _Response:
@@ -151,3 +152,88 @@ def test_main_rejects_foreign_service_on_port_8000(monkeypatch):
     launcher.main()
 
     assert errors == ["پورت 8000 در اختیار برنامه دیگری است."]
+
+
+def _models_not_ready():
+    return {
+        "detector_yolo11n_ready": False,
+        "detector_yolov8n_ready": False,
+        "detector_fallback_ready": False,
+        "hezar_ready": False,
+        "crnn_ready": False,
+        "cnn_ready": False,
+    }
+
+
+def test_model_preparation_retries_once_and_clears_error(monkeypatch):
+    calls = []
+    monkeypatch.setattr(model_manager, "model_status", _models_not_ready)
+
+    def prepare_models(*, download):
+        assert download is True
+        calls.append(True)
+        if len(calls) == 1:
+            raise OSError("temporary download failure")
+        return {"ready": True}
+
+    monkeypatch.setattr(model_manager, "prepare_models", prepare_models)
+    monkeypatch.setattr(launcher, "log", lambda _message: None)
+    for name in (
+        launcher.MODEL_PREPARATION_STATE_ENV,
+        launcher.MODEL_PREPARATION_ERROR_ENV,
+        launcher.MODEL_PREPARATION_ATTEMPT_ENV,
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    result = launcher.prepare_anpr_models(
+        max_attempts=2,
+        retry_delay=0,
+    )
+
+    assert result is True
+    assert len(calls) == 2
+    assert (
+        launcher.os.environ[launcher.MODEL_PREPARATION_STATE_ENV]
+        == "ready"
+    )
+    assert (
+        launcher.MODEL_PREPARATION_ERROR_ENV
+        not in launcher.os.environ
+    )
+    assert (
+        launcher.os.environ[launcher.MODEL_PREPARATION_ATTEMPT_ENV]
+        == "2"
+    )
+
+
+def test_model_preparation_publishes_terminal_failure_reason(monkeypatch):
+    calls = []
+    monkeypatch.setattr(model_manager, "model_status", _models_not_ready)
+
+    def prepare_models(*, download):
+        assert download is True
+        calls.append(True)
+        raise ValueError("YOLOv8n SHA-256 mismatch")
+
+    monkeypatch.setattr(model_manager, "prepare_models", prepare_models)
+    monkeypatch.setattr(launcher, "log", lambda _message: None)
+
+    result = launcher.prepare_anpr_models(
+        max_attempts=2,
+        retry_delay=0,
+    )
+
+    assert result is False
+    assert len(calls) == 2
+    assert (
+        launcher.os.environ[launcher.MODEL_PREPARATION_STATE_ENV]
+        == "error"
+    )
+    assert (
+        launcher.os.environ[launcher.MODEL_PREPARATION_ERROR_ENV]
+        == "ValueError: YOLOv8n SHA-256 mismatch"
+    )
+    assert (
+        launcher.os.environ[launcher.MODEL_PREPARATION_ATTEMPT_ENV]
+        == "2"
+    )

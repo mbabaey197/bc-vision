@@ -21,6 +21,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
@@ -68,6 +70,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
@@ -80,7 +84,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}\bcvision-models
-          key: bcvision-anpr-models-v3-yolo11n-hezar
+          key: bcvision-anpr-models-v4-yolo11n-yolov8n-hezar
+          restore-keys: |
+            bcvision-anpr-models-v3-yolo11n-hezar
 
       - name: Install AI runtime
         shell: pwsh
@@ -101,6 +107,7 @@ jobs:
         shell: pwsh
         env:
           BCVISION_PLATE_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo11n.onnx
+          BCVISION_PLATE_YOLOV8N_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolov8n.onnx
           BCVISION_PLATE_FALLBACK_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo_fallback.onnx
           BCVISION_CRNN_MODEL: ${{ runner.temp }}\bcvision-models\crnn\ocr_crnn.onnx
           BCVISION_CNN_MODEL: ${{ runner.temp }}\bcvision-models\cnn\ocr_cnn.onnx

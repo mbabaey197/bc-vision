@@ -8,5 +8,6 @@ numpy==2.5.1
 opencv-python-headless==5.0.0.93
 pillow==12.3.0
 python-multipart==0.0.32
+PyYAML==6.0.3
 pytest==9.0.2
 pytest-timeout==2.4.0

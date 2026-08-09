@@ -7,6 +7,7 @@ data/
 build/
 dist/
 setup_output/
+fast_update_payload/
 *.spec
 .idea/
 .vscode/

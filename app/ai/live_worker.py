@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+import os
 import threading
 import time
 
@@ -26,7 +27,6 @@ from .pipeline import (
 )
 from .plate_rules import normalize_plate, split_iran_plate
 from .feedback import apply_learned_correction
-from .next_engine import engine_router
 from .review_policy import (
     auto_confirm_guess,
     tag_assisted_candidate,
@@ -80,6 +80,8 @@ class _CameraState:
     seen: dict[str, float] = field(default_factory=dict)
     track_event_ids: dict[int, int] = field(default_factory=dict)
     last_error: str = ""
+    processing_errors: int = 0
+    last_processing_error: str = ""
     last_event_at: float = 0.0
     processed_frames: int = 0
     detected_candidates: int = 0
@@ -112,6 +114,12 @@ class _CameraState:
     overlay_mask_pixels: int = 0
     static_overlay_hits: dict = field(default_factory=dict)
     static_overlay_blocked_until: dict = field(default_factory=dict)
+    model_switch_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        repr=False,
+    )
+
+
 class LiveANPRWorker:
     def __init__(self, max_workers=None):
         self._states: dict[int, _CameraState] = {}
@@ -129,21 +137,165 @@ class LiveANPRWorker:
         self._stopped = False
         self._model_state = {}
         self._model_state_at = 0.0
+        self._model_state_variant = ""
+        self._detector_generation = 0
+
+    def _selected_detector_variant(self) -> str:
+        from .model_manager import normalize_detector_variant
+
+        with self._lock:
+            return normalize_detector_variant(
+                self._setting("anpr_detector_model", "yolo11n")
+            )
+
+    def begin_video_pass(self, camera_id: int) -> dict:
+        """Capture the detector/error generation owned by one video pass."""
+
+        with self._lock:
+            state = self._states.get(int(camera_id))
+            return {
+                "detector_generation": self._detector_generation,
+                "processing_errors": (
+                    int(state.processing_errors) if state else 0
+                ),
+                "processed_frames": (
+                    int(state.processed_frames) if state else 0
+                ),
+            }
+
+    def invalidate_model_cache(
+        self,
+        detector_variant=None,
+        persist_setting=None,
+    ) -> None:
+        """Atomically isolate the next detector generation.
+
+        Detector sessions are only part of the state involved in an A/B
+        switch. Consensus votes, duplicate cooldowns and published overlays
+        must also be discarded so the new detector cannot inherit evidence
+        or suppression decisions from the old detector.
+        """
+
+        from .model_manager import normalize_detector_variant
+        from .onnx_detector import clear_detector_sessions
+
+        with self._lock:
+            if detector_variant is not None:
+                selected = normalize_detector_variant(detector_variant)
+                if persist_setting is None:
+                    from app.database import set_setting
+
+                    persist_setting = set_setting
+                # Persist while new frame selection is blocked by _lock.
+                # The generation increments before any old commit state can
+                # survive the reset below.
+                persist_setting("anpr_detector_model", selected)
+            self._detector_generation += 1
+            self._model_state = {}
+            self._model_state_at = 0.0
+            self._model_state_variant = ""
+            for state in self._states.values():
+                with state.model_switch_lock:
+                    duplicate_seconds = max(
+                        0.0,
+                        float(
+                            (state.config or {}).get(
+                                "duplicate_seconds",
+                                5.0,
+                            )
+                        ),
+                    )
+                    state.tracker = PlateConsensusTracker(
+                        min_votes=2,
+                        max_age_seconds=2.2,
+                        emit_cooldown=duplicate_seconds,
+                        emit_unreadable=True,
+                    )
+                    state.pending = None
+                    state.seen.clear()
+                    state.track_event_ids.clear()
+                    state.latest_detections = []
+                    state.latest_detections_at = 0.0
+                    state.latest_detection_frame = None
+                    state.detection_revision += 1
+                    state.last_error = ""
+                    state.processing_errors = 0
+                    state.last_processing_error = ""
+                    state.last_event_at = 0.0
+                    state.processed_frames = 0
+                    state.detected_candidates = 0
+                    state.emitted_events = 0
+                    state.whole_plate_ocr_attempts = 0
+                    state.ocr_agreements = 0
+                    state.ocr_disagreements = 0
+                    state.crnn_selected = 0
+                    state.character_reader_selected = 0
+                    state.last_processed_at = 0.0
+                    state.last_processing_ms = 0.0
+                    state.processing_seconds_ema = 0.0
+                    state.no_plate_streak = 0
+                    state.next_inference_at = 0.0
+                    state.last_submitted_at = 0.0
+                    state.burst_frames_remaining = 0
+                    state.plate_visible = False
+                    state.shadow_frames = 0
+                    state.shadow_candidates = 0
+                    state.shadow_errors = 0
+                    state.motion_score = 0.0
+                    state.motion_wakeups = 0
+                    state.overlay_mask_pixels = 0
+                    state.static_overlay_hits.clear()
+                    state.static_overlay_blocked_until.clear()
+                    state.frame_counter = 0
+            clear_detector_sessions()
+
+    def _exclusive_engine_status(self) -> dict:
+        return {
+            "mode": "baseline",
+            "detector_variant": self._selected_detector_variant(),
+            "exclusive_detector": True,
+            "candidate_inference": False,
+        }
 
     def _models(self) -> dict:
         now = time.monotonic()
-        if now - self._model_state_at >= 30.0:
+        selected_variant = self._selected_detector_variant()
+        cached_preparation_state = str(
+            self._model_state.get("preparation_state", "")
+        ).strip().lower()
+        preparation_state = os.environ.get(
+            "BCVISION_MODEL_PREPARATION_STATE",
+            "",
+        ).strip().lower()
+        refresh_seconds = (
+            4.0
+            if preparation_state in {"preparing", "retrying"}
+            or (
+                not self._model_state.get("detector_ready")
+                and preparation_state != "error"
+            )
+            else 30.0
+        )
+        if (
+            now - self._model_state_at >= refresh_seconds
+            or preparation_state != cached_preparation_state
+            or selected_variant != self._model_state_variant
+        ):
             try:
                 from .model_manager import model_status
-                self._model_state = model_status()
+                self._model_state = model_status(
+                    selected_detector=selected_variant,
+                )
             except Exception as exc:
                 self._model_state = {
+                    "selected_detector": selected_variant,
                     "detector_ready": False,
                     "crnn_ready": False,
                     "cnn_ready": False,
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             self._model_state_at = now
+            self._model_state_variant = selected_variant
         status = dict(self._model_state)
         status["ocr_ready"] = bool(
             status.get("hezar_ready")
@@ -605,7 +757,10 @@ class LiveANPRWorker:
             try:
                 config = self._config(int(camera_id), state, now)
             except Exception as exc:
-                state.last_error = f"{type(exc).__name__}: {exc}"
+                error = f"{type(exc).__name__}: {exc}"
+                state.last_error = error
+                state.processing_errors += 1
+                state.last_processing_error = error
                 return
             if (
                 not config
@@ -643,6 +798,7 @@ class LiveANPRWorker:
                 now,
                 selection_score,
                 activity,
+                self._detector_generation,
             )
             if state.busy:
                 pending_score = (
@@ -717,7 +873,124 @@ class LiveANPRWorker:
                 state.pending = None
             state.last_submitted_at = now
             state.busy = True
-        self._executor.submit(self._process, state, payload)
+        try:
+            self._executor.submit(self._process, state, payload)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            with self._lock:
+                state.busy = False
+                state.last_error = error
+                state.processing_errors += 1
+                state.last_processing_error = error
+            raise
+
+    def drain_video_pass(
+        self,
+        camera_id: int,
+        pass_token: dict | None = None,
+        timeout: float = 60.0,
+    ) -> dict:
+        """Promote pending work and wait for one video pass to become idle."""
+
+        token = dict(pass_token or {})
+        expected_generation = int(
+            token.get("detector_generation", self._detector_generation)
+        )
+        baseline_errors = max(
+            0,
+            int(token.get("processing_errors", 0)),
+        )
+        baseline_processed = max(
+            0,
+            int(token.get("processed_frames", 0)),
+        )
+        deadline = time.monotonic() + max(
+            0.1,
+            min(300.0, float(timeout)),
+        )
+        camera_id = int(camera_id)
+        while True:
+            with self._lock:
+                if expected_generation != self._detector_generation:
+                    return {
+                        "ok": False,
+                        "error": (
+                            "RuntimeError: detector selection changed "
+                            "during uploaded-video processing"
+                        ),
+                    }
+                state = self._states.get(camera_id)
+                if state is None:
+                    return {
+                        "ok": False,
+                        "error": (
+                            "RuntimeError: uploaded video reached EOF "
+                            "without an ANPR worker submission"
+                        ),
+                    }
+                if not state.busy and state.pending is not None:
+                    payload = state.pending
+                    payload_generation = (
+                        int(payload[6])
+                        if len(payload) > 6
+                        else self._detector_generation
+                    )
+                    if payload_generation != expected_generation:
+                        return {
+                            "ok": False,
+                            "error": (
+                                "RuntimeError: detector selection changed "
+                                "during uploaded-video processing"
+                            ),
+                        }
+                    state.pending = None
+                    state.last_submitted_at = time.monotonic()
+                    state.busy = True
+                    try:
+                        self._executor.submit(self._process, state, payload)
+                    except Exception as exc:
+                        error = f"{type(exc).__name__}: {exc}"
+                        state.busy = False
+                        state.last_error = error
+                        state.processing_errors += 1
+                        state.last_processing_error = error
+                elif not state.busy:
+                    if state.processing_errors > baseline_errors:
+                        return {
+                            "ok": False,
+                            "error": (
+                                state.last_processing_error
+                                or state.last_error
+                                or "RuntimeError: ANPR processing failed"
+                            ),
+                            "processed_frames": state.processed_frames,
+                            "emitted_events": state.emitted_events,
+                        }
+                    if state.processed_frames <= baseline_processed:
+                        return {
+                            "ok": False,
+                            "error": (
+                                "RuntimeError: uploaded video reached EOF "
+                                "without a completed ANPR frame"
+                            ),
+                            "processed_frames": state.processed_frames,
+                            "emitted_events": state.emitted_events,
+                        }
+                    return {
+                        "ok": True,
+                        "error": "",
+                        "processed_frames": state.processed_frames,
+                        "emitted_events": state.emitted_events,
+                    }
+            if time.monotonic() >= deadline:
+                return {
+                    "ok": False,
+                    "error": (
+                        "TimeoutError: ANPR worker did not drain before "
+                        "uploaded-video completion"
+                    ),
+                }
+            time.sleep(0.01)
 
     @staticmethod
     def _local_motion_score(previous_frame, current_frame, bbox) -> float:
@@ -870,12 +1143,15 @@ class LiveANPRWorker:
     def _process(self, state: _CameraState, payload):
         camera_id, camera_name, frame, timestamp = payload[:4]
         activity = payload[5] if len(payload) > 5 else None
+        detector_generation = (
+            int(payload[6])
+            if len(payload) > 6
+            else self._detector_generation
+        )
+        model_switch_locked = False
         started = time.perf_counter()
         try:
             config = state.config or {}
-            stream_url = str(config.get("rtsp_url") or "")
-            is_uploaded_video = stream_url.startswith("video://")
-            use_candidate_router = bool(stream_url) and not is_uploaded_video
             source, offset_x, offset_y = self._roi_frame(
                 frame,
                 config,
@@ -897,6 +1173,7 @@ class LiveANPRWorker:
                 0.22,
                 min(0.70, min_confidence * 0.68),
             )
+            detector_variant = self._selected_detector_variant()
 
             def baseline_process():
                 kwargs = {"engine_key": camera_id}
@@ -908,59 +1185,30 @@ class LiveANPRWorker:
                     source,
                     live_detection_threshold,
                     max_candidates=2,
+                    detector_variant=detector_variant,
                     **kwargs,
                 )
 
-            if not use_candidate_router:
-                class _BaselineOnlyOutcome:
-                    mode = "baseline"
-                    shadow = []
-                    error = ""
-                outcome = _BaselineOnlyOutcome()
-                outcome.primary = baseline_process()
-            else:
-                outcome = engine_router.process(
-                    source,
-                    baseline=baseline_process,
-                    min_detection_confidence=live_detection_threshold,
-                    engine_key=camera_id,
-                    exclusion_mask=exclusion_mask,
+            primary_rows = []
+            for raw_row in baseline_process():
+                row = apply_learned_correction(
+                    self._translate(raw_row, offset_x, offset_y)
                 )
-            primary_rows = [
-                apply_learned_correction(
-                    self._translate(row, offset_x, offset_y)
-                )
-                for row in outcome.primary
-            ]
-            shadow_rows = [
-                {
-                    **self._translate(row, offset_x, offset_y),
-                    "engine_lane": "candidate-shadow",
-                    "experimental": True,
-                    "needs_review": True,
-                }
-                for row in outcome.shadow
-            ]
-            assisted_enabled = (
-                not is_uploaded_video
-                and self._setting("anpr_auto_confirm_guesses", "1") == "1"
-            )
-            rows = (
-                operator_assisted_rows(primary_rows, shadow_rows)
-                if outcome.mode == "shadow"
-                and assisted_enabled
-                and shadow_rows
-                else primary_rows
-            )
-            display_rows = (
-                rows
-                if outcome.mode == "shadow" and assisted_enabled
-                else rows + shadow_rows
-            )
-            if outcome.mode == "shadow":
-                state.shadow_frames += 1
-                state.shadow_candidates += len(outcome.shadow)
-                state.shadow_errors += int(bool(outcome.error))
+                row["engine_lane"] = "baseline"
+                row["detector_variant"] = detector_variant
+                row["detector_selection_exclusive"] = True
+                primary_rows.append(row)
+
+            # Serialize only the result-commit phase against a detector
+            # switch. Inference can remain parallel across cameras. If the
+            # setting changed while this frame was running, its old-model
+            # observations are discarded before tracker/persistence state.
+            state.model_switch_lock.acquire()
+            model_switch_locked = True
+            if detector_generation != self._detector_generation:
+                return
+            rows = primary_rows
+            display_rows = rows
             processing_seconds = time.perf_counter() - started
             if state.processing_seconds_ema:
                 state.processing_seconds_ema = (
@@ -1174,9 +1422,19 @@ class LiveANPRWorker:
             }
             state.last_error = ""
         except Exception as exc:
-            state.last_error = f"{type(exc).__name__}: {exc}"
+            if detector_generation == self._detector_generation:
+                error = f"{type(exc).__name__}: {exc}"
+                state.last_error = error
+                state.processing_errors += 1
+                state.last_processing_error = error
         finally:
+            if model_switch_locked:
+                state.model_switch_lock.release()
             with self._lock:
+                if detector_generation != self._detector_generation:
+                    state.next_inference_at = 0.0
+                    state.busy = False
+                    return
                 # Always leave real idle time after an expensive transaction.
                 # Previously a queued frame was submitted immediately here,
                 # which kept detector/OCR threads continuously busy even when
@@ -1208,6 +1466,13 @@ class LiveANPRWorker:
                     "detected_candidates": 0,
                     "emitted_events": 0,
                     "last_error": "",
+                    "anpr_engine": self._exclusive_engine_status(),
+                    "shadow": {
+                        "enabled": False,
+                        "frames": 0,
+                        "candidates": 0,
+                        "errors": 0,
+                    },
                     "models": self._models(),
                     "ocr_ab": {
                         "whole_plate_attempts": 0,
@@ -1241,8 +1506,9 @@ class LiveANPRWorker:
                 "motion_score": round(state.motion_score, 5),
                 "motion_wakeups": state.motion_wakeups,
                 "overlay_mask_pixels": state.overlay_mask_pixels,
-                "anpr_engine": engine_router.status(camera_id),
+                "anpr_engine": self._exclusive_engine_status(),
                 "shadow": {
+                    "enabled": False,
                     "frames": state.shadow_frames,
                     "candidates": state.shadow_candidates,
                     "errors": state.shadow_errors,
@@ -1336,6 +1602,18 @@ def submit_live_frame(camera_id, camera_name, frame):
     worker.submit(camera_id, camera_name, frame)
 
 
+def begin_live_video_pass(camera_id):
+    return worker.begin_video_pass(camera_id)
+
+
+def drain_live_video_pass(camera_id, pass_token=None, timeout=60.0):
+    return worker.drain_video_pass(
+        camera_id,
+        pass_token=pass_token,
+        timeout=timeout,
+    )
+
+
 def live_anpr_status(camera_id):
     return worker.status(camera_id)
 
@@ -1350,3 +1628,23 @@ def live_anpr_detection_snapshot(camera_id, after_revision=0):
 
 def stop_live_camera(camera_id):
     worker.remove(camera_id)
+
+
+def invalidate_live_anpr_model_cache(
+    detector_variant=None,
+    persist_setting=None,
+):
+    worker.invalidate_model_cache(
+        detector_variant=detector_variant,
+        persist_setting=persist_setting,
+    )
+
+
+def switch_live_anpr_detector(
+    detector_variant,
+    persist_setting=None,
+):
+    worker.invalidate_model_cache(
+        detector_variant=detector_variant,
+        persist_setting=persist_setting,
+    )

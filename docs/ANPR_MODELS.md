@@ -6,7 +6,16 @@ samples, settings, events, snapshots and the SQLite database.
 
 ## Active Iranian plate detectors
 
-The primary detector is the single-class YOLO11n plate model exported to ONNX:
+BC Vision installs two independently verified, single-class ONNX plate
+detectors. The persisted `anpr_detector_model` setting selects exactly one of
+them for live cameras and uploaded-video tests; `yolo11n` is the default.
+Selectable inference does not cascade to the other detector after a miss or a
+load failure, so counts from the same video remain attributable to the model
+chosen by the operator. These customer-facing paths are forced to effective
+Baseline mode: a legacy Shadow/Next runtime setting cannot start a candidate
+detector beside, or instead of, the selected YOLO graph.
+
+The YOLO11n choice is:
 
 - `plate_yolo11n.onnx`
   - Source: `morsetechlab/yolov11-license-plate-detection`
@@ -18,20 +27,48 @@ The primary detector is the single-class YOLO11n plate model exported to ONNX:
     `693133A1DB97A3BA1E90068986F80AFB72C3FCDDB681E57181A89A9A3DC351D6`
   - Upstream license: AGPL-3.0
 
-The verified Platrix `plate_yolo_fallback.onnx` remains a fail-safe and runs
-only after a zero-result YOLO11n pass:
+The YOLOv8n choice is the verified Platrix graph formerly stored under its
+upstream `plate_yolo.onnx` filename:
+
+- `plate_yolov8n.onnx`
+  - Source: `Dibachain/Platrix`, upstream file `plate_yolo.onnx`
+  - Pinned revision: `4f5a43eae683e0b6ad977d4001e3967dcb96e295`
+  - Architecture provenance: the Platrix training script initializes
+    `yolov8n.pt`
+  - Input: dynamic NCHW; BC Vision uses `1 x 3 x 416 x 416`
+  - Expected size: `12608775` bytes
+  - SHA-256:
+    `A54E475C402E6036BB5C70F1A6FF75179E76098A5C8039BB5D148C0B6421F5C6`
+  - Embedded exporter metadata: Ultralytics `8.4.104`, `AGPL-3.0 License`
+    (`https://ultralytics.com/license`)
+  - Platrix repository code license: MIT. That repository license does not
+    override the license metadata embedded in this ONNX graph.
+
+An existing verified
+`C:\ProgramData\BCVision\data\models\plate\plate_yolo.onnx` is migrated
+atomically to the explicit YOLOv8n filename, so an upgraded offline
+installation can reuse the identical graph.
+
+The historical Platrix `plate_yolo_fallback.onnx` is still verified, seeded,
+and reported for compatibility, but normal selectable live/video inference
+does not execute it:
 
 - Input size: `640`
 - Expected size: `12265080` bytes
 - SHA-256:
   `A6974FCB0A79755C270D50F1EBEFD4D96D765C879A29051A19AAC00DFDA8B5AF`
 
-Hardened OpenCV geometry is the final localization fallback. Ultralytics is
-not imported by the camera runtime; ONNX Runtime executes both graphs. The
+Hardened OpenCV geometry remains available only to legacy diagnostic calls
+that do not request a camera session or detector variant. Selectable live and
+video paths fail closed instead of changing algorithms. Ultralytics is not
+imported by the camera runtime; ONNX Runtime executes the selected graph. The
 YOLO11n model card reports possible train/test contamination in its source
 dataset, so it must be measured on BC Vision's independent field/Golden data
-before accuracy claims are made. AGPL and model-weight licensing must also be
-reviewed before commercial distribution.
+before accuracy claims are made. Both selectable graphs carry AGPL-related
+provenance. Their model-weight, execution, redistribution and commercial-use
+terms require legal/licensing review before commercial distribution; the MIT
+license on Platrix repository code is not evidence that its exported graph is
+MIT-licensed.
 
 ## Active Iranian OCR models
 
@@ -72,6 +109,7 @@ readers; `crnn` and `cnn` explicitly select the old readers.
 
 ```text
 C:\ProgramData\BCVision\data\models\plate\plate_yolo11n.onnx
+C:\ProgramData\BCVision\data\models\plate\plate_yolov8n.onnx
 C:\ProgramData\BCVision\data\models\plate\plate_yolo_fallback.onnx
 C:\ProgramData\BCVision\data\models\hezar\crnn_fa_v2.onnx
 C:\ProgramData\BCVision\data\models\crnn\ocr_crnn.onnx
@@ -84,6 +122,7 @@ Environment variables can override vendor model locations:
 
 ```text
 BCVISION_PLATE_MODEL
+BCVISION_PLATE_YOLOV8N_MODEL
 BCVISION_PLATE_FALLBACK_MODEL
 BCVISION_HEZAR_MODEL
 BCVISION_CRNN_MODEL
@@ -98,9 +137,12 @@ BCVISION_OCR_ENGINE=hezar|hezar-only|hybrid|crnn|cnn
 BCVISION_CPU_THREADS
 ```
 
-Every model is accepted only after exact size and SHA-256 verification.
-Per-camera ONNX Runtime sessions use at most two intra-operation threads, one
-inter-operation thread, sequential execution and disabled worker spinning.
+`BCVISION_PLATE_YOLO8N_MODEL` is retained as a compatibility alias for the
+YOLOv8n override. Every model is accepted only after exact size and SHA-256
+verification. Per-camera ONNX Runtime sessions are keyed by detector variant
+and verified path, use at most two intra-operation threads, one inter-operation
+thread, sequential execution and disabled worker spinning. Changing the
+persisted detector selection invalidates the live status/session cache.
 
 ## RC15 selected candidate bundle
 
@@ -136,11 +178,12 @@ do so. An operator correction stores the original guess, engine, model
 revision, exact-match result and character distance. Aggregate measurements
 therefore show whether a later trained revision improves over earlier ones.
 
-The video-test path runs Baseline and a verified candidate in separate lanes.
-Shadow rows are labelled experimental even when the candidate accepts them,
-and never replace Baseline events. Live shadow boxes are amber and labelled
-`GUESS`; confirmed Baseline boxes remain green. Candidate weights are still
-blocked on licensed real field data and the Golden promotion gates.
+Candidate evaluation remains available to explicit offline development and
+Golden/benchmark tooling. The customer live-camera, uploaded-camera and
+uploaded-video-test paths no longer start candidate Shadow/Next inference:
+they run only the YOLO11n or YOLOv8n detector selected in settings. Candidate
+weights remain blocked on licensed real field data and the Golden promotion
+gates.
 
 ## RC14 candidate bundle
 
@@ -175,6 +218,10 @@ BCVISION_NEXT_MANIFEST
 BCVISION_ANPR_MODEL_PUBLIC_KEY
 BCVISION_ANPR_MODE=baseline|shadow|next
 ```
+
+`BCVISION_ANPR_MODE` applies only to explicit candidate-engine tooling. It
+does not override the persisted exclusive detector selection in production
+live or uploaded-video paths.
 
 No trained YOLO26-OBB or promoted CCT weights are committed in RC14. Those
 weights must be produced from licensed data, signed, and pass the fixed real
@@ -218,10 +265,10 @@ the exported ONNX file through the existing bounded ONNX Runtime sessions.
 ### Operator-assisted automatic confirmation
 
 When `anpr_auto_confirm_guesses=1`, a complete guess supported by the live
-multi-frame review path is stored with `review_status=auto-confirmed`. A
-complete Shadow guess may replace only an overlapping unreadable Baseline
-result; a strict Baseline read keeps priority. The UI shows the source
-explicitly and offers `تأیید/اصلاح و آموزش`.
+multi-frame review path is stored with `review_status=auto-confirmed`. In the
+current selectable production path that evidence comes only from the chosen
+Baseline detector; candidate Shadow rows are not generated. The UI shows the
+source explicitly and offers `تأیید/اصلاح و آموزش`.
 
 Automatic confirmation is not a training label. The event remains
 `experimental=1`, `confirmation_source=ai-auto-guess` and
@@ -252,13 +299,13 @@ accept a third-party plate dataset hidden behind the synthetic manifest.
 For the owner's private internal RC15 evaluation only,
 `tools/build_internal_cct_model_installer.py` can build a separate one-click
 model pack. The pack is never committed, attached to a public GitHub release,
-or included in Setup/Update. It binds the fixed verified Baseline detector,
+or included in Setup/Update. It binds a fixed verified Baseline detector,
 installs the Stage-4 CCT weight under the persistent data root, verifies every
-payload by exact SHA-256, writes a signed `research-shadow-only` manifest and
-selects Shadow mode. The live worker reuses the Baseline detector crop for CCT
-OCR, matching the detector/OCR pairing used in the Golden benchmark and
-avoiding a second detector pass. Operator confirmation remains mandatory for
-training.
+payload by exact SHA-256 and writes a signed `research-shadow-only` manifest.
+That candidate is evaluated through explicit offline Golden/benchmark tools;
+the production live and uploaded-video workers remain exclusive-Baseline even
+if a legacy runtime-state file requests Shadow mode. Operator confirmation
+remains mandatory for training.
 
 ### Hezar v2 export and isolated benchmark
 

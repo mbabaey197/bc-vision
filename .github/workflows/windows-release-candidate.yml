@@ -1,23 +1,9 @@
 name: Windows release candidate
 
-# Candidate builds run on each relevant agent-branch update.
+# Full candidate builds are reserved for runtime/dependency changes.
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - "agent/**"
-    paths:
-      - "app/**"
-      - "installer/**"
-      - "tests/**"
-      - "launcher.py"
-      - "VERSION"
-      - "BUILD_PORTABLE_EXE.bat"
-      - "requirements-lock.txt"
-      - "requirements-ai-lock.txt"
-      - "requirements-test.txt"
-      - ".github/workflows/windows-release-candidate.yml"
 
 permissions:
   contents: read
@@ -37,14 +23,20 @@ jobs:
     steps:
       - name: Checkout exact candidate commit
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Read candidate version
         id: version
         shell: pwsh
         run: |
           $value = (Get-Content VERSION -Raw).Trim()
+          $baseVersion = (Get-Content FAST_UPDATE_BASE_VERSION -Raw).Trim()
           if ($value -notmatch '^\d+\.\d+\.\d+-rc(?<rc>\d+(?:\.\d+)*)$') {
             throw "Unsupported candidate version: $value"
+          }
+          if ($value -ne $baseVersion) {
+            throw "Full candidate VERSION must equal $baseVersion."
           }
           "value=$value" >> $env:GITHUB_OUTPUT
           "label=RC$($Matches.rc)" >> $env:GITHUB_OUTPUT
@@ -61,6 +53,8 @@ jobs:
       - name: Run source regression
         shell: pwsh
         run: |
+          python scripts\verify_runtime_contract.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip install --disable-pip-version-check -r requirements-test.txt --quiet
           python -m compileall -q app launcher.py
           python -m pytest -q tests --timeout=120 --timeout-method=thread --durations=20
@@ -129,6 +123,10 @@ jobs:
           if (-not $firstJson.ok -or $firstJson.version -ne $version) {
             throw "Installed executable self-test failed"
           }
+          if ($firstJson.runtime_source -ne "external" -or
+              $firstJson.runtime_version -ne $version) {
+            throw "Installed executable did not activate its versioned runtime"
+          }
 
           $env:BCVISION_TEST_MARKER = "preserve-$([guid]::NewGuid())"
           python -c "import os,sqlite3; p=os.path.join(os.environ['BCVISION_DATA_DIR'],'bcvision.db'); c=sqlite3.connect(p); c.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',('release_test_marker',os.environ['BCVISION_TEST_MARKER'])); c.commit(); c.close()"
@@ -158,6 +156,10 @@ jobs:
           $updatedJson = Get-Content $updatedResult -Raw | ConvertFrom-Json
           if (-not $updatedJson.ok -or $updatedJson.version -ne $version) {
             throw "Updated executable self-test failed"
+          }
+          if ($updatedJson.runtime_source -ne "external" -or
+              $updatedJson.runtime_version -ne $version) {
+            throw "Updated executable did not activate its versioned runtime"
           }
           if (-not $firstJson.anpr_ready -or -not $updatedJson.anpr_ready) {
             throw "Packaged ANPR models failed offline inference validation"

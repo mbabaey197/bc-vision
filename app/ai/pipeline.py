@@ -91,6 +91,7 @@ def process_frame(
     exclusion_mask=None,
     max_results=8,
     max_candidates=None,
+    detector_variant=None,
 ):
     results = []
     detector_kwargs = {
@@ -104,6 +105,8 @@ def process_frame(
         )
     if engine_key is not None:
         detector_kwargs["engine_key"] = engine_key
+    if detector_variant is not None:
+        detector_kwargs["detector_variant"] = detector_variant
     for item in detect_plates(frame, **detector_kwargs):
         crop = item["crop"]
         quality = image_quality(crop)
