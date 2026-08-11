@@ -39,6 +39,53 @@ except ImportError:  # pragma: no cover - exercised on Windows runners
 
 
 ACCURACY_MANIFEST_SCHEMA = "bcvision.anpr.accuracy-manifest/v1"
+ACCURACY_LABEL_SCOPES = ("exhaustive", "known_positives")
+_ACCURACY_MANIFEST_ROOT_KEYS = frozenset(
+    {
+        "schema",
+        "dataset_id",
+        "description",
+        "dataset_fingerprint_sha256",
+        "training_allowed",
+        "label_source",
+        "coverage",
+        "template",
+        "samples",
+    }
+)
+_ACCURACY_MANIFEST_SAMPLE_KEYS = frozenset(
+    {
+        "id",
+        "category",
+        "input",
+        "expected_plate",
+        "expected_events",
+        "label_status",
+        "label_scope",
+        "label_source",
+        "training_allowed",
+        "enabled",
+        "notes",
+    }
+)
+_ACCURACY_MANIFEST_INPUT_KEYS = frozenset(
+    {"path", "media_type", "start_ms", "end_ms", "sha256", "size_bytes"}
+)
+_ACCURACY_MANIFEST_EVENT_KEYS = frozenset(
+    {"plate", "start_ms", "end_ms", "track_id"}
+)
+_ACCURACY_ADAPTER_INPUT_KEYS = frozenset(
+    {
+        "path",
+        "media_type",
+        "sha256",
+        "size_bytes",
+        "start_ms",
+        "end_ms",
+        "resolved_path",
+    }
+)
+_ACCURACY_ADAPTER_METADATA_SCHEMA = "bcvision.anpr.accuracy-adapter-metadata/v1"
 REQUIRED_ACCURACY_CATEGORIES = (
     "clear_plate",
     "night",
@@ -1392,8 +1439,15 @@ class AccuracyManifest:
     dataset_id: str
     samples: tuple[dict[str, Any], ...]
     sha256: str
+    dataset_fingerprint: str
+    strict_evidence: bool = True
     negative_sample_count: int = 0
+    known_positive_sample_count: int = 0
+    coverage_complete: bool = False
+    missing_categories: tuple[str, ...] = ()
+    unreadable_categories: tuple[str, ...] = ()
     verified_media_sha256s: tuple[tuple[str, str], ...] = ()
+    verified_media_identities: tuple[tuple[str, str, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1431,20 +1485,185 @@ def _manifest_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _reject_unknown_accuracy_fields(
+    value: Mapping[str, Any],
+    allowed: frozenset[str],
+    *,
+    context: str,
+) -> None:
+    unknown = sorted(str(key) for key in value if key not in allowed)
+    if unknown:
+        raise ValueError(
+            f"{context} contains unsupported field(s): {', '.join(unknown)}"
+        )
+
+
+def _accuracy_path_component_is_link(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction):
+        try:
+            return bool(is_junction())
+        except OSError:
+            return True
+    os_is_junction = getattr(os.path, "isjunction", None)
+    if callable(os_is_junction):
+        try:
+            return bool(os_is_junction(path))
+        except OSError:
+            return True
+    return False
+
+
+def _validate_content_addressed_accuracy_path(
+    raw_path: str,
+    expected_sha256: str,
+    *,
+    sample_id: str,
+) -> None:
+    candidate = Path(raw_path)
+    parts = candidate.parts
+    if (
+        len(parts) != 2
+        or parts[0] != "media"
+        or raw_path != f"media/{parts[-1]}"
+    ):
+        raise ValueError(
+            f"sample {sample_id!r} input.path must use content-addressed "
+            "media/<sha256><suffix> form"
+        )
+    filename = parts[1]
+    suffix = Path(filename).suffix
+    if not suffix or suffix != suffix.lower() or filename != f"{expected_sha256}{suffix}":
+        raise ValueError(
+            f"sample {sample_id!r} input.path must use content-addressed "
+            "media/<sha256><suffix> form"
+        )
+
+
+def _resolve_accuracy_input_path(
+    manifest_directory: Path,
+    raw_path: str,
+    *,
+    sample_id: str,
+    strict_evidence: bool,
+) -> Path:
+    candidate = Path(raw_path)
+    if strict_evidence and candidate.is_absolute():
+        raise ValueError(
+            f"sample {sample_id!r} input.path must be relative to the manifest directory"
+        )
+    if strict_evidence:
+        current = manifest_directory
+        for part in candidate.parts:
+            current = current / part
+            if _accuracy_path_component_is_link(current):
+                raise ValueError(
+                    f"sample {sample_id!r} input.path contains a symbolic-link "
+                    "or junction component"
+                )
+    resolved = (manifest_directory / candidate).resolve()
+    if strict_evidence and not _path_is_within(resolved, manifest_directory):
+        raise ValueError(
+            f"sample {sample_id!r} input.path escapes the manifest directory"
+        )
+    return resolved
+
+
+def _coerce_input_bound(value: Any, *, sample_id: str, name: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"sample {sample_id!r} input.{name} is invalid")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"sample {sample_id!r} input.{name} is invalid") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise ValueError(f"sample {sample_id!r} input.{name} is invalid")
+    return parsed
+
+
+def _dataset_fingerprint(
+    dataset_id: str,
+    samples: Sequence[Mapping[str, Any]],
+) -> str:
+    """Hash the logical evaluation inputs without machine-specific absolute paths."""
+
+    canonical_samples: list[dict[str, Any]] = []
+    for sample in samples:
+        input_value = {
+            key: value
+            for key, value in dict(sample["input"]).items()
+            if key != "resolved_path"
+        }
+        canonical_samples.append(
+            {
+                "id": str(sample["id"]),
+                "category": str(sample["category"]),
+                "label_scope": str(sample.get("label_scope", "exhaustive")),
+                "input": input_value,
+                "expected_events": [
+                    dict(event) for event in sample["_expected_events"]
+                ],
+            }
+        )
+    return _canonical_sha256(
+        {
+            "schema": ACCURACY_MANIFEST_SCHEMA,
+            "dataset_id": dataset_id,
+            "samples": canonical_samples,
+        }
+    )
+
+
 def load_accuracy_manifest(
     path: str | Path,
     *,
     require_all_categories: bool = True,
     require_input_files: bool = True,
     require_negative_sample: bool = True,
+    strict_evidence: bool | None = None,
 ) -> AccuracyManifest:
     manifest_path = Path(path).resolve()
+    if strict_evidence is None:
+        # ``require_input_files=False`` is the existing explicit contract-test
+        # escape hatch. Callers can now spell that intent directly too.
+        strict_evidence = bool(require_input_files)
+    strict_evidence = bool(strict_evidence)
+    if strict_evidence and not require_input_files:
+        raise ValueError("strict evidence requires input files")
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid accuracy manifest JSON: {exc}") from exc
     if not isinstance(payload, Mapping):
         raise ValueError("accuracy manifest root must be an object")
+    if strict_evidence:
+        _reject_unknown_accuracy_fields(
+            payload,
+            _ACCURACY_MANIFEST_ROOT_KEYS,
+            context="accuracy manifest root",
+        )
     if payload.get("schema") != ACCURACY_MANIFEST_SCHEMA:
         raise ValueError(f"manifest schema must be {ACCURACY_MANIFEST_SCHEMA!r}")
     if payload.get("template") is True:
@@ -1452,6 +1671,16 @@ def load_accuracy_manifest(
     dataset_id = str(payload.get("dataset_id", "")).strip()
     if not dataset_id:
         raise ValueError("manifest dataset_id is required")
+    if strict_evidence:
+        if payload.get("training_allowed") is not False:
+            raise ValueError(
+                "strict evidence must explicitly set training_allowed=false"
+            )
+        label_source = payload.get("label_source")
+        if not isinstance(label_source, str) or not label_source.strip():
+            raise ValueError(
+                "strict evidence requires an explicit non-empty label_source"
+            )
     raw_samples = payload.get("samples")
     if not isinstance(raw_samples, list) or not raw_samples:
         raise ValueError("manifest samples must be a non-empty array")
@@ -1464,10 +1693,23 @@ def load_accuracy_manifest(
     }
     has_multi_vehicle_event_set = False
     negative_sample_count = 0
+    known_positive_sample_count = 0
     verified_media_sha256s: list[tuple[str, str]] = []
+    verified_media_identities: list[tuple[str, str, int]] = []
+    manifest_directory = manifest_path.parent.resolve()
     for index, raw in enumerate(raw_samples):
         if not isinstance(raw, Mapping):
             raise ValueError(f"sample {index} must be an object")
+        if "adapter_input" in raw:
+            raise ValueError(
+                f"sample {index} adapter_input is not permitted in accuracy evidence"
+            )
+        if strict_evidence:
+            _reject_unknown_accuracy_fields(
+                raw,
+                _ACCURACY_MANIFEST_SAMPLE_KEYS,
+                context=f"sample {index}",
+            )
         if raw.get("enabled", True) is not True:
             continue
         sample = dict(raw)
@@ -1481,6 +1723,15 @@ def load_accuracy_manifest(
         categories.add(category)
         if sample.get("label_status") != "verified":
             raise ValueError(f"sample {identifier!r} must have label_status='verified'")
+        label_scope = str(sample.get("label_scope", "exhaustive")).strip().lower()
+        if label_scope not in ACCURACY_LABEL_SCOPES:
+            raise ValueError(
+                f"sample {identifier!r} label_scope must be one of: "
+                + ", ".join(ACCURACY_LABEL_SCOPES)
+            )
+        sample["label_scope"] = label_scope
+        if label_scope == "known_positives":
+            known_positive_sample_count += 1
         has_single_label = "expected_plate" in sample
         has_event_labels = "expected_events" in sample
         if has_single_label == has_event_labels:
@@ -1497,6 +1748,14 @@ def load_accuracy_manifest(
                     raise ValueError(
                         f"sample {identifier!r} expected event {event_index} must be an object"
                     )
+                if strict_evidence:
+                    _reject_unknown_accuracy_fields(
+                        raw_event,
+                        _ACCURACY_MANIFEST_EVENT_KEYS,
+                        context=(
+                            f"sample {identifier!r} expected event {event_index}"
+                        ),
+                    )
                 plate = _verified_ground_truth_plate(
                     raw_event.get("plate"),
                     context=f"sample {identifier!r} expected event {event_index} plate",
@@ -1506,6 +1765,10 @@ def load_accuracy_manifest(
                 start_ms = event.get("start_ms")
                 end_ms = event.get("end_ms")
                 if start_ms is not None:
+                    if isinstance(start_ms, bool):
+                        raise ValueError(
+                            f"sample {identifier!r} expected event {event_index} has invalid start_ms"
+                        )
                     start_ms = float(start_ms)
                     if not math.isfinite(start_ms) or start_ms < 0:
                         raise ValueError(
@@ -1513,6 +1776,10 @@ def load_accuracy_manifest(
                         )
                     event["start_ms"] = start_ms
                 if end_ms is not None:
+                    if isinstance(end_ms, bool):
+                        raise ValueError(
+                            f"sample {identifier!r} expected event {event_index} has invalid end_ms"
+                        )
                     end_ms = float(end_ms)
                     if not math.isfinite(end_ms) or end_ms < 0:
                         raise ValueError(
@@ -1523,6 +1790,13 @@ def load_accuracy_manifest(
                     raise ValueError(
                         f"sample {identifier!r} expected event {event_index} ends before it starts"
                     )
+                if "track_id" in event:
+                    track_id = event["track_id"]
+                    if isinstance(track_id, bool) or not isinstance(track_id, (str, int)):
+                        raise ValueError(
+                            f"sample {identifier!r} expected event {event_index} "
+                            "track_id must be a string or integer"
+                        )
                 expected_events.append(event)
         elif sample["expected_plate"] is not None:
             plate = _verified_ground_truth_plate(
@@ -1532,6 +1806,10 @@ def load_accuracy_manifest(
             expected_events.append({"plate": plate})
         sample["_expected_events"] = expected_events
         if not expected_events:
+            if label_scope != "exhaustive":
+                raise ValueError(
+                    f"sample {identifier!r} known_positives scope requires at least one label"
+                )
             negative_sample_count += 1
         readable_events_by_category[category] += len(expected_events)
         if category == "multiple_vehicles" and len(expected_events) >= 2:
@@ -1539,10 +1817,49 @@ def load_accuracy_manifest(
         raw_input_value = sample.get("input")
         if not isinstance(raw_input_value, Mapping):
             raise ValueError(f"sample {identifier!r} input must be an object")
+        if strict_evidence:
+            _reject_unknown_accuracy_fields(
+                raw_input_value,
+                _ACCURACY_MANIFEST_INPUT_KEYS,
+                context=f"sample {identifier!r} input",
+            )
         input_value = dict(raw_input_value)
         input_path = str(input_value.get("path", "")).strip()
         if not input_path:
             raise ValueError(f"sample {identifier!r} input.path is required")
+        media_type = str(input_value.get("media_type", "")).strip().lower()
+        if strict_evidence and media_type not in {"image", "video"}:
+            raise ValueError(
+                f"sample {identifier!r} input.media_type must be image or video "
+                "in strict evidence mode"
+            )
+        if media_type:
+            if media_type not in {"image", "video"}:
+                raise ValueError(
+                    f"sample {identifier!r} input.media_type must be image or video"
+                )
+            input_value["media_type"] = media_type
+        is_uri = "://" in input_path
+        if strict_evidence and is_uri:
+            raise ValueError(
+                f"sample {identifier!r} URI inputs are not allowed in strict evidence mode"
+            )
+        start_ms = _coerce_input_bound(
+            input_value.get("start_ms"),
+            sample_id=identifier,
+            name="start_ms",
+        )
+        end_ms = _coerce_input_bound(
+            input_value.get("end_ms"),
+            sample_id=identifier,
+            name="end_ms",
+        )
+        if start_ms is not None:
+            input_value["start_ms"] = start_ms
+        if end_ms is not None:
+            input_value["end_ms"] = end_ms
+        if start_ms is not None and end_ms is not None and end_ms < start_ms:
+            raise ValueError(f"sample {identifier!r} input clip ends before it starts")
         expected_media_sha256 = input_value.get("sha256")
         if expected_media_sha256 is not None:
             expected_media_sha256 = str(expected_media_sha256).strip().lower()
@@ -1551,37 +1868,113 @@ def load_accuracy_manifest(
                     f"sample {identifier!r} input.sha256 must be 64 lowercase/uppercase hex characters"
                 )
             input_value["sha256"] = expected_media_sha256
-        if "://" not in input_path:
-            resolved = (manifest_path.parent / input_path).resolve()
+        elif strict_evidence:
+            raise ValueError(
+                f"sample {identifier!r} input.sha256 is required in strict evidence mode"
+            )
+        expected_size = input_value.get("size_bytes")
+        if expected_size is not None:
+            if isinstance(expected_size, bool) or not isinstance(expected_size, int):
+                raise ValueError(
+                    f"sample {identifier!r} input.size_bytes must be a non-negative integer"
+                )
+            if expected_size < 0:
+                raise ValueError(
+                    f"sample {identifier!r} input.size_bytes must be a non-negative integer"
+                )
+            input_value["size_bytes"] = expected_size
+        elif strict_evidence:
+            raise ValueError(
+                f"sample {identifier!r} input.size_bytes is required in strict evidence mode"
+            )
+        if strict_evidence:
+            _validate_content_addressed_accuracy_path(
+                input_path,
+                str(expected_media_sha256),
+                sample_id=identifier,
+            )
+        if not is_uri:
+            resolved = _resolve_accuracy_input_path(
+                manifest_directory,
+                input_path,
+                sample_id=identifier,
+                strict_evidence=strict_evidence,
+            )
             if require_input_files and not resolved.is_file():
                 raise FileNotFoundError(f"sample {identifier!r} input does not exist: {resolved}")
-            if resolved.is_file() and expected_media_sha256 is not None:
+            if resolved.is_file():
+                actual_size = resolved.stat().st_size
                 actual_media_sha256 = _file_sha256(resolved)
-                if actual_media_sha256 != expected_media_sha256:
+                # Resolve again after reading to catch a symlink target swap
+                # during the identity check.
+                if strict_evidence and resolved != _resolve_accuracy_input_path(
+                    manifest_directory,
+                    input_path,
+                    sample_id=identifier,
+                    strict_evidence=True,
+                ):
+                    raise ValueError(
+                        f"sample {identifier!r} input symlink target changed during verification"
+                    )
+                if expected_size is not None and actual_size != expected_size:
+                    raise ValueError(
+                        f"sample {identifier!r} input.size_bytes mismatch: "
+                        f"expected {expected_size}, got {actual_size}"
+                    )
+                if (
+                    expected_media_sha256 is not None
+                    and actual_media_sha256 != expected_media_sha256
+                ):
                     raise ValueError(
                         f"sample {identifier!r} input.sha256 mismatch: "
                         f"expected {expected_media_sha256}, got {actual_media_sha256}"
                     )
-                sample["_verified_input_sha256"] = actual_media_sha256
-                verified_media_sha256s.append((identifier, actual_media_sha256))
+                sample["_loaded_input_sha256"] = actual_media_sha256
+                sample["_loaded_input_size_bytes"] = actual_size
+                sample["_resolved_input_path"] = str(resolved)
+                if expected_media_sha256 is not None and expected_size is not None:
+                    sample["_verified_input_sha256"] = actual_media_sha256
+                    sample["_verified_input_size_bytes"] = actual_size
+                    verified_media_sha256s.append((identifier, actual_media_sha256))
+                    verified_media_identities.append(
+                        (identifier, actual_media_sha256, actual_size)
+                    )
         sample["input"] = input_value
-        sample["_manifest_directory"] = str(manifest_path.parent)
+        sample["_manifest_directory"] = str(manifest_directory)
         samples.append(sample)
     if not samples:
         raise ValueError("manifest contains no enabled, verified samples")
-    if require_all_categories:
-        missing = sorted(set(REQUIRED_ACCURACY_CATEGORIES) - categories)
-        if missing:
-            raise ValueError("manifest is missing required categories: " + ", ".join(missing))
-        empty_categories = sorted(
+    missing_categories = tuple(
+        sorted(set(REQUIRED_ACCURACY_CATEGORIES) - categories)
+    )
+    unreadable_categories = tuple(
+        sorted(
             category
             for category, event_count in readable_events_by_category.items()
             if event_count == 0
         )
-        if empty_categories:
+    )
+    coverage_complete = (
+        not missing_categories
+        and not unreadable_categories
+        and has_multi_vehicle_event_set
+        and negative_sample_count > 0
+        and known_positive_sample_count == 0
+    )
+    if require_all_categories:
+        if known_positive_sample_count:
+            raise ValueError(
+                "complete accuracy evidence requires exhaustive labels for every sample"
+            )
+        if missing_categories:
+            raise ValueError(
+                "manifest is missing required categories: "
+                + ", ".join(missing_categories)
+            )
+        if unreadable_categories:
             raise ValueError(
                 "manifest has no readable event labels for categories: "
-                + ", ".join(empty_categories)
+                + ", ".join(unreadable_categories)
             )
         if not has_multi_vehicle_event_set:
             raise ValueError(
@@ -1591,14 +1984,495 @@ def load_accuracy_manifest(
         raise ValueError(
             "manifest requires at least one verified negative sample with expected_plate=null"
         )
+    dataset_fingerprint = _dataset_fingerprint(dataset_id, samples)
+    claimed_fingerprint = payload.get("dataset_fingerprint_sha256")
+    if claimed_fingerprint is not None:
+        claimed_fingerprint = str(claimed_fingerprint).strip().lower()
+        if not _valid_sha256(claimed_fingerprint):
+            raise ValueError(
+                "manifest dataset_fingerprint_sha256 must be 64 hex characters"
+            )
+        if claimed_fingerprint != dataset_fingerprint:
+            raise ValueError(
+                "manifest dataset_fingerprint_sha256 does not match the loaded dataset"
+            )
     return AccuracyManifest(
         path=manifest_path,
         dataset_id=dataset_id,
         samples=tuple(samples),
         sha256=_manifest_sha256(manifest_path),
+        dataset_fingerprint=dataset_fingerprint,
+        strict_evidence=strict_evidence,
         negative_sample_count=negative_sample_count,
+        known_positive_sample_count=known_positive_sample_count,
+        coverage_complete=coverage_complete,
+        missing_categories=missing_categories,
+        unreadable_categories=unreadable_categories,
         verified_media_sha256s=tuple(verified_media_sha256s),
+        verified_media_identities=tuple(verified_media_identities),
     )
+
+
+def _accuracy_integrity_snapshot(
+    manifest: AccuracyManifest,
+    *,
+    checkpoint: str,
+) -> dict[str, Any]:
+    """Re-read the manifest and every available local input at a run boundary."""
+
+    if not manifest.path.is_file():
+        raise RuntimeError(
+            f"accuracy integrity failure at {checkpoint}: manifest disappeared"
+        )
+    actual_manifest_sha256 = _manifest_sha256(manifest.path)
+    if actual_manifest_sha256 != manifest.sha256:
+        raise RuntimeError(
+            f"accuracy integrity failure at {checkpoint}: manifest sha256 changed"
+        )
+    if _dataset_fingerprint(manifest.dataset_id, manifest.samples) != manifest.dataset_fingerprint:
+        raise RuntimeError(
+            f"accuracy integrity failure at {checkpoint}: loaded dataset definition changed"
+        )
+
+    manifest_directory = manifest.path.parent.resolve()
+    identities: list[dict[str, Any]] = []
+    all_input_bytes_verified = True
+    for sample in manifest.samples:
+        sample_id = str(sample["id"])
+        input_value = sample["input"]
+        raw_path = str(input_value["path"])
+        if "://" in raw_path:
+            if manifest.strict_evidence:
+                raise RuntimeError(
+                    f"accuracy integrity failure at {checkpoint}: "
+                    f"sample {sample_id!r} uses a URI"
+                )
+            identities.append(
+                {
+                    "sample_id": sample_id,
+                    "kind": "uri-unverified",
+                    "path": raw_path,
+                    "sha256": None,
+                    "size_bytes": None,
+                }
+            )
+            all_input_bytes_verified = False
+            continue
+
+        try:
+            resolved = _resolve_accuracy_input_path(
+                manifest_directory,
+                raw_path,
+                sample_id=sample_id,
+                strict_evidence=manifest.strict_evidence,
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"accuracy integrity failure at {checkpoint}: {exc}"
+            ) from exc
+        loaded_resolved = sample.get("_resolved_input_path")
+        if loaded_resolved is not None and resolved != Path(str(loaded_resolved)):
+            raise RuntimeError(
+                f"accuracy integrity failure at {checkpoint}: "
+                f"sample {sample_id!r} resolved path or symlink target changed"
+            )
+        if not resolved.is_file():
+            if manifest.strict_evidence or loaded_resolved is not None:
+                raise RuntimeError(
+                    f"accuracy integrity failure at {checkpoint}: "
+                    f"sample {sample_id!r} input is missing"
+                )
+            identities.append(
+                {
+                    "sample_id": sample_id,
+                    "kind": "missing-unverified",
+                    "path": raw_path,
+                    "sha256": None,
+                    "size_bytes": None,
+                }
+            )
+            all_input_bytes_verified = False
+            continue
+
+        actual_size = resolved.stat().st_size
+        actual_sha256 = _file_sha256(resolved)
+        if resolved != _resolve_accuracy_input_path(
+            manifest_directory,
+            raw_path,
+            sample_id=sample_id,
+            strict_evidence=manifest.strict_evidence,
+        ):
+            raise RuntimeError(
+                f"accuracy integrity failure at {checkpoint}: "
+                f"sample {sample_id!r} symlink target changed while hashing"
+            )
+        expected_size = input_value.get("size_bytes")
+        expected_sha256 = input_value.get("sha256")
+        if manifest.strict_evidence and expected_size is None:
+            raise RuntimeError(
+                f"accuracy integrity failure at {checkpoint}: "
+                f"sample {sample_id!r} has no declared byte size"
+            )
+        if manifest.strict_evidence and expected_sha256 is None:
+            raise RuntimeError(
+                f"accuracy integrity failure at {checkpoint}: "
+                f"sample {sample_id!r} has no declared sha256"
+            )
+        if expected_size is not None and actual_size != int(expected_size):
+            raise RuntimeError(
+                f"accuracy integrity failure at {checkpoint}: "
+                f"sample {sample_id!r} byte size changed"
+            )
+        if expected_sha256 is not None and actual_sha256 != str(expected_sha256):
+            raise RuntimeError(
+                f"accuracy integrity failure at {checkpoint}: "
+                f"sample {sample_id!r} sha256 changed"
+            )
+        if sample.get("_loaded_input_size_bytes") not in (None, actual_size):
+            raise RuntimeError(
+                f"accuracy integrity failure at {checkpoint}: "
+                f"sample {sample_id!r} differs from its loaded byte size"
+            )
+        if sample.get("_loaded_input_sha256") not in (None, actual_sha256):
+            raise RuntimeError(
+                f"accuracy integrity failure at {checkpoint}: "
+                f"sample {sample_id!r} differs from its loaded sha256"
+            )
+        identities.append(
+            {
+                "sample_id": sample_id,
+                "kind": "local-file",
+                "path": raw_path,
+                "sha256": actual_sha256,
+                "size_bytes": actual_size,
+            }
+        )
+
+    identities.sort(key=lambda entry: entry["sample_id"])
+    input_bytes_fingerprint = (
+        _canonical_sha256(
+            [
+                {
+                    "sample_id": entry["sample_id"],
+                    "sha256": entry["sha256"],
+                    "size_bytes": entry["size_bytes"],
+                }
+                for entry in identities
+            ]
+        )
+        if all_input_bytes_verified
+        else None
+    )
+    return {
+        "checkpoint": checkpoint,
+        "manifest_sha256": actual_manifest_sha256,
+        "dataset_fingerprint": manifest.dataset_fingerprint,
+        "input_bytes_fingerprint": input_bytes_fingerprint,
+        "all_input_bytes_verified": all_input_bytes_verified,
+        "inputs": identities,
+    }
+
+
+def _json_safe_reproducibility_mapping(value: Any) -> Mapping[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        return json.loads(
+            json.dumps(
+                dict(value),
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        )
+    except (TypeError, ValueError):
+        return {"note": "declared reproducibility metadata was not JSON-serializable"}
+
+
+def _declared_accuracy_adapter_reproducibility(
+    adapter: Any,
+) -> tuple[Mapping[str, Any] | None, str | None]:
+    function = getattr(adapter, "_function", None)
+    owner = getattr(function, "__self__", None) if function is not None else None
+    candidates = (adapter, owner, function)
+    seen: set[int] = set()
+    for target in candidates:
+        if target is None or id(target) in seen:
+            continue
+        seen.add(id(target))
+        if not hasattr(target, "reproducibility_metadata"):
+            continue
+        declared = getattr(target, "reproducibility_metadata")
+        if callable(declared):
+            try:
+                declared = declared()
+            except Exception as exc:
+                return None, f"{type(exc).__name__}: {exc}"
+        safe = _json_safe_reproducibility_mapping(declared)
+        if safe is None:
+            return None, "reproducibility_metadata must be a JSON object"
+        if safe.get("note") == "declared reproducibility metadata was not JSON-serializable":
+            return safe, str(safe["note"])
+        return safe, None
+    return None, "reproducibility_metadata is not declared"
+
+
+def _accuracy_adapter_reproducibility(adapter: Any) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "adapter_name": str(getattr(adapter, "adapter_name", type(adapter).__name__)),
+        "adapter_type": f"{type(adapter).__module__}.{type(adapter).__qualname__}",
+    }
+    declared, declared_error = _declared_accuracy_adapter_reproducibility(adapter)
+    function = getattr(adapter, "_function", None)
+    if declared is not None:
+        metadata["declared"] = declared
+    if declared_error is not None:
+        metadata["declared_error"] = declared_error
+
+    if function is not None:
+        metadata["callable_module"] = str(getattr(function, "__module__", ""))
+        metadata["callable_qualname"] = str(
+            getattr(function, "__qualname__", getattr(function, "__name__", ""))
+        )
+        try:
+            source_file = inspect.getsourcefile(function)
+        except (OSError, TypeError):
+            source_file = None
+        if source_file:
+            source_path = Path(source_file).resolve()
+            if source_path.is_file():
+                metadata["source_sha256"] = _file_sha256(source_path)
+
+    command = getattr(adapter, "command", None)
+    if isinstance(command, Sequence) and not isinstance(command, (str, bytes)):
+        tokens = [str(token) for token in command]
+        metadata["command_executable"] = tokens[0] if tokens else ""
+        metadata["command_sha256"] = _canonical_sha256(tokens)
+        metadata["timeout_seconds"] = float(getattr(adapter, "timeout_seconds", 0.0))
+    return metadata
+
+
+def _adapter_model_sha256_rows(declared: Mapping[str, Any]) -> list[dict[str, str]]:
+    raw_rows: list[Any] = []
+    models = declared.get("models")
+    if isinstance(models, Sequence) and not isinstance(models, (str, bytes)):
+        raw_rows.extend(models)
+    model_identity = declared.get("model_identity")
+    if isinstance(model_identity, Mapping):
+        files = model_identity.get("files")
+        if isinstance(files, Sequence) and not isinstance(files, (str, bytes)):
+            raw_rows.extend(files)
+    rows: list[dict[str, str]] = []
+    for raw in raw_rows:
+        if not isinstance(raw, Mapping) or raw.get("exists") is False:
+            continue
+        role = str(raw.get("role", "")).strip().lower()
+        digest = str(raw.get("sha256", "")).strip().lower()
+        if role and _valid_sha256(digest):
+            rows.append({"role": role, "sha256": digest})
+    return rows
+
+
+def _nonempty_runtime_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return any(isinstance(item, str) and item.strip() for item in value)
+    return False
+
+
+def _adapter_runtime_identity(declared: Mapping[str, Any]) -> dict[str, Any] | None:
+    model_identity = declared.get("model_identity")
+    if isinstance(model_identity, Mapping) and _nonempty_runtime_value(
+        model_identity.get("execution_provider_contract")
+    ):
+        provider = model_identity["execution_provider_contract"]
+        return {
+            "source": "model_identity.execution_provider_contract",
+            "implementation": (
+                "onnxruntime"
+                if str(provider).strip().endswith("ExecutionProvider")
+                else "declared-provider-contract"
+            ),
+            "provider": provider,
+            "device": model_identity.get("device_contract"),
+        }
+
+    shared_runtime = declared.get("selected_shared_model_runtime")
+    if isinstance(shared_runtime, Mapping):
+        components: dict[str, dict[str, Any]] = {}
+        for role in ("detector", "ocr"):
+            runtime = shared_runtime.get(role)
+            if not isinstance(runtime, Mapping):
+                break
+            provider = runtime.get("providers", runtime.get("provider"))
+            backend = runtime.get("backend", runtime.get("runtime"))
+            if not _nonempty_runtime_value(provider) or not _nonempty_runtime_value(backend):
+                break
+            components[role] = {
+                "backend": backend,
+                "provider": provider,
+                "device": runtime.get("device"),
+            }
+        if len(components) == 2:
+            return {
+                "source": "selected_shared_model_runtime",
+                "components": components,
+            }
+
+    runtime = declared.get("runtime")
+    if isinstance(runtime, Mapping):
+        provider = runtime.get(
+            "providers",
+            runtime.get("provider", runtime.get("execution_provider")),
+        )
+        implementation = runtime.get(
+            "name",
+            runtime.get("runtime", runtime.get("backend")),
+        )
+        if _nonempty_runtime_value(provider) and _nonempty_runtime_value(implementation):
+            return {
+                "source": "runtime",
+                "implementation": implementation,
+                "provider": provider,
+                "device": runtime.get("device"),
+            }
+    return None
+
+
+def _validate_accuracy_adapter_reproducibility(
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    declared = metadata.get("declared")
+    if not isinstance(declared, Mapping):
+        reasons.append("declared-metadata-missing")
+        declared = {}
+    elif declared.get("schema") != _ACCURACY_ADAPTER_METADATA_SCHEMA:
+        reasons.append("metadata-schema-unsupported")
+
+    model_rows = _adapter_model_sha256_rows(declared)
+    roles = {row["role"] for row in model_rows}
+    if not any("detector" in role for role in roles):
+        reasons.append("detector-model-sha256-not-proven")
+    if not any("ocr" in role for role in roles):
+        reasons.append("ocr-model-sha256-not-proven")
+    runtime_identity = _adapter_runtime_identity(declared)
+    if runtime_identity is None:
+        reasons.append("runtime-provider-not-identifiable")
+    if metadata.get("declared_error"):
+        reasons.append("declared-metadata-invalid")
+    return {
+        "valid": not reasons,
+        "reasons": reasons,
+        "model_sha256s": model_rows,
+        "runtime_identity": runtime_identity,
+    }
+
+
+def _accuracy_effective_input_options(
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    declared = metadata.get("declared")
+    if not isinstance(declared, Mapping):
+        return {
+            "proven": False,
+            "reason": "declared-metadata-missing",
+            "options": None,
+        }
+
+    explicit = declared.get("effective_input_options")
+    if isinstance(explicit, Mapping):
+        safe = _json_safe_reproducibility_mapping(explicit)
+        return {
+            "proven": safe is not None,
+            "source": "effective_input_options",
+            "reason": None if safe is not None else "options-not-json-object",
+            "options": safe,
+        }
+
+    adapter_kind = str(declared.get("adapter", ""))
+    if adapter_kind == "legacy-process-video":
+        settings = declared.get("settings")
+        if isinstance(settings, Mapping) and "frame_step" in settings:
+            return {
+                "proven": True,
+                "source": "legacy-process-video.settings",
+                "options": {
+                    "frame_step": settings.get("frame_step"),
+                    "max_frames": None,
+                    "roi": settings.get("roi"),
+                },
+            }
+    if adapter_kind == "engine-v2-offline-shared-inference":
+        config = declared.get("config")
+        adapter_config = config.get("adapter") if isinstance(config, Mapping) else None
+        if isinstance(adapter_config, Mapping) and "frame_step" in adapter_config:
+            return {
+                "proven": True,
+                "source": "engine-v2-offline.config.adapter",
+                "options": {
+                    "frame_step": adapter_config.get("frame_step"),
+                    "max_frames": adapter_config.get("max_frames"),
+                    "roi": None,
+                },
+            }
+    return {
+        "proven": False,
+        "reason": "effective-input-options-not-declared",
+        "options": None,
+    }
+
+
+def _compare_accuracy_effective_input_options(
+    v1_metadata: Mapping[str, Any],
+    v2_metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    v1 = _accuracy_effective_input_options(v1_metadata)
+    v2 = _accuracy_effective_input_options(v2_metadata)
+    differences: list[dict[str, Any]] = []
+    symmetric: bool | None = None
+    if v1["proven"] and v2["proven"]:
+        v1_options = dict(v1["options"])
+        v2_options = dict(v2["options"])
+        for option in sorted(set(v1_options) | set(v2_options)):
+            before = v1_options.get(option)
+            after = v2_options.get(option)
+            if _canonical_sha256(before) != _canonical_sha256(after):
+                differences.append(
+                    {"option": option, "v1": before, "v2": after}
+                )
+        symmetric = not differences
+    return {
+        "symmetric": symmetric,
+        "differences": differences,
+        "v1": v1,
+        "v2": v2,
+    }
+
+
+def _close_accuracy_adapters(adapters: Sequence[Any]) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    closed_targets: set[int] = set()
+    for adapter in adapters:
+        function = getattr(adapter, "_function", None)
+        owner = getattr(function, "__self__", None) if function is not None else None
+        target = owner if owner is not None else (function if function is not None else adapter)
+        close = getattr(target, "close", None)
+        if not callable(close) or id(target) in closed_targets:
+            continue
+        closed_targets.add(id(target))
+        entry = {
+            "adapter_name": str(getattr(adapter, "adapter_name", type(adapter).__name__)),
+            "closed": False,
+        }
+        try:
+            close()
+            entry["closed"] = True
+        except Exception as exc:  # Closing must not hide an inference/integrity failure.
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+        results.append(entry)
+    return results
 
 
 def _load_symbol(specification: str) -> Any:
@@ -1687,7 +2561,16 @@ class CommandAccuracyAdapter:
         self.timeout_seconds = max(0.1, float(timeout_seconds))
 
     def predict(self, sample: Mapping[str, Any]) -> AccuracyPrediction:
-        input_mapping = sample.get("input", {})
+        raw_input_mapping = sample.get("input", {})
+        input_mapping = (
+            {
+                key: value
+                for key, value in raw_input_mapping.items()
+                if key in _ACCURACY_ADAPTER_INPUT_KEYS
+            }
+            if isinstance(raw_input_mapping, Mapping)
+            else {}
+        )
         input_path = str(
             input_mapping.get("resolved_path", input_mapping.get("path", ""))
         )
@@ -1705,7 +2588,10 @@ class CommandAccuracyAdapter:
         request = {
             "schema": "bcvision.anpr.accuracy-sample/v1",
             "engine": self.adapter_name,
-            "sample": {key: value for key, value in sample.items() if not key.startswith("_")},
+            "sample": {
+                "id": str(sample.get("id", "")),
+                "input": input_mapping,
+            },
         }
         completed = subprocess.run(
             command,
@@ -1861,9 +2747,15 @@ def _prediction_events(prediction: AccuracyPrediction) -> list[dict[str, Any]]:
     return [event]
 
 
-def _event_matches(expected: Mapping[str, Any], predicted: Mapping[str, Any]) -> bool:
-    if normalize_plate_text(expected.get("plate")) != normalize_plate_text(predicted.get("plate")):
-        return False
+def _event_is_eligible(
+    expected: Mapping[str, Any],
+    predicted: Mapping[str, Any],
+) -> bool:
+    expected_track_id = expected.get("track_id")
+    if expected_track_id is not None:
+        predicted_track_id = predicted.get("track_id")
+        if predicted_track_id is None or str(predicted_track_id) != str(expected_track_id):
+            return False
     start_ms = expected.get("start_ms")
     end_ms = expected.get("end_ms")
     if start_ms is None and end_ms is None:
@@ -1877,6 +2769,137 @@ def _event_matches(expected: Mapping[str, Any], predicted: Mapping[str, Any]) ->
     if end_ms is not None and timestamp > float(end_ms):
         return False
     return True
+
+
+def _event_matches(expected: Mapping[str, Any], predicted: Mapping[str, Any]) -> bool:
+    return bool(
+        _event_is_eligible(expected, predicted)
+        and normalize_plate_text(expected.get("plate"))
+        == normalize_plate_text(predicted.get("plate"))
+    )
+
+
+def _minimum_cost_assignment(costs: Sequence[Sequence[int]]) -> list[int]:
+    """Return one assigned column per row for a rectangular integer matrix."""
+
+    row_count = len(costs)
+    if row_count == 0:
+        return []
+    column_count = len(costs[0])
+    if column_count < row_count or any(len(row) != column_count for row in costs):
+        raise ValueError("assignment matrix must be rectangular with at least as many columns")
+
+    row_potential = [0] * (row_count + 1)
+    column_potential = [0] * (column_count + 1)
+    column_match = [0] * (column_count + 1)
+    previous_column = [0] * (column_count + 1)
+    infinity = max(max(row) for row in costs) * (row_count + column_count + 1) + 1
+
+    for row_index in range(1, row_count + 1):
+        column_match[0] = row_index
+        minimum = [infinity] * (column_count + 1)
+        used = [False] * (column_count + 1)
+        column = 0
+        while True:
+            used[column] = True
+            current_row = column_match[column]
+            delta = infinity
+            next_column = 0
+            for candidate_column in range(1, column_count + 1):
+                if used[candidate_column]:
+                    continue
+                reduced_cost = (
+                    int(costs[current_row - 1][candidate_column - 1])
+                    - row_potential[current_row]
+                    - column_potential[candidate_column]
+                )
+                if reduced_cost < minimum[candidate_column]:
+                    minimum[candidate_column] = reduced_cost
+                    previous_column[candidate_column] = column
+                if minimum[candidate_column] < delta:
+                    delta = minimum[candidate_column]
+                    next_column = candidate_column
+            for candidate_column in range(column_count + 1):
+                if used[candidate_column]:
+                    row_potential[column_match[candidate_column]] += delta
+                    column_potential[candidate_column] -= delta
+                else:
+                    minimum[candidate_column] -= delta
+            column = next_column
+            if column_match[column] == 0:
+                break
+        while True:
+            previous = previous_column[column]
+            column_match[column] = column_match[previous]
+            column = previous
+            if column == 0:
+                break
+
+    assignment = [-1] * row_count
+    for column in range(1, column_count + 1):
+        if column_match[column]:
+            assignment[column_match[column] - 1] = column - 1
+    return assignment
+
+
+def _event_character_error_rates(
+    expected_events: Sequence[Mapping[str, Any]],
+    predicted_events: Sequence[Mapping[str, Any]],
+) -> list[float]:
+    """Minimum-edit one-to-one CER alignment over time/track-eligible events."""
+
+    if not expected_events:
+        return []
+    expected_plates = [
+        normalize_plate_text(event.get("plate")) for event in expected_events
+    ]
+    predicted_plates = [
+        normalize_plate_text(event.get("plate")) for event in predicted_events
+    ]
+    edit_distances = [
+        [
+            _character_distance(expected_plate, predicted_plate)
+            for predicted_plate in predicted_plates
+        ]
+        for expected_plate in expected_plates
+    ]
+    maximum_edit_distance = max(
+        (
+            distance
+            for row in edit_distances
+            for distance in row
+        ),
+        default=max((len(plate) for plate in expected_plates), default=1),
+    )
+    missing_cost = (maximum_edit_distance + 1) * (len(expected_events) + 1)
+    forbidden_cost = missing_cost * (len(expected_events) + 1)
+    prediction_count = len(predicted_events)
+    costs: list[list[int]] = []
+    for expected_index, expected_event in enumerate(expected_events):
+        real_costs = [
+            edit_distances[expected_index][predicted_index]
+            if _event_is_eligible(expected_event, predicted_event)
+            else forbidden_cost
+            for predicted_index, predicted_event in enumerate(predicted_events)
+        ]
+        costs.append(real_costs + [missing_cost] * len(expected_events))
+
+    assignment = _minimum_cost_assignment(costs)
+    rates: list[float] = []
+    for expected_index, assigned_column in enumerate(assignment):
+        expected_plate = expected_plates[expected_index]
+        if (
+            assigned_column < prediction_count
+            and _event_is_eligible(
+                expected_events[expected_index],
+                predicted_events[assigned_column],
+            )
+        ):
+            distance = edit_distances[expected_index][assigned_column]
+            rates.append(distance / max(1, len(expected_plate)))
+        else:
+            rates.append(1.0)
+    return rates
 
 
 def _match_event_sets(
@@ -1973,15 +2996,22 @@ def _score_accuracy_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "samples": 0,
         "positive_samples": 0,
         "negative_samples": 0,
+        "exhaustive_samples": 0,
+        "known_positive_samples": 0,
+        "exact_set_eligible_samples": 0,
         "exact_set_matches": 0,
         "false_accept_samples": 0,
         "readable_rejections": 0,
         "expected_events": 0,
         "predicted_events": 0,
+        "precision_scored_predicted_events": 0,
+        "precision_scored_matched_events": 0,
+        "precision_unscored_predicted_events": 0,
+        "unmatched_unscored_events": 0,
         "matched_events": 0,
         "missed_events": 0,
-        "false_positive_events": 0,
-        "duplicate_events": 0,
+        "scored_false_positive_events": 0,
+        "scored_duplicate_events": 0,
     }
     character_error_rates: list[float] = []
     latencies: list[float] = []
@@ -1991,6 +3021,7 @@ def _score_accuracy_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     for row in rows:
         expected_events = list(row["expected_events"])
         predicted_events = list(row["predicted_events"])
+        exhaustive = row.get("label_scope", "exhaustive") == "exhaustive"
         positive = bool(expected_events)
         false_accept_sample = not positive and bool(predicted_events)
         readable_rejection = positive and not predicted_events
@@ -1998,35 +3029,54 @@ def _score_accuracy_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "samples": 1,
             "positive_samples": int(positive),
             "negative_samples": int(not positive),
-            "exact_set_matches": int(bool(row["exact_set_match"])),
+            "exhaustive_samples": int(exhaustive),
+            "known_positive_samples": int(not exhaustive),
+            "exact_set_eligible_samples": int(exhaustive and positive),
+            "exact_set_matches": int(exhaustive and bool(row["exact_set_match"])),
             "false_accept_samples": int(false_accept_sample),
             "readable_rejections": int(readable_rejection),
             "expected_events": len(expected_events),
             "predicted_events": len(predicted_events),
+            "precision_scored_predicted_events": (
+                len(predicted_events) if exhaustive else 0
+            ),
+            "precision_scored_matched_events": (
+                int(row["matched_events"]) if exhaustive else 0
+            ),
+            "precision_unscored_predicted_events": (
+                0 if exhaustive else len(predicted_events)
+            ),
+            "unmatched_unscored_events": (
+                0 if exhaustive else int(row["unmatched_predicted_events"])
+            ),
             "matched_events": int(row["matched_events"]),
             "missed_events": int(row["missed_events"]),
-            "false_positive_events": int(row["false_positive_events"]),
-            "duplicate_events": int(row["duplicate_events"]),
+            "scored_false_positive_events": (
+                int(row["false_positive_events"]) if exhaustive else 0
+            ),
+            "scored_duplicate_events": (
+                int(row["duplicate_events"]) if exhaustive else 0
+            ),
         }
         bucket = categories[str(row["category"])]
         for key, amount in values.items():
             totals[key] += amount
             bucket[key] += amount
-        predicted_plates = [normalize_plate_text(event.get("plate")) for event in predicted_events]
-        for expected_event in expected_events:
-            expected_plate = normalize_plate_text(expected_event.get("plate"))
-            best_distance = (
-                min(_character_distance(predicted, expected_plate) for predicted in predicted_plates)
-                if predicted_plates
-                else len(expected_plate)
-            )
-            character_error_rates.append(best_distance / max(1, len(expected_plate)))
+        character_error_rates.extend(
+            _event_character_error_rates(expected_events, predicted_events)
+        )
         latencies.append(float(row["wall_latency_ms"]))
 
     def finalize(bucket: Mapping[str, Any]) -> dict[str, Any]:
         result = dict(bucket)
-        result["exact_set_accuracy"] = _optional_rate(
-            int(bucket["exact_set_matches"]), int(bucket["positive_samples"])
+        complete_label_scope = int(bucket["known_positive_samples"]) == 0
+        result["exact_set_accuracy"] = (
+            _optional_rate(
+                int(bucket["exact_set_matches"]),
+                int(bucket["exact_set_eligible_samples"]),
+            )
+            if complete_label_scope
+            else None
         )
         result["false_accept_rate"] = _optional_rate(
             int(bucket["false_accept_samples"]), int(bucket["negative_samples"])
@@ -2034,8 +3084,26 @@ def _score_accuracy_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         result["event_recall"] = _optional_rate(
             int(bucket["matched_events"]), int(bucket["expected_events"])
         )
-        result["event_precision"] = _optional_rate(
-            int(bucket["matched_events"]), int(bucket["predicted_events"])
+        result["event_precision"] = (
+            _optional_rate(
+                int(bucket["precision_scored_matched_events"]),
+                int(bucket["precision_scored_predicted_events"]),
+            )
+            if complete_label_scope
+            else None
+        )
+        has_exhaustive_scope = (
+            complete_label_scope and int(bucket["exhaustive_samples"]) > 0
+        )
+        result["false_positive_events"] = (
+            int(bucket["scored_false_positive_events"])
+            if has_exhaustive_scope
+            else None
+        )
+        result["duplicate_events"] = (
+            int(bucket["scored_duplicate_events"])
+            if has_exhaustive_scope
+            else None
         )
         return result
 
@@ -2066,16 +3134,18 @@ def run_accuracy_adapter(
     engine_label: str,
 ) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
-    for sample in manifest.samples:
+    for sample_index, sample in enumerate(manifest.samples, start=1):
         # Ground truth must never cross the adapter boundary. In particular,
         # expected_plate, label_status and operator notes stay scorer-only.
-        adapter_input = _accuracy_adapter_input(sample)
+        adapter_input = _accuracy_adapter_input(sample, sample_index=sample_index)
         started = time.perf_counter()
         prediction = _coerce_prediction(adapter.predict(adapter_input))
         wall_latency_ms = (time.perf_counter() - started) * 1000.0
         expected_events = [dict(event) for event in sample["_expected_events"]]
         predicted_events = _prediction_events(prediction)
         matching = _match_event_sets(expected_events, predicted_events)
+        label_scope = str(sample.get("label_scope", "exhaustive"))
+        exhaustive_labels = label_scope == "exhaustive"
         expected_plates = [str(event["plate"]) for event in expected_events]
         predicted_plates = [str(event["plate"]) for event in predicted_events]
         rows.append(
@@ -2084,19 +3154,29 @@ def run_accuracy_adapter(
                 "adapter_name": adapter.adapter_name,
                 "sample_id": sample["id"],
                 "category": sample["category"],
+                "label_scope": label_scope,
                 "input_path": sample["input"]["path"],
                 "expected_plate": expected_plates[0] if expected_plates else "",
                 "predicted_plate": predicted_plates[0] if predicted_plates else "",
                 "expected_events": expected_events,
                 "predicted_events": predicted_events,
                 "accepted": bool(predicted_events),
-                "exact_match": matching["exact_set_match"],
-                "exact_set_match": matching["exact_set_match"],
+                "exact_match": (
+                    matching["exact_set_match"] if exhaustive_labels else None
+                ),
+                "exact_set_match": (
+                    matching["exact_set_match"] if exhaustive_labels else None
+                ),
                 "false_accept": bool(not expected_events and predicted_events),
                 "matched_events": matching["matched_events"],
                 "missed_events": matching["missed_events"],
-                "false_positive_events": matching["false_positive_events"],
-                "duplicate_events": matching["duplicate_events"],
+                "unmatched_predicted_events": matching["false_positive_events"],
+                "false_positive_events": (
+                    matching["false_positive_events"] if exhaustive_labels else None
+                ),
+                "duplicate_events": (
+                    matching["duplicate_events"] if exhaustive_labels else None
+                ),
                 "confidence": prediction.confidence,
                 "wall_latency_ms": round(wall_latency_ms, 4),
                 "details": prediction.details,
@@ -2105,28 +3185,34 @@ def run_accuracy_adapter(
     return {
         "engine": engine_label,
         "adapter_name": adapter.adapter_name,
+        "adapter_reproducibility": _accuracy_adapter_reproducibility(adapter),
         "metrics": _score_accuracy_rows(rows),
         "predictions": rows,
     }
 
 
-def _accuracy_adapter_input(sample: Mapping[str, Any]) -> dict[str, Any]:
-    input_value = dict(sample["input"])
+def _accuracy_adapter_input(
+    sample: Mapping[str, Any],
+    *,
+    sample_index: int,
+) -> dict[str, Any]:
+    input_value = {
+        key: value
+        for key, value in dict(sample["input"]).items()
+        if key in _ACCURACY_ADAPTER_INPUT_KEYS
+    }
     raw_path = str(input_value["path"])
     if "://" not in raw_path:
-        input_value["resolved_path"] = str(
-            (Path(str(sample["_manifest_directory"])) / raw_path).resolve()
-        )
-    request = {
-        "id": str(sample["id"]),
-        "category": str(sample["category"]),
+        resolved_path = sample.get("_resolved_input_path")
+        if resolved_path is None:
+            resolved_path = (
+                Path(str(sample["_manifest_directory"])) / raw_path
+            ).resolve()
+        input_value["resolved_path"] = str(resolved_path)
+    return {
+        "id": f"sample-{sample_index:06d}",
         "input": input_value,
     }
-    # Optional adapter_input is explicitly inference-side configuration. The
-    # loader never copies arbitrary manifest fields into the adapter request.
-    if isinstance(sample.get("adapter_input"), Mapping):
-        request["adapter_input"] = dict(sample["adapter_input"])
-    return request
 
 
 def _category_accuracy_regressions(
@@ -2140,7 +3226,7 @@ def _category_accuracy_regressions(
         metrics: list[str] = []
         deltas: dict[str, float | int | None] = {}
 
-        for metric in ("exact_set_accuracy", "event_recall"):
+        for metric in ("exact_set_accuracy", "event_recall", "event_precision"):
             before = v1.get(metric)
             after = v2.get(metric)
             delta = (
@@ -2171,9 +3257,17 @@ def _category_accuracy_regressions(
             metrics.append("false_accept_rate")
 
         for metric in ("false_positive_events", "duplicate_events"):
-            delta = int(v2[metric]) - int(v1[metric])
+            before = v1.get(metric)
+            after = v2.get(metric)
+            delta = (
+                None
+                if before is None or after is None
+                else int(after) - int(before)
+            )
             deltas[metric] = delta
-            if delta > 0:
+            if (before is None) != (after is None) or (
+                delta is not None and delta > 0
+            ):
                 metrics.append(metric)
 
         if metrics:
@@ -2194,82 +3288,217 @@ def compare_accuracy_adapters(
 ) -> dict[str, Any]:
     """Run V1 and V2 independently over exactly the same verified samples."""
 
-    v1 = run_accuracy_adapter(manifest, v1_adapter, engine_label="v1")
-    v2 = run_accuracy_adapter(manifest, v2_adapter, engine_label="v2")
-    v1_metrics = v1["metrics"]
-    v2_metrics = v2["metrics"]
-    v1_false_accept_rate = v1_metrics["false_accept_rate"]
-    v2_false_accept_rate = v2_metrics["false_accept_rate"]
-    false_accept_not_worse = (
-        v1_false_accept_rate is None and v2_false_accept_rate is None
-    ) or (
-        v1_false_accept_rate is not None
-        and v2_false_accept_rate is not None
-        and float(v2_false_accept_rate) <= float(v1_false_accept_rate)
-    )
-    category_regressions = _category_accuracy_regressions(
-        v1_metrics["categories"],
-        v2_metrics["categories"],
-    )
-    accuracy_not_worse = (
-        float(v2_metrics["exact_accuracy"]) >= float(v1_metrics["exact_accuracy"])
-        and float(v2_metrics["event_recall"]) >= float(v1_metrics["event_recall"])
-        and false_accept_not_worse
-        and int(v2_metrics["false_positive_events"])
-        <= int(v1_metrics["false_positive_events"])
-        and int(v2_metrics["duplicate_events"]) <= int(v1_metrics["duplicate_events"])
-        and float(v2_metrics["mean_character_error_rate"])
-        <= float(v1_metrics["mean_character_error_rate"])
-        and not category_regressions
-    )
-    return {
-        "schema": "bcvision.anpr.accuracy-comparison/v1",
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "dataset_id": manifest.dataset_id,
-        "manifest_path": str(manifest.path),
-        "manifest_sha256": manifest.sha256,
-        "negative_sample_count": manifest.negative_sample_count,
-        "verified_media_sha256s": [
-            {"sample_id": sample_id, "sha256": sha256}
-            for sample_id, sha256 in manifest.verified_media_sha256s
-        ],
-        "required_categories": list(REQUIRED_ACCURACY_CATEGORIES),
-        "same_manifest_for_both_engines": True,
-        "v1": v1,
-        "v2": v2,
-        "comparison": {
-            "v2_accuracy_not_worse": accuracy_not_worse,
-            "category_regressions": category_regressions,
-            "exact_accuracy_delta": round(
-                float(v2_metrics["exact_accuracy"]) - float(v1_metrics["exact_accuracy"]), 6
+    report: dict[str, Any] | None = None
+    try:
+        before_v1 = _accuracy_integrity_snapshot(
+            manifest,
+            checkpoint="immediately-before-v1",
+        )
+        v1 = run_accuracy_adapter(manifest, v1_adapter, engine_label="v1")
+        between_engines = _accuracy_integrity_snapshot(
+            manifest,
+            checkpoint="between-v1-and-v2",
+        )
+        v2 = run_accuracy_adapter(manifest, v2_adapter, engine_label="v2")
+        after_v2 = _accuracy_integrity_snapshot(
+            manifest,
+            checkpoint="immediately-after-v2",
+        )
+
+        integrity_snapshots = (before_v1, between_engines, after_v2)
+        same_manifest = all(
+            snapshot["manifest_sha256"] == manifest.sha256
+            and snapshot["dataset_fingerprint"] == manifest.dataset_fingerprint
+            for snapshot in integrity_snapshots
+        )
+        input_fingerprints = [
+            snapshot["input_bytes_fingerprint"] for snapshot in integrity_snapshots
+        ]
+        same_input_bytes = (
+            all(snapshot["all_input_bytes_verified"] for snapshot in integrity_snapshots)
+            and input_fingerprints[0] is not None
+            and len(set(input_fingerprints)) == 1
+        )
+
+        v1_metrics = v1["metrics"]
+        v2_metrics = v2["metrics"]
+
+        def metric_delta(
+            before: Any,
+            after: Any,
+            *,
+            digits: int = 6,
+        ) -> float | int | None:
+            if before is None or after is None:
+                return None
+            if isinstance(before, int) and isinstance(after, int):
+                return after - before
+            return round(float(after) - float(before), digits)
+
+        v1_false_accept_rate = v1_metrics["false_accept_rate"]
+        v2_false_accept_rate = v2_metrics["false_accept_rate"]
+        false_accept_not_worse = (
+            v1_false_accept_rate is None and v2_false_accept_rate is None
+        ) or (
+            v1_false_accept_rate is not None
+            and v2_false_accept_rate is not None
+            and float(v2_false_accept_rate) <= float(v1_false_accept_rate)
+        )
+        category_regressions = _category_accuracy_regressions(
+            v1_metrics["categories"],
+            v2_metrics["categories"],
+        )
+        adapter_reproducibility_validation = {
+            "v1": _validate_accuracy_adapter_reproducibility(
+                v1["adapter_reproducibility"]
             ),
-            "false_accept_rate_delta": round(
-                float(v2_metrics["false_accept_rate"])
-                - float(v1_metrics["false_accept_rate"]),
-                6,
-            )
-            if v1_false_accept_rate is not None and v2_false_accept_rate is not None
-            else None,
-            "event_recall_delta": round(
-                float(v2_metrics["event_recall"]) - float(v1_metrics["event_recall"]),
-                6,
+            "v2": _validate_accuracy_adapter_reproducibility(
+                v2["adapter_reproducibility"]
             ),
-            "false_positive_event_delta": int(v2_metrics["false_positive_events"])
-            - int(v1_metrics["false_positive_events"]),
-            "duplicate_event_delta": int(v2_metrics["duplicate_events"])
-            - int(v1_metrics["duplicate_events"]),
-            "average_latency_ms_delta": round(
-                float(v2_metrics["average_latency_ms"])
-                - float(v1_metrics["average_latency_ms"]),
-                4,
+        }
+        effective_input_options = _compare_accuracy_effective_input_options(
+            v1["adapter_reproducibility"],
+            v2["adapter_reproducibility"],
+        )
+        required_gate_metrics = (
+            "exact_accuracy",
+            "event_recall",
+            "event_precision",
+            "false_positive_events",
+            "duplicate_events",
+        )
+        unavailable_gate_metrics = [
+            metric
+            for metric in required_gate_metrics
+            if v1_metrics.get(metric) is None or v2_metrics.get(metric) is None
+        ]
+        accuracy_gate_blockers: list[str] = []
+        if not manifest.strict_evidence:
+            accuracy_gate_blockers.append("non-strict-evidence")
+        if manifest.known_positive_sample_count:
+            accuracy_gate_blockers.append("non-exhaustive-label-scope")
+        if not manifest.coverage_complete:
+            accuracy_gate_blockers.append("incomplete-required-coverage")
+        if unavailable_gate_metrics:
+            accuracy_gate_blockers.append("unavailable-gate-metrics")
+        if not same_manifest or not same_input_bytes:
+            accuracy_gate_blockers.append("input-integrity-not-proven")
+        if not all(
+            result["valid"]
+            for result in adapter_reproducibility_validation.values()
+        ):
+            accuracy_gate_blockers.append("adapter-reproducibility-not-proven")
+        if effective_input_options["symmetric"] is None:
+            accuracy_gate_blockers.append("effective-input-symmetry-not-proven")
+        elif not effective_input_options["symmetric"]:
+            accuracy_gate_blockers.append("asymmetric-effective-input-options")
+        accuracy_gate_evaluable = not accuracy_gate_blockers
+        accuracy_not_worse = bool(
+            accuracy_gate_evaluable
+            and float(v2_metrics["exact_accuracy"])
+            >= float(v1_metrics["exact_accuracy"])
+            and float(v2_metrics["event_recall"])
+            >= float(v1_metrics["event_recall"])
+            and float(v2_metrics["event_precision"])
+            >= float(v1_metrics["event_precision"])
+            and false_accept_not_worse
+            and int(v2_metrics["false_positive_events"])
+            <= int(v1_metrics["false_positive_events"])
+            and int(v2_metrics["duplicate_events"])
+            <= int(v1_metrics["duplicate_events"])
+            and float(v2_metrics["mean_character_error_rate"])
+            <= float(v1_metrics["mean_character_error_rate"])
+            and not category_regressions
+        )
+        report = {
+            "schema": "bcvision.anpr.accuracy-comparison/v1",
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "dataset_id": manifest.dataset_id,
+            "dataset_fingerprint": manifest.dataset_fingerprint,
+            "manifest_path": str(manifest.path),
+            "manifest_sha256": manifest.sha256,
+            "strict_evidence": manifest.strict_evidence,
+            "negative_sample_count": manifest.negative_sample_count,
+            "label_scope": {
+                "fully_exhaustive": manifest.known_positive_sample_count == 0,
+                "known_positive_samples": manifest.known_positive_sample_count,
+            },
+            "coverage": {
+                "complete": manifest.coverage_complete,
+                "missing_categories": list(manifest.missing_categories),
+                "unreadable_categories": list(manifest.unreadable_categories),
+            },
+            "verified_media_sha256s": [
+                {"sample_id": sample_id, "sha256": sha256}
+                for sample_id, sha256 in manifest.verified_media_sha256s
+            ],
+            "verified_media_identities": [
+                {
+                    "sample_id": sample_id,
+                    "sha256": sha256,
+                    "size_bytes": size_bytes,
+                }
+                for sample_id, sha256, size_bytes in manifest.verified_media_identities
+            ],
+            "required_categories": list(REQUIRED_ACCURACY_CATEGORIES),
+            "same_manifest_for_both_engines": same_manifest,
+            "same_input_bytes_for_both_engines": same_input_bytes,
+            "integrity": {
+                "verified_at_run_boundaries": True,
+                "checkpoints": list(integrity_snapshots),
+            },
+            "adapter_reproducibility_validation": adapter_reproducibility_validation,
+            "effective_input_options": effective_input_options,
+            "v1": v1,
+            "v2": v2,
+            "comparison": {
+                "v2_accuracy_not_worse": accuracy_not_worse,
+                "accuracy_gate_evaluable": accuracy_gate_evaluable,
+                "accuracy_gate_blockers": accuracy_gate_blockers,
+                "unavailable_gate_metrics": unavailable_gate_metrics,
+                "category_regressions": category_regressions,
+                "exact_accuracy_delta": metric_delta(
+                    v1_metrics["exact_accuracy"],
+                    v2_metrics["exact_accuracy"],
+                ),
+                "false_accept_rate_delta": metric_delta(
+                    v1_false_accept_rate,
+                    v2_false_accept_rate,
+                ),
+                "event_recall_delta": metric_delta(
+                    v1_metrics["event_recall"],
+                    v2_metrics["event_recall"],
+                ),
+                "event_precision_delta": metric_delta(
+                    v1_metrics["event_precision"],
+                    v2_metrics["event_precision"],
+                ),
+                "false_positive_event_delta": metric_delta(
+                    v1_metrics["false_positive_events"],
+                    v2_metrics["false_positive_events"],
+                ),
+                "duplicate_event_delta": metric_delta(
+                    v1_metrics["duplicate_events"],
+                    v2_metrics["duplicate_events"],
+                ),
+                "average_latency_ms_delta": round(
+                    float(v2_metrics["average_latency_ms"])
+                    - float(v1_metrics["average_latency_ms"]),
+                    4,
+                ),
+            },
+            "production_decision_allowed": False,
+            "production_decision_reason": (
+                "Accuracy comparison alone is insufficient; verified real performance and "
+                "resource benchmarks are also required, and this harness never switches engines."
             ),
-        },
-        "production_decision_allowed": False,
-        "production_decision_reason": (
-            "Accuracy comparison alone is insufficient; verified real performance and resource "
-            "benchmarks are also required, and this harness never switches engines."
-        ),
-    }
+        }
+    finally:
+        close_results = _close_accuracy_adapters((v1_adapter, v2_adapter))
+    if report is None:  # pragma: no cover - an exception from the try is re-raised.
+        raise AssertionError("accuracy comparison did not produce a report")
+    report["adapter_lifecycle"] = {"close_results": close_results}
+    return report
 
 
 ACCURACY_CSV_FIELDS = (
@@ -2277,6 +3506,7 @@ ACCURACY_CSV_FIELDS = (
     "adapter_name",
     "sample_id",
     "category",
+    "label_scope",
     "input_path",
     "expected_plate",
     "predicted_plate",
@@ -2287,6 +3517,7 @@ ACCURACY_CSV_FIELDS = (
     "false_accept",
     "matched_events",
     "missed_events",
+    "unmatched_predicted_events",
     "false_positive_events",
     "duplicate_events",
     "confidence",

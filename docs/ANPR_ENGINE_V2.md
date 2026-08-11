@@ -241,8 +241,9 @@ python tools/benchmark_engine_v2.py compare-accuracy \
   --output-dir artifacts/engine-v2-accuracy
 ```
 
-The same operator-verified manifest is passed independently to V1 and V2. It
-must cover:
+The runner evaluates V1 and V2 independently against the same operator-verified
+manifest and constructs an inference-only request for each adapter. Complete
+promotion evidence must cover:
 
 - clear plate;
 - night;
@@ -253,10 +254,28 @@ must cover:
 - fast vehicle;
 - partial/dirty plate.
 
-The manifest requires at least one verified negative sample. Multiple-vehicle
-samples use `expected_events` with at least two events. Local media may include
-SHA-256 identities. Ground-truth labels are removed before calling an engine
-adapter, preventing label leakage.
+The default complete-coverage policy requires at least one verified negative
+sample. Multiple-vehicle coverage includes an `expected_events` sample with at
+least two events. These completeness rules are separate from strict evidence,
+which is the inference-only provenance and byte-integrity contract: local
+content-addressed media with required media type, SHA-256 and byte-size
+identities. The runner re-hashes every input before V1, between engines, and
+after V2.
+
+Manifest sample IDs must be opaque and final media paths are SHA-256-named.
+Adapters receive only an opaque request identity and allowlisted inference input;
+category, labels, label scope/provenance, notes and arbitrary per-sample adapter
+configuration stay scorer-side. This boundary prevents accidental leakage but
+is not an operating-system sandbox, so evidence adapters must be trusted and
+reviewed local code.
+
+Any `known_positives` sample requires the explicit
+`--allow-partial-coverage` opt-out and makes the accuracy promotion gate
+non-evaluable. Built-in comparisons also reject frame truncation, unequal V1/V2
+frame steps and a V1-only ROI so both engines consume the same effective input.
+The gate additionally requires both adapters to prove detector/OCR SHA-256 and
+runtime/provider identity and to declare symmetric effective-input options;
+missing reproducibility metadata remains fail-closed.
 
 Reports separate V1 and V2 predictions and measure exact event-set accuracy,
 event recall/precision, false accepts, false-positive events, duplicate events,
@@ -268,7 +287,10 @@ The deterministic suite proves contracts and failure handling, not real ANPR
 accuracy or real camera capacity. Promotion is still blocked by:
 
 - no repository recording set covering all required accuracy categories;
-- no verified V1/V2 result on the same real media;
+- only one same-input real-media comparison, with three known-positive labels
+  but no exhaustive event inventory, negative sample, or seven other required
+  categories; therefore its precision, false-positive, duplicate and exact-set
+  metrics are deliberately unavailable and its promotion gate is fail-closed;
 - no real RTSP/hardware-decode benchmark on the target Intel systems;
 - no long-duration day/night soak test;
 - no repeated/process-isolated benchmark with statistical confidence bounds;

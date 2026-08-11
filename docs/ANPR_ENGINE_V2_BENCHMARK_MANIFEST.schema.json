@@ -2,12 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://bcvision.local/schemas/anpr-engine-v2-accuracy-manifest-v1.json",
   "title": "BC Vision ANPR V1/V2 Accuracy Manifest",
-  "description": "Operator-verified inputs used unchanged for both engines. The runner requires readable labels in every category, a multi-event multiple_vehicles sample, and at least one verified negative sample.",
+  "description": "Operator-verified local inputs used byte-for-byte unchanged for both engines. Strict evidence describes byte/provenance integrity: explicit inference-only policy and label provenance plus a local relative media path, media type, SHA-256 digest, and byte size for every input. Category completeness, multi-event coverage, exhaustive labels, and negative samples are tracked separately.",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "schema",
     "dataset_id",
+    "label_source",
+    "training_allowed",
     "samples"
   ],
   "properties": {
@@ -20,6 +22,23 @@
     },
     "description": {
       "type": "string"
+    },
+    "dataset_fingerprint_sha256": {
+      "description": "Deterministic logical dataset identity written by prepare_engine_v2_accuracy_dataset.py.",
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "training_allowed": {
+      "description": "Accuracy evidence is inference-only and must never be admitted to training.",
+      "const": false
+    },
+    "label_source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "coverage": {
+      "description": "Coverage inventory written by the dataset preparer.",
+      "type": "object"
     },
     "template": {
       "type": "boolean",
@@ -36,7 +55,7 @@
   "$defs": {
     "sample": {
       "type": "object",
-      "additionalProperties": true,
+      "additionalProperties": false,
       "required": [
         "id",
         "category",
@@ -53,8 +72,35 @@
           "not": {"required": ["expected_plate"]}
         }
       ],
+      "allOf": [
+        {
+          "if": {
+            "required": ["label_scope"],
+            "properties": {
+              "label_scope": {"const": "known_positives"}
+            }
+          },
+          "then": {
+            "anyOf": [
+              {
+                "required": ["expected_events"]
+              },
+              {
+                "required": ["expected_plate"],
+                "properties": {
+                  "expected_plate": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
       "properties": {
         "id": {
+          "description": "Opaque manifest bookkeeping ID. Do not embed plate text or other label hints.",
           "type": "string",
           "minLength": 1
         },
@@ -72,12 +118,16 @@
         },
         "input": {
           "type": "object",
-          "additionalProperties": true,
+          "additionalProperties": false,
           "required": [
-            "path"
+            "path",
+            "media_type",
+            "sha256",
+            "size_bytes"
           ],
           "properties": {
             "path": {
+              "description": "Final strict evidence uses a local content-addressed media/<sha256><suffix> path relative to the manifest directory. URIs, absolute paths, parent traversal, and every symlink/junction component are rejected.",
               "type": "string",
               "minLength": 1
             },
@@ -96,18 +146,24 @@
               "minimum": 0
             },
             "sha256": {
-              "description": "Optional but recommended media identity verified by the runner before inference.",
+              "description": "Media identity re-hashed immediately before V1, between engines, and immediately after V2.",
               "type": "string",
               "pattern": "^[A-Fa-f0-9]{64}$"
+            },
+            "size_bytes": {
+              "description": "Exact media byte size checked at every integrity boundary.",
+              "type": "integer",
+              "minimum": 0
             }
           }
         },
         "expected_plate": {
-          "description": "Verified plate text, or null only when the verified expected outcome is rejection/unreadable.",
+          "description": "Verified plate text, or null only when an exhaustive review verified rejection/unreadable. known_positives never permits null.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "minLength": 1
         },
         "expected_events": {
           "description": "Verified event set for multi-vehicle/video samples. Each event may carry a matching time window.",
@@ -115,7 +171,7 @@
           "minItems": 1,
           "items": {
             "type": "object",
-            "additionalProperties": true,
+            "additionalProperties": false,
             "required": ["plate"],
             "properties": {
               "plate": {"type": "string", "minLength": 1},
@@ -131,6 +187,21 @@
             "pending",
             "verified"
           ]
+        },
+        "label_scope": {
+          "description": "exhaustive means all events are labelled. known_positives permits honest partial recall/CER evidence but makes exact-set, precision, false-positive, and duplicate metrics unavailable.",
+          "enum": [
+            "exhaustive",
+            "known_positives"
+          ],
+          "default": "exhaustive"
+        },
+        "label_source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "training_allowed": {
+          "const": false
         },
         "enabled": {
           "type": "boolean",

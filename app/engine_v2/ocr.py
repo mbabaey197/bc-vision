@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
@@ -182,6 +182,17 @@ class AbandonedOCRTask:
 
 
 @dataclass(slots=True)
+class OCRInFlightHandle:
+    """Observable ownership for a task popped by the background worker."""
+
+    task: OCRTask
+    done: threading.Event = field(default_factory=threading.Event)
+    processed: tuple[OCRTask, OCRVote] | None = None
+    callback_result: object | None = None
+    callback_error: Exception | None = None
+
+
+@dataclass(slots=True)
 class OCRWorkerStats:
     inference_count: int = 0
     failed_inference_count: int = 0
@@ -228,6 +239,12 @@ class SharedOCRWorker:
         self._stats_lock = threading.Lock()
         self._abandoned_lock = threading.Lock()
         self._abandoned: deque[AbandonedOCRTask] = deque()
+        # Queue-pop and in-flight publication share one ownership lock.  A
+        # camera finalizer can therefore never observe the transient state in
+        # which a task has left the queue but is not yet known as in flight.
+        self._ownership_lock = threading.Lock()
+        self._inflight: dict[str, OCRInFlightHandle] = {}
+        self._completed: OrderedDict[str, OCRInFlightHandle] = OrderedDict()
         self._lifecycle_lock = threading.Lock()
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -251,6 +268,8 @@ class SharedOCRWorker:
         self.queue.clear(reset_stats=True)
         with self._abandoned_lock:
             self._abandoned.clear()
+        with self._ownership_lock:
+            self._completed.clear()
         with self._stats_lock:
             self.stats = OCRWorkerStats()
 
@@ -261,13 +280,51 @@ class SharedOCRWorker:
     def process_next_with_abandoned(
         self,
     ) -> tuple[tuple[OCRTask, OCRVote] | None, tuple[AbandonedOCRTask, ...]]:
-        task, expired = self.queue.pop_with_expired(
-            max_age_seconds=self.max_task_age_seconds
-        )
+        handle, expired = self._pop_owned_task()
         for expired_task in expired:
             self._record_abandoned(expired_task, "expired")
-        if task is None:
+        if handle is None:
             return None, self.drain_abandoned()
+        try:
+            processed = self.process_task(handle.task)
+        except Exception as exc:
+            self._finish_owned_task(handle, callback_error=exc)
+            raise
+        self._finish_owned_task(handle, processed=processed)
+        return processed, self.drain_abandoned()
+
+    def cancel_queued_or_observe_inflight(
+        self,
+        key: str,
+    ) -> tuple[bool, OCRInFlightHandle | None]:
+        """Atomically cancel queued work or return its exact in-flight owner.
+
+        ``(True, None)`` means a queued task was cancelled. ``(False, handle)``
+        means the background worker owns that exact task and callers should
+        wait on ``handle.done`` instead of rebuilding it. ``(False, None)``
+        means neither location owns the key.
+        """
+
+        normalized = str(key)
+        with self._ownership_lock:
+            discarded = self.queue.discard(normalized)
+            if discarded:
+                return True, None
+            handle = self._inflight.get(normalized)
+            if handle is None:
+                handle = self._completed.pop(normalized, None)
+            return False, handle
+
+    def process_task(self, task: OCRTask) -> tuple[OCRTask, OCRVote]:
+        """Process one caller-owned task with the shared OCR session.
+
+        The task is intentionally not inserted into or removed from the global
+        OCR queue.  End-of-input handling uses this exact-task primitive to
+        drain one camera without evicting, expiring, or otherwise processing
+        work owned by another camera.  Inference and statistics retain the
+        same locks and semantics as normal queued processing.
+        """
+
         observations: list[OCRObservation] = []
         failures = 0
         with self._inference_lock:
@@ -298,7 +355,7 @@ class SharedOCRWorker:
         vote = self.voter.vote(observations)
         if task.crops and failures == len(task.crops):
             vote.reason = "ocr_error"
-        return (task, vote), self.drain_abandoned()
+        return task, vote
 
     def drain_abandoned(self) -> tuple[AbandonedOCRTask, ...]:
         with self._abandoned_lock:
@@ -320,10 +377,21 @@ class SharedOCRWorker:
         def run() -> None:
             try:
                 while not self._stop.is_set():
+                    handle: OCRInFlightHandle | None = None
                     try:
-                        processed, abandoned = self.process_next_with_abandoned()
+                        handle, expired = self._pop_owned_task()
+                        for expired_task in expired:
+                            self._record_abandoned(expired_task, "expired")
+                        abandoned = self.drain_abandoned()
+                        processed = (
+                            self.process_task(handle.task)
+                            if handle is not None
+                            else None
+                        )
                     except Exception as exc:
                         self._record_worker_error(exc, failed_task=True)
+                        if handle is not None:
+                            self._finish_owned_task(handle, callback_error=exc)
                         continue
                     if abandoned_callback is not None:
                         for item in abandoned:
@@ -335,10 +403,21 @@ class SharedOCRWorker:
                         self._wake.wait(0.05)
                         self._wake.clear()
                         continue
+                    callback_result: object | None = None
+                    callback_error: Exception | None = None
                     try:
-                        callback(*processed)
+                        callback_result = callback(*processed)
                     except Exception as exc:
+                        callback_error = exc
                         self._record_worker_error(exc, callback_error=True)
+                    finally:
+                        if handle is not None:
+                            self._finish_owned_task(
+                                handle,
+                                processed=processed,
+                                callback_result=callback_result,
+                                callback_error=callback_error,
+                            )
             finally:
                 with self._lifecycle_lock:
                     if self._thread is threading.current_thread():
@@ -370,6 +449,39 @@ class SharedOCRWorker:
                 if self._thread is thread:
                     self._thread = None
         return stopped
+
+    def _pop_owned_task(
+        self,
+    ) -> tuple[OCRInFlightHandle | None, tuple[OCRTask, ...]]:
+        with self._ownership_lock:
+            task, expired = self.queue.pop_with_expired(
+                max_age_seconds=self.max_task_age_seconds
+            )
+            if task is None:
+                return None, expired
+            handle = OCRInFlightHandle(task)
+            self._inflight[task.key] = handle
+            return handle, expired
+
+    def _finish_owned_task(
+        self,
+        handle: OCRInFlightHandle,
+        *,
+        processed: tuple[OCRTask, OCRVote] | None = None,
+        callback_result: object | None = None,
+        callback_error: Exception | None = None,
+    ) -> None:
+        with self._ownership_lock:
+            handle.processed = processed
+            handle.callback_result = callback_result
+            handle.callback_error = callback_error
+            handle.done.set()
+            if self._inflight.get(handle.task.key) is handle:
+                self._inflight.pop(handle.task.key, None)
+            self._completed[handle.task.key] = handle
+            self._completed.move_to_end(handle.task.key)
+            while len(self._completed) > max(32, self.queue.max_items * 2):
+                self._completed.popitem(last=False)
 
     def _record_abandoned(self, task: OCRTask, reason: str) -> None:
         item = AbandonedOCRTask(task=task, reason=str(reason))
