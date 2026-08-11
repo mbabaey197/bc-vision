@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
@@ -174,6 +175,12 @@ class OCRTask:
     metadata: dict[str, object] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class AbandonedOCRTask:
+    task: OCRTask
+    reason: str
+
+
 @dataclass(slots=True)
 class OCRWorkerStats:
     inference_count: int = 0
@@ -181,6 +188,9 @@ class OCRWorkerStats:
     task_count: int = 0
     failed_task_count: int = 0
     callback_error_count: int = 0
+    abandoned_task_count: int = 0
+    expired_task_count: int = 0
+    evicted_task_count: int = 0
     total_inference_seconds: float = 0.0
     last_inference_seconds: float = 0.0
     last_error: str | None = None
@@ -216,13 +226,21 @@ class SharedOCRWorker:
         self.stats = OCRWorkerStats()
         self._inference_lock = threading.Lock()
         self._stats_lock = threading.Lock()
+        self._abandoned_lock = threading.Lock()
+        self._abandoned: deque[AbandonedOCRTask] = deque()
         self._lifecycle_lock = threading.Lock()
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
 
     def submit(self, task: OCRTask) -> bool:
-        accepted = self.queue.submit(task.key, task, priority=task.priority)
+        accepted, evicted = self.queue.submit_with_evicted(
+            task.key,
+            task,
+            priority=task.priority,
+        )
+        if evicted is not None:
+            self._record_abandoned(evicted, "capacity_evicted")
         if accepted:
             self._wake.set()
         return accepted
@@ -230,14 +248,26 @@ class SharedOCRWorker:
     def reset(self) -> None:
         """Clear queued work and counters while retaining the shared session."""
 
-        self.queue.clear()
+        self.queue.clear(reset_stats=True)
+        with self._abandoned_lock:
+            self._abandoned.clear()
         with self._stats_lock:
             self.stats = OCRWorkerStats()
 
     def process_next(self) -> tuple[OCRTask, OCRVote] | None:
-        task = self.queue.pop(max_age_seconds=self.max_task_age_seconds)
+        processed, _ = self.process_next_with_abandoned()
+        return processed
+
+    def process_next_with_abandoned(
+        self,
+    ) -> tuple[tuple[OCRTask, OCRVote] | None, tuple[AbandonedOCRTask, ...]]:
+        task, expired = self.queue.pop_with_expired(
+            max_age_seconds=self.max_task_age_seconds
+        )
+        for expired_task in expired:
+            self._record_abandoned(expired_task, "expired")
         if task is None:
-            return None
+            return None, self.drain_abandoned()
         observations: list[OCRObservation] = []
         failures = 0
         with self._inference_lock:
@@ -268,9 +298,19 @@ class SharedOCRWorker:
         vote = self.voter.vote(observations)
         if task.crops and failures == len(task.crops):
             vote.reason = "ocr_error"
-        return task, vote
+        return (task, vote), self.drain_abandoned()
 
-    def start(self, callback: Callable[[OCRTask, OCRVote], None]) -> bool:
+    def drain_abandoned(self) -> tuple[AbandonedOCRTask, ...]:
+        with self._abandoned_lock:
+            items = tuple(self._abandoned)
+            self._abandoned.clear()
+            return items
+
+    def start(
+        self,
+        callback: Callable[[OCRTask, OCRVote], None],
+        abandoned_callback: Callable[[AbandonedOCRTask], None] | None = None,
+    ) -> bool:
         with self._lifecycle_lock:
             if self._thread is not None and self._thread.is_alive():
                 return False
@@ -281,10 +321,16 @@ class SharedOCRWorker:
             try:
                 while not self._stop.is_set():
                     try:
-                        processed = self.process_next()
+                        processed, abandoned = self.process_next_with_abandoned()
                     except Exception as exc:
                         self._record_worker_error(exc, failed_task=True)
                         continue
+                    if abandoned_callback is not None:
+                        for item in abandoned:
+                            try:
+                                abandoned_callback(item)
+                            except Exception as exc:
+                                self._record_worker_error(exc, callback_error=True)
                     if processed is None:
                         self._wake.wait(0.05)
                         self._wake.clear()
@@ -324,6 +370,17 @@ class SharedOCRWorker:
                 if self._thread is thread:
                     self._thread = None
         return stopped
+
+    def _record_abandoned(self, task: OCRTask, reason: str) -> None:
+        item = AbandonedOCRTask(task=task, reason=str(reason))
+        with self._abandoned_lock:
+            self._abandoned.append(item)
+        with self._stats_lock:
+            self.stats.abandoned_task_count += 1
+            if reason == "expired":
+                self.stats.expired_task_count += 1
+            elif reason == "capacity_evicted":
+                self.stats.evicted_task_count += 1
 
     def _record_worker_error(
         self,

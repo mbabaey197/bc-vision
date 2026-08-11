@@ -73,6 +73,24 @@ def _verified_manifest(tmp_path: Path) -> Path:
     return path
 
 
+def test_multi_event_matching_uses_maximum_cardinality_for_overlapping_windows() -> None:
+    expected = [
+        {"plate": "12ب34567", "start_ms": 0, "end_ms": 100},
+        {"plate": "12ب34567", "start_ms": 40, "end_ms": 60},
+    ]
+    predicted = [
+        {"plate": "12ب34567", "timestamp_ms": 49},
+        {"plate": "12ب34567", "timestamp_ms": 90},
+    ]
+
+    result = benchmark_module._match_event_sets(expected, predicted)
+
+    assert result["matched_events"] == 2
+    assert result["missed_events"] == 0
+    assert result["false_positive_events"] == 0
+    assert result["exact_set_match"] is True
+
+
 def test_default_suite_has_required_camera_counts_and_optional_32() -> None:
     scenarios = default_camera_scenarios(include_32=True, active_cameras=1)
 
@@ -234,12 +252,33 @@ def test_production_evidence_requires_verified_input_and_model_files(tmp_path: P
             ],
         }
 
+        def configure_scenario(self, scenario, cameras):
+            del scenario, cameras
+
+        def start_scenario(self, scenario):
+            del scenario
+
+        def stop_scenario(self, scenario):
+            del scenario
+
         def process(self, job):
             del job
-            return {"detector_inferences": 1}
+            return {
+                "detector_inferences": 1,
+                "decode_utilization_percent": 12.5,
+                "decode_utilization_kind": "measured",
+                "decode_utilization_source": "unit-test-decoder-counter",
+            }
 
     result = run_performance_scenario(
-        BenchmarkScenario("verified", 1, 1, nominal_seconds=0.1, ticks_per_second=1),
+        BenchmarkScenario(
+            "verified",
+            1,
+            1,
+            nominal_seconds=0.01,
+            ticks_per_second=1,
+            realtime_pacing=True,
+        ),
         VerifiedAdapter(),
     )
 

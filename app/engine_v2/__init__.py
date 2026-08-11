@@ -15,7 +15,7 @@ from .model_adapters import (
     YOLOPlateDetectorConfig,
 )
 from .motion import AdaptiveMotionGate, MotionGateConfig
-from .ocr import SharedOCRWorker, TemporalOCRVoter
+from .ocr import AbandonedOCRTask, SharedOCRWorker, TemporalOCRVoter
 from .quality import BestPlateFrameSelector, QualityBreakdown, evaluate_plate_quality
 from .runtime import CameraState, EngineV2Config, EventDrivenANPREngine
 from .scheduler import LatestOnlyPriorityQueue, QueueStats
@@ -32,6 +32,7 @@ from .validator import IranianPlateValidator, PlateValidation
 
 __all__ = [
     "AdaptiveMotionGate",
+    "AbandonedOCRTask",
     "AdaptiveLoadController",
     "AdaptiveFrameAdmissionController",
     "BestPlateFrameSelector",

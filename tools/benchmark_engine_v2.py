@@ -93,6 +93,14 @@ def build_parser() -> argparse.ArgumentParser:
     performance.add_argument("--producer-burst", type=int, default=2)
     performance.add_argument("--consumer-budget", type=int)
     performance.add_argument("--max-frame-age-ms", type=float, default=250.0)
+    performance.add_argument(
+        "--paced",
+        action="store_true",
+        help=(
+            "pace producer ticks against real monotonic time; required for any "
+            "production-evidence classification"
+        ),
+    )
     performance_adapter = performance.add_mutually_exclusive_group()
     performance_adapter.add_argument(
         "--adapter-callable",
@@ -169,6 +177,7 @@ def _run_performance(args: argparse.Namespace) -> int:
         "producer_burst": args.producer_burst,
         "consumer_budget_per_tick": args.consumer_budget,
         "max_frame_age_ms": args.max_frame_age_ms,
+        "realtime_pacing": args.paced,
     }
     if args.matrix == "standard":
         report = run_standard_performance_matrices(

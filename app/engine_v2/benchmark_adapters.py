@@ -7,7 +7,8 @@ import numpy as np
 
 from .benchmark import AdapterTelemetry, BenchmarkFrameJob, BenchmarkScenario
 from .runtime import EventDrivenANPREngine
-from .types import FramePacket, TrackPhase
+from .streams import AdaptiveFrameAdmissionController
+from .types import FramePacket
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,64 +44,93 @@ class EngineV2RuntimePerformanceAdapter:
         self.frames = frames or RuntimeBenchmarkFrameConfig()
         self.close_callback = close_callback
         self._sequences: dict[str, int] = {}
+        self._sequence_offsets: dict[str, int] = {}
         self._active_frame_indexes: dict[str, int] = {}
+        self._admission: dict[str, AdaptiveFrameAdmissionController] = {}
         self._initialized: set[str] = set()
+        self._source_fps = 10.0
+        self._ticks_per_second = 10
         self._idle_main, self._idle_detector = self._make_idle_frames()
         self._active_frames = self._make_active_frames()
 
     def prepare_scenario(self, scenario: BenchmarkScenario) -> None:
-        del scenario
         self.engine.reset_runtime_state()
         self._sequences.clear()
+        self._sequence_offsets.clear()
         self._active_frame_indexes.clear()
+        self._admission.clear()
         self._initialized.clear()
+        self._source_fps = float(scenario.ticks_per_second * scenario.producer_burst)
+        self._ticks_per_second = int(scenario.ticks_per_second)
 
     def process(self, job: BenchmarkFrameJob) -> AdapterTelemetry:
         self._ensure_camera(job.camera_id, job.nominal_timestamp)
         before = self.engine.telemetry()
-        state = self.engine.state_for(job.camera_id)
-        if state.phase is TrackPhase.IDLE:
-            stride = max(
-                1,
-                self.engine.config.idle_stride
-                * self.engine.policy.idle_stride_multiplier,
-            )
-        else:
-            stride = max(
-                1,
-                self.engine.config.active_stride
-                * self.engine.policy.detector_stride_multiplier,
-            )
-        sequence = self._next_aligned_sequence(job.camera_id, stride)
+        # Preserve the outer producer's natural newest-survivor sequence gaps.
+        # The runtime, not the adapter, must decide whether this packet is a
+        # detector or tracking-only cadence slot under current load.
+        offset = self._sequence_offsets[job.camera_id]
+        sequence = max(
+            self._sequences[job.camera_id] + 1,
+            offset + int(job.sequence),
+        )
+        self._sequences[job.camera_id] = sequence
         frame_index = self._active_frame_indexes.get(job.camera_id, 0)
         self._active_frame_indexes[job.camera_id] = frame_index + 1
         main, detector = self._active_frames[frame_index % len(self._active_frames)]
-        self.engine.submit_frame(
+        admission = self._admission[job.camera_id]
+        admission.update(
+            self.engine.producer_cadence_policy(job.camera_id, self._source_fps)
+        )
+        decision = admission.decide(float(job.nominal_timestamp))
+        if not decision.admit:
+            return self._delta(before, self.engine.telemetry())
+        accepted = self.engine.submit_frame(
             FramePacket(
                 camera_id=job.camera_id,
                 seq=sequence,
                 ts=float(job.nominal_timestamp),
                 frame=main,
                 detector_frame=detector,
-                metadata={"benchmark_input": "synthetic-active"},
+                metadata={
+                    "benchmark_input": "synthetic-active",
+                    "adaptive_admission": True,
+                    "detector_due": decision.detector_due,
+                },
             )
         )
+        if accepted is False and decision.detector_due:
+            admission.detector_unaccepted()
         self.engine.process_available(limit=8)
         return self._delta(before, self.engine.telemetry())
 
     def observe_idle(self, camera_id: str, tick: int) -> AdapterTelemetry:
         self._ensure_camera(camera_id, float(tick))
         before = self.engine.telemetry()
-        self.engine.submit_frame(
+        admission = self._admission[camera_id]
+        admission.update(
+            self.engine.producer_cadence_policy(camera_id, self._source_fps)
+        )
+        timestamp = float(tick) / float(max(1, self._ticks_per_second))
+        decision = admission.decide(timestamp)
+        if not decision.admit:
+            return self._delta(before, self.engine.telemetry())
+        accepted = self.engine.submit_frame(
             FramePacket(
                 camera_id=camera_id,
                 seq=self._next_sequence(camera_id),
-                ts=float(tick),
+                ts=timestamp,
                 frame=self._idle_main,
                 detector_frame=self._idle_detector,
-                metadata={"benchmark_input": "synthetic-idle"},
+                metadata={
+                    "benchmark_input": "synthetic-idle",
+                    "adaptive_admission": True,
+                    "detector_due": decision.detector_due,
+                },
             )
         )
+        if accepted is False and decision.detector_due:
+            admission.detector_unaccepted()
         self.engine.process_available(limit=2)
         return self._delta(before, self.engine.telemetry())
 
@@ -123,6 +153,9 @@ class EngineV2RuntimePerformanceAdapter:
             * self.engine.policy.idle_stride_multiplier,
         )
         self._sequences[camera_id] = stride - 1
+        self._admission[camera_id] = AdaptiveFrameAdmissionController(
+            self.engine.producer_cadence_policy(camera_id, self._source_fps)
+        )
         self.engine.submit_frame(
             FramePacket(
                 camera_id=camera_id,
@@ -130,18 +163,17 @@ class EngineV2RuntimePerformanceAdapter:
                 ts=timestamp,
                 frame=self._idle_main,
                 detector_frame=self._idle_detector,
-                metadata={"benchmark_input": "synthetic-baseline"},
+                metadata={
+                    "benchmark_input": "synthetic-baseline",
+                    "adaptive_admission": True,
+                    "detector_due": True,
+                },
             )
         )
+        self._sequence_offsets[camera_id] = self._sequences[camera_id]
 
     def _next_sequence(self, camera_id: str) -> int:
         value = self._sequences.get(camera_id, 0) + 1
-        self._sequences[camera_id] = value
-        return value
-
-    def _next_aligned_sequence(self, camera_id: str, stride: int) -> int:
-        current = self._sequences.get(camera_id, 0)
-        value = ((current // max(1, int(stride))) + 1) * max(1, int(stride))
         self._sequences[camera_id] = value
         return value
 
@@ -179,6 +211,8 @@ class EngineV2RuntimePerformanceAdapter:
             decode_utilization_percent=None,
             decode_utilization_kind=self.decode_utilization_kind,
             decode_utilization_source=self.decode_utilization_source,
+            active_cameras=int(after["active_cameras"]),
+            idle_cameras=int(after["idle_cameras"]),
         )
 
 

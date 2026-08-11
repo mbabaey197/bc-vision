@@ -10,7 +10,7 @@ import numpy as np
 from .dedup import DuplicateSuppressor, DuplicateSuppressorConfig
 from .load import AdaptiveLoadController, LoadPolicy, LoadSnapshot, SystemLoadSampler
 from .motion import AdaptiveMotionGate
-from .ocr import OCRTask, SharedOCRWorker, TemporalOCRVoter
+from .ocr import AbandonedOCRTask, OCRTask, SharedOCRWorker, TemporalOCRVoter
 from .quality import BestPlateFrameSelector
 from .scheduler import LatestOnlyPriorityQueue
 from .streams import ProducerActivity, ProducerCadencePolicy
@@ -381,8 +381,13 @@ class EventDrivenANPREngine:
             if packet is not None:
                 self._process_detector_packet(packet)
             ocr_tasks_before = self.ocr_worker.stats.task_count
+            abandoned_before = self.ocr_worker.stats.abandoned_task_count
             event = self._process_one_ocr()
-            if packet is not None or self.ocr_worker.stats.task_count != ocr_tasks_before:
+            if (
+                packet is not None
+                or self.ocr_worker.stats.task_count != ocr_tasks_before
+                or self.ocr_worker.stats.abandoned_task_count != abandoned_before
+            ):
                 self._observe_load()
             return event
 
@@ -425,7 +430,7 @@ class EventDrivenANPREngine:
         """
 
         with self._process_lock, self._state_lock:
-            self.queue.clear()
+            self.queue.clear(reset_stats=True)
             self.ocr_worker.reset()
             self.deduplicator.clear()
             self._states.clear()
@@ -469,6 +474,9 @@ class EventDrivenANPREngine:
                 "detector_latency_ema_ms": self.metrics.detector_latency_ema_seconds * 1_000.0,
                 "ocr_inferences": self.ocr_worker.stats.inference_count,
                 "ocr_mean_ms": self.ocr_worker.stats.mean_inference_seconds * 1_000.0,
+                "ocr_abandoned_tasks": self.ocr_worker.stats.abandoned_task_count,
+                "ocr_expired_tasks": self.ocr_worker.stats.expired_task_count,
+                "ocr_evicted_tasks": self.ocr_worker.stats.evicted_task_count,
                 "queue_depth": len(self.queue),
                 "ocr_queue_depth": len(self.ocr_worker.queue),
                 "dropped_stale_frames": self.queue.stats.stale_dropped,
@@ -591,12 +599,24 @@ class EventDrivenANPREngine:
                 episode = state.tracks.get(track_id)
                 if episode is not None:
                     episode.tracker_removed = True
-                    self._maybe_submit_ocr(packet.camera_id, episode, force=True)
+                    submitted = self._maybe_submit_ocr(packet.camera_id, episode, force=True)
+                    if (
+                        not submitted
+                        and not episode.ocr_submitted
+                        and episode.phase is not TrackPhase.DONE
+                    ):
+                        # The track has left and no candidate meets the quality
+                        # floor. Avoid OCR on bad evidence without leaving an
+                        # episode active when no future crops can arrive.
+                        episode.advance(TrackPhase.DONE)
+                        state.last_done_seq = max(state.last_done_seq, episode.last_seq)
 
             active_episodes = [
                 episode for episode in state.tracks.values()
                 if episode.phase is not TrackPhase.DONE
             ]
+            if state.tracks and not active_episodes:
+                state.phase = TrackPhase.DONE
             if was_done and candidates and not active_episodes:
                 # Motion woke the detector, but every observation still belongs
                 # to a completed track. Preserve camera DONE so active-cadence
@@ -637,9 +657,13 @@ class EventDrivenANPREngine:
             if episode.phase in (TrackPhase.DONE, TrackPhase.OCR):
                 continue
 
-            episode.last_seq = packet.seq
-            episode.last_ts = packet.ts
-            episode.last_bbox = observation.bbox
+            # A detector may finish after a newer tracking-only packet was
+            # harvested. Keep the newest episode clock/evidence pointer; the
+            # older detector crop may still be a useful quality candidate.
+            if packet.seq >= episode.last_seq:
+                episode.last_seq = packet.seq
+                episode.last_ts = packet.ts
+                episode.last_bbox = observation.bbox
             episode.advance(TrackPhase.PLATE_FOUND)
             padded = self._pad_bbox(observation.bbox, packet.frame.shape[:2])
             crop = self._crop_bbox(packet.frame, padded)
@@ -723,7 +747,9 @@ class EventDrivenANPREngine:
         return True
 
     def _process_one_ocr(self) -> PlateEvent | None:
-        processed = self.ocr_worker.process_next()
+        processed, abandoned = self.ocr_worker.process_next_with_abandoned()
+        for item in abandoned:
+            self._reconcile_abandoned_ocr(item)
         if processed is None:
             return None
         task, vote = processed
@@ -792,6 +818,52 @@ class EventDrivenANPREngine:
         if self.on_event is not None:
             self.on_event(event)
         return event
+
+    def _reconcile_abandoned_ocr(self, abandoned: AbandonedOCRTask) -> None:
+        task = abandoned.task
+        camera_value = task.metadata.get("camera_id")
+        track_value = task.metadata.get("track_id")
+        if camera_value is None or track_value is None:
+            return
+        camera_id = str(camera_value)
+        try:
+            track_id = int(track_value)
+        except (TypeError, ValueError):
+            return
+
+        with self._state_lock:
+            state = self._states.get(camera_id)
+            episode = state.tracks.get(track_id) if state is not None else None
+            if (
+                state is None
+                or task.metadata.get("runtime_epoch") != state.runtime_epoch
+                or episode is None
+                or episode.episode_id != task.key
+                or not episode.ocr_submitted
+            ):
+                return
+
+            episode.ocr_submitted = False
+            terminal = (
+                episode.tracker_removed
+                or episode.ocr_attempts >= self.config.max_ocr_attempts
+            )
+            if terminal:
+                episode.advance(TrackPhase.DONE)
+                try:
+                    task_seq = int(task.metadata.get("seq", episode.last_seq))
+                except (TypeError, ValueError):
+                    task_seq = episode.last_seq
+                state.last_done_seq = max(state.last_done_seq, task_seq)
+                unfinished = any(
+                    item.phase is not TrackPhase.DONE for item in state.tracks.values()
+                )
+                state.phase = TrackPhase.TRACKING if unfinished else TrackPhase.DONE
+            else:
+                # Wait for genuinely fresh evidence before retrying. Immediate
+                # re-submission of the same stale/evicted crops would hot-loop.
+                episode.advance(TrackPhase.COLLECTING)
+                state.phase = TrackPhase.COLLECTING
 
     def _observe_load(self) -> None:
         if not self.config.load_control_enabled:

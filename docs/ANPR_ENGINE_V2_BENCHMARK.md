@@ -9,6 +9,7 @@ written with `production_evidence=false` and cannot support a release decision.
 ```bash
 python tools/benchmark_engine_v2.py performance \
   --output-dir benchmark-results/engine-v2 \
+  --paced \
   --include-32
 ```
 
@@ -16,6 +17,8 @@ The default `standard` matrix runs two independent 1, 4, 8 and 16 camera sweeps
 (optionally 32): a fixed-active sweep that isolates incremental idle-camera
 cost, and an all-active sweep that measures busy-site scaling. Use
 `--matrix fixed-active` or `--matrix all-active` to run only one side.
+Without `--paced`, nominal time controls workload size only so CI remains fast;
+that mode cannot be classified as production evidence.
 
 Synthetic mode does not load a model or decoder. For a real in-process run,
 provide a long-lived callable so model sessions remain shared:
@@ -53,6 +56,14 @@ An adapter requesting that label must supply `evidence_metadata` with verified
 input/model file SHA-256 values, the execution provider, `resource_scope` set to
 `current-process`, and `uses_child_processes=false`. The harness re-hashes those
 files; self-asserted counters alone never become production evidence.
+Per-scenario validation additionally requires real-time pacing, complete
+configure/start/stop stream lifecycle hooks, and numeric `measured` decode
+utilization with a precise source. Estimated or unavailable decode cannot pass.
+
+Configured Active/Idle counts are separate from optional measured runtime
+mean/max counts. If `resource.getrusage.maxrss` is the only RAM source, it is a
+process-lifetime peak rather than an independent peak for each scenario; use
+process isolation or a trustworthy current-RSS sampler for capacity evidence.
 
 Command performance adapters are supported for contract tests, but are marked
 non-production evidence because parent-process CPU/RAM counters do not include

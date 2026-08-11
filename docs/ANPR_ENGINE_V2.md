@@ -122,6 +122,9 @@ Its score combines:
 - directional edge/motion-blur proxy.
 
 Normally the best two or three candidates are sent to the shared OCR worker.
+Expired or priority-evicted OCR tasks are surfaced back to the runtime so their
+episodes return to COLLECTING or terminate after exit; no track can remain stuck
+in OCR with an empty queue.
 The temporal voter:
 
 - counts support only from distinct source sequences;
@@ -195,6 +198,7 @@ The independent CLI never changes the production engine:
 ```bash
 python tools/benchmark_engine_v2.py performance \
   --matrix standard \
+  --paced \
   --include-32 \
   --output-dir artifacts/engine-v2
 ```
@@ -216,6 +220,16 @@ measured process and provide verifiable recording/model SHA-256 identities,
 execution-provider metadata, decoder lifecycle instrumentation, and resource
 scope before the report can classify it as production evidence. Even then, the
 harness reports evidence and never switches engines.
+
+`--paced` schedules producer ticks against the real monotonic clock. Production
+evidence is rejected unless pacing, verified input/model hashes, in-process
+resource scope, complete stream lifecycle hooks, and numeric measured decode
+utilization with provenance are all present.
+
+The initial 1/4/8/16/32 host smoke and shared-model microbenchmark are recorded
+in `docs/benchmarks/engine_v2_initial_host_2026-08-11/README.md`. They are
+explicitly synthetic/non-production: idle cameras performed zero detector/OCR
+calls, while motion-gate CPU and per-camera state memory remained non-zero.
 
 ### Accuracy comparison
 
@@ -257,6 +271,7 @@ accuracy or real camera capacity. Promotion is still blocked by:
 - no verified V1/V2 result on the same real media;
 - no real RTSP/hardware-decode benchmark on the target Intel systems;
 - no long-duration day/night soak test;
+- no repeated/process-isolated benchmark with statistical confidence bounds;
 - latest-arrival main/sub pairing rather than a nearest-PTS frame buffer;
 - continuous main-stream decode cost, which must be measured on real hardware;
 - axis-aligned boxes and scale mapping; strongly angled/letterboxed/cropped

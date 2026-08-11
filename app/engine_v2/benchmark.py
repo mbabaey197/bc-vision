@@ -55,9 +55,10 @@ REQUIRED_ACCURACY_CATEGORIES = (
 class BenchmarkScenario:
     """A finite, repeatable producer/consumer workload.
 
-    ``nominal_seconds`` controls workload size, not a sleep interval.  Throughput
-    rates use observed wall time, while frame timestamps use the nominal clock.
-    This keeps CI fast without presenting simulated time as measured throughput.
+    By default ``nominal_seconds`` controls workload size rather than sleeping,
+    which keeps contract tests fast. ``realtime_pacing=True`` schedules ticks
+    against the monotonic clock and is required before a run can be labelled
+    production evidence.
     """
 
     name: str
@@ -70,6 +71,7 @@ class BenchmarkScenario:
     max_frame_age_ms: float = 250.0
     queue_capacity: int = 128
     matrix: str = "custom"
+    realtime_pacing: bool = False
 
     def __post_init__(self) -> None:
         if self.camera_count < 1:
@@ -118,10 +120,16 @@ class AdapterTelemetry:
     decode_utilization_percent: float | None = None
     decode_utilization_kind: str = "unavailable"
     decode_utilization_source: str = "unavailable"
+    active_cameras: int | None = None
+    idle_cameras: int | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("detector_inferences", "ocr_inferences", "plate_events"):
             if int(getattr(self, field_name)) < 0:
+                raise ValueError(f"{field_name} cannot be negative")
+        for field_name in ("active_cameras", "idle_cameras"):
+            count = getattr(self, field_name)
+            if count is not None and int(count) < 0:
                 raise ValueError(f"{field_name} cannot be negative")
         value = self.decode_utilization_percent
         if value is not None and (not math.isfinite(float(value)) or not 0.0 <= float(value) <= 100.0):
@@ -304,6 +312,12 @@ def _coerce_telemetry(value: Any, default_decode_source: str) -> AdapterTelemetr
         ),
         decode_utilization_source=str(
             value.get("decode_utilization_source", default_decode_source)
+        ),
+        active_cameras=(
+            None if value.get("active_cameras") is None else int(value["active_cameras"])
+        ),
+        idle_cameras=(
+            None if value.get("idle_cameras") is None else int(value["idle_cameras"])
         ),
     )
 
@@ -580,6 +594,8 @@ def run_performance_scenario(
     decode_values: list[float] = []
     decode_kinds: set[str] = set()
     decode_sources: set[str] = set()
+    measured_active_cameras: list[int] = []
+    measured_idle_cameras: list[int] = []
     sequence_by_camera = [0] * scenario.camera_count
     camera_metrics: dict[str, dict[str, Any]] = {
         f"camera-{index + 1:02d}": {
@@ -630,6 +646,10 @@ def run_performance_scenario(
             decode_values.append(float(telemetry.decode_utilization_percent))
             decode_kinds.add(telemetry.decode_utilization_kind)
             decode_sources.add(telemetry.decode_utilization_source)
+        if telemetry.active_cameras is not None:
+            measured_active_cameras.append(int(telemetry.active_cameras))
+        if telemetry.idle_cameras is not None:
+            measured_idle_cameras.append(int(telemetry.idle_cameras))
 
     def consume_one() -> bool:
         nonlocal expired_frames, processed_jobs
@@ -683,7 +703,13 @@ def run_performance_scenario(
     sampler.start()
     if callable(start_scenario):
         start_scenario(scenario)
+    pacing_started = time.perf_counter()
     for tick in range(scenario.ticks):
+        if scenario.realtime_pacing:
+            target = pacing_started + tick / float(scenario.ticks_per_second)
+            remaining = target - time.perf_counter()
+            if remaining > 0:
+                time.sleep(remaining)
         nominal_timestamp = tick / float(scenario.ticks_per_second)
         # Rotate producer order so a constrained consumer budget cannot always
         # favor the first camera IDs.
@@ -754,6 +780,10 @@ def run_performance_scenario(
     # are ignored by LatestOnlyPriorityQueue.pop().
     while consume_one():
         pass
+    if scenario.realtime_pacing:
+        remaining = pacing_started + scenario.nominal_seconds - time.perf_counter()
+        if remaining > 0:
+            time.sleep(remaining)
     if callable(stop_scenario):
         stop_scenario(scenario)
     measured = sampler.finish()
@@ -791,10 +821,22 @@ def run_performance_scenario(
 
     evidence = dict(evidence_status or _performance_evidence_status(adapter))
     evidence["reasons"] = list(evidence.get("reasons", []))
-    if scenario.idle_cameras and not stream_lifecycle_included:
+    scenario_evidence_failures: set[str] = set()
+    if not scenario.realtime_pacing:
+        scenario_evidence_failures.add("real-time-pacing-required")
+    if not stream_lifecycle_included:
+        scenario_evidence_failures.add("stream-lifecycle-not-instrumented")
+    if (
+        decode_utilization is None
+        or decode_kind != "measured"
+        or not decode_source.strip()
+        or decode_source.startswith("unavailable")
+    ):
+        scenario_evidence_failures.add("measured-decode-utilization-required")
+    if scenario_evidence_failures:
         evidence["valid"] = False
         evidence["reasons"] = sorted(
-            set(evidence["reasons"]) | {"idle-stream-lifecycle-not-instrumented"}
+            set(evidence["reasons"]) | scenario_evidence_failures
         )
     per_camera: dict[str, dict[str, Any]] = {}
     for camera_id, raw in camera_metrics.items():
@@ -829,7 +871,27 @@ def run_performance_scenario(
         "camera_count": scenario.camera_count,
         "active_cameras": scenario.active_cameras,
         "idle_cameras": scenario.idle_cameras,
+        "configured_active_cameras": scenario.active_cameras,
+        "configured_idle_cameras": scenario.idle_cameras,
+        "active_idle_count_source": "benchmark-scenario-configuration",
+        "measured_active_cameras_mean": (
+            None
+            if not measured_active_cameras
+            else round(statistics.fmean(measured_active_cameras), 4)
+        ),
+        "measured_active_cameras_max": (
+            None if not measured_active_cameras else max(measured_active_cameras)
+        ),
+        "measured_idle_cameras_mean": (
+            None
+            if not measured_idle_cameras
+            else round(statistics.fmean(measured_idle_cameras), 4)
+        ),
+        "measured_idle_cameras_max": (
+            None if not measured_idle_cameras else max(measured_idle_cameras)
+        ),
         "nominal_workload_seconds": scenario.nominal_seconds,
+        "realtime_pacing": scenario.realtime_pacing,
         "scenario_config": {
             "ticks_per_second": scenario.ticks_per_second,
             "ticks": scenario.ticks,
@@ -837,6 +899,7 @@ def run_performance_scenario(
             "consumer_budget_per_tick": scenario.consumer_budget_per_tick,
             "max_frame_age_ms": scenario.max_frame_age_ms,
             "queue_capacity": scenario.queue_capacity,
+            "realtime_pacing": scenario.realtime_pacing,
         },
         "observed_wall_seconds": round(wall, 6),
         "throughput_time_source": "observed-wall-time",
@@ -929,6 +992,7 @@ def default_camera_scenarios(
     producer_burst: int = 2,
     consumer_budget_per_tick: int | None = None,
     max_frame_age_ms: float = 250.0,
+    realtime_pacing: bool = False,
 ) -> list[BenchmarkScenario]:
     """Return 1/4/8/16 camera cases with a fixed active count.
 
@@ -952,6 +1016,7 @@ def default_camera_scenarios(
                 consumer_budget_per_tick=consumer_budget_per_tick,
                 max_frame_age_ms=max_frame_age_ms,
                 matrix="fixed-active-idle-scaling",
+                realtime_pacing=realtime_pacing,
             )
         )
     return scenarios
@@ -965,6 +1030,7 @@ def all_active_camera_scenarios(
     producer_burst: int = 2,
     consumer_budget_per_tick: int | None = None,
     max_frame_age_ms: float = 250.0,
+    realtime_pacing: bool = False,
 ) -> list[BenchmarkScenario]:
     """Return the standard all-active busy scaling matrix."""
 
@@ -979,6 +1045,7 @@ def all_active_camera_scenarios(
             consumer_budget_per_tick=consumer_budget_per_tick,
             max_frame_age_ms=max_frame_age_ms,
             matrix="all-active-busy-scaling",
+            realtime_pacing=realtime_pacing,
         )
         for count in _standard_camera_counts(include_32)
     ]
@@ -993,6 +1060,7 @@ def standard_camera_matrices(
     producer_burst: int = 2,
     consumer_budget_per_tick: int | None = None,
     max_frame_age_ms: float = 250.0,
+    realtime_pacing: bool = False,
 ) -> dict[str, list[BenchmarkScenario]]:
     """Build fixed-active idle and all-active busy matrices together."""
 
@@ -1003,6 +1071,7 @@ def standard_camera_matrices(
         "producer_burst": producer_burst,
         "consumer_budget_per_tick": consumer_budget_per_tick,
         "max_frame_age_ms": max_frame_age_ms,
+        "realtime_pacing": realtime_pacing,
     }
     return {
         "fixed_active_idle_scaling": default_camera_scenarios(
@@ -1202,6 +1271,7 @@ def run_standard_performance_matrices(
     producer_burst: int = 2,
     consumer_budget_per_tick: int | None = None,
     max_frame_age_ms: float = 250.0,
+    realtime_pacing: bool = False,
 ) -> dict[str, Any]:
     """Run the standard idle and busy matrices with one shared adapter lifecycle."""
 
@@ -1213,6 +1283,7 @@ def run_standard_performance_matrices(
         producer_burst=producer_burst,
         consumer_budget_per_tick=consumer_budget_per_tick,
         max_frame_age_ms=max_frame_age_ms,
+        realtime_pacing=realtime_pacing,
     )
     evidence = _performance_evidence_status(adapter)
     results_by_matrix: dict[str, list[dict[str, Any]]] = {}
@@ -1249,7 +1320,14 @@ PERFORMANCE_CSV_FIELDS = (
     "camera_count",
     "active_cameras",
     "idle_cameras",
+    "configured_active_cameras",
+    "configured_idle_cameras",
+    "measured_active_cameras_mean",
+    "measured_active_cameras_max",
+    "measured_idle_cameras_mean",
+    "measured_idle_cameras_max",
     "nominal_workload_seconds",
+    "realtime_pacing",
     "observed_wall_seconds",
     "adapter_name",
     "evidence_kind",
@@ -1805,17 +1883,8 @@ def _match_event_sets(
     expected_events: Sequence[Mapping[str, Any]],
     predicted_events: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    remaining = set(range(len(predicted_events)))
-    matched_pairs: list[tuple[int, int]] = []
-    for expected_index, expected in enumerate(expected_events):
-        candidates = [
-            predicted_index
-            for predicted_index in remaining
-            if _event_matches(expected, predicted_events[predicted_index])
-        ]
-        if not candidates:
-            continue
-        # Prefer the closest timestamp to the center of a labelled event window.
+    def candidate_cost(expected_index: int, predicted_index: int) -> tuple[float, int]:
+        expected = expected_events[expected_index]
         start_ms = expected.get("start_ms")
         end_ms = expected.get("end_ms")
         if start_ms is not None or end_ms is not None:
@@ -1826,12 +1895,50 @@ def _match_event_sets(
                     if value is not None
                 ]
             )
-            candidates.sort(
-                key=lambda index: abs(float(predicted_events[index]["timestamp_ms"]) - center)
+            return (
+                abs(float(predicted_events[predicted_index]["timestamp_ms"]) - center),
+                predicted_index,
             )
-        predicted_index = candidates[0]
-        remaining.remove(predicted_index)
-        matched_pairs.append((expected_index, predicted_index))
+        return (0.0, predicted_index)
+
+    adjacency = {
+        expected_index: sorted(
+            (
+                predicted_index
+                for predicted_index, predicted in enumerate(predicted_events)
+                if _event_matches(expected, predicted)
+            ),
+            key=lambda predicted_index: candidate_cost(expected_index, predicted_index),
+        )
+        for expected_index, expected in enumerate(expected_events)
+    }
+    predicted_to_expected: dict[int, int] = {}
+
+    def augment(expected_index: int, seen_predictions: set[int]) -> bool:
+        for predicted_index in adjacency[expected_index]:
+            if predicted_index in seen_predictions:
+                continue
+            seen_predictions.add(predicted_index)
+            previous = predicted_to_expected.get(predicted_index)
+            if previous is None or augment(previous, seen_predictions):
+                predicted_to_expected[predicted_index] = expected_index
+                return True
+        return False
+
+    # Constrained windows first improves deterministic timestamp locality;
+    # augmenting paths still guarantee maximum-cardinality matching.
+    expected_order = sorted(
+        range(len(expected_events)),
+        key=lambda index: (len(adjacency[index]), index),
+    )
+    for expected_index in expected_order:
+        augment(expected_index, set())
+
+    matched_pairs = sorted(
+        (expected_index, predicted_index)
+        for predicted_index, expected_index in predicted_to_expected.items()
+    )
+    remaining = set(range(len(predicted_events))) - set(predicted_to_expected)
 
     expected_counts = Counter(
         normalize_plate_text(event.get("plate")) for event in expected_events

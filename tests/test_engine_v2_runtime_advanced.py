@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
 
 from app.engine_v2 import EngineV2Config, EventDrivenANPREngine, FramePacket, OCRResult, PlateCandidate
@@ -208,6 +211,111 @@ def test_removed_track_with_invalid_forced_ocr_reaches_terminal_done() -> None:
     assert episode.tracker_removed is True
     assert episode.phase is TrackPhase.DONE
     assert state.phase is TrackPhase.DONE
+
+
+def test_removed_track_below_quality_floor_finishes_without_bad_ocr() -> None:
+    detector = OneShotDetector()
+    ocr = InvalidOCR()
+    engine = EventDrivenANPREngine(
+        detector,
+        ocr,
+        EngineV2Config(
+            idle_stride=1,
+            active_stride=1,
+            min_quality=1.0,
+            min_candidates_before_ocr=2,
+            early_ocr_quality=1.1,
+            tracker_max_missed=0,
+            load_control_enabled=False,
+        ),
+    )
+    engine.submit_frame(FramePacket("low-quality", 1, 1.0, _frame(10)))
+    assert engine.submit_frame(FramePacket("low-quality", 2, 2.0, _frame(100)))
+    assert engine.process_next() is None
+    assert engine.submit_frame(FramePacket("low-quality", 3, 3.0, _frame(105)))
+    assert engine.process_next() is None
+
+    state = engine.state_for("low-quality")
+    episode = next(iter(state.tracks.values()))
+    assert ocr.calls == 0
+    assert episode.tracker_removed is True
+    assert episode.phase is TrackPhase.DONE
+    assert state.phase is TrackPhase.DONE
+
+
+def test_expired_ocr_task_releases_episode_for_fresh_evidence() -> None:
+    engine = EventDrivenANPREngine(
+        CentralDetector(),
+        SequenceOCR(),
+        EngineV2Config(
+            idle_stride=1,
+            active_stride=1,
+            min_quality=0.0,
+            min_candidates_before_ocr=1,
+            max_ocr_attempts=2,
+            load_control_enabled=False,
+        ),
+    )
+    engine.ocr_worker.max_task_age_seconds = 0.0
+    engine.submit_frame(FramePacket("ocr-expiry", 1, 1.0, _frame(10)))
+    assert engine.submit_frame(FramePacket("ocr-expiry", 2, 2.0, _frame(100)))
+    packet = engine.queue.pop()
+    assert packet is not None
+    engine._process_detector_packet(packet)
+    episode = next(iter(engine.state_for("ocr-expiry").tracks.values()))
+    assert episode.ocr_submitted is True
+    assert episode.phase is TrackPhase.OCR
+
+    time.sleep(0.001)
+    assert engine._process_one_ocr() is None
+    assert episode.ocr_submitted is False
+    assert episode.phase is TrackPhase.COLLECTING
+    assert engine.state_for("ocr-expiry").phase is TrackPhase.COLLECTING
+    assert engine.telemetry()["ocr_expired_tasks"] == 1
+
+
+def test_late_detector_completion_does_not_regress_newer_tracking_state() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingDetector(CentralDetector):
+        def detect(self, frame: np.ndarray):
+            if self.calls == 1:
+                entered.set()
+                release.wait(1.0)
+            return super().detect(frame)
+
+    detector = BlockingDetector()
+    engine = EventDrivenANPREngine(
+        detector,
+        SequenceOCR(),
+        EngineV2Config(
+            idle_stride=1,
+            active_stride=2,
+            min_quality=0.0,
+            min_candidates_before_ocr=5,
+            early_ocr_quality=1.1,
+            max_collection_frames=100,
+            load_control_enabled=False,
+        ),
+    )
+    engine.submit_frame(FramePacket("in-flight", 1, 1.0, _frame(10)))
+    assert engine.submit_frame(FramePacket("in-flight", 2, 2.0, _frame(100)))
+    assert engine.process_next() is None
+
+    assert engine.submit_frame(FramePacket("in-flight", 10, 10.0, _frame(110)))
+    worker = threading.Thread(target=engine.process_next)
+    worker.start()
+    assert entered.wait(1.0)
+    assert engine.submit_frame(FramePacket("in-flight", 11, 11.0, _frame(115))) is False
+    episode = next(iter(engine.state_for("in-flight").tracks.values()))
+    assert episode.last_seq == 11
+
+    release.set()
+    worker.join(1.0)
+    assert not worker.is_alive()
+    assert episode.last_seq == 11
+    assert episode.last_ts == 11.0
 
 
 def test_producer_epoch_allows_safe_sequence_restart_without_blind_window() -> None:

@@ -203,8 +203,30 @@ def test_shared_ocr_worker_reports_queue_rejection_and_expires_stale_tasks() -> 
     stale_worker = SharedOCRWorker(_ConstantOCR(), max_task_age_seconds=0.0)
     assert stale_worker.submit(_task("stale")) is True
     time.sleep(0.001)
-    assert stale_worker.process_next() is None
+    processed, abandoned = stale_worker.process_next_with_abandoned()
+    assert processed is None
+    assert [(item.task.key, item.reason) for item in abandoned] == [("stale", "expired")]
     assert stale_worker.queue.stats.expired == 1
+    assert stale_worker.stats.expired_task_count == 1
+
+
+def test_shared_ocr_worker_surfaces_capacity_eviction() -> None:
+    worker = SharedOCRWorker(_ConstantOCR(), queue_size=1, max_task_age_seconds=None)
+    normal = _task("normal")
+    forced = _task("forced")
+    normal.priority = 20
+    forced.priority = 5
+
+    assert worker.submit(normal) is True
+    assert worker.submit(forced) is True
+    processed, abandoned = worker.process_next_with_abandoned()
+
+    assert processed is not None
+    assert processed[0].key == "forced"
+    assert [(item.task.key, item.reason) for item in abandoned] == [
+        ("normal", "capacity_evicted")
+    ]
+    assert worker.stats.evicted_task_count == 1
 
 
 def test_shared_ocr_worker_converts_inference_error_to_failed_vote() -> None:

@@ -133,6 +133,20 @@ def test_latest_only_queue_counts_replacement_and_expiration() -> None:
     assert queue.stats.expired == 1
 
 
+def test_latest_only_queue_reports_evicted_item_and_can_reset_statistics() -> None:
+    queue = LatestOnlyPriorityQueue[str](max_items=1)
+    assert queue.submit("normal", "normal-task", priority=20)
+    accepted, evicted = queue.submit_with_evicted("urgent", "urgent-task", priority=5)
+    assert accepted is True
+    assert evicted == "normal-task"
+    assert queue.stats.evicted == 1
+
+    queue.clear(reset_stats=True)
+    assert len(queue) == 0
+    assert queue.stats.evicted == 0
+    assert queue.stats.submitted == 0
+
+
 def test_priority_scheduler_does_not_starve_other_cameras() -> None:
     queue = LatestOnlyPriorityQueue[str](max_items=4, fairness_penalty=8)
     queue.submit("cam-a", "a1", priority=10)

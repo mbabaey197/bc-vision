@@ -1092,7 +1092,12 @@ class DualStreamRTSPProducer:
                     continue
                 remaining = max(0.0, deadline - self._monotonic_clock())
                 thread.join(remaining)
-            stopped = all(thread is current or not thread.is_alive() for thread in threads)
+            # A managed reader cannot join itself. It is still alive until the
+            # callback/decoder loop unwinds, so do not report a complete stop or
+            # clear its registry entry. Otherwise start() can clear the shared
+            # stop event and launch a new generation while the old thread is
+            # untracked and still running.
+            stopped = all(not thread.is_alive() for thread in threads)
             if stopped:
                 with self._lifecycle_lock:
                     self._threads.clear()

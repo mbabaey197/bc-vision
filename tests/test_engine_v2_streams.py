@@ -268,6 +268,32 @@ def test_dual_stream_producer_emits_substream_packet_with_latest_main_frame() ->
     assert producer.running is False
 
 
+def test_stop_called_from_reader_thread_cannot_start_overlapping_generation() -> None:
+    main = DecodedFrame(_image(240, 320, 70), captured_at=100.0, monotonic_at=10.0)
+    sub = DecodedFrame(_image(60, 80, 20), captured_at=100.1, monotonic_at=10.1)
+    factory = FakeDecoderFactory(main, sub)
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    inner_stop_results: list[bool] = []
+    producer: DualStreamRTSPProducer
+
+    def accept(_packet: FramePacket) -> bool:
+        inner_stop_results.append(producer.stop(0.2))
+        callback_entered.set()
+        release_callback.wait(1.0)
+        return True
+
+    producer = DualStreamRTSPProducer(_config(), accept, decoder_factory=factory)
+    assert producer.start() is True
+    assert callback_entered.wait(1.0)
+    assert inner_stop_results == [False]
+    assert producer.start() is False
+
+    release_callback.set()
+    assert producer.stop(1.0) is True
+    assert producer.running is False
+
+
 def test_stale_main_frame_is_not_sent_to_detector_scheduler() -> None:
     main = DecodedFrame(_image(240, 320, 1), captured_at=10.0, monotonic_at=1.0)
     sub = DecodedFrame(_image(60, 80, 2), captured_at=12.0, monotonic_at=3.0)
