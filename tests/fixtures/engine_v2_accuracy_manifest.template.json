@@ -1,0 +1,83 @@
+{
+  "schema": "bcvision.anpr.accuracy-manifest/v1",
+  "dataset_id": "REPLACE_WITH_DATASET_ID",
+  "description": "Template only. Replace every path, verify every label, set label_status to verified, enable samples, and remove template=true before running.",
+  "template": true,
+  "samples": [
+    {
+      "id": "clear-001",
+      "category": "clear_plate",
+      "input": {"path": "REPLACE/clear-001.mp4", "media_type": "video"},
+      "expected_plate": null,
+      "label_status": "pending",
+      "enabled": false
+    },
+    {
+      "id": "night-001",
+      "category": "night",
+      "input": {"path": "REPLACE/night-001.mp4", "media_type": "video"},
+      "expected_plate": null,
+      "label_status": "pending",
+      "enabled": false
+    },
+    {
+      "id": "overexposure-001",
+      "category": "overexposure",
+      "input": {"path": "REPLACE/overexposure-001.mp4", "media_type": "video"},
+      "expected_plate": null,
+      "label_status": "pending",
+      "enabled": false
+    },
+    {
+      "id": "motion-blur-001",
+      "category": "motion_blur",
+      "input": {"path": "REPLACE/motion-blur-001.mp4", "media_type": "video"},
+      "expected_plate": null,
+      "label_status": "pending",
+      "enabled": false
+    },
+    {
+      "id": "angled-001",
+      "category": "angled_plate",
+      "input": {"path": "REPLACE/angled-001.mp4", "media_type": "video"},
+      "expected_plate": null,
+      "label_status": "pending",
+      "enabled": false
+    },
+    {
+      "id": "multiple-001",
+      "category": "multiple_vehicles",
+      "input": {"path": "REPLACE/multiple-001.mp4", "media_type": "video"},
+      "expected_events": [
+        {"plate": "REPLACE_VERIFIED_PLATE_1", "start_ms": 0, "end_ms": 1000},
+        {"plate": "REPLACE_VERIFIED_PLATE_2", "start_ms": 1001, "end_ms": 2000}
+      ],
+      "label_status": "pending",
+      "enabled": false
+    },
+    {
+      "id": "fast-001",
+      "category": "fast_vehicle",
+      "input": {"path": "REPLACE/fast-001.mp4", "media_type": "video"},
+      "expected_plate": null,
+      "label_status": "pending",
+      "enabled": false
+    },
+    {
+      "id": "partial-dirty-001",
+      "category": "partial_dirty_plate",
+      "input": {"path": "REPLACE/partial-dirty-001.mp4", "media_type": "video"},
+      "expected_plate": null,
+      "label_status": "pending",
+      "enabled": false
+    },
+    {
+      "id": "negative-001",
+      "category": "clear_plate",
+      "input": {"path": "REPLACE/verified-empty-lane.mp4", "media_type": "video"},
+      "expected_plate": null,
+      "label_status": "pending",
+      "enabled": false
+    }
+  ]
+}

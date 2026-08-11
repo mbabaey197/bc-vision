@@ -1,68 +1,283 @@
 # BC Vision ANPR Engine V2
 
-Engine V2 is a clean-room runtime path that does not reuse the camera-centric execution model of the existing ANPR engine.
+Engine V2 is an independent, clean-room ANPR path. It does not import, refactor,
+configure, or replace the legacy production engine. V2 remains evaluation-only
+until the same verified inputs prove that it is both accurate enough and more
+resource-efficient than V1.
 
-## Design goals
-
-- Scale camera count without loading detector/OCR sessions per camera.
-- Keep expensive AI asleep while a fixed lane is idle.
-- Discard stale video work instead of accumulating latency.
-- Detect on a low-resolution stream and crop/OCR from the main stream.
-- Share detector and OCR instances across all cameras.
-- Treat one passing vehicle/plate episode as one job, not one job per frame.
-- Make load shedding and future CPU/iGPU/NPU routing possible at one central scheduler.
-
-## Data path
+## Architecture contract
 
 ```text
-RTSP readers (producers only)
-        |
-        +--> main stream (evidence/crop)
-        |
-        `--> detector stream (low resolution)
-                    |
-             AdaptiveMotionGate
-                    |
-          LatestOnlyPriorityQueue
-                    |
-          Shared Plate Detector
-                    |
-       coordinate map to main frame
-                    |
-          Plate Quality Selector
-                    |
-              Shared OCR
-                    |
-               Event sink
+RTSP main + sub stream producers
+        -> hardware/software decode selection
+        -> low-cost motion/ROI gate
+        -> central latest-only priority scheduler
+        -> one shared detector session
+        -> lightweight multi-object tracking
+        -> detector-to-main coordinate mapping
+        -> high-resolution plate crops
+        -> quality-ranked candidate collection
+        -> one shared OCR session/worker
+        -> temporal confidence voting
+        -> Iranian plate validation
+        -> exact duplicate suppression
+        -> PlateEvent callback/database adapter
 ```
 
-## What is implemented in the first slice
+Camera readers are producers only. A camera never constructs or owns a detector
+or OCR session. `SharedModelBundle` owns exactly two model sessions for the
+service: one detector and one OCR session, independent of camera count.
 
-`app/engine_v2/` contains an independent core with:
+## Implemented components
 
-- adaptive background/motion wake-up;
-- bounded newest-frame-wins priority queue;
-- per-camera state without per-camera model sessions;
-- shared detector and OCR protocol boundaries;
-- detector-substream to main-stream coordinate mapping;
-- best-crop quality scoring using sharpness, exposure and contrast;
-- DONE cooldown to suppress repeated OCR for the same passing episode;
-- deterministic unit tests using fake detector/OCR implementations.
+### Shared inference and model adapters
 
-## What is intentionally not wired yet
+- `SharedInferenceBackend` lazily selects a direct OpenVINO runtime or a ranked
+  ONNX Runtime execution provider and exposes provider/device metadata.
+- Direct OpenVINO ranks Intel GPU/iGPU before CPU when both are available. It
+  falls back safely when compilation fails and records the reason.
+- ONNX Runtime ranks OpenVINO, TensorRT/CUDA and other accelerator providers
+  before CPU, with configurable provider options and fallback behavior.
+- A single inference lock protects runtimes that do not guarantee concurrent use
+  of one request/session. Queue-wait and inference latency are recorded.
+- `YOLOPlateDetector` provides clean-room letterbox, YOLOv5/v8/v11 output
+  decoding, class filtering, NMS, and mapping back to source coordinates.
+- Ambiguous six-column single-class YOLO output defaults to raw decoding;
+  end-to-end exports must be pinned explicitly, while heuristic guessing is an
+  opt-in compatibility mode.
+- `CTCPlateOCR` provides configurable resize/padding, normalization, tensor
+  layouts, CTC blank/repeat collapse, and per-character confidence.
+- `build_engine_v2()` creates the two shared sessions and wires their adapters to
+  the independent V2 runtime. Failure during construction closes partial state.
 
-The first slice is not enabled in production and does not change the old engine. Before activation it still needs:
+OpenVINO and ONNX Runtime remain optional imports at module-load time. A clean
+installation must include the intended runtime package before hardware evidence
+can be collected; unit tests use injected fake runtimes and do not prove a real
+device path.
 
-1. a real ONNX/OpenVINO shared detector adapter;
-2. a real Iranian OCR adapter and canonical validator;
-3. RTSP dual-stream producer integration;
-4. a real multi-object tracker/state machine for simultaneous vehicles;
-5. temporal OCR voting across multiple best candidates;
-6. adaptive load controller based on queue age, CPU load and inference latency;
-7. benchmark harness against 1/4/8/16+ camera recordings;
-8. feature flag and dashboard observability;
-9. long-duration real-camera validation day/night.
+### RTSP dual-stream producers
 
-## Compatibility rule
+- `DualStreamRTSPProducer` reads main and detector/sub streams independently.
+- Main frames are held in a one-slot replacement cache; sub-stream frames are
+  paired only with a sufficiently close main frame.
+- Main/sub skew is measured as `main_detector_skew_ms`; overly old or future
+  main frames are rejected using the absolute skew limit.
+- Decoder selection supports PyAV, FFmpeg, and OpenCV with hardware-to-software
+  fallback after a verified first frame.
+- Intel Quick Sync (`qsv`) is preferred when FFmpeg reports it and the device is
+  usable. VAAPI, D3D11VA/DXVA2, CUDA, or VideoToolbox may be selected by OS.
+- Reconnect uses bounded exponential backoff and redacts RTSP credentials from
+  errors.
+- A non-blocking admission controller continuously drains RTSP but forwards
+  only the newest due sub-stream frames. Active policies interleave cheap
+  tracking frames between detector frames; idle policies retain a motion-gate
+  safety floor.
+- Sequence numbers remain monotonic across stop/start. Every producer lifecycle
+  also emits a unique `producer_epoch`, allowing the runtime to recover safely
+  when a new reader instance starts its sequence at one.
 
-Engine V2 must remain behind a separate feature flag until it beats the existing production path on both accuracy and resource use. No V2 change may alter the legacy engine's runtime behavior, model files or database schema during the evaluation phase.
+The producer owns no detector, OCR, tracker, validator, or database logic.
+
+### Scheduling and event-driven execution
+
+- `LatestOnlyPriorityQueue` keeps at most one live job per camera/track key.
+- Re-submission replaces stale work; a global generation prevents the ABA bug
+  where an obsolete heap node could become live again after key reuse.
+- Capacity pressure can evict lower-priority work. A fairness penalty prevents
+  one hot camera from monopolizing consecutive scheduling turns.
+- Queue age is bounded. Expired frames are counted and never inferred.
+- Idle cameras run only the motion/ROI gate at an adaptive stride. They submit
+  no detector or OCR work until motion crosses the configured threshold.
+
+### Per-vehicle episode state
+
+Each camera owns a cheap tracker, while each tracked plate/vehicle owns an
+independent `TrackEpisode`:
+
+```text
+IDLE -> ACTIVE -> TRACKING -> PLATE_FOUND -> COLLECTING
+     -> OCR -> VALIDATED -> DONE
+```
+
+- The tracker associates multiple simultaneous detections without neural state
+  and predicts boxes between selected detector frames.
+- DONE is held for the same track/episode; it cannot trigger repeated OCR.
+- Track removal forces one final OCR attempt from the best collected candidates.
+  An invalid terminal attempt closes the episode instead of leaving the camera
+  permanently stuck in COLLECTING.
+- A new producer epoch resets stale sequence/tracker state. If the previous
+  stream was active, one detector job is scheduled immediately so a restart does
+  not create a long blind window.
+
+### Candidate quality and OCR
+
+`BestPlateFrameSelector` retains a bounded, temporally diverse candidate set.
+Its score combines:
+
+- Laplacian sharpness;
+- centered exposure and clipped-pixel penalty;
+- contrast;
+- plate area relative to the main frame;
+- detector confidence;
+- directional edge/motion-blur proxy.
+
+Normally the best two or three candidates are sent to the shared OCR worker.
+The temporal voter:
+
+- counts support only from distinct source sequences;
+- rejects observations below confidence/quality floors;
+- normalizes Persian/Arabic digits and character forms;
+- requires structural Iranian-plate validation;
+- accepts a single crop only at stricter confidence and quality thresholds.
+
+The bundled CTC label contract emits `ا`; the validator also accepts the word
+`الف` and canonicalizes both to `ا` before voting. Diplomatic `d/s` output is
+canonicalized to uppercase. Bidi/zero-width controls are removed. The validator
+is structural and deliberately does not guess ambiguous OCR characters.
+
+Duplicate suppression is exact-match and bounded. It uses sliding same-camera
+and short overlapping-camera windows, handles delayed timestamps without moving
+last-seen state backwards, and never performs fuzzy suppression that could hide
+a different vehicle.
+
+## Adaptive load shedding
+
+`AdaptiveLoadController` observes:
+
+- host CPU percentage;
+- detector latency EMA;
+- OCR latency;
+- detector queue depth/capacity;
+- recent stale-frame drop rate;
+- active and total camera count.
+
+Escalation is immediate and recovery is hysteretic. Policies progressively:
+
+- increase detector and idle strides;
+- use more tracker-predicted frames between detections;
+- reduce active and idle target FPS;
+- shorten permitted queue age;
+- reduce OCR candidates only when quality permits.
+
+Returning to NORMAL restores the configured cadence and up to three OCR
+candidates. Camera count alone does not create AI pressure; active work,
+latency, queueing, and CPU do.
+
+`producer_cadence_policy(camera_id, source_fps)` is wired directly as the
+producer's `cadence_provider`. The producer applies its detector/tracking
+cadence without sleeping or buffering old frames, and tagged adaptive packets
+bypass the runtime's fallback modulo stride so throttling is not applied twice.
+If the policy callback fails or is unbound, admission fails open for accuracy.
+
+```python
+producer = DualStreamRTSPProducer(
+    stream_config,
+    engine.submit_frame,
+    cadence_provider=engine.producer_cadence_policy,
+)
+```
+
+## Telemetry
+
+Runtime telemetry includes frames received, motion evaluations/wakeups, active
+and idle cameras, detector/OCR counts and mean latency, queue depth,
+replacements/expired stale frames, emitted events, duplicate suppressions, and
+the current load policy.
+
+RTSP producer telemetry separately records decoder backend, hardware
+accelerator, connection attempts/reconnects, decoded frames, main-frame pairing
+drops, sink rejections, and errors.
+
+## Benchmark harness
+
+The independent CLI never changes the production engine:
+
+```bash
+python tools/benchmark_engine_v2.py performance \
+  --matrix standard \
+  --include-32 \
+  --output-dir artifacts/engine-v2
+```
+
+`--matrix standard` runs both:
+
+1. fixed-active `1/4/8/16[/32]` for the incremental cost of idle cameras;
+2. all-active `1/4/8/16[/32]` for busy-site scaling.
+
+The report records CPU, process CPU, RAM and metric provenance, decode
+utilization and provenance, detector/OCR inference rate, queue average/max,
+latest replacements, expired/dropped frames, average/P95 latency, event rate,
+and active/idle camera counts. Per-camera rows and idle/busy scaling deltas are
+included.
+
+The built-in synthetic adapter validates scheduling and report accounting only.
+It is always marked non-production. A real callable adapter must run inside the
+measured process and provide verifiable recording/model SHA-256 identities,
+execution-provider metadata, decoder lifecycle instrumentation, and resource
+scope before the report can classify it as production evidence. Even then, the
+harness reports evidence and never switches engines.
+
+### Accuracy comparison
+
+```bash
+python tools/benchmark_engine_v2.py compare-accuracy \
+  --manifest /path/to/verified-manifest.json \
+  --v1-callable package.v1_adapter:predict \
+  --v2-callable package.v2_adapter:predict \
+  --output-dir artifacts/engine-v2-accuracy
+```
+
+The same operator-verified manifest is passed independently to V1 and V2. It
+must cover:
+
+- clear plate;
+- night;
+- overexposure;
+- motion blur;
+- angled plate;
+- multiple vehicles;
+- fast vehicle;
+- partial/dirty plate.
+
+The manifest requires at least one verified negative sample. Multiple-vehicle
+samples use `expected_events` with at least two events. Local media may include
+SHA-256 identities. Ground-truth labels are removed before calling an engine
+adapter, preventing label leakage.
+
+Reports separate V1 and V2 predictions and measure exact event-set accuracy,
+event recall/precision, false accepts, false-positive events, duplicate events,
+character error rate, and latency overall and per category.
+
+## Current evidence and remaining limitations
+
+The deterministic suite proves contracts and failure handling, not real ANPR
+accuracy or real camera capacity. Promotion is still blocked by:
+
+- no repository recording set covering all required accuracy categories;
+- no verified V1/V2 result on the same real media;
+- no real RTSP/hardware-decode benchmark on the target Intel systems;
+- no long-duration day/night soak test;
+- latest-arrival main/sub pairing rather than a nearest-PTS frame buffer;
+- continuous main-stream decode cost, which must be measured on real hardware;
+- axis-aligned boxes and scale mapping; strongly angled/letterboxed/cropped
+  installations may require explicit transform calibration or quadrilateral
+  rectification;
+- static provider priority rather than a startup micro-benchmark across every
+  installed accelerator;
+- feature-flag/dashboard/database integration is intentionally not enabled.
+
+## Production compatibility rule
+
+Do not import V2 into the legacy camera worker and do not change the production
+engine selector until all of the following are true:
+
+1. V1 and V2 have run on the same immutable, verified media set.
+2. V2 has no unacceptable overall or per-category accuracy regression.
+3. Real fixed-active and all-active camera matrices demonstrate better resource
+   behavior and bounded P95 latency on target hardware.
+4. Idle-camera additions do not create linear detector/OCR work.
+5. Day/night real-camera soak tests pass with bounded queues and duplicate rate.
+6. Activation remains reversible behind an explicit feature flag.
+
+Until then, V1 remains the production engine and V2 remains a separate Draft PR
+evaluation path.

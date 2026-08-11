@@ -10,8 +10,13 @@ import numpy as np
 class TrackPhase(str, Enum):
     IDLE = "idle"
     ACTIVE = "active"
+    TRACKING = "tracking"
     PLATE_FOUND = "plate_found"
-    OCR_PENDING = "ocr_pending"
+    COLLECTING = "collecting"
+    OCR = "ocr"
+    # Compatibility alias for the first V2 slice. New code uses ``OCR``.
+    OCR_PENDING = "ocr"
+    VALIDATED = "validated"
     DONE = "done"
 
 
@@ -24,12 +29,23 @@ class FramePacket:
     detector_frame: np.ndarray | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def main_frame(self) -> np.ndarray:
+        """High-resolution evidence frame.
+
+        ``frame`` keeps its original name for compatibility with the first V2
+        slice. Producers may supply an independently decoded detector frame.
+        """
+
+        return self.frame
+
 
 @dataclass(slots=True)
 class PlateCandidate:
     bbox: tuple[int, int, int, int]
     confidence: float
     class_id: int = 0
+    track_hint: str | None = None
 
 
 @dataclass(slots=True)
@@ -37,6 +53,8 @@ class OCRResult:
     text: str
     confidence: float
     valid: bool = True
+    character_confidences: tuple[float, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -48,6 +66,10 @@ class PlateEvent:
     confidence: float
     bbox: tuple[int, int, int, int]
     quality: float
+    track_id: str | None = None
+    episode_id: str | None = None
+    observations: int = 1
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class PlateDetector(Protocol):

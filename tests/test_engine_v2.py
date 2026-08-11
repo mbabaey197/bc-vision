@@ -42,13 +42,33 @@ def test_latest_only_queue_replaces_stale_frame() -> None:
     assert q.stats.replaced == 1
 
 
+def test_latest_only_queue_discards_one_key_without_disturbing_other_work() -> None:
+    q = LatestOnlyPriorityQueue[int](max_items=4)
+    q.submit("stale-episode", 1)
+    q.submit("other-camera", 2)
+
+    assert q.discard("stale-episode") is True
+    assert q.discard("stale-episode") is False
+    assert len(q) == 1
+    assert q.pop() == 2
+    assert q.pop() is None
+    assert q.stats.discarded == 1
+
+
 def test_engine_sleeps_until_motion_then_emits_one_event() -> None:
     detector = FakeDetector()
     ocr = FakeOCR()
     engine = EventDrivenANPREngine(
         detector,
         ocr,
-        EngineV2Config(idle_stride=1, active_stride=1, min_quality=0.0, done_cooldown_frames=10),
+        EngineV2Config(
+            idle_stride=1,
+            active_stride=1,
+            min_quality=0.0,
+            min_candidates_before_ocr=1,
+            done_cooldown_frames=10,
+            load_control_enabled=False,
+        ),
     )
 
     # First frame establishes the motion baseline and should not wake AI.
@@ -66,10 +86,11 @@ def test_engine_sleeps_until_motion_then_emits_one_event() -> None:
     assert detector.calls == 1
     assert ocr.calls == 1
 
-    # DONE cooldown prevents repeated OCR on the same passing vehicle.
-    assert engine.submit_frame(FramePacket("cam-1", 3, 3.0, moving)) is False
+    # DONE is per-track: a cheap motion-gate probe may run the detector again,
+    # but the completed episode cannot be sent to OCR twice.
+    assert engine.submit_frame(FramePacket("cam-1", 3, 3.0, moving)) is True
     assert engine.process_next() is None
-    assert detector.calls == 1
+    assert detector.calls == 2
     assert ocr.calls == 1
 
 
@@ -79,7 +100,17 @@ def test_multiple_cameras_share_one_detector_instance() -> None:
     engine = EventDrivenANPREngine(
         detector,
         ocr,
-        EngineV2Config(idle_stride=1, active_stride=1, min_quality=0.0),
+        EngineV2Config(
+            idle_stride=1,
+            active_stride=1,
+            min_quality=0.0,
+            min_candidates_before_ocr=1,
+            # This test verifies shared model ownership, not host-dependent
+            # adaptive load behavior.
+            load_control_enabled=False,
+            # This test verifies model sharing, not overlapping-camera dedup.
+            cross_camera_duplicate_seconds=0.0,
+        ),
     )
 
     for cam in ("cam-a", "cam-b"):

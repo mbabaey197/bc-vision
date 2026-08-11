@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bcvision.local/schemas/anpr-engine-v2-accuracy-manifest-v1.json",
+  "title": "BC Vision ANPR V1/V2 Accuracy Manifest",
+  "description": "Operator-verified inputs used unchanged for both engines. The runner requires readable labels in every category, a multi-event multiple_vehicles sample, and at least one verified negative sample.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "dataset_id",
+    "samples"
+  ],
+  "properties": {
+    "schema": {
+      "const": "bcvision.anpr.accuracy-manifest/v1"
+    },
+    "dataset_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "template": {
+      "type": "boolean",
+      "description": "Must be false or absent for a benchmark run. Template manifests are rejected as evidence."
+    },
+    "samples": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/sample"
+      }
+    }
+  },
+  "$defs": {
+    "sample": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "id",
+        "category",
+        "input",
+        "label_status"
+      ],
+      "oneOf": [
+        {
+          "required": ["expected_plate"],
+          "not": {"required": ["expected_events"]}
+        },
+        {
+          "required": ["expected_events"],
+          "not": {"required": ["expected_plate"]}
+        }
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "category": {
+          "enum": [
+            "clear_plate",
+            "night",
+            "overexposure",
+            "motion_blur",
+            "angled_plate",
+            "multiple_vehicles",
+            "fast_vehicle",
+            "partial_dirty_plate"
+          ]
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "path"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "media_type": {
+              "enum": [
+                "image",
+                "video"
+              ]
+            },
+            "start_ms": {
+              "type": "number",
+              "minimum": 0
+            },
+            "end_ms": {
+              "type": "number",
+              "minimum": 0
+            },
+            "sha256": {
+              "description": "Optional but recommended media identity verified by the runner before inference.",
+              "type": "string",
+              "pattern": "^[A-Fa-f0-9]{64}$"
+            }
+          }
+        },
+        "expected_plate": {
+          "description": "Verified plate text, or null only when the verified expected outcome is rejection/unreadable.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expected_events": {
+          "description": "Verified event set for multi-vehicle/video samples. Each event may carry a matching time window.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["plate"],
+            "properties": {
+              "plate": {"type": "string", "minLength": 1},
+              "start_ms": {"type": "number", "minimum": 0},
+              "end_ms": {"type": "number", "minimum": 0},
+              "track_id": {"type": ["string", "integer"]}
+            }
+          }
+        },
+        "label_status": {
+          "description": "The runner accepts only verified. Pending is allowed solely so the supplied template can be edited and schema-checked before evidence collection.",
+          "enum": [
+            "pending",
+            "verified"
+          ]
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}
