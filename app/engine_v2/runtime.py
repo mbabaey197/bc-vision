@@ -111,7 +111,8 @@ class EventDrivenANPREngine:
         if not candidates:
             return None
 
-        candidate = max(candidates, key=lambda c: c.confidence)
+        raw_candidate = max(candidates, key=lambda c: c.confidence)
+        candidate = self._map_candidate(raw_candidate, detector_frame.shape[:2], packet.frame.shape[:2])
         crop = self._crop(packet.frame, candidate)
         quality = evaluate_plate_quality(crop).score
         if quality > state.best_quality:
@@ -144,6 +145,25 @@ class EventDrivenANPREngine:
         if self.on_event is not None:
             self.on_event(event)
         return event
+
+    @staticmethod
+    def _map_candidate(
+        candidate: PlateCandidate,
+        source_hw: tuple[int, int],
+        target_hw: tuple[int, int],
+    ) -> PlateCandidate:
+        sh, sw = source_hw
+        th, tw = target_hw
+        if sw <= 0 or sh <= 0 or (sw == tw and sh == th):
+            return candidate
+        sx = tw / float(sw)
+        sy = th / float(sh)
+        x1, y1, x2, y2 = candidate.bbox
+        return PlateCandidate(
+            (round(x1 * sx), round(y1 * sy), round(x2 * sx), round(y2 * sy)),
+            candidate.confidence,
+            candidate.class_id,
+        )
 
     @staticmethod
     def _crop(frame: np.ndarray, candidate: PlateCandidate) -> np.ndarray:
