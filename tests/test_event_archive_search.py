@@ -140,6 +140,8 @@ def test_dashboard_places_camera_left_and_content_right_then_stacks_mobile(
 
     assert response.status_code == 200
     text = response.text
+    summary_start = text.index("<div id='dashboardCounterStrip'")
+    layout_start = text.index("<div class='dashboard-layout'>")
     camera_start = text.index(
         "<section class='dashboard-camera-column'"
     )
@@ -148,16 +150,35 @@ def test_dashboard_places_camera_left_and_content_right_then_stacks_mobile(
         "<section class='dashboard-main-column'"
     )
     main_end = text.index("</section>", main_start)
+    summary = text[summary_start:layout_start]
     camera_column = text[camera_start:camera_end]
     main_column = text[main_start:main_end]
 
-    assert camera_start < main_start
+    assert summary_start < layout_start <= camera_start < main_start
+    assert summary.count("dashboard-summary-item") == 4
+    assert "دوربین فعال" in summary
+    assert "تردد امروز" in summary
+    assert "هشدار امروز" in summary
+    assert "کل ترددها" in summary
     assert "نمایش زنده" in camera_column
     assert "id='liveGrid'" in camera_column
     assert "stats-grid" not in camera_column
-    assert "stats-grid" in main_column
+    assert "stats-grid" not in main_column
+    assert "dashboard-events-card" in main_column
+    assert "id='dashboardEventsCard'" in main_column
     assert "آخرین تشخیص‌های پلاک و خودرو" in main_column
-    assert "افزودن دوربین" in main_column
+    assert "id='dashboardClearButton'" in main_column
+    assert "پاک‌کردن نمایش" in main_column
+    assert "افزودن دوربین" not in main_column
+    assert "page-title" not in main_column
+    assert "feedback-note" not in main_column
+    assert (
+        ".dashboard-summary{display:flex;align-items:center;"
+        "min-height:32px;overflow-x:auto"
+    ) in text
+    assert (
+        ".dashboard-events-card{padding:12px 14px;margin-bottom:0}"
+    ) in text
     assert (
         ".dashboard-layout{display:grid;grid-template-columns:"
         "minmax(360px,.82fr) minmax(0,1.58fr);gap:18px;"
@@ -176,10 +197,9 @@ def test_dashboard_places_camera_left_and_content_right_then_stacks_mobile(
         "grid-template-columns:1fr;direction:rtl}"
     ) in text
     assert (
-        ".dashboard-camera-column{order:1}"
-        ".dashboard-main-column{order:2}"
+        ".dashboard-main-column{order:1}"
+        ".dashboard-camera-column{order:2}"
     ) in text
-
 
 def test_dashboard_prioritizes_exact_anpr_errors_over_preview_status(
     isolated_archive,
@@ -264,8 +284,9 @@ def test_dashboard_display_reset_is_safe_and_scoped_to_uploaded_video(
     assert "VIDEO-OLD" not in response.text
     assert "OTHER-NEW" not in response.text
     assert "پلاک‌های این ویدئو" in response.text
-    assert ">۲</b>" in response.text
-    assert "پاک‌کردن نمایش" in response.text
+    assert "id='dashboardPlateCount'>۲</b>" in response.text
+    assert "id='dashboardClearButton'" in response.text
+    assert "onclick='clearDashboardReadings()'" in response.text
     assert "آرشیو و تصاویر حذف نمی‌شوند" in response.text
     assert "justify-content:end" in response.text
     assert f"events_after={boundary}" in response.text
