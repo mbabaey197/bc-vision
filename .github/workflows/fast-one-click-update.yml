@@ -227,6 +227,8 @@ jobs:
           "runtime_contract=$releasedId" >> $env:GITHUB_OUTPUT
           "base_version=$baseVersion" >> $env:GITHUB_OUTPUT
           "first_fast=$firstFast" >> $env:GITHUB_OUTPUT
+          # Missing candidate tags are expected for new fast releases.
+          exit 0
 
       - name: Build and size-check verified application payload
         if: steps.metadata.outputs.eligible == 'true'
