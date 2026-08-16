@@ -9,6 +9,8 @@ on:
       - main
     paths:
       - VERSION
+      # Commit-only fallback when workflow dispatch is unavailable.
+      - FAST_UPDATE_TRIGGER
   workflow_dispatch:
     inputs:
       verify_base_install:
