@@ -605,6 +605,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           $ErrorActionPreference = "Stop"
           function Assert-ExactReleaseAssets(
