@@ -126,6 +126,115 @@ def test_stop_all_stops_every_stream():
     assert manager.streams == {}
 
 
+def test_publish_prioritizes_anpr_and_skips_jpeg_without_viewer(
+    monkeypatch,
+):
+    stream = CameraStream(10, "rtsp://gate", "Gate", fps=5)
+    frame = np.zeros((24, 32, 3), dtype=np.uint8)
+    calls = []
+    monkeypatch.setattr(
+        stream,
+        "_queue_anpr",
+        lambda _frame: calls.append("anpr"),
+    )
+    monkeypatch.setattr(
+        stream,
+        "_encode",
+        lambda _frame: calls.append("jpeg") or b"jpeg",
+    )
+
+    stream._publish(frame)
+
+    assert calls == ["anpr"]
+    assert stream.latest is None
+
+    stream._register_viewer()
+    try:
+        calls.clear()
+        stream._publish(frame)
+        assert calls == ["anpr", "jpeg"]
+        assert stream.latest == b"jpeg"
+    finally:
+        stream._unregister_viewer()
+
+
+def test_frames_tracks_viewer_lifetime_and_releases_preview(monkeypatch):
+    stream = CameraStream(11, "demo://camera", "Demo", fps=30)
+    monkeypatch.setattr(stream, "start", lambda: None)
+    with stream.lock:
+        stream.latest = b"jpeg"
+        stream.latest_frame = np.zeros((2, 2, 3), dtype=np.uint8)
+
+    frames = stream.frames()
+    chunk = next(frames)
+
+    assert stream.viewer_count == 1
+    assert b"Content-Type: image/jpeg" in chunk
+    assert chunk.endswith(b"jpeg\r\n")
+
+    frames.close()
+
+    assert stream.viewer_count == 0
+    assert stream.latest is None
+    assert stream.latest_frame is None
+
+
+def test_rtsp_ingest_is_not_throttled_by_dashboard_fps(monkeypatch):
+    stream = CameraStream(12, "rtsp://gate", "Gate", fps=5)
+    frame = np.zeros((24, 32, 3), dtype=np.uint8)
+    wait_calls = []
+
+    class RecordingEvent:
+        def __init__(self):
+            self.value = False
+
+        def clear(self):
+            self.value = False
+
+        def is_set(self):
+            return self.value
+
+        def set(self):
+            self.value = True
+
+        def wait(self, timeout=None):
+            wait_calls.append(timeout)
+            return self.value
+
+    class Capture:
+        def isOpened(self):
+            return True
+
+        def set(self, *_args):
+            return True
+
+        def read(self):
+            return True, frame
+
+        def release(self):
+            pass
+
+    stream.stop_event = RecordingEvent()
+    published = []
+
+    def publish(_frame):
+        published.append(_frame)
+        if len(published) == 3:
+            stream.stop_event.set()
+
+    monkeypatch.setattr(
+        app.streams.cv2,
+        "VideoCapture",
+        lambda *_args: Capture(),
+    )
+    monkeypatch.setattr(stream, "_publish", publish)
+
+    stream._run()
+
+    assert len(published) == 3
+    assert wait_calls == []
+
+
 def test_live_overlay_survives_stream_resize(monkeypatch):
     stream = CameraStream(
         camera_id=7,

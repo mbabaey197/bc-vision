@@ -1087,17 +1087,24 @@ def test_uploaded_video_stream_produces_real_jpeg(tmp_path):
         "Dashboard upload",
         fps=30,
     )
-    stream.start()
-    for _ in range(100):
-        if stream.latest:
-            break
-        time.sleep(0.01)
-    stream.stop()
-    stream.thread.join(timeout=2)
+    jpeg = None
+    stream._register_viewer()
+    try:
+        stream.start()
+        for _ in range(100):
+            with stream.lock:
+                jpeg = stream.latest
+            if jpeg:
+                break
+            time.sleep(0.01)
+    finally:
+        stream.stop()
+        stream.thread.join(timeout=2)
+        stream._unregister_viewer()
 
-    assert stream.latest
-    assert stream.latest.startswith(b"\xff\xd8")
-    assert stream.latest.endswith(b"\xff\xd9")
+    assert jpeg
+    assert jpeg.startswith(b"\xff\xd8")
+    assert jpeg.endswith(b"\xff\xd9")
 
 
 def test_uploaded_video_can_pause_and_resume(tmp_path, monkeypatch):
