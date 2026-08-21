@@ -1,10 +1,11 @@
-"""Exclusive YOLO11n/YOLOv8n Iranian plate localization with ONNX Runtime.
+"""Exclusive YOLO11n/YOLOv8n/YOLOX plate localization with ONNX Runtime.
 
-The operator-selected graph is hash verified and owns an isolated per-camera
-session. Selectable inference never cascades into the other primary or the
-retired secondary detector, so field-video counts remain attributable to one
-model. Both graphs use the same single-class ``cx,cy,w,h,confidence`` output
-contract and the configured CPU ceiling.
+The operator-selected graph is hash verified. Production passes one shared
+inference key, while queues and temporal state remain per camera. Selectable
+inference never cascades into another detector, so field-video counts remain
+attributable to one model. YOLO11n/YOLOv8n use the historical single-class
+``cx,cy,w,h,confidence`` contract; custom YOLOX is decoded only through its
+explicit persistent manifest.
 """
 from __future__ import annotations
 
@@ -40,6 +41,7 @@ _cache_lock = threading.RLock()
 _sessions: OrderedDict[tuple[str, str, str], _SessionEntry] = (
     OrderedDict()
 )
+_verified_detector_cache: dict[str, tuple] = {}
 _last_status = {
     "engine": "yolo11n-plate-onnx",
     "selected_variant": "yolo11n",
@@ -64,6 +66,7 @@ def detector_status() -> dict:
 def clear_detector_sessions() -> None:
     with _cache_lock:
         _sessions.clear()
+        _verified_detector_cache.clear()
         _last_status.update(
             engine="yolo11n-plate-onnx",
             selected_variant="yolo11n",
@@ -78,6 +81,12 @@ def clear_detector_sessions() -> None:
             error="",
             threads=0,
         )
+    try:
+        from .onnx_yolox import clear_yolox_session
+
+        clear_yolox_session()
+    except Exception:
+        pass
 
 
 def _session_options(ort):
@@ -107,12 +116,36 @@ def _verified_paths(
 
     spec = detector_variant_spec(detector_variant)
     primary = Path(spec["path"])
-    if not verify_file(primary, spec["sha256"], spec["size"]):
+    try:
+        stat = primary.stat()
+        cache_key = (
+            str(primary.resolve()),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            int(getattr(stat, "st_ctime_ns", 0)),
+            str(spec["sha256"]),
+        )
+    except OSError:
+        cache_key = ()
+    with _cache_lock:
+        verified = (
+            bool(cache_key)
+            and _verified_detector_cache.get(str(spec["variant"]))
+            == cache_key
+        )
+    if not verified and not verify_file(
+        primary,
+        spec["sha256"],
+        spec["size"],
+    ):
         raise FileNotFoundError(
             "Verified "
             + str(spec["variant"])
             + f" plate detector not found: {primary}"
         )
+    if not verified:
+        with _cache_lock:
+            _verified_detector_cache[str(spec["variant"])] = cache_key
     # The historical recovery model remains installable for backward
     # compatibility but is deliberately excluded from selectable inference.
     return primary, None
@@ -322,6 +355,8 @@ def detect_plates_onnx(
     engine_key=None,
     detector_variant=None,
     raise_on_error=False,
+    expected_model_revision=None,
+    runtime_metadata=None,
 ) -> list[dict]:
     if frame is None or getattr(frame, "size", 0) == 0:
         return []
@@ -331,10 +366,50 @@ def detect_plates_onnx(
     )
 
     selected_variant = normalize_detector_variant(detector_variant)
-    spec = detector_variant_spec(selected_variant)
     camera_key = str(
         engine_key if engine_key is not None else "default"
     )
+    if selected_variant == "yolox":
+        from .onnx_yolox import detect_plates_yolox, yolox_status
+
+        try:
+            detections = detect_plates_yolox(
+                frame,
+                min_confidence=min_confidence,
+                max_results=max_results,
+                engine_key=engine_key,
+                raise_on_error=raise_on_error,
+                expected_model_revision=expected_model_revision,
+                runtime_metadata=runtime_metadata,
+            )
+        finally:
+            status = yolox_status()
+            with _cache_lock:
+                _last_status.update(
+                    engine="yolox-custom-onnx",
+                    selected_variant="yolox",
+                    attempted=bool(status.get("attempted")),
+                    model_loaded=bool(status.get("model_loaded")),
+                    primary_path=str(status.get("model_path", "")),
+                    fallback_path="",
+                    fallback_loaded=False,
+                    fallback_used=False,
+                    engine_key=camera_key,
+                    detections=int(status.get("detections", 0)),
+                    error=str(status.get("error", "")),
+                    threads=int(status.get("threads", 0)),
+                )
+        return detections
+    spec = detector_variant_spec(selected_variant)
+    if expected_model_revision:
+        raise ValueError(
+            "expected_model_revision is supported only for custom YOLOX"
+        )
+    if runtime_metadata is not None:
+        runtime_metadata.update(
+            detector_variant=selected_variant,
+            detector_model_revision=str(spec["sha256"])[:16].lower(),
+        )
     try:
         primary_path, _ = _verified_paths(selected_variant)
         entry = _load_session(

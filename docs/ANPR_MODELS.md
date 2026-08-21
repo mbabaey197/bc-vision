@@ -7,8 +7,11 @@ samples, settings, events, snapshots and the SQLite database.
 ## Active Iranian plate detectors
 
 BC Vision installs two independently verified, single-class ONNX plate
-detectors. The persisted `anpr_detector_model` setting selects exactly one of
-them for live cameras and uploaded-video tests; `yolo11n` is the default.
+detectors and can register one hash-verified customer YOLOX export. The
+persisted `anpr_detector_model` setting selects exactly one of them for live
+cameras and uploaded-video tests; `yolo11n` is the default. The YOLOX manifest,
+runtime contract and installation command are documented in
+[`ANPR_ENGINE_V3.md`](ANPR_ENGINE_V3.md).
 Selectable inference does not cascade to the other detector after a miss or a
 load failure, so counts from the same video remain attributable to the model
 chosen by the operator. These customer-facing paths are forced to effective
@@ -91,19 +94,21 @@ accepts only the fixed ONNX hash above. Portable builds ship that ONNX file in
 `model-seed`; the live camera path does not load PyTorch or the Hezar Python
 package.
 
-The previous verified readers remain fail-safe engines:
+The fixed Platrix CRNN remains the only production fallback:
 
 - `ocr_crnn.onnx`: full-plate CRNN, 10452525 bytes,
   SHA-256
   `45F8C45F29EB1EE91F6274CB8D9C328DA1A2050EA7D8596BAE61F4A6B9F9FB1E`
-- `ocr_cnn.onnx`: eight-glyph Iranian CNN, 2226402 bytes,
+- `ocr_cnn.onnx`: diagnostic-only eight-glyph Iranian CNN, 2226402 bytes,
   SHA-256
   `7D573C51CC855A8E080F1F88597477F4FB5A2B9CAFA1BB125BD6038E441F5BCA`
 
-OCR order is Hezar v2, previous CRNN, then character CNN. Every candidate must
-still satisfy the eight-position Iranian plate layout. Missing characters are
-never invented. `BCVISION_OCR_ENGINE=hezar-only` disables the fallback
-readers; `crnn` and `cnn` explicitly select the old readers.
+Production OCR order is immutable: Hezar v2, then the fixed Platrix CRNN only
+after Hezar rejects or errors. Every candidate must still satisfy the
+eight-position Iranian plate layout and the Platrix confidence floor. Missing
+characters are never invented. The promoted custom CRNN and character CNN are
+available only to explicit training/diagnostic APIs. Legacy
+`BCVISION_OCR_ENGINE` values are ignored by the production route.
 
 ## Persistent Windows paths
 
@@ -111,6 +116,8 @@ readers; `crnn` and `cnn` explicitly select the old readers.
 C:\ProgramData\BCVision\data\models\plate\plate_yolo11n.onnx
 C:\ProgramData\BCVision\data\models\plate\plate_yolov8n.onnx
 C:\ProgramData\BCVision\data\models\plate\plate_yolo_fallback.onnx
+C:\ProgramData\BCVision\data\models\plate\yolox-<sha-prefix>.onnx
+C:\ProgramData\BCVision\data\models\plate\yolox-custom.json
 C:\ProgramData\BCVision\data\models\hezar\crnn_fa_v2.onnx
 C:\ProgramData\BCVision\data\models\crnn\ocr_crnn.onnx
 C:\ProgramData\BCVision\data\models\cnn\ocr_cnn.onnx
@@ -124,6 +131,8 @@ Environment variables can override vendor model locations:
 BCVISION_PLATE_MODEL
 BCVISION_PLATE_YOLOV8N_MODEL
 BCVISION_PLATE_FALLBACK_MODEL
+BCVISION_YOLOX_MODEL
+BCVISION_YOLOX_MANIFEST
 BCVISION_HEZAR_MODEL
 BCVISION_CRNN_MODEL
 BCVISION_CNN_MODEL
@@ -133,16 +142,17 @@ BCVISION_HEZAR_CACHE_DIR
 BCVISION_CRNN_SOURCE_DIR
 BCVISION_CNN_SOURCE_DIR
 BCVISION_ONNX_DETECTOR_SIZE
-BCVISION_OCR_ENGINE=hezar|hezar-only|hybrid|crnn|cnn
 BCVISION_CPU_THREADS
 ```
 
 `BCVISION_PLATE_YOLO8N_MODEL` is retained as a compatibility alias for the
 YOLOv8n override. Every model is accepted only after exact size and SHA-256
-verification. Per-camera ONNX Runtime sessions are keyed by detector variant
-and verified path, use at most two intra-operation threads, one inter-operation
-thread, sequential execution and disabled worker spinning. Changing the
-persisted detector selection invalidates the live status/session cache.
+verification. Production passes one service-wide inference key, so detector,
+Hezar and Platrix sessions are shared across cameras and protected by per-model
+run locks. They use at most two intra-operation threads, one inter-operation
+thread, sequential execution and disabled worker spinning. Camera queues and
+trackers remain isolated. Changing the persisted detector selection invalidates
+the live status/session and temporal-consensus cache.
 
 ## RC15 selected candidate bundle
 
@@ -321,8 +331,10 @@ plates must be supplied explicitly; other outputs remain unverified.
 The historical `01.mp4` benchmark on 2026-07-28 processed all 546 frames.
 Baseline and ready-made Hezar v2 each matched only 1 of the 3 known plates,
 while Hezar was 37.3% slower. It was not auto-promoted at that checkpoint. The
-current Hezar-first path is an explicit experimental selection and still must
-be re-evaluated with the new YOLO11n crops and independent field/Golden data.
+Engine V3 now makes Hezar-first the explicit production policy, but that policy
+decision does not turn the historical three-plate run into accuracy evidence.
+It must be re-evaluated with the registered YOLOX crops and independent
+field/Golden data before any comparative accuracy claim.
 See `agent-results/latest/ANPR_HEZAR_VIDEO_BENCHMARK_RC13.md`.
 
 ## Operator training and promotion

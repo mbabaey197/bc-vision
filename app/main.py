@@ -43,7 +43,21 @@ try:
 except Exception:
     psutil = None
 
+
+_ANPR_V3_DETECTOR_MIGRATION = "migration_anpr_v3_yolo11n_default_v1"
+
+
+def _migrate_anpr_v3_detector_selection():
+    """Select YOLO11n once without overriding later operator choices."""
+    if get_setting(_ANPR_V3_DETECTOR_MIGRATION, "") == "1":
+        return False
+    set_setting("anpr_detector_model", "yolo11n")
+    set_setting(_ANPR_V3_DETECTOR_MIGRATION, "1")
+    return True
+
+
 init_db()
+_migrate_anpr_v3_detector_selection()
 app = FastAPI(title=f"{APP_NAME} | {COMPANY_NAME}", docs_url="/api/docs", redoc_url=None)
 
 try:
@@ -818,7 +832,7 @@ def dashboard(
     )
     js=f"""<script>
 const ids=[{ids}];
-async function cameraStatus(){{for(const id of ids){{try{{let r=await fetch('/api/cameras/'+id+'/status');let s=await r.json();let e=document.getElementById('st-'+id),a=document.getElementById('anpr-'+id),n=v=>Number(v||0).toLocaleString('fa-IR');e.textContent=s.ended?'پایان ویدئو':(s.paused?'متوقف':(s.online?'آنلاین':'آفلاین'));e.className='badge '+(s.online?'online':'');const play=document.getElementById('play-'+id),pause=document.getElementById('pause-'+id);if(play)play.classList.toggle('active',!s.paused);if(pause)pause.classList.toggle('active',!!s.paused);const p=s.anpr||{{}},m=p.models||{{}},engine=m.selected_detector==='yolov8n'?'YOLOv8n':'YOLO11n';if(p.last_error){{a.textContent='خطای '+engine+': '+p.last_error;a.className='anpr-status bad'}}else if(s.anpr_marker_error){{a.textContent='خطای تکمیل پردازش ویدئو: '+s.anpr_marker_error;a.className='anpr-status bad'}}else if(s.anpr_preview_only){{a.textContent=s.anpr_completed?'بازپخش فقط نمایشی است؛ پلاک‌خوان این ویدئو یک‌بار کامل شده است':'پردازش قبلی ناتمام بود؛ برای جلوگیری از ثبت تکراری، پخش فقط نمایشی است';a.className='anpr-status'}}else if(m.preparation_error){{a.textContent='خطای آماده‌سازی مدل: '+m.preparation_error;a.className='anpr-status bad'}}else if(!m.ready){{a.textContent=engine+' آماده نیست: مدل تشخیص یا OCR نصب نشده است';a.className='anpr-status bad'}}else{{const idle=p.idle_mode?' | حالت کم‌مصرف':'';a.textContent=engine+' | پردازش: '+n(p.processed_frames)+' فریم | تشخیص: '+n(p.detected_candidates)+' | ثبت: '+n(p.emitted_events)+idle;a.className='anpr-status'}}}}catch(e){{}}}}}}
+async function cameraStatus(){{for(const id of ids){{try{{let r=await fetch('/api/cameras/'+id+'/status');let s=await r.json();let e=document.getElementById('st-'+id),a=document.getElementById('anpr-'+id),n=v=>Number(v||0).toLocaleString('fa-IR');e.textContent=s.ended?'پایان ویدئو':(s.paused?'متوقف':(s.online?'آنلاین':'آفلاین'));e.className='badge '+(s.online?'online':'');const play=document.getElementById('play-'+id),pause=document.getElementById('pause-'+id);if(play)play.classList.toggle('active',!s.paused);if(pause)pause.classList.toggle('active',!!s.paused);const p=s.anpr||{{}},m=p.models||{{}},engine=m.selected_detector==='yolox'?'YOLOX اختصاصی':(m.selected_detector==='yolov8n'?'YOLOv8n':'YOLO11n');if(p.last_error){{a.textContent='خطای '+engine+': '+p.last_error;a.className='anpr-status bad'}}else if(s.anpr_marker_error){{a.textContent='خطای تکمیل پردازش ویدئو: '+s.anpr_marker_error;a.className='anpr-status bad'}}else if(s.anpr_preview_only){{a.textContent=s.anpr_completed?'بازپخش فقط نمایشی است؛ پلاک‌خوان این ویدئو یک‌بار کامل شده است':'پردازش قبلی ناتمام بود؛ برای جلوگیری از ثبت تکراری، پخش فقط نمایشی است';a.className='anpr-status'}}else if(m.preparation_error){{a.textContent='خطای آماده‌سازی مدل: '+m.preparation_error;a.className='anpr-status bad'}}else if(!m.ready){{a.textContent=engine+' آماده نیست: مدل تشخیص یا OCR نصب نشده است';a.className='anpr-status bad'}}else{{const idle=p.idle_mode?' | حالت کم‌مصرف':'';a.textContent=engine+' | پردازش: '+n(p.processed_frames)+' فریم | تشخیص: '+n(p.detected_candidates)+' | ثبت: '+n(p.emitted_events)+idle;a.className='anpr-status'}}}}catch(e){{}}}}}}
 async function videoPlayback(id,action){{try{{const r=await fetch('/api/cameras/'+id+'/playback',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action}})}});if(!r.ok)throw new Error();await cameraStatus()}}catch(e){{alert('تغییر وضعیت پخش انجام نشد.')}}}}
 let latestEventId={latest_event_id};
 let latestEventUpdated={json.dumps(latest_event_updated)};
@@ -1723,9 +1737,9 @@ def settings(request:Request,saved:int=0,restart:int=0,error:str=''):
     training_labels={
         'queued':'در صف','running':'در حال آموزش',
         'awaiting-golden':'در انتظار ارزیابی Golden',
-        'candidate-ready':'مدل نامزد آماده اعمال',
+        'candidate-ready':'مدل نامزد آماده فعال‌سازی آزمایشی',
         'rejected':'ردشده به‌دلیل افت دقت',
-        'applied':'اعمال‌شده','error':'خطای آموزش',
+        'applied':'فعال‌شده در مسیر آزمایشی','error':'خطای آموزش',
         'interrupted':'متوقف‌شده با بستن برنامه',
     }
     training_state=(
@@ -1736,7 +1750,7 @@ def settings(request:Request,saved:int=0,restart:int=0,error:str=''):
         if training_run else 'بدون آموزش'
     )
     training_metrics=(
-        "<p class='muted'>دقت مدل فعال: "
+        "<p class='muted'>دقت مدل کنترل آزمایشی: "
         + persian_digits(f"{float(training_run['baseline_accuracy'] or 0)*100:.1f}")
         + "٪ | دقت مدل نامزد: "
         + persian_digits(f"{float(training_run['candidate_accuracy'] or 0)*100:.1f}")
@@ -1749,7 +1763,7 @@ def settings(request:Request,saved:int=0,restart:int=0,error:str=''):
     training_action=(
         f"<form method='post' action='/settings/ai/training/apply'>"
         f"<input type='hidden' name='run_id' value='{training_run['id']}'>"
-        "<button>اعمال مدل نامزد تأییدشده</button></form>"
+        "<button>فعال‌سازی آزمایشی مدل نامزد</button></form>"
         if training_run and training_run['status']=='candidate-ready'
         else (
             f"<form method='post' action='/settings/ai/training/evaluate'>"
@@ -1788,11 +1802,13 @@ def settings(request:Request,saved:int=0,restart:int=0,error:str=''):
 <form method='post' action='/settings/ai'>
 <label>مدل تشخیص پلاک</label>
 <select name='anpr_detector_model'>
-<option value='yolo11n' {selected('anpr_detector_model','yolo11n')}>YOLO11n</option>
+<option value='yolo11n' {selected('anpr_detector_model','yolo11n')}>YOLO11n (پیش‌فرض پیشنهادی)</option>
 <option value='yolov8n' {selected('anpr_detector_model','yolov8n')}>YOLOv8n</option>
+<option value='yolox' {selected('anpr_detector_model','yolox')}>YOLOX اختصاصی</option>
 </select>
-<p class='muted'>فقط مدل انتخاب‌شده اجرا می‌شود تا سرعت و تعداد خوانش هر
-ویدئو را بتوانید بدون دخالت پنهانی مدل دیگر مقایسه کنید.</p>
+<p class='muted'>مسیر پیشنهادی فعلی: YOLO11n برای تشخیص کادر، سپس Hezar v2
+برای خواندن پلاک و فقط در صورت رد یا خطای آن، Platrix ثابت. فقط تشخیصگر
+انتخاب‌شده اجرا می‌شود و مدل دیگری پنهانی وارد پردازش نمی‌شود.</p>
 <label>روش پردازش AI</label>
 <select name='ai_accelerator'>
 <option value='auto'>Auto (پیشنهادی)</option>
@@ -1820,7 +1836,8 @@ name='anpr_auto_confirm_guesses' value='1'
 </div>
 <div class='card' id='ai-training'><h3>یادگیری از اصلاحات اپراتور</h3>
 <p class='muted'>تصاویر اصلاح‌شده در دیتاست محلی نگهداری می‌شوند. مدل نامزد
-فقط پس از آزمون روی مجموعه جدا و بدون افت نسبت به مدل فعال قابل اعمال است.</p>
+فقط پس از آزمون روی مجموعه جدا و بدون افت قابل فعال‌سازی آزمایشی است. این مدل
+روی تشخیص زنده اثر ندارد؛ مسیر تولید همیشه HEZAR v2 و سپس Platrix ثابت است.</p>
 <div class='stats-grid'>
 <div class='stat-card'><span class='muted'>نمونه آموزشی</span><div class='stat'>{persian_digits(training['train_samples'])}</div></div>
 <div class='stat-card'><span class='muted'>نمونه اعتبارسنجی</span><div class='stat'>{persian_digits(training['validation_samples'])}</div></div>
@@ -1953,14 +1970,38 @@ def save_ai_settings(request:Request, ai_accelerator:str=Form('auto'), ai_qualit
     if not u:return RedirectResponse('/login',302)
     if not has_permission(request,'system.manage'):return access_denied()
     detector_model=str(anpr_detector_model or '').strip().lower()
-    if detector_model not in {'yolo11n','yolov8n'}:
+    if detector_model not in {'yolo11n','yolov8n','yolox'}:
         return RedirectResponse(
             '/settings?error='+quote('مدل تشخیص پلاک معتبر نیست.'),
             303,
         )
+    if detector_model == 'yolox':
+        from app.ai.model_manager import model_status
+        yolox_status = model_status(selected_detector='yolox')
+        if not yolox_status.get('detector_yolox_ready'):
+            return RedirectResponse(
+                '/settings?error='+quote(
+                    'مدل YOLOX یا manifest هش‌شده آن هنوز نصب و تأیید نشده است.'
+                ),
+                303,
+            )
     detector_changed=(
         get_setting('anpr_detector_model','yolo11n') != detector_model
     )
+    if detector_changed:
+        from app.ai.live_worker import switch_live_anpr_detector
+        try:
+            switch_live_anpr_detector(
+                detector_model,
+                persist_setting=set_setting,
+            )
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            return RedirectResponse(
+                '/settings?error='+quote(
+                    'تغییر مدل انجام نشد: '+str(exc)
+                ),
+                303,
+            )
     set_setting('ai_accelerator', ai_accelerator)
     set_setting('ai_quality', ai_quality)
     set_setting('ai_confidence', max(1,min(99,ai_confidence)))
@@ -1970,18 +2011,11 @@ def save_ai_settings(request:Request, ai_accelerator:str=Form('auto'), ai_qualit
         '1' if anpr_auto_confirm_guesses else '0',
     )
     if detector_changed:
-        from app.ai.live_worker import switch_live_anpr_detector
-        switch_live_anpr_detector(
-            detector_model,
-            persist_setting=set_setting,
-        )
         audit(
             request,
             'anpr_detector_switch',
             detector_model+'; execution=exclusive-baseline',
         )
-    else:
-        set_setting('anpr_detector_model',detector_model)
     return RedirectResponse('/settings?saved=1',302)
 
 
@@ -2537,11 +2571,10 @@ async def ai_video_test_upload(request: Request, video: UploadFile = File(...)):
         detector_variant=str(
             info.get('detector_variant') or 'yolo11n'
         ).lower()
-        detector_label=(
-            'YOLOv8n'
-            if detector_variant == 'yolov8n'
-            else 'YOLO11n'
-        )
+        detector_label={
+            'yolox': 'YOLOX اختصاصی',
+            'yolov8n': 'YOLOv8n',
+        }.get(detector_variant, 'YOLO11n')
         rows = ''.join(
             _video_test_result_row(event, index)
             for index, event in enumerate(events, start=1)

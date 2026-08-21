@@ -1,9 +1,9 @@
 """Whole-plate Iranian OCR using a CRNN+CTC model in ONNX Runtime.
 
-The reader is intentionally independent from EasyOCR and PyTorch.  A separate
-ONNX session is cached for each active camera so the existing per-camera CPU
-budget remains enforceable.  Missing or invalid model files fail closed and
-leave the legacy OCR path available.
+The reader is intentionally independent from EasyOCR and PyTorch. Production
+passes a service-wide inference key so one locked session is shared by all
+cameras; explicit diagnostic callers may still isolate sessions by key.
+Missing or invalid model files fail closed.
 """
 from __future__ import annotations
 
@@ -39,8 +39,8 @@ class _SessionEntry:
 
 _cache_lock = threading.RLock()
 _sessions: OrderedDict[tuple[str, str], _SessionEntry] = OrderedDict()
-_verified_model_cache: tuple[str, int, int] | None = None
-_invalid_model_cache: tuple[str, int, int] | None = None
+_verified_model_cache: tuple | None = None
+_invalid_model_cache: tuple | None = None
 _last_status = {
     "engine": "crnn-onnx",
     "attempted": False,
@@ -162,14 +162,21 @@ def _session_options(ort):
     return options
 
 
-def _verified_model_path() -> Path:
+def _verified_model_path(fixed_vendor=False) -> Path:
     global _invalid_model_cache, _verified_model_cache
     from .model_manager import (
+        CRNN_SHA256,
+        CRNN_SIZE,
         active_crnn_model,
+        crnn_path,
         verify_file,
     )
 
-    path, expected_sha256, expected_size = active_crnn_model()
+    path, expected_sha256, expected_size = (
+        (crnn_path(), CRNN_SHA256, CRNN_SIZE)
+        if fixed_vendor
+        else active_crnn_model()
+    )
     try:
         stat = path.stat()
     except OSError as exc:
@@ -180,6 +187,9 @@ def _verified_model_path() -> Path:
         str(path.resolve()),
         int(stat.st_size),
         int(stat.st_mtime_ns),
+        int(getattr(stat, "st_ctime_ns", 0)),
+        str(expected_sha256).upper(),
+        int(expected_size),
     )
     with _cache_lock:
         if _verified_model_cache == cache_key:
@@ -200,8 +210,8 @@ def _verified_model_path() -> Path:
     return path
 
 
-def _load_session(engine_key=None) -> _SessionEntry:
-    path = _verified_model_path()
+def _load_session(engine_key=None, fixed_vendor=False) -> _SessionEntry:
+    path = _verified_model_path(fixed_vendor=fixed_vendor)
     camera_key = str(
         engine_key if engine_key is not None else "default"
     )
@@ -242,8 +252,13 @@ def _load_session(engine_key=None) -> _SessionEntry:
         return entry
 
 
-def read_plate_crnn(image, engine_key=None) -> tuple[str, float]:
-    """Read one complete plate crop, returning raw evidence on invalid layout."""
+def _read_plate_crnn(
+    image,
+    engine_key=None,
+    *,
+    fixed_vendor=False,
+    engine_name="crnn-onnx",
+) -> tuple[str, float]:
 
     tensor = prepare_crnn_input(image)
     if tensor is None:
@@ -251,8 +266,11 @@ def read_plate_crnn(image, engine_key=None) -> tuple[str, float]:
 
     camera_key = str(engine_key if engine_key is not None else "default")
     try:
-        path = _verified_model_path()
-        entry = _load_session(engine_key=engine_key)
+        path = _verified_model_path(fixed_vendor=fixed_vendor)
+        entry = _load_session(
+            engine_key=engine_key,
+            fixed_vendor=fixed_vendor,
+        )
         with entry.run_lock:
             output = entry.session.run(
                 None,
@@ -278,6 +296,7 @@ def read_plate_crnn(image, engine_key=None) -> tuple[str, float]:
         )
         with _cache_lock:
             _last_status.update(
+                engine=engine_name,
                 attempted=True,
                 model_loaded=True,
                 model_path=str(path),
@@ -291,6 +310,7 @@ def read_plate_crnn(image, engine_key=None) -> tuple[str, float]:
     except Exception as exc:
         with _cache_lock:
             _last_status.update(
+                engine=engine_name,
                 attempted=True,
                 model_loaded=False,
                 engine_key=camera_key,
@@ -300,3 +320,25 @@ def read_plate_crnn(image, engine_key=None) -> tuple[str, float]:
                 threads=threads_per_camera(),
             )
         return "", 0.0
+
+
+def read_plate_crnn(image, engine_key=None) -> tuple[str, float]:
+    """Read with the promoted/custom CRNN for training and diagnostics."""
+
+    return _read_plate_crnn(
+        image,
+        engine_key=engine_key,
+        fixed_vendor=False,
+        engine_name="crnn-onnx",
+    )
+
+
+def read_plate_platrix(image, engine_key=None) -> tuple[str, float]:
+    """Read with the fixed, hash-pinned Platrix CRNN production fallback."""
+
+    return _read_plate_crnn(
+        image,
+        engine_key=engine_key,
+        fixed_vendor=True,
+        engine_name="platrix-crnn-onnx",
+    )

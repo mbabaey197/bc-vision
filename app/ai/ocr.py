@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import product
-import os
 from typing import Iterable, Sequence
 
 import cv2
@@ -22,8 +21,15 @@ from .plate_rules import (
     normalize_plate,
     plausible_plate,
 )
-from .onnx_crnn import get_crnn_status, read_plate_crnn
-from .onnx_cnn import get_cnn_status, read_plate_cnn
+from .onnx_crnn import (
+    get_crnn_status,
+    read_plate_crnn,  # compatibility/diagnostic API; not production-routed
+    read_plate_platrix,
+)
+from .onnx_cnn import (
+    get_cnn_status,
+    read_plate_cnn,  # compatibility diagnostic API
+)
 from .onnx_hezar import (
     PRIMARY_ENGINE as HEZAR_ENGINE,
     hezar_status,
@@ -32,11 +38,13 @@ from .onnx_hezar import (
 
 _last_status = {
     "engine": "none",
+    "policy": "hezar-v2-then-fixed-platrix",
     "hezar_error": "",
     "crnn_error": "",
     "cnn_error": "",
     "candidate_count": 0,
 }
+PLATRIX_MIN_CONFIDENCE = 0.55
 
 # These replacements are only used in numeric positions.
 DIGIT_CONFUSIONS = {
@@ -524,86 +532,66 @@ def read_plate_candidate(
     engine_key=None,
     allow_legacy=True,
 ) -> tuple[str, float, str]:
+    """Run the immutable production policy: Hezar v2, then fixed Platrix.
+
+    ``allow_legacy`` remains in the public signature for older integrations,
+    but cannot enable the promoted custom CRNN or character CNN in production.
+    Those models remain available only through their explicit diagnostic and
+    training APIs.
+    """
+
     if image is None or getattr(image, "size", 0) == 0:
         return "", 0.0, "none"
 
-    mode = os.environ.get(
-        "BCVISION_OCR_ENGINE",
-        "hezar",
-    ).strip().lower()
-    if mode not in {
-        "hezar",
-        "hezar-only",
-        "hybrid",
-        "crnn",
-        "cnn",
-    }:
-        mode = "hezar"
-
-    if mode in {"hezar", "hezar-only", "hybrid"}:
-        hezar = read_plate_hezar_primary(
-            image,
-            engine_key=engine_key,
-        )
-        if hezar.get("accepted") and plausible_plate(
-            hezar.get("plate_norm", "")
-        ):
-            _last_status.update(
-                engine=HEZAR_ENGINE,
-                hezar_error="",
-                candidate_count=len(hezar.get("hypotheses", [])),
-            )
-            return (
-                format_iran_plate(hezar["plate_norm"]),
-                float(hezar.get("confidence", 0.0)),
-                HEZAR_ENGINE,
-            )
-        _last_status["hezar_error"] = hezar_status().get(
-            "error",
-            "",
-        )
-        if mode == "hezar-only":
-            return "", 0.0, HEZAR_ENGINE
-
-    if mode not in {"cnn", "hezar-only"}:
-        crnn_text, crnn_confidence = read_plate_crnn(
-            image,
-            engine_key=engine_key,
-        )
-        if plausible_plate(crnn_text):
-            _last_status.update(
-                engine="crnn-onnx",
-                crnn_error="",
-            )
-            return (
-                format_iran_plate(crnn_text),
-                float(crnn_confidence),
-                "crnn-onnx",
-            )
-        crnn_status = get_crnn_status()
-        _last_status["crnn_error"] = crnn_status.get(
-            "error",
-            "",
-        )
-
-    if mode == "crnn" or not allow_legacy:
-        return "", 0.0, "crnn-onnx"
-
-    cnn_text, cnn_confidence = read_plate_cnn(
+    hezar = read_plate_hezar_primary(
         image,
         engine_key=engine_key,
     )
-    if plausible_plate(cnn_text):
+    if hezar.get("accepted") and plausible_plate(
+        hezar.get("plate_norm", "")
+    ):
         _last_status.update(
-            engine="cnn-onnx",
-            cnn_error="",
+            engine=HEZAR_ENGINE,
+            hezar_error="",
+            crnn_error="",
+            cnn_error="disabled-by-production-policy",
+            candidate_count=len(hezar.get("hypotheses", [])),
         )
         return (
-            format_iran_plate(cnn_text),
-            float(cnn_confidence),
-            "cnn-onnx",
+            format_iran_plate(hezar["plate_norm"]),
+            float(hezar.get("confidence", 0.0)),
+            HEZAR_ENGINE,
         )
-    _last_status["cnn_error"] = get_cnn_status().get("error", "")
+
+    _last_status.update(
+        hezar_error=hezar_status().get("error", "") or "rejected",
+        candidate_count=len(hezar.get("hypotheses", [])),
+        cnn_error="disabled-by-production-policy",
+    )
+    platrix_text, platrix_confidence = read_plate_platrix(
+        image,
+        engine_key=engine_key,
+    )
+    if (
+        plausible_plate(platrix_text)
+        and float(platrix_confidence) >= PLATRIX_MIN_CONFIDENCE
+    ):
+        _last_status.update(
+            engine="platrix-crnn-onnx",
+            crnn_error="",
+        )
+        return (
+            format_iran_plate(platrix_text),
+            float(platrix_confidence),
+            "platrix-crnn-onnx",
+        )
+    crnn_error = get_crnn_status().get("error", "")
+    if plausible_plate(platrix_text) and not crnn_error:
+        crnn_error = "below-production-confidence"
+    _last_status.update(
+        engine="none",
+        crnn_error=crnn_error or "rejected",
+    )
 
     return "", 0.0, "none"
 

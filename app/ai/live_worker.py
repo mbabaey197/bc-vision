@@ -6,7 +6,7 @@ apply ROI, multi-frame consensus, duplicate suppression, and persist events.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 import os
@@ -19,6 +19,7 @@ from app.cpu_budget import parallel_camera_limit, threads_per_camera
 from app.media_storage import save_event_images
 
 from .activity import FrameActivityAnalyzer
+from .event_dedup import PlateVisitLedger, strict_plate_key
 from .pipeline import (
     PlateConsensusTracker,
     add_vehicle_analysis,
@@ -31,6 +32,9 @@ from .review_policy import (
     auto_confirm_guess,
     tag_assisted_candidate,
 )
+
+
+ENGINE_V3_INFERENCE_KEY = "engine-v3-shared"
 
 
 def operator_assisted_rows(primary: list, shadow: list) -> list:
@@ -66,6 +70,7 @@ def operator_assisted_rows(primary: list, shadow: list) -> list:
 class _CameraState:
     frame_counter: int = 0
     busy: bool = False
+    retired: bool = False
     pending: tuple | None = None
     config: dict | None = None
     config_loaded_at: float = 0.0
@@ -78,6 +83,7 @@ class _CameraState:
         )
     )
     seen: dict[str, float] = field(default_factory=dict)
+    visits: PlateVisitLedger = field(default_factory=PlateVisitLedger)
     track_event_ids: dict[int, int] = field(default_factory=dict)
     last_error: str = ""
     processing_errors: int = 0
@@ -91,6 +97,7 @@ class _CameraState:
     ocr_disagreements: int = 0
     crnn_selected: int = 0
     character_reader_selected: int = 0
+    detector_model_revision: str = ""
     last_processed_at: float = 0.0
     last_processing_ms: float = 0.0
     processing_seconds_ema: float = 0.0
@@ -119,6 +126,11 @@ class _CameraState:
         repr=False,
     )
 
+    def __post_init__(self):
+        # Keep the legacy ``seen`` view used by diagnostics/tests backed by
+        # the visit ledger's canonical timestamps.
+        self.visits.seen = self.seen
+
 
 class LiveANPRWorker:
     def __init__(self, max_workers=None):
@@ -134,6 +146,7 @@ class LiveANPRWorker:
             thread_name_prefix="bc-anpr",
         )
         self._lock = threading.RLock()
+        self._event_commit_locks: dict[int, threading.RLock] = {}
         self._stopped = False
         self._model_state = {}
         self._model_state_at = 0.0
@@ -146,6 +159,15 @@ class LiveANPRWorker:
         with self._lock:
             return normalize_detector_variant(
                 self._setting("anpr_detector_model", "yolo11n")
+            )
+
+    def _event_commit_lock(self, camera_id: int) -> threading.RLock:
+        """Return a lock that survives per-camera state recreation."""
+
+        with self._lock:
+            return self._event_commit_locks.setdefault(
+                int(camera_id),
+                threading.RLock(),
             )
 
     def begin_video_pass(self, camera_id: int) -> dict:
@@ -176,26 +198,45 @@ class LiveANPRWorker:
         or suppression decisions from the old detector.
         """
 
-        from .model_manager import normalize_detector_variant
+        from .model_manager import (
+            detector_variant_spec,
+            normalize_detector_variant,
+        )
         from .onnx_detector import clear_detector_sessions
 
         with self._lock:
+            selected = None
             if detector_variant is not None:
                 selected = normalize_detector_variant(detector_variant)
+                selected_spec = detector_variant_spec(selected)
+                if selected == "yolox" and not selected_spec.get("ready"):
+                    raise FileNotFoundError(
+                        selected_spec.get("error")
+                        or "Verified YOLOX detector is not installed"
+                    )
                 if persist_setting is None:
                     from app.database import set_setting
 
                     persist_setting = set_setting
-                # Persist while new frame selection is blocked by _lock.
-                # The generation increments before any old commit state can
-                # survive the reset below.
-                persist_setting("anpr_detector_model", selected)
-            self._detector_generation += 1
-            self._model_state = {}
-            self._model_state_at = 0.0
-            self._model_state_variant = ""
-            for state in self._states.values():
-                with state.model_switch_lock:
+
+            # Acquire every per-camera commit boundary before changing the
+            # persisted selection or generation. A transaction that already
+            # passed its generation guard may finish first, but it remains on
+            # the old setting side of this atomic switch boundary.
+            states = list(self._states.values())
+            locked_states = []
+            try:
+                for state in states:
+                    state.model_switch_lock.acquire()
+                    locked_states.append(state)
+
+                if selected is not None:
+                    persist_setting("anpr_detector_model", selected)
+                self._detector_generation += 1
+                self._model_state = {}
+                self._model_state_at = 0.0
+                self._model_state_variant = ""
+                for state in states:
                     duplicate_seconds = max(
                         0.0,
                         float(
@@ -212,7 +253,7 @@ class LiveANPRWorker:
                         emit_unreadable=True,
                     )
                     state.pending = None
-                    state.seen.clear()
+                    state.visits.reset_tracker_bindings()
                     state.track_event_ids.clear()
                     state.latest_detections = []
                     state.latest_detections_at = 0.0
@@ -230,6 +271,7 @@ class LiveANPRWorker:
                     state.ocr_disagreements = 0
                     state.crnn_selected = 0
                     state.character_reader_selected = 0
+                    state.detector_model_revision = ""
                     state.last_processed_at = 0.0
                     state.last_processing_ms = 0.0
                     state.processing_seconds_ema = 0.0
@@ -247,7 +289,10 @@ class LiveANPRWorker:
                     state.static_overlay_hits.clear()
                     state.static_overlay_blocked_until.clear()
                     state.frame_counter = 0
-            clear_detector_sessions()
+                clear_detector_sessions()
+            finally:
+                for state in reversed(locked_states):
+                    state.model_switch_lock.release()
 
     def _exclusive_engine_status(self) -> dict:
         return {
@@ -297,11 +342,16 @@ class LiveANPRWorker:
             self._model_state_at = now
             self._model_state_variant = selected_variant
         status = dict(self._model_state)
-        status["ocr_ready"] = bool(
-            status.get("hezar_ready")
-            or status.get("crnn_ready")
-            or status.get("cnn_ready")
+        status["ocr_primary_ready"] = bool(status.get("hezar_ready"))
+        status["ocr_fallback_ready"] = bool(status.get("crnn_ready"))
+        status["ocr_degraded"] = bool(
+            not status["ocr_primary_ready"]
+            and status["ocr_fallback_ready"]
         )
+        # CNN/custom CRNN availability cannot make the production stack ready.
+        # Hezar v2 is the required primary; fixed Platrix is an optional
+        # degraded-path fallback after a Hezar rejection.
+        status["ocr_ready"] = status["ocr_primary_ready"]
         status["ready"] = bool(
             status.get("detector_ready")
             and status["ocr_ready"]
@@ -402,6 +452,7 @@ class LiveANPRWorker:
         result: dict,
         processing_ms: float,
         event_id: int | None = None,
+        duplicate_seconds: float = 0.0,
     ):
         from app.database import connect
         from app.config import PLATE_DIR, SNAPSHOT_DIR
@@ -425,10 +476,42 @@ class LiveANPRWorker:
             except Exception:
                 # Compatibility with pre-migration/minimal recovery schemas.
                 camera_row = None
+            incoming_strict_identity = strict_plate_key(result)
+            recent_window = max(
+                0.0,
+                float(duplicate_seconds),
+                2.0 if incoming_strict_identity else 0.0,
+            )
+            if event_id is None and incoming_strict_identity:
+                cutoff = datetime.fromtimestamp(
+                    datetime.now(timezone.utc).timestamp() - recent_window,
+                    timezone.utc,
+                ).strftime("%Y-%m-%d %H:%M:%S.%f")
+                try:
+                    recent = con.execute(
+                        "SELECT id FROM plate_events "
+                        "WHERE camera_id=? AND plate_norm=? "
+                        "AND COALESCE(source,'live')='live' "
+                        "AND COALESCE(updated_at,created_at)>=? "
+                        "ORDER BY COALESCE(updated_at,created_at) DESC,id DESC "
+                        "LIMIT 1",
+                        (
+                            int(camera_id),
+                            incoming_strict_identity,
+                            cutoff,
+                        ),
+                    ).fetchone()
+                except Exception:
+                    # Minimal recovery/test schemas may not have lifecycle
+                    # columns. The visit ledger remains the primary guard.
+                    recent = None
+                if recent:
+                    event_id = int(recent["id"])
             if event_id:
                 try:
                     existing = con.execute(
-                        "SELECT image_path,plate_image_path,city,plate_norm "
+                        "SELECT image_path,plate_image_path,city,plate_norm,"
+                        "review_status,operator_reviewed,confirmation_source "
                         "FROM plate_events WHERE id=?",
                         (int(event_id),),
                     ).fetchone()
@@ -678,6 +761,20 @@ class LiveANPRWorker:
                 or result.get("needs_review")
             )),
         }
+        if (
+            existing
+            and "operator_reviewed" in existing.keys()
+            and bool(existing["operator_reviewed"])
+        ):
+            # Camera refreshes may improve media, but they must never undo a
+            # human decision already attached to the canonical event.
+            values["operator_reviewed"] = 1
+            if "review_status" in existing.keys():
+                values["review_status"] = existing["review_status"]
+            if "confirmation_source" in existing.keys():
+                values["confirmation_source"] = existing[
+                    "confirmation_source"
+                ]
         with connect() as con:
             columns = {
                 row[1]
@@ -1140,8 +1237,95 @@ class LiveANPRWorker:
             selected.append(row)
         return selected
 
+    @staticmethod
+    def _merge_payload_wake(selected, discarded):
+        """Keep wake intent while using masks from the selected frame only."""
+
+        selected_activity = selected[5] if len(selected) > 5 else None
+        discarded_activity = discarded[5] if len(discarded) > 5 else None
+        discarded_wake = bool(
+            discarded_activity is not None
+            and discarded_activity.wake_inference
+        )
+        if not discarded_wake:
+            return selected
+        if selected_activity is None:
+            from .activity import FrameActivity
+
+            merged_activity = FrameActivity(
+                motion_score=0.0,
+                moving=False,
+                scene_change=False,
+                wake_inference=True,
+                exclusion_mask=None,
+            )
+        elif selected_activity.wake_inference:
+            return selected
+        else:
+            merged_activity = replace(
+                selected_activity,
+                wake_inference=True,
+            )
+        values = list(selected)
+        while len(values) <= 5:
+            values.append(None)
+        values[5] = merged_activity
+        return tuple(values)
+
+    def _claim_latest_payload(self, state: _CameraState, scheduled):
+        """Replace an executor-queued frame with the newest pending frame.
+
+        ``busy`` remains owned by the already scheduled Future. New submits
+        therefore keep replacing one per-camera pending slot instead of
+        creating a second Future for the same camera.
+        """
+
+        with self._lock:
+            pending = state.pending
+            if pending is None:
+                return scheduled
+            state.pending = None
+            current_generation = self._detector_generation
+            scheduled_generation = (
+                int(scheduled[6])
+                if len(scheduled) > 6
+                else current_generation
+            )
+            pending_generation = (
+                int(pending[6])
+                if len(pending) > 6
+                else current_generation
+            )
+            if (
+                pending_generation == current_generation
+                and scheduled_generation != current_generation
+            ):
+                selected, discarded = pending, scheduled
+            elif (
+                scheduled_generation == current_generation
+                and pending_generation != current_generation
+            ):
+                selected, discarded = scheduled, pending
+            elif (
+                scheduled_generation == current_generation
+                and pending_generation == current_generation
+                and float(pending[3]) >= float(scheduled[3])
+            ):
+                selected, discarded = pending, scheduled
+            else:
+                # If both payloads are obsolete, keep the scheduled one so
+                # the existing generation guard discards it fail-closed.
+                selected, discarded = scheduled, pending
+            return self._merge_payload_wake(selected, discarded)
+
     def _process(self, state: _CameraState, payload):
+        payload = self._claim_latest_payload(state, payload)
         camera_id, camera_name, frame, timestamp = payload[:4]
+        # Resolve the worker-stable lock before taking model_switch_lock.
+        # invalidate_model_cache takes those locks in the opposite outer
+        # scope, so looking this up from inside the commit section would
+        # create a lock-order inversion.
+        event_commit_lock = self._event_commit_lock(camera_id)
         activity = payload[5] if len(payload) > 5 else None
         detector_generation = (
             int(payload[6])
@@ -1174,9 +1358,20 @@ class LiveANPRWorker:
                 min(0.70, min_confidence * 0.68),
             )
             detector_variant = self._selected_detector_variant()
+            inference_metadata = {}
 
             def baseline_process():
-                kwargs = {"engine_key": camera_id}
+                kwargs = {
+                    "engine_key": camera_id,
+                    # Tracking and pending-frame state remain per camera, but
+                    # ONNX detector/OCR sessions are shared service-wide. This
+                    # bounds RAM on installations with many cameras.
+                    "inference_key": ENGINE_V3_INFERENCE_KEY,
+                    # This call-owned dict carries the detector revision even
+                    # when the graph returns no boxes. A global status object
+                    # would race across concurrent cameras.
+                    "runtime_metadata": inference_metadata,
+                }
                 if exclusion_mask is not None:
                     kwargs["exclusion_mask"] = exclusion_mask
                 # Limit expensive OCR work without changing process_frame's
@@ -1191,9 +1386,23 @@ class LiveANPRWorker:
 
             primary_rows = []
             for raw_row in baseline_process():
-                row = apply_learned_correction(
-                    self._translate(raw_row, offset_x, offset_y)
+                translated = self._translate(
+                    raw_row,
+                    offset_x,
+                    offset_y,
                 )
+                # Corrections learned from an older/custom OCR model are not
+                # portable evidence for Hezar v2 or fixed Platrix. Preserve
+                # the model read exactly; operator feedback remains available
+                # to training and diagnostics without mutating production.
+                if translated.get("ocr_engine") in {
+                    "hezar-crnn-fa-v2-onnx",
+                    "platrix-crnn-onnx",
+                }:
+                    row = translated
+                    row["learned_correction_eligible"] = False
+                else:
+                    row = apply_learned_correction(translated)
                 row["engine_lane"] = "baseline"
                 row["detector_variant"] = detector_variant
                 row["detector_selection_exclusive"] = True
@@ -1205,10 +1414,55 @@ class LiveANPRWorker:
             # observations are discarded before tracker/persistence state.
             state.model_switch_lock.acquire()
             model_switch_locked = True
-            if detector_generation != self._detector_generation:
+            if (
+                state.retired
+                or detector_generation != self._detector_generation
+            ):
                 return
             rows = primary_rows
             display_rows = rows
+            detector_revisions = {
+                str(row.get("detector_model_revision", "")).strip()
+                for row in rows
+                if str(row.get("detector_model_revision", "")).strip()
+            }
+            call_detector_revision = str(
+                inference_metadata.get("detector_model_revision", "")
+            ).strip()
+            if call_detector_revision:
+                detector_revisions.add(call_detector_revision)
+            if len(detector_revisions) > 1:
+                raise RuntimeError(
+                    "one inference returned mixed detector revisions"
+                )
+            if detector_revisions:
+                detector_revision = next(iter(detector_revisions))
+                if (
+                    state.detector_model_revision
+                    and detector_revision != state.detector_model_revision
+                ):
+                    # A content-addressed YOLOX manifest may be activated while
+                    # the service is running. Never let old/new detector crops
+                    # contribute to the same temporal identity.
+                    duplicate_seconds = max(
+                        0.0,
+                        float(config.get("duplicate_seconds", 5.0)),
+                    )
+                    state.tracker = PlateConsensusTracker(
+                        min_votes=2,
+                        max_age_seconds=2.2,
+                        emit_cooldown=duplicate_seconds,
+                        emit_unreadable=True,
+                    )
+                    state.visits.reset_tracker_bindings()
+                    state.track_event_ids.clear()
+                    state.latest_detections = []
+                    state.latest_detection_frame = None
+                    state.detection_revision += 1
+                    state.static_overlay_hits.clear()
+                    state.static_overlay_blocked_until.clear()
+                    state.plate_visible = False
+                state.detector_model_revision = detector_revision
             processing_seconds = time.perf_counter() - started
             if state.processing_seconds_ema:
                 state.processing_seconds_ema = (
@@ -1239,6 +1493,7 @@ class LiveANPRWorker:
                     row.get("ocr_engine") in {
                         "hezar-crnn-fa-v2-onnx",
                         "crnn-onnx",
+                        "platrix-crnn-onnx",
                     }
                 )
                 state.character_reader_selected += int(
@@ -1265,10 +1520,29 @@ class LiveANPRWorker:
                         12,
                         state.no_plate_streak + 1,
                     )
+            duplicate_seconds = max(
+                0.0,
+                float(config.get("duplicate_seconds", 30)),
+            )
             stable = state.tracker.update(
                 rows,
                 timestamp=timestamp,
                 frame=frame,
+            )
+            active_tracks = state.tracker.active_track_ids()
+            retired_tracks = state.visits.observe(
+                rows,
+                active_tracks,
+                timestamp,
+                duplicate_seconds,
+            )
+            if retired_tracks:
+                state.tracker.retire_tracks(retired_tracks)
+                for track_id in retired_tracks:
+                    state.track_event_ids.pop(track_id, None)
+                active_tracks = state.tracker.active_track_ids()
+            state.track_event_ids.update(
+                state.visits.track_event_refs()
             )
             stable = [
                 auto_confirm_guess(row)
@@ -1352,14 +1626,34 @@ class LiveANPRWorker:
             state.detection_revision += 1
             state.last_processed_at = time.time()
             state.last_processing_ms = processing_seconds * 1000.0
-            duplicate_seconds = max(
-                0.0,
-                float(config.get("duplicate_seconds", 30)),
-            )
             processing_ms = processing_seconds * 1000.0
             for result in stable:
+                if state.retired:
+                    return
                 track_id = int(result.get("track_id") or 0)
                 event_id = state.track_event_ids.get(track_id)
+                if (
+                    result.get("capture_only")
+                    and result.get("provisional")
+                ):
+                    # A volatile track fragment is not a durable event.  Its
+                    # best frame remains in the tracker until consensus or a
+                    # final unreadable result can own exactly one row.
+                    continue
+                key, visit_event_id = state.visits.event_ref(
+                    result,
+                    timestamp,
+                    duplicate_seconds,
+                    allow_candidate=True,
+                )
+                if visit_event_id is not None:
+                    event_id = visit_event_id
+                if event_id is not None and not key:
+                    # The raw observation already refreshed this active
+                    # visit. A finalized OCR-less fragment must not erase a
+                    # complete strict or review-only candidate previously
+                    # stored for it.
+                    continue
                 capture_frame = result.pop("capture_frame", None)
                 persistence_frame = (
                     capture_frame
@@ -1368,15 +1662,26 @@ class LiveANPRWorker:
                     else frame
                 )
                 if result.get("capture_only"):
-                    saved_id = self._persist(
-                        camera_id,
-                        camera_name,
-                        persistence_frame,
-                        result,
-                        processing_ms,
-                        event_id,
-                    )
+                    with event_commit_lock:
+                        if state.retired:
+                            return
+                        saved_id = self._persist(
+                            camera_id,
+                            camera_name,
+                            persistence_frame,
+                            result,
+                            processing_ms,
+                            event_id,
+                            duplicate_seconds,
+                        )
                     state.track_event_ids[track_id] = saved_id
+                    if key:
+                        state.visits.register(
+                            result,
+                            saved_id,
+                            timestamp,
+                            allow_candidate=True,
+                        )
                     if event_id is None:
                         state.emitted_events += 1
                         state.last_event_at = time.time()
@@ -1390,31 +1695,30 @@ class LiveANPRWorker:
                     and not result.get("needs_review")
                 ):
                     continue
-                key = result.get("plate_norm") or normalize_plate(
-                    result.get("plate")
-                )
                 if not key:
                     continue
-                previous = state.seen.get(key, -1e12)
-                if (
-                    event_id is None
-                    and timestamp - previous < duplicate_seconds
-                ):
-                    continue
-                state.seen[key] = timestamp
-                saved_id = self._persist(
-                    camera_id,
-                    camera_name,
-                    persistence_frame,
-                    result,
-                    processing_ms,
-                    event_id,
-                )
+                with event_commit_lock:
+                    if state.retired:
+                        return
+                    saved_id = self._persist(
+                        camera_id,
+                        camera_name,
+                        persistence_frame,
+                        result,
+                        processing_ms,
+                        event_id,
+                        duplicate_seconds,
+                    )
                 state.track_event_ids[track_id] = saved_id
+                state.visits.register(
+                    result,
+                    saved_id,
+                    timestamp,
+                    allow_candidate=True,
+                )
                 if event_id is None:
                     state.emitted_events += 1
                 state.last_event_at = time.time()
-            active_tracks = state.tracker.active_track_ids()
             state.track_event_ids = {
                 track_id: event_id
                 for track_id, event_id in state.track_event_ids.items()
@@ -1431,7 +1735,11 @@ class LiveANPRWorker:
             if model_switch_locked:
                 state.model_switch_lock.release()
             with self._lock:
-                if detector_generation != self._detector_generation:
+                if (
+                    state.retired
+                    or detector_generation != self._detector_generation
+                ):
+                    state.pending = None
                     state.next_inference_at = 0.0
                     state.busy = False
                     return
@@ -1465,6 +1773,7 @@ class LiveANPRWorker:
                     "processed_frames": 0,
                     "detected_candidates": 0,
                     "emitted_events": 0,
+                    "detector_model_revision": "",
                     "last_error": "",
                     "anpr_engine": self._exclusive_engine_status(),
                     "shadow": {
@@ -1490,6 +1799,7 @@ class LiveANPRWorker:
                 "processed_frames": state.processed_frames,
                 "detected_candidates": state.detected_candidates,
                 "emitted_events": state.emitted_events,
+                "detector_model_revision": state.detector_model_revision,
                 "last_event_at": state.last_event_at,
                 "last_processed_at": state.last_processed_at,
                 "last_processing_ms": round(
@@ -1585,7 +1895,15 @@ class LiveANPRWorker:
 
     def remove(self, camera_id: int):
         with self._lock:
-            self._states.pop(int(camera_id), None)
+            state = self._states.pop(int(camera_id), None)
+        if state is None:
+            return
+        state.retired = True
+        # The commit lock is stable for the lifetime of this detached state.
+        # An inference already past its commit boundary may finish first; an
+        # inference still running is marked retired and must discard output.
+        with state.model_switch_lock:
+            state.pending = None
 
     def shutdown(self):
         self._stopped = True

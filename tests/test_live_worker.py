@@ -301,6 +301,73 @@ def test_confirmed_event_cannot_be_downgraded_by_reviewable_result(
     assert rows[0]["review_status"] == "confirmed-ai"
 
 
+def test_recent_exact_event_is_reused_after_worker_state_restart(
+    tmp_path,
+    monkeypatch,
+):
+    import app.database
+
+    db_path = tmp_path / "restart-dedup.db"
+    monkeypatch.setattr(app.database, "DB_PATH", db_path)
+    app.database.init_db()
+    with app.database.connect() as con:
+        camera_id = int(con.execute(
+            "INSERT INTO cameras(name,rtsp_url,duplicate_seconds) "
+            "VALUES(?,?,?)",
+            ("Gate", "rtsp://gate", 30),
+        ).lastrowid)
+    settings = {
+        "plate_path": str(tmp_path / "plates"),
+        "snapshot_path": str(tmp_path / "vehicles"),
+        "save_plate_images": "0",
+        "save_snapshots": "0",
+    }
+    frame = np.full((120, 220, 3), 140, dtype=np.uint8)
+    result = {
+        "plate": "31-ط-556-74",
+        "plate_norm": "31ط55674",
+        "valid": True,
+        "confidence": 0.94,
+        "bbox": (60, 70, 160, 100),
+        "crop": frame[70:100, 60:160].copy(),
+    }
+    first_worker = live_worker.LiveANPRWorker(max_workers=1)
+    second_worker = live_worker.LiveANPRWorker(max_workers=1)
+    for worker in (first_worker, second_worker):
+        monkeypatch.setattr(
+            worker,
+            "_setting",
+            lambda key, default="": settings.get(key, default),
+        )
+
+    first_id = first_worker._persist(
+        camera_id,
+        "Gate",
+        frame,
+        dict(result),
+        20.0,
+        duplicate_seconds=30,
+    )
+    second_id = second_worker._persist(
+        camera_id,
+        "Gate",
+        frame,
+        dict(result),
+        20.0,
+        duplicate_seconds=30,
+    )
+    first_worker.shutdown()
+    second_worker.shutdown()
+
+    with app.database.connect() as con:
+        count = int(con.execute(
+            "SELECT COUNT(*) FROM plate_events WHERE camera_id=?",
+            (camera_id,),
+        ).fetchone()[0])
+    assert second_id == first_id
+    assert count == 1
+
+
 def test_media_encoder_failure_keeps_text_event_and_records_error(
     tmp_path,
     monkeypatch,
@@ -593,6 +660,7 @@ def test_slow_cpu_keeps_three_observations_for_consensus(monkeypatch):
         saved_result,
         _processing_ms,
         event_id=None,
+        _duplicate_seconds=0.0,
     ):
         persisted.append((saved_result, event_id))
         return event_id or 41
@@ -613,17 +681,305 @@ def test_slow_cpu_keeps_three_observations_for_consensus(monkeypatch):
         )
     worker.shutdown()
 
-    assert persisted[0][0]["capture_only"] is True
+    # Provisional captures stay in tracker memory; only the strict consensus
+    # becomes a durable row.
+    assert all(not row.get("capture_only") for row, _event_id in persisted)
     recognized = [
         row for row, _event_id in persisted
         if not row.get("capture_only")
     ]
     assert len(recognized) == 1
     assert recognized[0]["plate_norm"] == "12ب34567"
-    assert persisted[-1][1] == 41
+    assert persisted[-1][1] is None
+    assert state.emitted_events == 1
     # Slow inference must preserve consecutive observations without leaving a
     # physical track open long enough to absorb a later vehicle.
     assert state.tracker.max_age_seconds == 6.0
+
+
+def test_fragmented_continuous_plate_reuses_one_event_after_cooldown(
+    monkeypatch,
+):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState()
+    state.config = {
+        "enabled": 1,
+        "lpr_enabled": 1,
+        "lpr_confidence": 50,
+        "duplicate_seconds": 30,
+        "roi_x": 0,
+        "roi_y": 0,
+        "roi_w": 100,
+        "roi_h": 100,
+    }
+    frame = np.full((100, 180, 3), 120, dtype=np.uint8)
+    detected = {
+        "plate": "31-ط-556-74",
+        "plate_norm": "31ط55674",
+        "raw_guess_text": "31-ط-556-74",
+        "raw_guess_norm": "31ط55674",
+        "valid": True,
+        "confidence": 0.92,
+        "ocr_confidence": 0.90,
+        "quality_score": 0.82,
+        "bbox": (25, 30, 155, 68),
+        "crop": frame[30:68, 25:155].copy(),
+        "method": "test",
+    }
+    monkeypatch.setattr(
+        live_worker,
+        "process_frame",
+        lambda *_args, **_kwargs: [dict(detected)],
+    )
+    monkeypatch.setattr(
+        live_worker,
+        "apply_learned_correction",
+        lambda result: result,
+    )
+    writes = []
+
+    def persist(
+        _camera_id,
+        _camera_name,
+        _frame,
+        result,
+        _processing_ms,
+        event_id=None,
+        _duplicate_seconds=0.0,
+    ):
+        saved_id = int(event_id) if event_id is not None else 71
+        writes.append((saved_id, event_id, dict(result)))
+        return saved_id
+
+    monkeypatch.setattr(worker, "_persist", persist)
+    # The 40-second inference gap forces a new tracker id and exceeds the
+    # configured cooldown, but no empty observation ever ended the visit.
+    for timestamp in (0.0, 0.2, 0.4, 40.0, 40.2, 40.4):
+        state.busy = True
+        worker._process(
+            state,
+            (1, "Gate", frame.copy(), timestamp),
+        )
+    worker.shutdown()
+
+    assert [event_id for _saved, event_id, _row in writes] == [None, 71]
+    assert {saved for saved, _event_id, _row in writes} == {71}
+    assert state.emitted_events == 1
+    assert state.seen["31ط55674"] == 40.4
+
+
+def test_same_plate_after_confirmed_absence_creates_new_event(
+    monkeypatch,
+):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState()
+    state.config = {
+        "enabled": 1,
+        "lpr_enabled": 1,
+        "lpr_confidence": 50,
+        "duplicate_seconds": 0,
+        "roi_x": 0,
+        "roi_y": 0,
+        "roi_w": 100,
+        "roi_h": 100,
+    }
+    frame = np.full((100, 180, 3), 120, dtype=np.uint8)
+    detected = {
+        "plate": "31-ط-556-74",
+        "plate_norm": "31ط55674",
+        "raw_guess_text": "31-ط-556-74",
+        "raw_guess_norm": "31ط55674",
+        "valid": True,
+        "confidence": 0.92,
+        "ocr_confidence": 0.90,
+        "quality_score": 0.82,
+        "bbox": (25, 30, 155, 68),
+        "crop": frame[30:68, 25:155].copy(),
+        "method": "test",
+    }
+    outputs = iter(
+        [[dict(detected)] for _ in range(3)]
+        + [[] for _ in range(3)]
+        + [[dict(detected)] for _ in range(3)]
+    )
+    monkeypatch.setattr(
+        live_worker,
+        "process_frame",
+        lambda *_args, **_kwargs: next(outputs),
+    )
+    monkeypatch.setattr(
+        live_worker,
+        "apply_learned_correction",
+        lambda result: result,
+    )
+    inserted = []
+
+    def persist(
+        _camera_id,
+        _camera_name,
+        _frame,
+        _result,
+        _processing_ms,
+        event_id=None,
+        _duplicate_seconds=0.0,
+    ):
+        if event_id is None:
+            inserted.append(80 + len(inserted))
+            return inserted[-1]
+        return int(event_id)
+
+    monkeypatch.setattr(worker, "_persist", persist)
+    # The return happens before the tracker's normal expiry.  Three empty
+    # observations must retire the old one-shot track so a new visit can emit.
+    timestamps = (0.0, 0.2, 0.4, 0.8, 1.2, 1.6, 2.0, 2.2, 2.4)
+    for timestamp in timestamps:
+        state.busy = True
+        worker._process(
+            state,
+            (1, "Gate", frame.copy(), timestamp),
+        )
+    worker.shutdown()
+
+    assert inserted == [80, 81]
+    assert state.emitted_events == 2
+
+
+def test_provisional_capture_waits_for_one_final_row(monkeypatch):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState()
+    state.config = {
+        "enabled": 1,
+        "lpr_enabled": 1,
+        "lpr_confidence": 50,
+        "duplicate_seconds": 30,
+        "roi_x": 0,
+        "roi_y": 0,
+        "roi_w": 100,
+        "roi_h": 100,
+    }
+    frame = np.full((100, 180, 3), 120, dtype=np.uint8)
+    monkeypatch.setattr(
+        live_worker,
+        "process_frame",
+        lambda *_args, **_kwargs: [{
+            "plate": "31-ط-556-74",
+            "plate_norm": "31ط55674",
+            "raw_guess_text": "31-ط-556-74",
+            "raw_guess_norm": "31ط55674",
+            "valid": True,
+            "confidence": 0.92,
+            "ocr_confidence": 0.90,
+            "quality_score": 0.82,
+            "bbox": (25, 30, 155, 68),
+            "crop": frame[30:68, 25:155].copy(),
+            "method": "test",
+        }],
+    )
+    writes = []
+
+    def persist(
+        _camera_id,
+        _camera_name,
+        _frame,
+        result,
+        _processing_ms,
+        event_id=None,
+        _duplicate_seconds=0.0,
+    ):
+        writes.append((dict(result), event_id))
+        return event_id or 91
+
+    monkeypatch.setattr(worker, "_persist", persist)
+
+    state.busy = True
+    worker._process(state, (1, "Gate", frame, 0.0))
+    assert writes == []
+
+    monkeypatch.setattr(
+        live_worker,
+        "process_frame",
+        lambda *_args, **_kwargs: [],
+    )
+    state.busy = True
+    worker._process(state, (1, "Gate", frame, 6.0))
+    worker.shutdown()
+
+    assert len(writes) == 1
+    assert writes[0][0]["provisional"] is False
+    assert writes[0][0]["valid"] is False
+    assert writes[0][0]["needs_review"] is True
+    assert writes[0][1] is None
+    assert state.emitted_events == 1
+
+
+def test_unknown_fragment_cannot_erase_live_review_candidate(monkeypatch):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState()
+    state.config = {
+        "enabled": 1,
+        "lpr_enabled": 1,
+        "lpr_confidence": 50,
+        "duplicate_seconds": 0,
+        "roi_x": 0,
+        "roi_y": 0,
+        "roi_w": 100,
+        "roi_h": 100,
+    }
+    candidate = {
+        "plate": "31-ط-556-74",
+        "plate_norm": "",
+        "raw_guess_text": "31-ط-556-74",
+        "raw_guess_norm": "31ط55674",
+        "valid": False,
+        "needs_review": True,
+        "track_id": 1,
+    }
+    state.visits.register(
+        candidate,
+        77,
+        0.0,
+        allow_candidate=True,
+    )
+    state.track_event_ids[1] = 77
+    frame = np.full((100, 180, 3), 120, dtype=np.uint8)
+    unknown = {
+        "plate": "ناخوانا",
+        "plate_norm": "",
+        "raw_guess_text": "",
+        "raw_guess_norm": "",
+        "valid": False,
+        "needs_review": True,
+        "confidence": 0.35,
+        "detector_confidence": 0.82,
+        "ocr_confidence": 0.0,
+        "quality_score": 0.66,
+        "bbox": (25, 30, 155, 68),
+        "crop": frame[30:68, 25:155].copy(),
+        "method": "test",
+    }
+    monkeypatch.setattr(
+        live_worker,
+        "process_frame",
+        lambda *_args, **_kwargs: [dict(unknown)],
+    )
+    monkeypatch.setattr(
+        worker,
+        "_persist",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unknown fragment must not downgrade candidate")
+        ),
+    )
+
+    for timestamp in (0.0, 0.4, 0.8):
+        state.busy = True
+        worker._process(
+            state,
+            (1, "Gate", frame.copy(), timestamp),
+        )
+    worker.shutdown()
+
+    assert state.visits.event_refs == {"31ط55674": 77}
+    assert state.emitted_events == 0
 
 
 def test_latest_detection_is_available_for_live_overlay(monkeypatch):
@@ -992,7 +1348,11 @@ def test_detector_selection_cache_can_be_invalidated(monkeypatch):
     state.tracker.update([observation], timestamp=0.0)
     state.tracker.update([observation], timestamp=0.2)
     old_tracker = state.tracker
-    state.seen["31ط55674"] = 10.0
+    state.visits.register(
+        {**observation, "track_id": 3},
+        41,
+        10.0,
+    )
     state.track_event_ids[3] = 41
     state.latest_detections = [{"plate": "31-ط-556-74"}]
     state.processed_frames = 12
@@ -1014,7 +1374,11 @@ def test_detector_selection_cache_can_be_invalidated(monkeypatch):
     assert state.tracker is not old_tracker
     assert state.tracker.emit_cooldown == 27
     assert state.tracker.update([observation], timestamp=0.4) == []
-    assert state.seen == {}
+    # Exact durable visit identity survives a detector switch, while all
+    # model-specific track bindings are reset.
+    assert state.seen == {"31ط55674": 10.0}
+    assert state.visits.event_refs == {"31ط55674": 41}
+    assert state.visits.track_keys == {}
     assert state.track_event_ids == {}
     assert state.latest_detections == []
     assert state.processed_frames == 0
@@ -1074,6 +1438,67 @@ def test_inflight_old_detector_result_is_discarded_on_switch(monkeypatch):
     assert state.tracker.active_track_ids() == set()
     assert state.seen == {}
     assert state.latest_detections == []
+
+
+def test_removed_camera_discards_inflight_result_before_persistence(
+    monkeypatch,
+):
+    worker = live_worker.LiveANPRWorker(max_workers=1)
+    state = live_worker._CameraState()
+    state.config = {
+        "enabled": 1,
+        "lpr_enabled": 1,
+        "lpr_confidence": 50,
+        "duplicate_seconds": 30,
+        "roi_x": 0,
+        "roi_y": 0,
+        "roi_w": 100,
+        "roi_h": 100,
+    }
+    state.busy = True
+    worker._states[44] = state
+    frame = np.full((100, 180, 3), 120, dtype=np.uint8)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def process(*_args, **_kwargs):
+        entered.set()
+        assert release.wait(2.0)
+        return [{
+            "plate": "31-ط-556-74",
+            "plate_norm": "31ط55674",
+            "valid": True,
+            "confidence": 0.92,
+            "quality_score": 0.82,
+            "bbox": (25, 30, 155, 68),
+            "crop": frame[30:68, 25:155].copy(),
+            "method": "test",
+        }]
+
+    monkeypatch.setattr(live_worker, "process_frame", process)
+    monkeypatch.setattr(
+        worker,
+        "_persist",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a retired camera must not persist")
+        ),
+    )
+    thread = threading.Thread(
+        target=worker._process,
+        args=(state, (44, "Gate", frame, 1.0)),
+    )
+    thread.start()
+    assert entered.wait(1.0)
+
+    worker.remove(44)
+    release.set()
+    thread.join(timeout=2.0)
+    worker.shutdown()
+
+    assert not thread.is_alive()
+    assert state.retired is True
+    assert state.busy is False
+    assert 44 not in worker._states
 
 
 def test_selected_inference_failure_reaches_camera_last_error(monkeypatch):

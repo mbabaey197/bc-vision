@@ -53,6 +53,8 @@ class _SessionEntry:
 
 _cache_lock = threading.RLock()
 _sessions: OrderedDict[tuple[str, str], _SessionEntry] = OrderedDict()
+_verified_primary_cache: tuple | None = None
+_invalid_primary_cache: tuple | None = None
 _last_status = {
     "engine": PRIMARY_ENGINE,
     "attempted": False,
@@ -71,8 +73,11 @@ def hezar_status() -> dict:
 
 
 def clear_hezar_sessions() -> None:
+    global _invalid_primary_cache, _verified_primary_cache
     with _cache_lock:
         _sessions.clear()
+        _verified_primary_cache = None
+        _invalid_primary_cache = None
         _last_status.update(
             engine=PRIMARY_ENGINE,
             attempted=False,
@@ -83,6 +88,50 @@ def clear_hezar_sessions() -> None:
             accepted=False,
             error="",
         )
+
+
+def _verified_primary_path() -> Path:
+    """Hash Hezar once per file revision instead of once per plate crop."""
+
+    global _invalid_primary_cache, _verified_primary_cache
+    from .model_manager import (
+        HEZAR_ONNX_SHA256,
+        HEZAR_ONNX_SIZE,
+        hezar_path,
+        verify_file,
+    )
+
+    path = hezar_path()
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise FileNotFoundError(
+            f"Verified Hezar CRNN model not found: {path}"
+        ) from exc
+    cache_key = (
+        str(path.resolve()),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        int(getattr(stat, "st_ctime_ns", 0)),
+        HEZAR_ONNX_SHA256,
+    )
+    with _cache_lock:
+        if _verified_primary_cache == cache_key:
+            return path
+        if _invalid_primary_cache == cache_key:
+            raise FileNotFoundError(
+                f"Verified Hezar CRNN model not found: {path}"
+            )
+    if not verify_file(path, HEZAR_ONNX_SHA256, HEZAR_ONNX_SIZE):
+        with _cache_lock:
+            _invalid_primary_cache = cache_key
+        raise FileNotFoundError(
+            f"Verified Hezar CRNN model not found: {path}"
+        )
+    with _cache_lock:
+        _invalid_primary_cache = None
+        _verified_primary_cache = cache_key
+    return path
 
 
 def _softmax(logits: np.ndarray) -> np.ndarray:
@@ -455,20 +504,12 @@ def _read_plate_with_spec(
 
 def read_plate_hezar_primary(image, engine_key=None) -> dict:
     """Read a cropped plate with the fixed, verified Hezar v2 model."""
-
-    from .model_manager import (
-        HEZAR_ONNX_SHA256,
-        HEZAR_ONNX_SIZE,
-        hezar_path,
-        verify_file,
-    )
+    from .model_manager import hezar_path
 
     path = hezar_path()
-    spec = {**HEZAR_V2_SPEC, "path": str(path)}
-    if not verify_file(path, HEZAR_ONNX_SHA256, HEZAR_ONNX_SIZE):
-        exc = FileNotFoundError(
-            f"Verified Hezar CRNN model not found: {path}"
-        )
+    try:
+        path = _verified_primary_path()
+    except Exception as exc:
         with _cache_lock:
             _last_status.update(
                 engine=PRIMARY_ENGINE,
@@ -483,6 +524,7 @@ def read_plate_hezar_primary(image, engine_key=None) -> dict:
                 error=f"{type(exc).__name__}: {exc}",
             )
         return _failure_result(exc)
+    spec = {**HEZAR_V2_SPEC, "path": str(path)}
     return _read_plate_with_spec(
         image,
         spec,
