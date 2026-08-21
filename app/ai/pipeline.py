@@ -92,6 +92,9 @@ def process_frame(
     max_results=8,
     max_candidates=None,
     detector_variant=None,
+    inference_key=None,
+    expected_detector_revision=None,
+    runtime_metadata=None,
 ):
     results = []
     detector_kwargs = {
@@ -103,29 +106,50 @@ def process_frame(
         detector_kwargs["max_results"] = max(
             1, int(max_candidates)
         )
-    if engine_key is not None:
-        detector_kwargs["engine_key"] = engine_key
+    model_key = inference_key if inference_key is not None else engine_key
+    if model_key is not None:
+        detector_kwargs["engine_key"] = model_key
     if detector_variant is not None:
         detector_kwargs["detector_variant"] = detector_variant
-    for item in detect_plates(frame, **detector_kwargs):
+    detector_metadata = (
+        runtime_metadata if runtime_metadata is not None else {}
+    )
+    if runtime_metadata is not None:
+        detector_kwargs["runtime_metadata"] = detector_metadata
+    if expected_detector_revision:
+        detector_kwargs["expected_model_revision"] = (
+            expected_detector_revision
+        )
+    detected_items = detect_plates(frame, **detector_kwargs)
+    call_detector_revision = str(
+        detector_metadata.get("detector_model_revision", "")
+    ).strip()
+    for item in detected_items:
         crop = item["crop"]
         quality = image_quality(crop)
-        text = item.get("direct_text", "")
-        ocr_confidence = float(
-            item.get("direct_ocr_confidence", 0.0)
+        # Engine V3 has one authoritative OCR route. Detector-attached or
+        # promoted custom OCR evidence is deliberately excluded from both the
+        # selected plate and temporal hypotheses; it can still be inspected by
+        # explicit training/diagnostic tools outside this production path.
+        production_policy = detector_variant is not None
+        text = "" if production_policy else item.get("direct_text", "")
+        ocr_confidence = (
+            0.0
+            if production_policy
+            else float(item.get("direct_ocr_confidence", 0.0))
         )
         direct_valid = plausible_plate(text)
         direct_norm = normalize_plate(text) if direct_valid else ""
         ocr_engine = (
             "dedicated-character-detector"
-            if item.get("direct_ocr_attempted")
+            if item.get("direct_ocr_attempted") and not production_policy
             else "none"
         )
         whole_plate_ocr_attempted = False
         generic_ocr_attempted = False
-        # Hezar CRNN is the preferred whole-plate reader. The prior CRNN and
-        # lightweight character CNN remain fail-safe readers for credible
-        # crops when Hezar has no accepted full-plate result.
+        # Production OCR is immutable: Hezar v2 first, then the fixed Platrix
+        # CRNN only after a Hezar rejection/error. Promoted custom CRNNs,
+        # detector-attached text and the character CNN are diagnostic-only.
         generic_fallback_eligible = bool(
             not direct_valid
             and (
@@ -155,7 +179,7 @@ def process_frame(
                 fallback_engine,
             ) = read_plate_candidate(
                 crop,
-                engine_key=engine_key,
+                engine_key=model_key,
                 allow_legacy=generic_fallback_eligible,
             )
             generic_ocr_attempted = bool(
@@ -163,7 +187,11 @@ def process_frame(
                 and fallback_engine in {"cnn-onnx", "none"}
             )
         plate_hypotheses = []
-        for hypothesis in item.get("plate_hypotheses", []):
+        for hypothesis in (
+            ()
+            if production_policy
+            else item.get("plate_hypotheses", [])
+        ):
             normalized = normalize_plate(
                 hypothesis.get("plate_norm")
                 or hypothesis.get("plate")
@@ -255,7 +283,11 @@ def process_frame(
                 if fallback_engine not in matched["engine"]:
                     matched["engine"] += "+" + fallback_engine
         position_hypotheses = []
-        for hypothesis in item.get("position_hypotheses", []):
+        for hypothesis in (
+            ()
+            if production_policy
+            else item.get("position_hypotheses", [])
+        ):
             positions = {}
             for raw_position, raw_value in hypothesis.get(
                 "positions",
@@ -419,6 +451,26 @@ def process_frame(
             ),
             reverse=True,
         )
+        detector_model_revision = str(
+            item.get("model_revision", "") or call_detector_revision
+        ).strip()
+        ocr_model_revision = str(
+            raw_guess_engine or ocr_engine
+        ).strip()
+        detector_revision_label = str(
+            detector_metadata.get("detector_variant")
+            or detector_variant
+            or "detector"
+        ).strip().lower()
+        runtime_model_revision = (
+            detector_revision_label
+            + ":"
+            + detector_model_revision
+            + "+ocr:"
+            + ocr_model_revision
+            if detector_model_revision
+            else ocr_model_revision
+        )
         results.append({
             "plate": text or "ناخوانا",
             "plate_norm": normalize_plate(text) if valid else "",
@@ -444,6 +496,15 @@ def process_frame(
             "whole_plate_ocr_attempted": whole_plate_ocr_attempted,
             "dedicated_ocr_attempted": bool(
                 item.get("direct_ocr_attempted")
+            ),
+            "dedicated_ocr_ignored": bool(
+                production_policy
+                and (
+                    item.get("direct_ocr_attempted")
+                    or item.get("direct_text")
+                    or item.get("plate_hypotheses")
+                    or item.get("position_hypotheses")
+                )
             ),
             "generic_ocr_attempted": generic_ocr_attempted,
             "plate_hypotheses": plate_hypotheses[:5],
@@ -476,7 +537,9 @@ def process_frame(
             "raw_guess_confidence": raw_guess_confidence,
             "raw_guess_engine": raw_guess_engine,
             "raw_guess_reason": raw_guess_reason,
-            "model_revision": raw_guess_engine or ocr_engine,
+            "detector_model_revision": detector_model_revision,
+            "ocr_model_revision": ocr_model_revision,
+            "model_revision": runtime_model_revision,
             "experimental": bool(best_effort and needs_review),
             "hypotheses_accepted_for_consensus": bool(
                 (valid and not needs_review)
@@ -1169,8 +1232,44 @@ class PlateConsensusTracker:
             for track_id, track in self._tracks.items()
             if timestamp - track.last_seen > self.max_age_seconds * 2.2
         ]
+        finalized = []
         for track_id in stale:
-            self._tracks.pop(track_id, None)
+            track = self._tracks.pop(track_id, None)
+            if track is None:
+                continue
+            final_read = self._final_track_result(
+                track,
+                timestamp,
+                force=True,
+            )
+            if final_read is not None:
+                track.unreadable_finalized = True
+                finalized.append(final_read)
+        return finalized
+
+    def _final_track_result(
+        self,
+        track: _Track,
+        timestamp: float,
+        force=False,
+    ) -> dict | None:
+        if track.emitted_plate or track.unreadable_finalized:
+            return None
+        consensus = self._consensus(track)
+        if consensus is not None:
+            return consensus
+        if not self.emit_unreadable:
+            return None
+        if not force and not self._unreadable_ready(track, timestamp):
+            return None
+        return (
+            self._best_effort_result(track)
+            or self._capture_result(
+                track,
+                refresh=True,
+                final_unreadable=True,
+            )
+        )
 
     @staticmethod
     def _observation_weight(row: dict) -> float:
@@ -1779,8 +1878,7 @@ class PlateConsensusTracker:
 
     def update(self, results, timestamp=None, frame=None):
         timestamp = time.monotonic() if timestamp is None else float(timestamp)
-        self._expire(timestamp)
-        emitted = []
+        emitted = self._expire(timestamp)
         results = list(results)
         assigned = self._associate(results, timestamp)
 
@@ -1874,33 +1972,24 @@ class PlateConsensusTracker:
     def active_track_ids(self) -> set[int]:
         return set(self._tracks)
 
+    def retire_tracks(self, track_ids) -> None:
+        """End tracker fragments after the visit ledger confirms absence."""
+
+        for track_id in track_ids:
+            self._tracks.pop(int(track_id), None)
+
     def flush(self):
         rows = []
         for track in list(self._tracks.values()):
-            if track.emitted_plate:
-                continue
-            consensus = self._consensus(track)
-            if consensus is not None:
-                rows.append(consensus)
-            elif (
-                self.emit_unreadable
-                and self._unreadable_ready(
-                    track,
-                    max(
-                        track.last_seen,
-                        track.first_seen + self.min_unreadable_seconds,
-                    ),
-                )
-            ):
-                final_read = (
-                    self._best_effort_result(track)
-                    or self._capture_result(
-                        track,
-                        refresh=True,
-                        final_unreadable=True,
-                    )
-                )
-                if final_read is not None:
-                    track.unreadable_finalized = True
-                    rows.append(final_read)
+            final_read = self._final_track_result(
+                track,
+                max(
+                    track.last_seen,
+                    track.first_seen + self.min_unreadable_seconds,
+                ),
+                force=True,
+            )
+            if final_read is not None:
+                track.unreadable_finalized = True
+                rows.append(final_read)
         return rows

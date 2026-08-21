@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 import app.ai.video_test as video_test
+from app.ai import model_manager
 import app.media_storage as media_storage
 import app.streams as streams
 from app.streams import CameraStream
@@ -101,6 +102,308 @@ def test_video_emits_one_consensus_event(tmp_path, monkeypatch):
         assert decoded.size > 0
 
 
+def test_video_track_fragment_keeps_one_event_when_cooldown_is_zero(
+    tmp_path,
+    monkeypatch,
+):
+    video_path = tmp_path / "fragmented.avi"
+    _write_video(video_path, frames=8)
+    calls = {"count": 0}
+
+    def fake_process(_frame, _threshold, detector_variant=None):
+        calls["count"] += 1
+        # The large position jump starts a new visual track even though the
+        # exact same plate remains the active visit.
+        bbox = (
+            (20, 70, 140, 110)
+            if calls["count"] <= 3
+            else (180, 70, 300, 110)
+        )
+        return [{
+            "plate": "31-ط-556-74",
+            "plate_norm": "31ط55674",
+            "raw_guess_text": "31-ط-556-74",
+            "raw_guess_norm": "31ط55674",
+            "valid": True,
+            "confidence": 0.91,
+            "detector_confidence": 0.90,
+            "ocr_confidence": 0.89,
+            "quality_score": 0.82,
+            "bbox": bbox,
+            "crop": None,
+            "method": "test",
+        }]
+
+    monkeypatch.setattr(video_test, "process_frame", fake_process)
+
+    _info, events = video_test.process_video(
+        video_path,
+        tmp_path / "plates",
+        tmp_path / "vehicles",
+        frame_step=1,
+        duplicate_seconds=0,
+        min_confidence=0.5,
+        detector_variant="yolo8n",
+    )
+
+    assert len(events) == 1
+    assert events[0]["plate_norm"] == "31ط55674"
+
+
+def test_video_short_unreadable_track_survives_mid_video_expiry(
+    tmp_path,
+    monkeypatch,
+):
+    video_path = tmp_path / "short-unreadable.avi"
+    _write_video(video_path, frames=40)
+    calls = {"count": 0}
+
+    def fake_process(_frame, _threshold, detector_variant=None):
+        calls["count"] += 1
+        if calls["count"] > 2:
+            return []
+        return [{
+            "plate": "ناخوانا",
+            "plate_norm": "",
+            "valid": False,
+            "confidence": 0.42,
+            "detector_confidence": 0.84,
+            "ocr_confidence": 0.0,
+            "quality_score": 0.72,
+            "bbox": (80, 75, 240, 118),
+            "crop": None,
+            "method": "test",
+        }]
+
+    monkeypatch.setattr(video_test, "process_frame", fake_process)
+
+    _info, events = video_test.process_video(
+        video_path,
+        tmp_path / "plates",
+        tmp_path / "vehicles",
+        frame_step=1,
+        duplicate_seconds=0,
+        detector_variant="yolo8n",
+    )
+
+    assert len(events) == 1
+    assert events[0]["capture_only"] is True
+    assert events[0]["provisional"] is False
+    assert events[0]["needs_review"] is True
+
+
+def test_video_unreadable_fragment_does_not_split_recognized_visit(
+    tmp_path,
+    monkeypatch,
+):
+    video_path = tmp_path / "ocr-gap.avi"
+    _write_video(video_path, frames=18)
+    calls = {"count": 0}
+
+    def fake_process(_frame, _threshold, detector_variant=None):
+        calls["count"] += 1
+        if 4 <= calls["count"] <= 13:
+            return [{
+                "plate": "ناخوانا",
+                "plate_norm": "",
+                "valid": False,
+                "confidence": 0.40,
+                "detector_confidence": 0.82,
+                "ocr_confidence": 0.0,
+                "quality_score": 0.68,
+                "bbox": (180, 70, 300, 110),
+                "crop": None,
+                "method": "test",
+            }]
+        bbox = (
+            (20, 70, 140, 110)
+            if calls["count"] <= 3
+            else (180, 70, 300, 110)
+        )
+        return [{
+            "plate": "31-ط-556-74",
+            "plate_norm": "31ط55674",
+            "raw_guess_text": "31-ط-556-74",
+            "raw_guess_norm": "31ط55674",
+            "valid": True,
+            "confidence": 0.91,
+            "detector_confidence": 0.90,
+            "ocr_confidence": 0.89,
+            "quality_score": 0.82,
+            "bbox": bbox,
+            "crop": None,
+            "method": "test",
+        }]
+
+    monkeypatch.setattr(video_test, "process_frame", fake_process)
+
+    _info, events = video_test.process_video(
+        video_path,
+        tmp_path / "plates",
+        tmp_path / "vehicles",
+        frame_step=1,
+        duplicate_seconds=0,
+        detector_variant="yolo8n",
+    )
+
+    assert len(events) == 1
+    assert events[0]["plate_norm"] == "31ط55674"
+    assert events[0]["valid"] is True
+
+
+def test_video_distinct_review_candidate_is_not_merged_with_known_plate(
+    tmp_path,
+    monkeypatch,
+):
+    video_path = tmp_path / "distinct-review-candidate.avi"
+    _write_video(video_path, frames=13)
+    calls = {"count": 0}
+
+    def fake_process(_frame, _threshold, detector_variant=None):
+        calls["count"] += 1
+        if calls["count"] <= 3:
+            return [{
+                "plate": "31-ط-556-74",
+                "plate_norm": "31ط55674",
+                "raw_guess_text": "31-ط-556-74",
+                "raw_guess_norm": "31ط55674",
+                "valid": True,
+                "confidence": 0.91,
+                "detector_confidence": 0.90,
+                "ocr_confidence": 0.89,
+                "quality_score": 0.82,
+                "bbox": (20, 70, 140, 110),
+                "crop": None,
+                "method": "test",
+            }]
+        return [{
+            "plate": "ناخوانا",
+            "plate_norm": "",
+            "raw_guess_text": "12-ب-345-67",
+            "raw_guess_norm": "12ب34567",
+            "valid": False,
+            "needs_review": True,
+            "confidence": 0.45,
+            "detector_confidence": 0.86,
+            "ocr_confidence": 0.48,
+            "quality_score": 0.70,
+            "bbox": (180, 70, 300, 110),
+            "crop": None,
+            "method": "test",
+        }]
+
+    monkeypatch.setattr(video_test, "process_frame", fake_process)
+
+    _info, events = video_test.process_video(
+        video_path,
+        tmp_path / "plates",
+        tmp_path / "vehicles",
+        frame_step=1,
+        duplicate_seconds=0,
+        min_confidence=0.5,
+        detector_variant="yolo8n",
+    )
+
+    assert len(events) == 2
+    assert events[0]["plate_norm"] == "31ط55674"
+    assert events[1]["raw_guess_norm"] == "12ب34567"
+    assert events[1]["needs_review"] is True
+
+
+def test_video_unknown_fragment_cannot_erase_review_candidate(
+    tmp_path,
+    monkeypatch,
+):
+    video_path = tmp_path / "candidate-then-unknown.avi"
+    _write_video(video_path, frames=20)
+    calls = {"count": 0}
+
+    def fake_process(_frame, _threshold, detector_variant=None):
+        calls["count"] += 1
+        if calls["count"] <= 10:
+            return [{
+                "plate": "31-ط-556-74",
+                "plate_norm": "",
+                "raw_guess_text": "31-ط-556-74",
+                "raw_guess_norm": "31ط55674",
+                "valid": False,
+                "needs_review": True,
+                "confidence": 0.45,
+                "detector_confidence": 0.86,
+                "ocr_confidence": 0.48,
+                "quality_score": 0.70,
+                "bbox": (20, 70, 140, 110),
+                "crop": None,
+                "method": "test",
+            }]
+        return [{
+            "plate": "ناخوانا",
+            "plate_norm": "",
+            "raw_guess_text": "",
+            "raw_guess_norm": "",
+            "valid": False,
+            "needs_review": True,
+            "confidence": 0.35,
+            "detector_confidence": 0.82,
+            "ocr_confidence": 0.0,
+            "quality_score": 0.66,
+            "bbox": (180, 70, 300, 110),
+            "crop": None,
+            "method": "test",
+        }]
+
+    monkeypatch.setattr(video_test, "process_frame", fake_process)
+
+    _info, events = video_test.process_video(
+        video_path,
+        tmp_path / "plates",
+        tmp_path / "vehicles",
+        frame_step=1,
+        duplicate_seconds=0,
+        detector_variant="yolo8n",
+    )
+
+    assert len(events) == 1
+    assert events[0]["raw_guess_norm"] == "31ط55674"
+    assert events[0]["needs_review"] is True
+
+
+def test_video_max_events_caps_final_unreadable_rows(tmp_path, monkeypatch):
+    video_path = tmp_path / "unreadable-cap.avi"
+    _write_video(video_path, frames=1)
+
+    def fake_process(_frame, _threshold, detector_variant=None):
+        return [
+            {
+                "plate": "ناخوانا",
+                "plate_norm": "",
+                "valid": False,
+                "confidence": 0.40,
+                "detector_confidence": 0.82,
+                "ocr_confidence": 0.0,
+                "quality_score": 0.68,
+                "bbox": (20 + index * 90, 70, 90 + index * 90, 105),
+                "crop": None,
+                "method": "test",
+            }
+            for index in range(3)
+        ]
+
+    monkeypatch.setattr(video_test, "process_frame", fake_process)
+
+    _info, events = video_test.process_video(
+        video_path,
+        tmp_path / "plates",
+        tmp_path / "vehicles",
+        frame_step=1,
+        max_events=1,
+        duplicate_seconds=0,
+        detector_variant="yolo8n",
+    )
+
+    assert len(events) == 1
+
+
 def test_video_media_failure_keeps_result_and_reports_error(
     tmp_path,
     monkeypatch,
@@ -186,6 +489,56 @@ def test_video_selected_inference_failure_is_not_treated_as_no_plate(
             tmp_path / "snapshots",
             frame_step=1,
             detector_variant="yolov8n",
+        )
+
+
+def test_video_fails_closed_if_detector_revision_changes_mid_pass(
+    tmp_path,
+    monkeypatch,
+):
+    video_path = tmp_path / "revision-change.avi"
+    _write_video(video_path, frames=2)
+    revisions = iter(("revision-a", "revision-b"))
+    monkeypatch.setattr(
+        model_manager,
+        "yolox_detector_spec",
+        lambda: {
+            "ready": True,
+            "model_revision": "revision-a",
+            "error": "",
+        },
+    )
+
+    def rows(frame, *_args, **kwargs):
+        revision = next(revisions)
+        assert kwargs["expected_detector_revision"] == "revision-a"
+        kwargs["runtime_metadata"].update(
+            detector_variant="yolox",
+            detector_model_revision=revision,
+        )
+        if revision == "revision-b":
+            return []
+        return [{
+            "plate": "ناخوانا",
+            "plate_norm": "",
+            "valid": False,
+            "confidence": 0.8,
+            "quality_score": 0.5,
+            "bbox": (80, 80, 240, 120),
+            "crop": frame[80:120, 80:240].copy(),
+            "method": "yolox-custom-onnx",
+            "detector_model_revision": revision,
+        }]
+
+    monkeypatch.setattr(video_test, "process_frame", rows)
+
+    with pytest.raises(RuntimeError, match="revision changed"):
+        video_test.process_video(
+            video_path,
+            tmp_path / "plates",
+            tmp_path / "snapshots",
+            frame_step=1,
+            detector_variant="yolox",
         )
 
 

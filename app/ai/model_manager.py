@@ -12,6 +12,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import ssl
 import sys
@@ -43,6 +44,12 @@ YOLOV8N_DETECTOR_SHA256 = (
     "9E76098A5C8039BB5D148C0B6421F5C6"
 )
 YOLOV8N_DETECTOR_SIZE = 12_608_775
+YOLOX_MANIFEST_SCHEMA_VERSION = 1
+YOLOX_OUTPUT_FORMATS = {
+    "raw-grid",
+    "decoded-cxcywh",
+    "nms-xyxy",
+}
 MODEL_PREPARATION_STATE_ENV = "BCVISION_MODEL_PREPARATION_STATE"
 MODEL_PREPARATION_ERROR_ENV = "BCVISION_MODEL_PREPARATION_ERROR"
 MODEL_PREPARATION_ATTEMPT_ENV = "BCVISION_MODEL_PREPARATION_ATTEMPT"
@@ -109,6 +116,219 @@ def yolov8n_detector_path() -> Path:
     return _data_dir() / "models" / "plate" / "plate_yolov8n.onnx"
 
 
+def yolox_manifest_path() -> Path:
+    configured = os.environ.get(
+        "BCVISION_YOLOX_MANIFEST",
+        "",
+    ).strip()
+    if configured:
+        return Path(configured).expanduser()
+    return _data_dir() / "models" / "plate" / "yolox-custom.json"
+
+
+def yolox_detector_path() -> Path:
+    configured = os.environ.get(
+        "BCVISION_YOLOX_MODEL",
+        "",
+    ).strip()
+    if configured:
+        return Path(configured).expanduser()
+    return _data_dir() / "models" / "plate" / "yolox-custom.onnx"
+
+
+def _empty_yolox_spec(error="YOLOX manifest is not installed") -> dict:
+    return {
+        "variant": "yolox",
+        "path": yolox_detector_path(),
+        "manifest_path": yolox_manifest_path(),
+        "manifest_digest": "",
+        "sha256": "",
+        "size": 0,
+        "input_size": 640,
+        "input_height": 640,
+        "input_width": 640,
+        "output_format": "raw-grid",
+        "coordinate_space": "grid",
+        "output_index": 0,
+        "class_count": 1,
+        "plate_class_id": 0,
+        "strides": [8, 16, 32],
+        "color": "bgr",
+        "input_scale": 1.0,
+        "letterbox_mode": "top-left",
+        "scores_are_logits": False,
+        "method": "yolox-custom-onnx",
+        "model_revision": "",
+        "ready": False,
+        "error": str(error),
+    }
+
+
+def yolox_detector_spec(
+    manifest_path_override: Path | None = None,
+    model_path_override: Path | None = None,
+) -> dict:
+    """Return a fail-closed, hash-verified custom YOLOX contract.
+
+    Custom weights are installation data and live outside the application
+    tree.  The sidecar manifest is deliberately explicit because common
+    YOLOX exports disagree about whether grid/stride decoding or NMS is
+    embedded in the ONNX graph.
+    """
+
+    manifest_path = (
+        Path(manifest_path_override)
+        if manifest_path_override is not None
+        else yolox_manifest_path()
+    )
+    if not manifest_path.is_file():
+        return _empty_yolox_spec()
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+        payload = json.loads(manifest_bytes.decode("utf-8"))
+        if int(payload.get("schema_version", 0)) != YOLOX_MANIFEST_SCHEMA_VERSION:
+            raise ValueError("unsupported YOLOX manifest schema")
+        filename = str(payload.get("filename", "")).strip()
+        digest = str(payload.get("sha256", "")).strip().upper()
+        size = int(payload.get("size", 0))
+        if not filename or Path(filename).name != filename:
+            raise ValueError("YOLOX filename must be a plain file name")
+        if not re.fullmatch(r"[0-9A-F]{64}", digest):
+            raise ValueError("YOLOX SHA-256 is invalid")
+        if size <= 0:
+            raise ValueError("YOLOX model size is invalid")
+
+        raw_input = payload.get("input_size", 640)
+        if isinstance(raw_input, (list, tuple)) and len(raw_input) == 2:
+            input_height, input_width = (int(raw_input[0]), int(raw_input[1]))
+        else:
+            input_height = input_width = int(raw_input)
+        if not (
+            160 <= input_height <= 1280
+            and 160 <= input_width <= 1280
+            and input_height % 32 == 0
+            and input_width % 32 == 0
+        ):
+            raise ValueError("YOLOX input size must be 160..1280 and divisible by 32")
+
+        output_format = str(payload.get("output_format", "")).strip().lower()
+        if output_format not in YOLOX_OUTPUT_FORMATS:
+            raise ValueError("YOLOX output_format must be explicit")
+        coordinate_space = str(
+            payload.get("coordinate_space", "")
+        ).strip().lower()
+        expected_space = (
+            "grid" if output_format == "raw-grid" else "input-pixels"
+        )
+        if coordinate_space != expected_space:
+            raise ValueError(
+                f"YOLOX {output_format} coordinate_space must be {expected_space}"
+            )
+        class_count = int(payload.get("class_count", 1))
+        plate_class_id = int(payload.get("plate_class_id", 0))
+        if (
+            not 1 <= class_count <= 256
+            or not 0 <= plate_class_id < class_count
+        ):
+            raise ValueError("YOLOX class contract is invalid")
+        strides = [int(value) for value in payload.get("strides", [8, 16, 32])]
+        if (
+            not strides
+            or any(value <= 0 for value in strides)
+            or len(set(strides)) != len(strides)
+            or any(
+                input_height % value != 0
+                or input_width % value != 0
+                for value in strides
+            )
+        ):
+            raise ValueError("YOLOX strides are invalid")
+        color = str(payload.get("color", "")).strip().lower()
+        if color not in {"rgb", "bgr"}:
+            raise ValueError("YOLOX color must be rgb or bgr")
+        input_scale = float(payload.get("input_scale", 0.0))
+        if not 0.0 < input_scale <= 1.0:
+            raise ValueError("YOLOX input_scale is invalid")
+        letterbox_mode = str(
+            payload.get("letterbox_mode", "")
+        ).strip().lower()
+        if letterbox_mode not in {"center", "top-left"}:
+            raise ValueError(
+                "YOLOX letterbox_mode must be center or top-left"
+            )
+
+        configured_model = os.environ.get("BCVISION_YOLOX_MODEL", "").strip()
+        model_path = (
+            Path(model_path_override)
+            if model_path_override is not None
+            else (
+                Path(configured_model).expanduser()
+                if configured_model
+                else manifest_path.parent / filename
+            )
+        )
+        output_index = int(payload.get("output_index", 0))
+        if output_index < 0:
+            raise ValueError("YOLOX output_index is invalid")
+        scores_are_logits = payload.get("scores_are_logits", False)
+        if not isinstance(scores_are_logits, bool):
+            raise ValueError("YOLOX scores_are_logits must be boolean")
+        ready = verify_file(model_path, digest, size)
+        contract_identity = json.dumps(
+            {
+                "input_height": input_height,
+                "input_width": input_width,
+                "output_format": output_format,
+                "coordinate_space": coordinate_space,
+                "output_index": output_index,
+                "class_count": class_count,
+                "plate_class_id": plate_class_id,
+                "strides": strides,
+                "color": color,
+                "input_scale": input_scale,
+                "letterbox_mode": letterbox_mode,
+                "scores_are_logits": scores_are_logits,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        model_revision = hashlib.sha256(
+            (digest + ":" + contract_identity).encode("utf-8")
+        ).hexdigest()[:16]
+        return {
+            "variant": "yolox",
+            "path": model_path,
+            "manifest_path": manifest_path,
+            "manifest_digest": manifest_digest,
+            "sha256": digest,
+            "size": size,
+            "input_size": (
+                input_height
+                if input_height == input_width
+                else [input_height, input_width]
+            ),
+            "input_height": input_height,
+            "input_width": input_width,
+            "output_format": output_format,
+            "coordinate_space": coordinate_space,
+            "output_index": output_index,
+            "class_count": class_count,
+            "plate_class_id": plate_class_id,
+            "strides": strides,
+            "color": color,
+            "input_scale": input_scale,
+            "letterbox_mode": letterbox_mode,
+            "scores_are_logits": scores_are_logits,
+            "method": "yolox-custom-onnx",
+            "model_revision": model_revision,
+            "ready": ready,
+            "error": "" if ready else "YOLOX model does not match its manifest",
+        }
+    except Exception as exc:
+        return _empty_yolox_spec(f"{type(exc).__name__}: {exc}")
+
+
 def normalize_detector_variant(value, default="yolo11n") -> str:
     aliases = {
         "yolo11": "yolo11n",
@@ -118,6 +338,9 @@ def normalize_detector_variant(value, default="yolo11n") -> str:
         "yolo8n": "yolov8n",
         "yolov8": "yolov8n",
         "yolov8n": "yolov8n",
+        "yolox": "yolox",
+        "yolox-custom": "yolox",
+        "custom-yolox": "yolox",
     }
     normalized_default = aliases.get(
         str(default or "").strip().lower(),
@@ -131,6 +354,8 @@ def normalize_detector_variant(value, default="yolo11n") -> str:
 
 def detector_variant_spec(variant=None) -> dict:
     selected = normalize_detector_variant(variant)
+    if selected == "yolox":
+        return yolox_detector_spec()
     if selected == "yolov8n":
         return {
             "variant": selected,
@@ -445,6 +670,135 @@ def verify_file(
     ):
         return False
     return sha256_file(path) == expected_sha256.upper()
+
+
+def install_yolox_model(
+    source: Path,
+    *,
+    input_size=640,
+    output_format="raw-grid",
+    class_count=1,
+    plate_class_id=0,
+    strides=(8, 16, 32),
+    color="bgr",
+    input_scale=1.0,
+    letterbox_mode="top-left",
+    scores_are_logits=False,
+    output_index=0,
+) -> dict:
+    """Atomically install custom YOLOX weights and their decode contract."""
+
+    source = Path(source).expanduser()
+    if not source.is_file() or source.suffix.lower() != ".onnx":
+        raise FileNotFoundError(f"YOLOX ONNX model not found: {source}")
+    size = source.stat().st_size
+    if size <= 0:
+        raise ValueError("YOLOX ONNX model is empty")
+    digest = sha256_file(source)
+    manifest = yolox_manifest_path()
+    configured_target = os.environ.get("BCVISION_YOLOX_MODEL", "").strip()
+    target = (
+        Path(configured_target).expanduser()
+        if configured_target
+        else manifest.parent / f"yolox-{digest[:12].lower()}.onnx"
+    )
+    if configured_target and source.resolve() != target.resolve():
+        raise ValueError(
+            "BCVISION_YOLOX_MODEL is read-only during registration; "
+            "place the model at that exact path first or unset the override"
+        )
+    target_was_present = target.exists()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+
+    if source.resolve() != target.resolve():
+        temp_model = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "wb",
+                delete=False,
+                dir=target.parent,
+                prefix=target.name + ".",
+                suffix=".part",
+            ) as output, source.open("rb") as input_file:
+                temp_model = Path(output.name)
+                shutil.copyfileobj(input_file, output, length=1024 * 1024)
+                output.flush()
+                os.fsync(output.fileno())
+            if not verify_file(temp_model, digest, size):
+                raise ValueError("Copied YOLOX model failed verification")
+            os.replace(temp_model, target)
+            temp_model = None
+        finally:
+            if temp_model is not None:
+                temp_model.unlink(missing_ok=True)
+    elif not verify_file(target, digest, size):
+        raise ValueError("YOLOX model failed verification")
+
+    payload = {
+        "schema_version": YOLOX_MANIFEST_SCHEMA_VERSION,
+        "filename": target.name,
+        "sha256": digest,
+        "size": size,
+        "input_size": input_size,
+        "output_format": str(output_format).strip().lower(),
+        "coordinate_space": (
+            "grid"
+            if str(output_format).strip().lower() == "raw-grid"
+            else "input-pixels"
+        ),
+        "output_index": int(output_index),
+        "class_count": int(class_count),
+        "plate_class_id": int(plate_class_id),
+        "strides": [int(value) for value in strides],
+        "color": str(color).strip().lower(),
+        "input_scale": float(input_scale),
+        "letterbox_mode": str(letterbox_mode).strip().lower(),
+        "scores_are_logits": bool(scores_are_logits),
+    }
+    temp_manifest = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            delete=False,
+            dir=manifest.parent,
+            prefix=manifest.name + ".",
+            suffix=".part",
+        ) as output:
+            temp_manifest = Path(output.name)
+            json.dump(payload, output, ensure_ascii=False, indent=2)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        candidate = yolox_detector_spec(
+            manifest_path_override=temp_manifest,
+            model_path_override=target,
+        )
+        if not candidate.get("ready"):
+            raise ValueError(candidate.get("error") or "Invalid YOLOX manifest")
+        from .onnx_yolox import validate_yolox_model
+
+        validate_yolox_model(candidate)
+        os.replace(temp_manifest, manifest)
+        temp_manifest = None
+    except Exception:
+        try:
+            from .onnx_yolox import clear_yolox_session
+
+            clear_yolox_session()
+        except Exception:
+            pass
+        if (
+            not target_was_present
+            and source.resolve() != target.resolve()
+        ):
+            target.unlink(missing_ok=True)
+        raise
+    finally:
+        if temp_manifest is not None:
+            temp_manifest.unlink(missing_ok=True)
+    return yolox_detector_spec()
 
 
 def _download_verified(
@@ -917,11 +1271,17 @@ def model_status(selected_detector=None) -> dict:
         YOLOV8N_DETECTOR_SHA256,
         YOLOV8N_DETECTOR_SIZE,
     )
-    selected_ready = (
-        detector_yolov8n_ready
-        if selected_variant == "yolov8n"
-        else detector_yolo11n_ready
+    detector_yolox_spec = (
+        selected_spec
+        if selected_variant == "yolox"
+        else yolox_detector_spec()
     )
+    detector_yolox_ready = bool(detector_yolox_spec.get("ready"))
+    selected_ready = {
+        "yolo11n": detector_yolo11n_ready,
+        "yolov8n": detector_yolov8n_ready,
+        "yolox": detector_yolox_ready,
+    }[selected_variant]
     preparation_state = os.environ.get(
         MODEL_PREPARATION_STATE_ENV,
         "",
@@ -952,6 +1312,16 @@ def model_status(selected_detector=None) -> dict:
         "detector_yolo11n_ready": detector_yolo11n_ready,
         "detector_yolov8n_path": str(detector_yolov8n),
         "detector_yolov8n_ready": detector_yolov8n_ready,
+        "detector_yolox_path": str(detector_yolox_spec["path"]),
+        "detector_yolox_manifest_path": str(
+            detector_yolox_spec["manifest_path"]
+        ),
+        "detector_yolox_ready": detector_yolox_ready,
+        "detector_yolox_error": detector_yolox_spec.get("error", ""),
+        "detector_yolox_revision": detector_yolox_spec.get(
+            "model_revision",
+            "",
+        ),
         "detector_fallback_path": str(detector_fallback),
         "detector_fallback_ready": verify_file(
             detector_fallback,
@@ -964,6 +1334,13 @@ def model_status(selected_detector=None) -> dict:
             CRNN_SHA256,
             CRNN_SIZE,
         ),
+        "platrix_crnn_path": str(crnn),
+        "platrix_crnn_ready": verify_file(
+            crnn,
+            CRNN_SHA256,
+            CRNN_SIZE,
+        ),
+        "production_ocr_policy": "hezar-v2-then-fixed-platrix",
         "active_crnn_path": str(active_crnn),
         "active_crnn_sha256": active_crnn_sha,
         "active_crnn_ready": verify_file(
@@ -1019,17 +1396,91 @@ def main(argv=None):
         type=Path,
         help="Create a verified offline model seed for packaging",
     )
+    parser.add_argument(
+        "--install-yolox",
+        type=Path,
+        help="Atomically install a custom YOLOX ONNX model",
+    )
+    parser.add_argument(
+        "--yolox-input-size",
+        type=int,
+        default=640,
+        help="Square YOLOX input size (default: 640)",
+    )
+    parser.add_argument(
+        "--yolox-output-format",
+        choices=sorted(YOLOX_OUTPUT_FORMATS),
+        default="raw-grid",
+        help="Explicit ONNX output contract",
+    )
+    parser.add_argument(
+        "--yolox-output-index",
+        type=int,
+        default=0,
+        help="Zero-based graph output containing detections (default: 0)",
+    )
+    parser.add_argument(
+        "--yolox-scores-are-logits",
+        action="store_true",
+        help="Apply sigmoid to objectness/class scores emitted as logits",
+    )
+    parser.add_argument("--yolox-class-count", type=int, default=1)
+    parser.add_argument("--yolox-plate-class-id", type=int, default=0)
+    parser.add_argument(
+        "--yolox-strides",
+        default="8,16,32",
+        help="Comma-separated raw-grid strides",
+    )
+    parser.add_argument(
+        "--yolox-color",
+        choices=("bgr", "rgb"),
+        default="bgr",
+    )
+    parser.add_argument(
+        "--yolox-input-scale",
+        type=float,
+        default=1.0,
+        help="Input multiplier; standard Megvii YOLOX uses 1.0",
+    )
+    parser.add_argument(
+        "--yolox-letterbox",
+        choices=("top-left", "center"),
+        default="top-left",
+    )
     args = parser.parse_args(argv)
-    if args.seed_dir:
+    if args.install_yolox:
+        strides = [
+            int(value.strip())
+            for value in str(args.yolox_strides).split(",")
+            if value.strip()
+        ]
+        install_yolox_model(
+            args.install_yolox,
+            input_size=args.yolox_input_size,
+            output_format=args.yolox_output_format,
+            class_count=args.yolox_class_count,
+            plate_class_id=args.yolox_plate_class_id,
+            strides=strides,
+            color=args.yolox_color,
+            input_scale=args.yolox_input_scale,
+            letterbox_mode=args.yolox_letterbox,
+            scores_are_logits=args.yolox_scores_are_logits,
+            output_index=args.yolox_output_index,
+        )
+    elif args.seed_dir:
         prepare_seed(
             args.seed_dir,
             download=not args.no_download,
         )
     elif not args.check:
         prepare_models(download=not args.no_download)
-    status = model_status()
+    status = model_status(
+        selected_detector="yolox" if args.install_yolox else None
+    )
     for key, value in status.items():
         print(f"{key.upper()}={value}")
+    if args.install_yolox:
+        return 0 if status["detector_yolox_ready"] else 1
     return 0 if (
         status["detector_ready"]
         and status["detector_yolo11n_ready"]

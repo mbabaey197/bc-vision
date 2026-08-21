@@ -7,12 +7,15 @@ import cv2
 
 from app.media_storage import save_event_images
 
+from .event_dedup import (
+    PlateVisitLedger,
+    candidate_plate_key,
+)
 from .pipeline import (
     PlateConsensusTracker,
     add_vehicle_analysis,
     process_frame,
 )
-from .plate_rules import normalize_plate
 
 
 class VideoTester:
@@ -148,11 +151,28 @@ def process_video(
         except Exception:
             detector_variant = "yolo11n"
     detector_variant = normalize_detector_variant(detector_variant)
+    pinned_detector_revision = ""
+    if detector_variant == "yolox":
+        from .model_manager import yolox_detector_spec
+
+        pinned_spec = yolox_detector_spec()
+        if not pinned_spec.get("ready"):
+            raise FileNotFoundError(
+                pinned_spec.get("error")
+                or "Verified YOLOX detector is not installed"
+            )
+        pinned_detector_revision = str(
+            pinned_spec.get("model_revision", "")
+        ).strip()
+        if not pinned_detector_revision:
+            raise ValueError("YOLOX detector revision is missing")
     tester = VideoTester(video_path)
     info = tester.info()
     info["detector_variant"] = detector_variant
     info["detector_execution_mode"] = "exclusive-baseline"
     info["exclusive_detector"] = True
+    if pinned_detector_revision:
+        info["detector_model_revision"] = pinned_detector_revision
     info["candidate_shadow_requested"] = bool(
         include_candidate_shadow
     )
@@ -167,8 +187,8 @@ def process_video(
     snapshot_dir = Path(snapshot_dir)
     plate_dir.mkdir(parents=True, exist_ok=True)
     snapshot_dir.mkdir(parents=True, exist_ok=True)
-    trackers = {
-        lane: PlateConsensusTracker(
+    def new_tracker():
+        return PlateConsensusTracker(
             min_votes=2,
             max_age_seconds=max(
                 1.2,
@@ -177,11 +197,10 @@ def process_video(
             emit_cooldown=max(0.0, float(duplicate_seconds)),
             emit_unreadable=True,
         )
-        for lane in ("baseline",)
-    }
+    trackers = {"baseline": new_tracker()}
+    visits = {"baseline": PlateVisitLedger()}
     events = []
     events_by_track: dict[tuple[str, int], int] = {}
-    seen: dict[tuple[str, str], float] = {}
     frame_no = 0
     last_frame = None
 
@@ -190,37 +209,57 @@ def process_video(
             result = dict(result)
             result["engine_lane"] = lane
             capture_only = bool(result.get("capture_only"))
+            if capture_only and result.get("provisional"):
+                # Do not turn every short tracker fragment into a database
+                # row.  The tracker retains the best capture until a strict
+                # consensus or final unreadable result is available.
+                continue
             if (
                 not capture_only
                 and result["confidence"] < float(min_confidence)
             ):
                 continue
-            key = result.get("plate_norm") or normalize_plate(result.get("plate"))
             now_sec = frame_no / fps
             track_id = int(result.get("track_id") or 0)
             track_key = (lane, track_id)
             event_index = events_by_track.get(track_key)
-            if (
-                event_index is None
-                and key
-                and (lane, key) in seen
-                and now_sec - seen[(lane, key)]
-                < max(0.0, float(duplicate_seconds))
-            ):
+            key, visit_event_index = visits[lane].event_ref(
+                result,
+                now_sec,
+                duplicate_seconds,
+                allow_candidate=True,
+            )
+            if visit_event_index is not None:
+                event_index = visit_event_index
+            existing = (
+                events[event_index]
+                if event_index is not None
+                else None
+            )
+            existing_identity = (
+                candidate_plate_key(existing) if existing else ""
+            )
+            incoming_identity = candidate_plate_key(result)
+            if existing_identity and not incoming_identity:
+                # A final unreadable fragment may never downgrade an event
+                # that this visit already identified as a complete strict or
+                # review-only candidate.
                 continue
-            if key:
-                seen[(lane, key)] = now_sec
+            if (
+                existing_identity
+                and incoming_identity
+                and incoming_identity != existing_identity
+            ):
+                event_index = None
+                existing = None
+            if event_index is None and len(events) >= int(max_events):
+                return True
             capture_frame = result.pop("capture_frame", None)
             persistence_frame = (
                 capture_frame
                 if capture_frame is not None
                 and getattr(capture_frame, "size", 0)
                 else frame
-            )
-            existing = (
-                events[event_index]
-                if event_index is not None
-                else None
             )
             saved = _save_event(
                 result,
@@ -233,14 +272,19 @@ def process_video(
                 existing=existing,
             )
             if event_index is None:
-                events_by_track[track_key] = len(events)
+                event_index = len(events)
                 events.append(saved)
             else:
                 events[event_index] = saved
-            if (
-                len(events) >= int(max_events)
-                and not capture_only
-            ):
+            events_by_track[track_key] = event_index
+            if key:
+                visits[lane].register(
+                    result,
+                    event_index,
+                    now_sec,
+                    allow_candidate=True,
+                )
+            if len(events) >= int(max_events):
                 return True
         return False
 
@@ -251,10 +295,17 @@ def process_video(
             if frame_no % max(1, int(frame_step)) != 0:
                 continue
             source, offset_x, offset_y = _roi_frame(frame, roi)
+            inference_metadata = {}
+            process_kwargs = {"detector_variant": detector_variant}
+            if pinned_detector_revision:
+                process_kwargs.update(
+                    expected_detector_revision=pinned_detector_revision,
+                    runtime_metadata=inference_metadata,
+                )
             primary = process_frame(
                 source,
                 min_confidence,
-                detector_variant=detector_variant,
+                **process_kwargs,
             )
             primary = [
                 {
@@ -269,11 +320,52 @@ def process_video(
                 _translate_result(result, offset_x, offset_y)
                 for result in primary
             ]
-            stable = trackers["baseline"].update(
+            detector_revisions = {
+                str(result.get("detector_model_revision", "")).strip()
+                for result in primary
+                if str(result.get("detector_model_revision", "")).strip()
+            }
+            call_detector_revision = str(
+                inference_metadata.get("detector_model_revision", "")
+            ).strip()
+            if call_detector_revision:
+                detector_revisions.add(call_detector_revision)
+            if len(detector_revisions) > 1:
+                raise RuntimeError(
+                    "one video frame returned mixed detector revisions"
+                )
+            if pinned_detector_revision:
+                if detector_revisions != {pinned_detector_revision}:
+                    raise RuntimeError(
+                        "YOLOX detector revision changed during video test; "
+                        "retry with one pinned manifest"
+                    )
+            elif detector_revisions:
+                info["detector_model_revision"] = next(
+                    iter(detector_revisions)
+                )
+            tracker = trackers["baseline"]
+            stable = tracker.update(
                 primary,
                 timestamp=frame_no / fps,
                 frame=frame,
             )
+            retired_tracks = visits["baseline"].observe(
+                primary,
+                tracker.active_track_ids(),
+                frame_no / fps,
+                duplicate_seconds,
+            )
+            if retired_tracks:
+                tracker.retire_tracks(retired_tracks)
+                for track_id in retired_tracks:
+                    events_by_track.pop(("baseline", track_id), None)
+            events_by_track.update({
+                ("baseline", track_id): event_index
+                for track_id, event_index in visits[
+                    "baseline"
+                ].track_event_refs().items()
+            })
             if accept(stable, frame, "baseline"):
                 return info, events
         if last_frame is not None:

@@ -171,6 +171,120 @@ def test_ai_settings_reject_unknown_detector_model(monkeypatch):
     assert writes == []
 
 
+def test_ai_settings_reject_unready_yolox_without_partial_writes(monkeypatch):
+    from app.ai import live_worker, model_manager
+
+    _as_role(monkeypatch, "system")
+    writes = []
+    monkeypatch.setattr(main, "set_setting", lambda key, value: writes.append((key, value)))
+    monkeypatch.setattr(
+        model_manager,
+        "model_status",
+        lambda selected_detector=None: {"detector_yolox_ready": False},
+    )
+    monkeypatch.setattr(
+        live_worker,
+        "switch_live_anpr_detector",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unready YOLOX must not reach the worker")
+        ),
+    )
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/settings/ai",
+            data={
+                "ai_accelerator": "cpu",
+                "ai_quality": "balanced",
+                "ai_confidence": "80",
+                "ai_frames": "7",
+                "anpr_detector_model": "yolox",
+            },
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/settings?error=")
+    assert writes == []
+
+
+def test_yolox_worker_recheck_failure_has_no_partial_ai_writes(monkeypatch):
+    from app.ai import live_worker, model_manager
+
+    _as_role(monkeypatch, "system")
+    writes = []
+    monkeypatch.setattr(main, "set_setting", lambda key, value: writes.append((key, value)))
+    monkeypatch.setattr(
+        main,
+        "get_setting",
+        lambda key, default="": "yolo11n" if key == "anpr_detector_model" else default,
+    )
+    monkeypatch.setattr(
+        model_manager,
+        "model_status",
+        lambda selected_detector=None: {"detector_yolox_ready": True},
+    )
+    monkeypatch.setattr(
+        live_worker,
+        "switch_live_anpr_detector",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            FileNotFoundError("YOLOX changed during activation")
+        ),
+    )
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/settings/ai",
+            data={
+                "ai_accelerator": "cpu",
+                "ai_quality": "balanced",
+                "ai_confidence": "80",
+                "ai_frames": "7",
+                "anpr_detector_model": "yolox",
+            },
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/settings?error=")
+    assert writes == []
+
+
+def test_unchanged_detector_setting_is_not_rewritten_outside_worker(
+    monkeypatch,
+):
+    _as_role(monkeypatch, "system")
+    writes = []
+    monkeypatch.setattr(
+        main,
+        "get_setting",
+        lambda key, default="": (
+            "yolo11n" if key == "anpr_detector_model" else default
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "set_setting",
+        lambda key, value: writes.append((key, value)),
+    )
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/settings/ai",
+            data={
+                "ai_accelerator": "cpu",
+                "ai_quality": "balanced",
+                "ai_confidence": "80",
+                "ai_frames": "7",
+                "anpr_detector_model": "yolo11n",
+            },
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 302
+    assert all(key != "anpr_detector_model" for key, _value in writes)
+
+
 def test_uploaded_video_playback_endpoint(monkeypatch):
     _as_role(monkeypatch, "operator")
     calls = []
@@ -1144,3 +1258,30 @@ def test_public_health_does_not_expose_license_or_customer_data():
 )
 def test_csv_cells_neutralize_spreadsheet_formulas(value, expected):
     assert main._csv_cell(value) == expected
+
+
+def test_engine_v3_selects_yolo11n_once_without_overriding_later_choice(
+    monkeypatch,
+):
+    settings = {
+        "anpr_detector_model": "yolov8n",
+    }
+
+    monkeypatch.setattr(
+        main,
+        "get_setting",
+        lambda key, default="": settings.get(key, default),
+    )
+    monkeypatch.setattr(
+        main,
+        "set_setting",
+        lambda key, value: settings.__setitem__(key, str(value)),
+    )
+
+    assert main._migrate_anpr_v3_detector_selection() is True
+    assert settings["anpr_detector_model"] == "yolo11n"
+    assert settings[main._ANPR_V3_DETECTOR_MIGRATION] == "1"
+
+    settings["anpr_detector_model"] = "yolov8n"
+    assert main._migrate_anpr_v3_detector_selection() is False
+    assert settings["anpr_detector_model"] == "yolov8n"
