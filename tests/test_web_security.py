@@ -962,12 +962,7 @@ def test_uploaded_video_flows_through_worker_to_sqlite_and_dashboard(
                         (virtual_id,),
                     ).fetchone()
                 stream = main.manager.streams.get(virtual_id)
-                if (
-                    event
-                    and event["plate_norm"] == "12ب34567"
-                    and stream
-                    and stream.latest
-                ):
+                if event and event["plate_norm"] == "12ب34567" and stream:
                     break
                 time.sleep(0.02)
 
@@ -1054,7 +1049,8 @@ def test_uploaded_video_flows_through_worker_to_sqlite_and_dashboard(
         assert dashboard.status_code == 200
         assert f"id='anpr-{virtual_id}'" in dashboard.text
         assert "ویدئو: traffic" in dashboard.text
-        assert main.manager.streams[virtual_id].latest.startswith(b"\xff\xd8")
+        assert main.manager.streams[virtual_id].viewer_count == 0
+        assert main.manager.streams[virtual_id].latest is None
     finally:
         if virtual_id is not None:
             main.manager.remove(virtual_id)

@@ -78,6 +78,8 @@ class CameraStream:
         self.pause_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.lock = threading.Lock()
+        self._viewer_lock = threading.Lock()
+        self._viewer_count = 0
         self._overlay_rows: list[dict] = []
         self._overlay_gray = None
         self._overlay_revision = 0
@@ -92,6 +94,32 @@ class CameraStream:
         self._anpr_submit_error = ""
         self._anpr_aborted = False
         self._anpr_thread = None
+
+    @property
+    def viewer_count(self):
+        with self._viewer_lock:
+            return self._viewer_count
+
+    def _register_viewer(self):
+        with self._viewer_lock:
+            self._viewer_count += 1
+            if self._viewer_count == 1:
+                # Publish the next decoded frame immediately for the first
+                # browser that opens the live feed.
+                self._last_display_publish_at = 0.0
+
+    def _unregister_viewer(self):
+        with self._viewer_lock:
+            if self._viewer_count > 0:
+                self._viewer_count -= 1
+            if self._viewer_count == 0:
+                # Enabled cameras keep decoding for ANPR in the background,
+                # but a stale preview should not retain image memory forever.
+                with self.lock:
+                    self.latest = None
+                    self.latest_frame = None
+                self._last_display_publish_at = 0.0
+
     def start(self):
         if self.thread and self.thread.is_alive():
             if not self._anpr_thread or not self._anpr_thread.is_alive():
@@ -739,30 +767,37 @@ class CameraStream:
                     break
 
     def _publish(self, frame):
-        # Browser JPEG encoding and AI submission are fully detached from the
-        # decoder. Neither OCR nor activity scoring can slow the video clock.
+        # Hand the native frame to ANPR before doing optional browser work.
+        # The ANPR queue coalesces pending frames, so OCR remains detached from
+        # the decoder while always receiving the newest available frame.
         now_mono = time.monotonic()
+        self.state.online = True
+        self.state.last_frame_at = time.time()
+        self.state.last_error = ""
+        self._queue_anpr(frame)
+
         display_fps = (
             min(20, max(self.fps, 15))
             if self.url.startswith("video://")
             else self.fps
         )
-        display_due = (
-            self.latest is None
-            or now_mono - self._last_display_publish_at
-            >= 1.0 / max(1, display_fps)
-        )
+        with self._viewer_lock:
+            display_due = (
+                self._viewer_count > 0
+                and now_mono - self._last_display_publish_at
+                >= 1.0 / max(1, display_fps)
+            )
         if display_due:
             data = self._encode(frame)
             if data:
-                with self.lock:
-                    self.latest = data
-                    self.latest_frame = frame
-                self._last_display_publish_at = now_mono
-        self.state.online = True
-        self.state.last_frame_at = time.time()
-        self.state.last_error = ""
-        self._queue_anpr(frame)
+                # The last viewer may have disconnected while JPEG encoding
+                # was running. Recheck before retaining the rendered frame.
+                with self._viewer_lock:
+                    if self._viewer_count > 0:
+                        with self.lock:
+                            self.latest = data
+                            self.latest_frame = frame
+                        self._last_display_publish_at = now_mono
 
     def _demo_frame(self):
         height, width = 360, 640
@@ -929,8 +964,10 @@ class CameraStream:
                                 return
                         elif wait < -0.75:
                             deadline = time.monotonic()
-                    elif self.stop_event.wait(dashboard_delay):
-                        return
+                    # A real camera or RTSP capture is paced by capture.read().
+                    # Do not throttle native ingest to the dashboard FPS: the
+                    # JPEG preview cadence is handled independently in
+                    # _publish(). Uploaded files still use source-FPS pacing.
             except Exception as exc:
                 if is_video_file and published == 0 and AV_OK:
                     try:
@@ -948,24 +985,29 @@ class CameraStream:
                     capture.release()
 
     def frames(self) -> Iterator[bytes]:
-        self.start()
-        while not self.stop_event.is_set():
-            with self.lock:
-                frame = self.latest
-            if frame:
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n"
-                    b"Cache-Control: no-cache\r\n\r\n"
-                    + frame
-                    + b"\r\n"
+        self._register_viewer()
+        try:
+            self.start()
+            while not self.stop_event.is_set():
+                with self.lock:
+                    frame = self.latest
+                if frame:
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Cache-Control: no-cache\r\n\r\n"
+                        + frame
+                        + b"\r\n"
+                    )
+                display_fps = (
+                    min(20, max(self.fps, 15))
+                    if self.url.startswith("video://")
+                    else self.fps
                 )
-            display_fps = (
-                min(20, max(self.fps, 15))
-                if self.url.startswith("video://")
-                else self.fps
-            )
-            time.sleep(1.0 / max(1, display_fps))
+                time.sleep(1.0 / max(1, display_fps))
+        finally:
+            self._unregister_viewer()
+
 
 class StreamManager:
     def __init__(self):
@@ -1090,6 +1132,7 @@ class StreamManager:
             "anpr_marker_error": "",
             "error": "stream not started",
             "last_frame_at": 0.0,
+            "viewers": 0,
         }
         if stream:
             base = {
@@ -1102,6 +1145,7 @@ class StreamManager:
                 "anpr_marker_error": stream.state.anpr_marker_error,
                 "error": stream.state.last_error,
                 "last_frame_at": stream.state.last_frame_at,
+                "viewers": stream.viewer_count,
             }
         try:
             from app.ai.live_worker import live_anpr_status
