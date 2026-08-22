@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 import app.database as database
 import app.main as main
 from app import config
+from app.file_identity import path_file_identity
 
 
 def _as_role(monkeypatch, role):
@@ -27,6 +28,21 @@ def _as_role(monkeypatch, role):
             "is_admin": 1 if role == "admin" else 0,
         },
     )
+
+
+def _insert_admin(password, *, must_change_password=False):
+    with database.connect() as connection:
+        connection.execute(
+            "INSERT INTO users(username,password_hash,display_name,is_admin,"
+            "role,is_active,must_change_password,session_version) "
+            "VALUES(?,?,?,1,'admin',1,?,0)",
+            (
+                "admin",
+                main.hash_password(password),
+                "مدیر سیستم",
+                1 if must_change_password else 0,
+            ),
+        )
 
 
 def _allow_test_upload_handoff(monkeypatch):
@@ -847,7 +863,7 @@ def test_storage_migration_publish_falls_back_without_hardlinks(
     target = tmp_path / "published.db"
     staged.write_bytes(b"complete-snapshot")
     details = staged.lstat()
-    staged_identity = (int(details.st_dev), int(details.st_ino))
+    staged_identity = path_file_identity(staged, details=details)
     monkeypatch.setattr(
         main.os,
         "link",
@@ -863,7 +879,7 @@ def test_storage_migration_publish_falls_back_without_hardlinks(
     )
 
     current = target.lstat()
-    assert published_identity == (int(current.st_dev), int(current.st_ino))
+    assert published_identity == path_file_identity(target, details=current)
     assert published_identity != staged_identity
     assert current.st_nlink == 1
     assert target.read_bytes() == b"complete-snapshot"
@@ -2939,7 +2955,87 @@ def test_public_health_does_not_expose_license_or_customer_data():
     assert response.headers["referrer-policy"] == "no-referrer"
 
 
-def test_bootstrap_admin_is_confined_until_password_is_changed(
+def test_first_run_setup_creates_one_admin_without_a_default_password(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "first-run-setup.db"
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    database.init_db()
+
+    with TestClient(main.app) as client:
+        login_before_setup = client.get("/login", follow_redirects=False)
+        setup_page = client.get("/setup", follow_redirects=False)
+        weak = client.post(
+            "/setup",
+            data={
+                "display_name": "مدیر",
+                "password": "too-short",
+                "password_confirm": "too-short",
+            },
+            follow_redirects=False,
+        )
+        mismatch = client.post(
+            "/setup",
+            data={
+                "display_name": "مدیر",
+                "password": "unique-first-run-password",
+                "password_confirm": "different-first-run-password",
+            },
+            follow_redirects=False,
+        )
+        created = client.post(
+            "/setup",
+            data={
+                "display_name": "مدیر اصلی",
+                "password": "unique-first-run-password",
+                "password_confirm": "unique-first-run-password",
+            },
+            follow_redirects=False,
+        )
+        repeated = client.post(
+            "/setup",
+            data={
+                "display_name": "مهاجم",
+                "password": "another-first-run-password",
+                "password_confirm": "another-first-run-password",
+            },
+            follow_redirects=False,
+        )
+        login = client.post(
+            "/login",
+            data={
+                "username": "admin",
+                "password": "unique-first-run-password",
+                "next": "/dashboard",
+            },
+            follow_redirects=False,
+        )
+
+    assert login_before_setup.status_code == 302
+    assert login_before_setup.headers["location"] == "/setup"
+    assert setup_page.status_code == 200
+    assert "هیچ رمز پیش‌فرضی وجود ندارد" in setup_page.text
+    assert weak.headers["location"] == "/setup?error=weak"
+    assert mismatch.headers["location"] == "/setup?error=mismatch"
+    assert created.headers["location"] == "/login?created=1"
+    assert repeated.headers["location"] == "/login"
+    assert login.headers["location"] == "/dashboard"
+    with database.connect() as connection:
+        rows = connection.execute(
+            "SELECT username,password_hash,must_change_password FROM users"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["username"] == "admin"
+    assert rows[0]["must_change_password"] == 0
+    assert main.verify_password(
+        "unique-first-run-password",
+        rows[0]["password_hash"],
+    )
+
+
+def test_legacy_admin_is_confined_until_password_is_changed(
     tmp_path,
     monkeypatch,
 ):
@@ -2947,13 +3043,17 @@ def test_bootstrap_admin_is_confined_until_password_is_changed(
     monkeypatch.setattr(database, "DB_PATH", db_path)
     monkeypatch.setattr(main, "DB_PATH", db_path)
     database.init_db()
+    _insert_admin(
+        "legacy-admin-password",
+        must_change_password=True,
+    )
 
     with TestClient(main.app) as client:
         login_response = client.post(
             "/login",
             data={
                 "username": "admin",
-                "password": "123456",
+                "password": "legacy-admin-password",
                 "next": "/dashboard",
             },
             follow_redirects=False,
@@ -3015,7 +3115,7 @@ def test_bootstrap_admin_is_confined_until_password_is_changed(
             "WHERE username='admin'"
         ).fetchone()
     assert admin["must_change_password"] == 0
-    assert database.verify_password(
+    assert main.verify_password(
         "new-admin-password",
         admin["password_hash"],
     )
@@ -3029,6 +3129,7 @@ def test_password_change_revokes_other_sessions_but_keeps_current_one(
     monkeypatch.setattr(database, "DB_PATH", db_path)
     monkeypatch.setattr(main, "DB_PATH", db_path)
     database.init_db()
+    _insert_admin("session-start-password")
 
     with TestClient(main.app) as current, TestClient(main.app) as stale:
         for client in (current, stale):
@@ -3036,7 +3137,7 @@ def test_password_change_revokes_other_sessions_but_keeps_current_one(
                 "/login",
                 data={
                     "username": "admin",
-                    "password": "123456",
+                    "password": "session-start-password",
                     "next": "/dashboard",
                 },
                 follow_redirects=False,
@@ -3080,11 +3181,12 @@ def test_logout_revokes_the_exact_copied_session_token(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "DB_PATH", db_path)
     monkeypatch.setattr(main, "DB_PATH", db_path)
     database.init_db()
+    _insert_admin("logout-start-password")
 
     with TestClient(main.app) as current:
         current.post(
             "/login",
-            data={"username": "admin", "password": "123456"},
+            data={"username": "admin", "password": "logout-start-password"},
             follow_redirects=False,
         )
         current.post(

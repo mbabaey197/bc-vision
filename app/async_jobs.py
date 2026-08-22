@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import ParamSpec, TypeVar
 
+from app.file_identity import descriptor_file_identity, path_file_identity
+
 P = ParamSpec("P")
 R = TypeVar("R")
 
@@ -59,14 +61,37 @@ class _FileIdentity:
     inode: int
 
     @classmethod
-    def from_stat(cls, value: os.stat_result) -> "_FileIdentity":
-        return cls(device=int(value.st_dev), inode=int(value.st_ino))
+    def from_path(cls, path, value: os.stat_result) -> "_FileIdentity":
+        device, inode = path_file_identity(path, details=value)
+        return cls(device=device, inode=inode)
 
-    def matches(self, value: os.stat_result) -> bool:
-        return (
-            int(value.st_dev) == self.device
-            and int(value.st_ino) == self.inode
+    @classmethod
+    def from_descriptor(
+        cls,
+        descriptor: int,
+        value: os.stat_result,
+    ) -> "_FileIdentity":
+        device, inode = descriptor_file_identity(
+            descriptor,
+            details=value,
         )
+        return cls(device=device, inode=inode)
+
+    def matches_path(self, path, value: os.stat_result) -> bool:
+        return path_file_identity(path, details=value) == (
+            self.device,
+            self.inode,
+        )
+
+    def matches_descriptor(
+        self,
+        descriptor: int,
+        value: os.stat_result,
+    ) -> bool:
+        return descriptor_file_identity(
+            descriptor,
+            details=value,
+        ) == (self.device, self.inode)
 
 
 class _BoundedWriter:
@@ -127,21 +152,30 @@ class _SafeResultUnpickler(pickle.Unpickler):
 def _regular_owned_file(
     value: os.stat_result,
     identity: _FileIdentity,
+    *,
+    path=None,
+    descriptor: int | None = None,
 ) -> bool:
     return (
         stat.S_ISREG(value.st_mode)
         and int(value.st_nlink) == 1
-        and identity.matches(value)
+        and (
+            identity.matches_descriptor(descriptor, value)
+            if descriptor is not None
+            else identity.matches_path(path, value)
+        )
     )
 
 
 def _private_owned_directory(
     value: os.stat_result,
     identity: _FileIdentity,
+    *,
+    path,
 ) -> bool:
     return (
         stat.S_ISDIR(value.st_mode)
-        and identity.matches(value)
+        and identity.matches_path(path, value)
         and (
             os.name == "nt"
             or stat.S_IMODE(value.st_mode) & 0o077 == 0
@@ -203,10 +237,14 @@ def _open_verified_result(
 ) -> int:
     directory = Path(result_path).parent
     directory_before = directory.lstat()
-    if not _private_owned_directory(directory_before, directory_identity):
+    if not _private_owned_directory(
+        directory_before,
+        directory_identity,
+        path=directory,
+    ):
         raise RuntimeError("module-job workspace identity changed")
     before = os.lstat(result_path)
-    if not _regular_owned_file(before, identity):
+    if not _regular_owned_file(before, identity, path=result_path):
         raise RuntimeError("module-job result path identity changed")
     descriptor = os.open(result_path, _open_flags(flags))
     try:
@@ -214,9 +252,17 @@ def _open_verified_result(
         directory_after = directory.lstat()
         after = os.lstat(result_path)
         if not (
-            _private_owned_directory(directory_after, directory_identity)
-            and _regular_owned_file(opened, identity)
-            and _regular_owned_file(after, identity)
+            _private_owned_directory(
+                directory_after,
+                directory_identity,
+                path=directory,
+            )
+            and _regular_owned_file(
+                opened,
+                identity,
+                descriptor=descriptor,
+            )
+            and _regular_owned_file(after, identity, path=result_path)
         ):
             raise RuntimeError("module-job result path identity changed")
         return descriptor
@@ -378,12 +424,16 @@ def _create_result_workspace() -> tuple[Path, _FileIdentity, Path, _FileIdentity
         directory_stat = directory.lstat()
         if not stat.S_ISDIR(directory_stat.st_mode):
             raise RuntimeError("module-job workspace is not a directory")
-        directory_identity = _FileIdentity.from_stat(directory_stat)
+        directory_identity = _FileIdentity.from_path(
+            directory,
+            directory_stat,
+        )
         os.chmod(directory, 0o700)
         directory_after_chmod = directory.lstat()
         if not _private_owned_directory(
             directory_after_chmod,
             directory_identity,
+            path=directory,
         ):
             raise RuntimeError("module-job workspace identity changed")
 
@@ -395,14 +445,22 @@ def _create_result_workspace() -> tuple[Path, _FileIdentity, Path, _FileIdentity
         )
         try:
             result_stat = os.fstat(descriptor)
-            result_identity = _FileIdentity.from_stat(result_stat)
+            result_identity = _FileIdentity.from_descriptor(
+                descriptor,
+                result_stat,
+            )
             directory_after_create = directory.lstat()
             if not (
                 _private_owned_directory(
                     directory_after_create,
                     directory_identity,
+                    path=directory,
                 )
-                and _regular_owned_file(result_stat, result_identity)
+                and _regular_owned_file(
+                    result_stat,
+                    result_identity,
+                    descriptor=descriptor,
+                )
             ):
                 raise RuntimeError(
                     "module-job result workspace identity changed"
@@ -419,7 +477,11 @@ def _create_result_workspace() -> tuple[Path, _FileIdentity, Path, _FileIdentity
             except FileNotFoundError:
                 pass
             else:
-                if _private_owned_directory(current, directory_identity):
+                if _private_owned_directory(
+                    current,
+                    directory_identity,
+                    path=directory,
+                ):
                     try:
                         directory.rmdir()
                     except OSError:
@@ -432,7 +494,7 @@ def _unlink_if_owned(path: Path, identity: _FileIdentity) -> None:
         value = path.lstat()
     except FileNotFoundError:
         return
-    if _regular_owned_file(value, identity):
+    if _regular_owned_file(value, identity, path=path):
         path.unlink()
 
 
@@ -447,7 +509,11 @@ def _cleanup_result_workspace(
         value = directory.lstat()
     except FileNotFoundError:
         return
-    if _private_owned_directory(value, directory_identity):
+    if _private_owned_directory(
+        value,
+        directory_identity,
+        path=directory,
+    ):
         try:
             directory.rmdir()
         except OSError:

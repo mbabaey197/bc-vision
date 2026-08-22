@@ -637,7 +637,6 @@ def run_self_test() -> int:
             "ok": (
                 DB_PATH.is_file()
                 and table_count >= 6
-                and user_count >= 1
                 and app is not None
                 and anpr_ready
                 and candidate_ready
@@ -649,6 +648,7 @@ def run_self_test() -> int:
             "web_app_ready": app is not None,
             "anpr_ready": anpr_ready,
             "candidate_ready": candidate_ready,
+            "administrator_setup_required": user_count == 0,
             "user_count": user_count,
             "table_count": table_count,
         })

@@ -6,6 +6,7 @@ from app import database, storage_policy
 from app.media_acceptance import (
     accept_intent,
     create_intent,
+    current_identity,
     require_full_synchronous,
 )
 
@@ -47,7 +48,7 @@ def _accepted_reservation(tmp_path, monkeypatch, *, target_name):
     )
     target.write_bytes(b"v" * 6)
     reservation.claim_created_path(target)
-    details = target.lstat()
+    identity, _ = current_identity(target)
     with database.connect() as connection:
         require_full_synchronous(connection)
         event_id = int(connection.execute(
@@ -58,7 +59,7 @@ def _accepted_reservation(tmp_path, monkeypatch, *, target_name):
             connection,
             acceptance_id,
             target,
-            (int(details.st_dev), int(details.st_ino)),
+            identity,
             6,
             owner_kind="plate-event",
             owner_id=event_id,
@@ -84,7 +85,7 @@ def test_accepted_sqlite_owner_commits_pending_journal_after_crash(
     )
     target.write_bytes(b"v" * 6)
     reservation.claim_created_path(target)
-    details = target.lstat()
+    identity, _ = current_identity(target)
     with database.connect() as connection:
         require_full_synchronous(connection)
         event_id = int(connection.execute(
@@ -95,7 +96,7 @@ def test_accepted_sqlite_owner_commits_pending_journal_after_crash(
             connection,
             acceptance_id,
             target,
-            (int(details.st_dev), int(details.st_ino)),
+            identity,
             6,
             owner_kind="plate-event",
             owner_id=event_id,
@@ -312,14 +313,14 @@ def test_accepted_identity_mismatch_fails_closed_without_deleting_either_side(
     )
     target.write_bytes(b"v" * 6)
     reservation.claim_created_path(target)
-    details = target.lstat()
+    identity, _ = current_identity(target)
     with database.connect() as connection:
         require_full_synchronous(connection)
         accept_intent(
             connection,
             acceptance_id,
             target,
-            (int(details.st_dev), int(details.st_ino)),
+            identity,
             6,
             owner_kind="video-test-run",
             owner_id="run-1",

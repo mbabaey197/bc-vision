@@ -1120,7 +1120,7 @@ class PersistenceOutbox:
                         raise OutboxError(
                             "retry outbox backup integrity failed"
                         )
-            with temporary.open("rb") as snapshot_file:
+            with temporary.open("r+b") as snapshot_file:
                 os.fsync(snapshot_file.fileno())
             temporary.replace(target)
             from app.storage_policy import fsync_parent_directory

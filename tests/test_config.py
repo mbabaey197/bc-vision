@@ -9,6 +9,7 @@ import sys
 import pytest
 
 import app.config as config
+from app.file_identity import path_file_identity
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -88,6 +89,7 @@ def test_valid_private_storage_pointer_selects_canonical_root(tmp_path):
     marker = bootstrap / config.STORAGE_MIGRATION_MARKER_NAME
     assert marker.read_bytes() == config.STORAGE_MIGRATION_MARKER_PAYLOAD
     marker_details = marker.lstat()
+    marker_identity = path_file_identity(marker, details=marker_details)
     assert stat.S_ISREG(marker_details.st_mode)
     assert marker_details.st_nlink == 1
     if os.name != "nt":
@@ -100,10 +102,10 @@ def test_valid_private_storage_pointer_selects_canonical_root(tmp_path):
 
     assert restarted.returncode == 0, restarted.stderr
     restarted_details = marker.lstat()
-    assert (
-        restarted_details.st_dev,
-        restarted_details.st_ino,
-    ) == (marker_details.st_dev, marker_details.st_ino)
+    assert path_file_identity(
+        marker,
+        details=restarted_details,
+    ) == marker_identity
     _assert_no_data_artifacts(bootstrap)
 
 

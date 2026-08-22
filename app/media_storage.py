@@ -8,6 +8,7 @@ from pathlib import Path
 
 import cv2
 
+from app.file_identity import descriptor_file_identity, path_file_identity
 from app.storage_policy import StorageWriteRejected, begin_media_write
 
 
@@ -103,10 +104,13 @@ class PendingMediaFile:
             raise MediaTransportError(
                 "pending media is not a private regular file"
             )
-        if (
-            (int(current.st_dev), int(current.st_ino)) != self.identity
-            or int(current.st_size) != self.size_bytes
-        ):
+        try:
+            identity = path_file_identity(self.path, details=current)
+        except OSError as exc:
+            raise MediaTransportError(
+                "pending media identity could not be inspected"
+            ) from exc
+        if identity != self.identity or int(current.st_size) != self.size_bytes:
             raise MediaTransportError(
                 "pending media identity changed during subprocess handoff"
             )
@@ -450,7 +454,7 @@ def _unlink_owned_file(path: Path, identity: tuple[int, int] | None) -> bool:
     if (
         not stat.S_ISREG(current.st_mode)
         or int(current.st_nlink) != 1
-        or (int(current.st_dev), int(current.st_ino)) != identity
+        or path_file_identity(path, details=current) != identity
     ):
         return False
     path.unlink()
@@ -622,7 +626,10 @@ def write_jpeg_bytes_atomic(
             ) from exc
         with stream_context as stream:
             created = os.fstat(stream.fileno())
-            created_identity = (int(created.st_dev), int(created.st_ino))
+            created_identity = descriptor_file_identity(
+                stream.fileno(),
+                details=created,
+            )
             claim_created_path = getattr(
                 reservation,
                 "claim_created_path",

@@ -7,7 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.config import DB_PATH
-from app.security import hash_password, verify_password
+from app.file_identity import descriptor_file_identity, path_file_identity
 
 
 def connect():
@@ -53,8 +53,9 @@ def backup_database(destination):
             temporary = candidate
             try:
                 opened = os.fstat(descriptor)
-                temporary_identity = (
-                    int(opened.st_dev), int(opened.st_ino),
+                temporary_identity = descriptor_file_identity(
+                    descriptor,
+                    details=opened,
                 )
             finally:
                 os.close(descriptor)
@@ -71,13 +72,13 @@ def backup_database(destination):
                 raise sqlite3.DatabaseError(
                     "SQLite backup integrity check failed."
                 )
-        with temporary.open("rb") as snapshot_file:
+        with temporary.open("r+b") as snapshot_file:
             os.fsync(snapshot_file.fileno())
         completed = temporary.lstat()
         if (
             not stat.S_ISREG(completed.st_mode)
             or int(completed.st_nlink) != 1
-            or (int(completed.st_dev), int(completed.st_ino))
+            or path_file_identity(temporary, details=completed)
             != temporary_identity
         ):
             raise OSError("database backup temporary changed before publish")
@@ -95,7 +96,7 @@ def backup_database(destination):
             if current is not None and (
                 stat.S_ISREG(current.st_mode)
                 and int(current.st_nlink) == 2
-                and (int(current.st_dev), int(current.st_ino))
+                and path_file_identity(target, details=current)
                 == temporary_identity
             ):
                 hardlinked = True
@@ -114,8 +115,9 @@ def backup_database(destination):
                         0o600,
                     )
                     created = os.fstat(target_descriptor)
-                    published_identity = (
-                        int(created.st_dev), int(created.st_ino),
+                    published_identity = descriptor_file_identity(
+                        target_descriptor,
+                        details=created,
                     )
                     if (
                         not stat.S_ISREG(created.st_mode)
@@ -127,9 +129,9 @@ def backup_database(destination):
                         if (
                             not stat.S_ISREG(source_details.st_mode)
                             or int(source_details.st_nlink) != 1
-                            or (
-                                int(source_details.st_dev),
-                                int(source_details.st_ino),
+                            or descriptor_file_identity(
+                                source_file.fileno(),
+                                details=source_details,
                             ) != temporary_identity
                         ):
                             raise OSError(
@@ -161,7 +163,7 @@ def backup_database(destination):
             if (
                 not stat.S_ISREG(published.st_mode)
                 or int(published.st_nlink) != 2
-                or (int(published.st_dev), int(published.st_ino))
+                or path_file_identity(target, details=published)
                 != temporary_identity
             ):
                 raise OSError("database backup target changed during publish")
@@ -175,7 +177,7 @@ def backup_database(destination):
         if (
             not stat.S_ISREG(final.st_mode)
             or int(final.st_nlink) != 1
-            or (int(final.st_dev), int(final.st_ino))
+            or path_file_identity(target, details=final)
             != published_identity
         ):
             raise OSError("database backup target failed final validation")
@@ -188,7 +190,7 @@ def backup_database(destination):
             if current is not None and (
                 stat.S_ISREG(current.st_mode)
                 and int(current.st_nlink) == 1
-                and (int(current.st_dev), int(current.st_ino))
+                and path_file_identity(target, details=current)
                 == published_identity
             ):
                 target.unlink()
@@ -200,7 +202,7 @@ def backup_database(destination):
             if current is not None and (
                 stat.S_ISREG(current.st_mode)
                 and int(current.st_nlink) == 1
-                and (int(current.st_dev), int(current.st_ino))
+                and path_file_identity(temporary, details=current)
                 == temporary_identity
             ):
                 temporary.unlink()
@@ -256,7 +258,7 @@ def set_settings_for_database(
     if checkpoint_wal:
         from app.storage_policy import fsync_parent_directory
 
-        with path.open("rb") as database_file:
+        with path.open("r+b") as database_file:
             os.fsync(database_file.fileno())
         fsync_parent_directory(path)
 
@@ -275,22 +277,30 @@ def _add_missing_columns(con, table, migrations):
             )
 
 
-def _require_bootstrap_admin_password_change(con):
-    """Mark the built-in administrator unsafe while it uses the known secret."""
+def _require_legacy_admin_password_change(con):
+    """Confine the pre-setup administrator once on upgrade.
 
-    row = con.execute(
-        "SELECT id,password_hash,must_change_password FROM users "
-        "WHERE username='admin' LIMIT 1"
-    ).fetchone()
-    if (
-        row
-        and not int(row["must_change_password"] or 0)
-        and verify_password("123456", row["password_hash"])
-    ):
-        con.execute(
-            "UPDATE users SET must_change_password=1 WHERE id=?",
-            (int(row["id"]),),
-        )
+    Older releases created a predictable bootstrap account.  The plaintext
+    credential is deliberately absent from current source.  A one-time
+    migration confines any existing ``admin`` account until its owner replaces
+    the old credential; first-run databases have no account and use /setup.
+    """
+
+    marker = "migration_legacy_admin_password_change_rc30_v1"
+    if con.execute(
+        "SELECT 1 FROM settings WHERE key=?",
+        (marker,),
+    ).fetchone() is not None:
+        return
+    con.execute(
+        "UPDATE users SET must_change_password=1,"
+        "session_version=session_version+1 "
+        "WHERE username='admin' AND is_active=1"
+    )
+    con.execute(
+        "INSERT INTO settings(key,value) VALUES(?,?)",
+        (marker, "1"),
+    )
 
 
 def _supersede_duplicate_current_feedback(con):
@@ -813,22 +823,7 @@ def init_db():
         _mark_pre_rc29_uploaded_videos_completed(con)
         _backfill_event_metadata(con)
 
-        if con.execute(
-            "SELECT 1 FROM users WHERE username=?",
-            ("admin",),
-        ).fetchone() is None:
-            con.execute(
-                "INSERT INTO users(" 
-                "username,password_hash,display_name,is_admin,"
-                "must_change_password"
-                ") VALUES(?,?,?,1,1)",
-                (
-                    "admin",
-                    hash_password("123456"),
-                    "مدیر سیستم",
-                ),
-            )
-        _require_bootstrap_admin_password_change(con)
+        _require_legacy_admin_password_change(con)
 
         defaults = {
             "company_name": "گیلاس آبی البرز",

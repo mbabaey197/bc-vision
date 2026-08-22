@@ -21,6 +21,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.config import DATA_DIR, PLATE_DIR, SNAPSHOT_DIR, VIDEO_DIR
+from app.file_identity import path_file_identity
 
 GIB = 1024 * 1024 * 1024
 DEFAULT_MAX_SCAN_ENTRIES = 200_000
@@ -332,7 +333,9 @@ def _normalise_config(
             invalid_history.append(
                 f"<media-roots-history-overflow:{len(history_payload)}>"
             )
-            history_payload = history_payload[:MAX_HISTORY_ROOTS]
+            # The policy is already incomplete and all writes will fail
+            # closed. Do not resolve attacker-controlled overflow entries.
+            history_payload = []
         for raw_history in history_payload:
             value = str(raw_history or "").strip()
             if not value:
@@ -778,12 +781,12 @@ def _move_record(move: _QuarantineMove) -> _FileRecord:
 def _safe_quarantine_file(path: Path, move: _QuarantineMove) -> bool:
     try:
         current = path.lstat()
+        identity = path_file_identity(path, details=current)
     except OSError:
         return False
     return bool(
         stat.S_ISREG(current.st_mode)
-        and int(current.st_dev) == move.device
-        and int(current.st_ino) == move.inode
+        and identity == (move.device, move.inode)
     )
 
 
@@ -878,9 +881,9 @@ def _finish_quarantine_locked(
                     or int(protected_stat.st_nlink) != 1
                 ):
                     return False
-                identity = (
-                    int(protected_stat.st_dev),
-                    int(protected_stat.st_ino),
+                identity = path_file_identity(
+                    protected,
+                    details=protected_stat,
                 )
                 if identity in owned_identities:
                     protected.unlink()
@@ -901,9 +904,9 @@ def _finish_quarantine_locked(
                     or int(target_stat.st_nlink) != 1
                 ):
                     return False
-                identity = (
-                    int(target_stat.st_dev),
-                    int(target_stat.st_ino),
+                identity = path_file_identity(
+                    target,
+                    details=target_stat,
                 )
                 if identity in owned_identities:
                     target.unlink()
@@ -1351,7 +1354,14 @@ def _scan_inventory(
                         except OSError:
                             complete = False
                             continue
-                        identity = (int(file_stat.st_dev), int(file_stat.st_ino))
+                        try:
+                            identity = path_file_identity(
+                                entry.path,
+                                details=file_stat,
+                            )
+                        except OSError:
+                            complete = False
+                            continue
                         if identity in seen_files:
                             continue
                         seen_files.add(identity)
@@ -1433,11 +1443,12 @@ def _record_is_safe(record: _FileRecord, config: StoragePolicyConfig) -> bool:
         return False
     try:
         current = record.path.lstat()
+        identity = path_file_identity(record.path, details=current)
     except OSError:
         return False
     if not stat.S_ISREG(current.st_mode):
         return False
-    if (int(current.st_dev), int(current.st_ino)) != (
+    if identity != (
         record.device,
         record.inode,
     ):
@@ -1818,7 +1829,12 @@ def _validated_committable_target(
         raise StorageWriteRejected(
             "media write target is not a private regular file"
         )
-    identity = (int(details.st_dev), int(details.st_ino))
+    try:
+        identity = path_file_identity(target, details=details)
+    except OSError as exc:
+        raise StorageWriteRejected(
+            "media write target identity is unavailable before commit"
+        ) from exc
     if state.target_existed:
         owned = identity == state.original_file_identity
     else:
@@ -1951,7 +1967,12 @@ class MediaWriteReservation:
                 raise StorageWriteRejected(
                     "claimed media path is not a private regular file"
                 )
-            identity = (int(claimed.st_dev), int(claimed.st_ino))
+            try:
+                identity = path_file_identity(candidate, details=claimed)
+            except OSError as exc:
+                raise StorageWriteRejected(
+                    "claimed media file identity is unavailable"
+                ) from exc
             if identity in state.owned_file_identities:
                 return
             state.owned_file_identities.add(identity)
@@ -2210,9 +2231,9 @@ def begin_media_write(
                 and int(original_stat.st_nlink) == 1
             ):
                 original_size = max(0, int(original_stat.st_size))
-                original_file_identity = (
-                    int(original_stat.st_dev),
-                    int(original_stat.st_ino),
+                original_file_identity = path_file_identity(
+                    resolved_target,
+                    details=original_stat,
                 )
         except FileNotFoundError:
             pass

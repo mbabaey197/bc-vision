@@ -26,6 +26,7 @@ from app.security import (
 )
 from app.streams import manager, CV_OK
 from app.csv_export import csv_safe_cell, iter_event_csv
+from app.file_identity import descriptor_file_identity, path_file_identity
 from app.storage_policy import (
     StoragePolicyError,
     WriterPreferredGate,
@@ -89,6 +90,7 @@ _STORAGE_RESTART_REQUIRED = threading.Event()
 _PASSWORD_CHANGE_ALLOWED_PATHS = frozenset({
     "/login",
     "/logout",
+    "/setup",
     "/settings",
     "/settings/display",
     "/api/system/status",
@@ -956,7 +958,12 @@ def audit(request, action, details=''):
     with connect() as con:con.execute('INSERT INTO audit_logs(username,action,details,ip_address) VALUES(?,?,?,?)',(username,action,details,ip))
 
 
-def _bootstrap_login_help():
+def _administrator_setup_required():
+    with connect() as con:
+        return con.execute("SELECT 1 FROM users LIMIT 1").fetchone() is None
+
+
+def _legacy_login_help():
     with connect() as con:
         row = con.execute(
             "SELECT must_change_password FROM users "
@@ -965,8 +972,8 @@ def _bootstrap_login_help():
     if not row or not int(row["must_change_password"] or 0):
         return ""
     return (
-        "<div class='login-help'><span>ورود اولیه: <b>admin</b> / "
-        "<b>123456</b></span><span>تعویض رمز در اولین ورود اجباری است."
+        "<div class='login-help'><span>حساب مدیر از نسخه قدیمی شناسایی شد."
+        "</span><span>پس از ورود با رمز فعلی، تعویض رمز اجباری است."
         "</span></div>"
     )
 
@@ -976,14 +983,98 @@ def camera_rows(enabled_only=False):
         return con.execute(q).fetchall()
 
 @app.get('/')
-def root(request:Request): return RedirectResponse('/dashboard' if user(request) else '/login',302)
+def root(request:Request):
+    if user(request):
+        return RedirectResponse('/dashboard',302)
+    return RedirectResponse(
+        '/setup' if _administrator_setup_required() else '/login',
+        302,
+    )
+
+
+@app.get('/setup')
+def setup_form(request:Request,error:str=''):
+    if not _administrator_setup_required():
+        return RedirectResponse('/login',302)
+    messages={
+        'weak':'رمز مدیر باید حداقل ۱۲ کاراکتر و اختصاصی باشد.',
+        'mismatch':'تکرار رمز با رمز انتخابی یکسان نیست.',
+        'name':'نام نمایشی مدیر معتبر نیست.',
+    }
+    alert=(
+        f"<div class='alert'>{escape(messages.get(error,'اطلاعات راه‌اندازی معتبر نیست.'))}</div>"
+        if error else ''
+    )
+    body=f"""<div class='login-page'>
+    <section class='login-panel'><div class='login-box'>
+      <div class='login-logo'><span class='brand-mark'>BC</span><div><h1>BC Vision</h1><p>{escape(COMPANY_NAME)}</p></div></div>
+      <h2 class='login-title'>راه‌اندازی امن مدیر</h2><p class='login-subtitle'>در اولین اجرا، رمز اختصاصی مدیر را خودتان تعیین کنید. هیچ رمز پیش‌فرضی وجود ندارد.</p>
+      {alert}
+      <form method='post' action='/setup' autocomplete='off'>
+        <label for='display_name'>نام نمایشی</label><input id='display_name' name='display_name' value='مدیر سیستم' maxlength='80' required autofocus>
+        <label for='password'>رمز مدیر (حداقل ۱۲ کاراکتر)</label><div class='password-wrap'><input id='password' type='password' name='password' minlength='12' autocomplete='new-password' required><button type='button' class='password-toggle' id='passwordToggle' aria-label='نمایش رمز'>◉</button></div>
+        <label for='password_confirm'>تکرار رمز</label><input id='password_confirm' type='password' name='password_confirm' minlength='12' autocomplete='new-password' required>
+        <button class='login-submit' type='submit'>ایجاد مدیر و ادامه</button>
+      </form>
+    </div></section>
+    <section class='login-visual'><div class='login-hero'><h2>شروع امن<br>بدون رمز عمومی</h2><p>حساب مدیر فقط یک‌بار و روی همین دستگاه ساخته می‌شود. رمز انتخابی را در محل امن نگهداری کنید.</p></div><span class='login-version'>نسخه {APP_VERSION}</span></section>
+    </div><script>document.getElementById('passwordToggle').addEventListener('click',function(){{const p=document.getElementById('password');p.type=p.type==='password'?'text':'password';this.textContent=p.type==='password'?'◉':'⊘';}});</script>"""
+    return page('راه‌اندازی مدیر',body)
+
+
+@app.post('/setup')
+def setup_admin(
+    request:Request,
+    display_name:str=Form(...),
+    password:str=Form(...),
+    password_confirm:str=Form(...),
+):
+    display_name=display_name.strip()
+    if not display_name or len(display_name)>80:
+        return RedirectResponse('/setup?error=name',303)
+    if password!=password_confirm:
+        return RedirectResponse('/setup?error=mismatch',303)
+    if (
+        len(password)<12
+        or password!=password.strip()
+        or password.casefold() in {'admin','bcvision'}
+    ):
+        return RedirectResponse('/setup?error=weak',303)
+    password_hash=hash_password(password)
+    with connect() as con:
+        con.execute('BEGIN IMMEDIATE')
+        if con.execute('SELECT 1 FROM users LIMIT 1').fetchone() is not None:
+            return RedirectResponse('/login',303)
+        con.execute(
+            'INSERT INTO users('
+            'username,password_hash,display_name,is_admin,role,is_active,'
+            'must_change_password,session_version'
+            ") VALUES('admin',?,?,1,'admin',1,0,0)",
+            (password_hash,display_name),
+        )
+        con.execute(
+            'INSERT INTO audit_logs(username,action,details,ip_address) '
+            'VALUES(?,?,?,?)',
+            (
+                'admin','bootstrap_admin_created',
+                'ایجاد امن مدیر در اولین اجرا',
+                request.client.host if request.client else '',
+            ),
+        )
+    return RedirectResponse('/login?created=1',303)
+
+
 @app.get('/login')
-def login_form(request:Request,error:str='',next:str='/dashboard',logged_out:int=0):
+def login_form(request:Request,error:str='',next:str='/dashboard',logged_out:int=0,created:int=0):
+    if _administrator_setup_required():
+        return RedirectResponse('/setup',302)
     if user(request): return RedirectResponse('/dashboard',302)
     safe_next=next if next.startswith('/') and not next.startswith('//') else '/dashboard'
     alert="<div class='alert'>نام کاربری یا رمز عبور صحیح نیست.</div>" if error else ''
     notice="<div class='alert' style='background:#eaf8f1;color:#146b45;border-color:#bdebd5'>با موفقیت از حساب خارج شدید.</div>" if logged_out else ''
-    login_help=_bootstrap_login_help()
+    if created:
+        notice="<div class='alert' style='background:#eaf8f1;color:#146b45;border-color:#bdebd5'>حساب مدیر ساخته شد؛ اکنون وارد شوید.</div>"
+    login_help=_legacy_login_help()
     body=f"""<div class='login-page'>
     <section class='login-panel'><div class='login-box'>
       <div class='login-logo'><span class='brand-mark'>BC</span><div><h1>BC Vision</h1><p>{escape(COMPANY_NAME)}</p></div></div>
@@ -1002,6 +1093,8 @@ def login_form(request:Request,error:str='',next:str='/dashboard',logged_out:int
     return page('ورود',body)
 @app.post('/login')
 def login(request:Request,username:str=Form(...),password:str=Form(...),next:str=Form('/dashboard')):
+    if _administrator_setup_required():
+        return RedirectResponse('/setup',303)
     username=username.strip()
     safe_next=next if next.startswith('/') and not next.startswith('//') else '/dashboard'
     login_succeeded=False
@@ -2065,7 +2158,7 @@ def _fmt_bytes(n):
         n/=1024
 
 def _fsync_file(path):
-    with Path(path).open('rb') as handle:
+    with Path(path).open('r+b') as handle:
         os.fsync(handle.fileno())
 
 def _lstat(path):
@@ -2078,7 +2171,7 @@ def _regular_file_identity(path, *, expected=None, links=1):
     details=_lstat(path)
     if details is None:
         raise RuntimeError(f'فایل مورد انتظار ایجاد نشد: {path}')
-    identity=(int(details.st_dev),int(details.st_ino))
+    identity=path_file_identity(path,details=details)
     if (
         not stat.S_ISREG(details.st_mode)
         or int(details.st_nlink)!=int(links)
@@ -2095,7 +2188,7 @@ def _unlink_owned_regular(path, identity):
     if (
         not stat.S_ISREG(details.st_mode)
         or int(details.st_nlink)!=1
-        or (int(details.st_dev),int(details.st_ino))!=identity
+        or path_file_identity(target,details=details)!=identity
     ):
         raise RuntimeError(
             f'فایل مهاجرت با فایل دیگری جایگزین شده و حذف نشد: {target}'
@@ -2111,7 +2204,7 @@ def _rmdir_owned(path, identity):
         return False
     if (
         not stat.S_ISDIR(details.st_mode)
-        or (int(details.st_dev),int(details.st_ino))!=identity
+        or path_file_identity(target,details=details)!=identity
     ):
         raise RuntimeError(
             f'پوشه موقت مهاجرت با مسیر دیگری جایگزین شده است: {target}'
@@ -2124,9 +2217,7 @@ def _copy_private_regular_file(source, destination):
     source=Path(source)
     destination=Path(destination)
     source_details=source.lstat()
-    source_identity=(
-        int(source_details.st_dev),int(source_details.st_ino),
-    )
+    source_identity=path_file_identity(source,details=source_details)
     if (
         not stat.S_ISREG(source_details.st_mode)
         or int(source_details.st_nlink)!=1
@@ -2139,14 +2230,18 @@ def _copy_private_regular_file(source, destination):
             if (
                 not stat.S_ISREG(opened.st_mode)
                 or int(opened.st_nlink)!=1
-                or (int(opened.st_dev),int(opened.st_ino))!=source_identity
+                or descriptor_file_identity(
+                    reader.fileno(),details=opened,
+                )!=source_identity
             ):
                 raise RuntimeError(
                     f'فایل محرمانه منبع هنگام مهاجرت تغییر کرد: {source}'
                 )
             with destination.open('xb') as writer:
                 created=os.fstat(writer.fileno())
-                created_identity=(int(created.st_dev),int(created.st_ino))
+                created_identity=descriptor_file_identity(
+                    writer.fileno(),details=created,
+                )
                 os.fchmod(writer.fileno(),0o600)
                 shutil.copyfileobj(reader,writer,1024*1024)
                 writer.flush()
@@ -2190,7 +2285,7 @@ def _publish_staged_file(staged, target, staged_identity):
         if current is not None and (
             stat.S_ISREG(current.st_mode)
             and int(current.st_nlink)==2
-            and (int(current.st_dev),int(current.st_ino))==staged_identity
+            and path_file_identity(target,details=current)==staged_identity
         ):
             hardlinked=True
         elif current is not None:
@@ -2209,7 +2304,9 @@ def _publish_staged_file(staged, target, staged_identity):
                     stat.S_IMODE(staged_details.st_mode) or 0o600,
                 )
                 created=os.fstat(descriptor)
-                target_identity=(int(created.st_dev),int(created.st_ino))
+                target_identity=descriptor_file_identity(
+                    descriptor,details=created,
+                )
                 if (
                     not stat.S_ISREG(created.st_mode)
                     or int(created.st_nlink)!=1
@@ -2222,8 +2319,9 @@ def _publish_staged_file(staged, target, staged_identity):
                     if (
                         not stat.S_ISREG(opened.st_mode)
                         or int(opened.st_nlink)!=1
-                        or (int(opened.st_dev),int(opened.st_ino))
-                        !=staged_identity
+                        or descriptor_file_identity(
+                            reader.fileno(),details=opened,
+                        )!=staged_identity
                     ):
                         raise RuntimeError(
                             'فایل staging هنگام انتشار تغییر کرد.'
@@ -2277,7 +2375,7 @@ def _publish_staged_file(staged, target, staged_identity):
         current=_lstat(target)
         if current is not None and (
             stat.S_ISREG(current.st_mode)
-            and (int(current.st_dev),int(current.st_ino))==staged_identity
+            and path_file_identity(target,details=current)==staged_identity
         ):
             try:
                 target.unlink()
@@ -2298,10 +2396,12 @@ def _storage_pointer_targets_root(config_path, expected_root):
             or details.st_size>4096
         ):
             return False
-        identity=(int(details.st_dev),int(details.st_ino))
+        identity=path_file_identity(path,details=details)
         with path.open('r',encoding='utf-8') as handle:
             opened=os.fstat(handle.fileno())
-            if (int(opened.st_dev),int(opened.st_ino))!=identity:
+            if descriptor_file_identity(
+                handle.fileno(),details=opened,
+            )!=identity:
                 return False
             payload=json.load(handle)
         if not isinstance(payload,dict):
@@ -2486,8 +2586,9 @@ class _PendingVideoUpload:
                 if current is not None and (
                     stat.S_ISREG(current.st_mode)
                     and int(current.st_nlink)==1
-                    and (int(current.st_dev),int(current.st_ino))
-                    == self._created_identity
+                    and path_file_identity(
+                        self.target,details=current,
+                    )==self._created_identity
                 ):
                     self.target.unlink()
                     fsync_parent_directory(self.target)
@@ -2578,7 +2679,9 @@ async def _stage_video_upload(
         _mkdir_durable(save_dir)
         with target.open('xb') as f:
             created=os.fstat(f.fileno())
-            created_identity=(int(created.st_dev),int(created.st_ino))
+            created_identity=descriptor_file_identity(
+                f.fileno(),details=created,
+            )
             claim_created_path=getattr(
                 reservation,'claim_created_path',None,
             )
@@ -2934,14 +3037,12 @@ def save_display_settings(request:Request,dashboard_grid:int=Form(2),dashboard_e
             + quote('تعویض رمز پیش‌فرض الزامی است.'),
             303,
         )
-    if new_password and (
-        len(new_password) < 8 or new_password == '123456'
-    ):
+    if new_password and len(new_password) < 8:
         return RedirectResponse(
             '/settings?password_required='
             + ('1' if password_required else '0')
             + '&error='
-            + quote('رمز جدید باید حداقل ۸ کاراکتر و غیر از رمز پیش‌فرض باشد.'),
+            + quote('رمز جدید باید حداقل ۸ کاراکتر باشد.'),
             303,
         )
     set_setting('dashboard_grid',max(1,min(4,dashboard_grid)));set_setting('dashboard_event_rows',max(6,min(50,dashboard_event_rows)));set_setting('live_fps',max(1,min(15,live_fps)));set_setting('stream_width',stream_width);set_setting('jpeg_quality',max(30,min(95,jpeg_quality)))
@@ -3126,8 +3227,8 @@ def save_storage_settings(request:Request,storage_root:str=Form(...),snapshot_pa
                     raise RuntimeError(
                         'پوشه موقت مهاجرت قابل اعتبارسنجی نیست.'
                     )
-                staging_identity=(
-                    int(staging_details.st_dev),int(staging_details.st_ino),
+                staging_identity=path_file_identity(
+                    staging_root,details=staging_details,
                 )
                 fsync_parent_directory(staging_root)
 
@@ -3202,8 +3303,8 @@ def save_storage_settings(request:Request,storage_root:str=Form(...),snapshot_pa
                 try:
                     with config_temp.open('x',encoding='utf-8') as handle:
                         opened=os.fstat(handle.fileno())
-                        config_temp_identity=(
-                            int(opened.st_dev),int(opened.st_ino),
+                        config_temp_identity=descriptor_file_identity(
+                            handle.fileno(),details=opened,
                         )
                         os.fchmod(handle.fileno(),0o600)
                         handle.write(json.dumps({'storage_root':str(new_root)},ensure_ascii=False,indent=2))

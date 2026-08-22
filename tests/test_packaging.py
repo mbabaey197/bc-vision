@@ -49,6 +49,8 @@ def test_launcher_self_test_uses_isolated_data_directory(tmp_path):
     assert Path(result["database_path"]).is_file()
     assert result["database_ready"] is True
     assert result["web_app_ready"] is True
+    assert result["administrator_setup_required"] is True
+    assert result["user_count"] == 0
     assert "public_key_ready" not in result
 
 

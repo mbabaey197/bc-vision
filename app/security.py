@@ -11,6 +11,7 @@ import time
 from fastapi import Request
 
 from app.config import SECRET_PATH
+from app.file_identity import descriptor_file_identity, path_file_identity
 
 COOKIE_NAME = "gilaslpr_session"
 _SECRET_SIZE = 32
@@ -35,17 +36,21 @@ def _secret_file_value(path) -> bytes | None:
         )
     ):
         return None
+    try:
+        before_identity = path_file_identity(path, details=before)
+    except OSError:
+        return None
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
     try:
         opened = os.fstat(descriptor)
-        identity = (int(opened.st_dev), int(opened.st_ino))
+        identity = descriptor_file_identity(descriptor, details=opened)
         if (
             not stat.S_ISREG(opened.st_mode)
             or int(opened.st_nlink) != 1
             or int(opened.st_size) != _SECRET_SIZE
-            or identity != (int(before.st_dev), int(before.st_ino))
+            or identity != before_identity
         ):
             return None
         value = b""
@@ -55,10 +60,15 @@ def _secret_file_value(path) -> bytes | None:
                 break
             value += chunk
         after = os.fstat(descriptor)
+        after_identity = descriptor_file_identity(descriptor, details=after)
     finally:
         os.close(descriptor)
     try:
         current = os.lstat(path)
+    except OSError:
+        return None
+    try:
+        current_identity = path_file_identity(path, details=current)
     except OSError:
         return None
     if (
@@ -66,8 +76,8 @@ def _secret_file_value(path) -> bytes | None:
         or not stat.S_ISREG(after.st_mode)
         or int(after.st_nlink) != 1
         or int(after.st_size) != _SECRET_SIZE
-        or (int(after.st_dev), int(after.st_ino)) != identity
-        or (int(current.st_dev), int(current.st_ino)) != identity
+        or after_identity != identity
+        or current_identity != identity
         or not stat.S_ISREG(current.st_mode)
         or int(current.st_nlink) != 1
         or int(current.st_size) != _SECRET_SIZE
@@ -79,12 +89,15 @@ def _secret_file_value(path) -> bytes | None:
 def _unlink_owned_secret_temporary(path, identity) -> bool:
     try:
         details = os.lstat(path)
+        current_identity = path_file_identity(path, details=details)
     except FileNotFoundError:
+        return False
+    except OSError:
         return False
     if (
         not stat.S_ISREG(details.st_mode)
         or int(details.st_nlink) != 1
-        or (int(details.st_dev), int(details.st_ino)) != identity
+        or current_identity != identity
     ):
         return False
     os.unlink(path)
@@ -136,7 +149,7 @@ def _replace_secret_atomically(value: bytes) -> None:
                 "could not reserve a private session-secret temporary"
             )
         opened = os.fstat(descriptor)
-        identity = (int(opened.st_dev), int(opened.st_ino))
+        identity = descriptor_file_identity(descriptor, details=opened)
         if not stat.S_ISREG(opened.st_mode) or int(opened.st_nlink) != 1:
             raise OSError("session-secret temporary is unsafe")
         with os.fdopen(descriptor, "wb") as handle:
@@ -155,7 +168,7 @@ def _replace_secret_atomically(value: bytes) -> None:
             not stat.S_ISREG(current.st_mode)
             or int(current.st_nlink) != 1
             or int(current.st_size) != _SECRET_SIZE
-            or (int(current.st_dev), int(current.st_ino)) != identity
+            or path_file_identity(temporary, details=current) != identity
         ):
             raise OSError("session-secret temporary changed before publish")
         try:
@@ -170,7 +183,10 @@ def _replace_secret_atomically(value: bytes) -> None:
             if (
                 not stat.S_ISREG(published.st_mode)
                 or int(published.st_nlink) != 1
-                or (int(published.st_dev), int(published.st_ino)) != identity
+                or path_file_identity(
+                    SECRET_PATH,
+                    details=published,
+                ) != identity
                 or _secret_file_value(SECRET_PATH) != value
             ):
                 raise
@@ -178,7 +194,10 @@ def _replace_secret_atomically(value: bytes) -> None:
         if (
             not stat.S_ISREG(published.st_mode)
             or int(published.st_nlink) != 1
-            or (int(published.st_dev), int(published.st_ino)) != identity
+            or path_file_identity(
+                SECRET_PATH,
+                details=published,
+            ) != identity
             or _secret_file_value(SECRET_PATH) != value
         ):
             raise OSError("published session secret failed identity validation")

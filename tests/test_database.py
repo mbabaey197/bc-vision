@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.security import hash_password
+
 
 def test_old_database_migrates_without_data_loss(
     tmp_path,
@@ -244,12 +246,14 @@ def test_new_database_has_no_automatic_demo_camera(
             "SELECT value FROM settings "
             "WHERE key='migration_video_anpr_markers_rc29_v1'"
         ).fetchone()[0] == "1"
+        assert con.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
         assert con.execute(
-            "SELECT must_change_password FROM users WHERE username='admin'"
-        ).fetchone()[0] == 1
+            "SELECT value FROM settings WHERE key="
+            "'migration_legacy_admin_password_change_rc30_v1'"
+        ).fetchone()[0] == "1"
 
 
-def test_legacy_bootstrap_password_requires_change_but_custom_password_does_not(
+def test_legacy_admin_is_confined_once_but_new_password_is_not_reflagged(
     tmp_path,
     monkeypatch,
 ):
@@ -260,7 +264,14 @@ def test_legacy_bootstrap_password_requires_change_but_custom_password_does_not(
     app.database.init_db()
     with app.database.connect() as con:
         con.execute(
-            "UPDATE users SET must_change_password=0 WHERE username='admin'"
+            "DELETE FROM settings WHERE key="
+            "'migration_legacy_admin_password_change_rc30_v1'"
+        )
+        con.execute(
+            "INSERT INTO users(username,password_hash,display_name,is_admin,"
+            "role,is_active,must_change_password,session_version) "
+            "VALUES(?,?,?,1,'admin',1,0,0)",
+            ("admin", hash_password("legacy-admin-password"), "مدیر"),
         )
 
     app.database.init_db()
@@ -271,7 +282,7 @@ def test_legacy_bootstrap_password_requires_change_but_custom_password_does_not(
         con.execute(
             "UPDATE users SET password_hash=?,must_change_password=0 "
             "WHERE username='admin'",
-            (app.database.hash_password("a-unique-strong-password"),),
+            (hash_password("a-unique-strong-password"),),
         )
 
     app.database.init_db()

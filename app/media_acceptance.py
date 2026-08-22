@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
+from app.file_identity import path_file_identity
+
 
 class MediaAcceptanceError(RuntimeError):
     """Raised when a media intent cannot be validated or transitioned."""
@@ -187,7 +189,7 @@ def current_identity(path) -> tuple[tuple[int, int], int]:
             "accepted media path is not a private regular file"
         )
     return (
-        (int(details.st_dev), int(details.st_ino)),
+        path_file_identity(path, details=details),
         max(0, int(details.st_size)),
     )
 

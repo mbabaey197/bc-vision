@@ -1,6 +1,8 @@
 from pathlib import Path
 import json, os, secrets, stat, sys
 
+from app.file_identity import descriptor_file_identity, path_file_identity
+
 COMPANY_NAME = "گیلاس آبی البرز"
 APP_NAME = "BC Vision"
 APP_VERSION = "2.2.0-rc30"
@@ -80,6 +82,12 @@ def _read_private_regular_file(
         raise StorageConfigurationError(
             f"{label} size is invalid."
         )
+    try:
+        before_identity = path_file_identity(path, details=before)
+    except OSError as exc:
+        raise StorageConfigurationError(
+            f"{label} could not be identified."
+        ) from exc
 
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -87,11 +95,14 @@ def _read_private_regular_file(
     try:
         descriptor = os.open(path, flags)
         opened = os.fstat(descriptor)
+        opened_identity = descriptor_file_identity(
+            descriptor,
+            details=opened,
+        )
         if (
             not stat.S_ISREG(opened.st_mode)
             or int(opened.st_nlink) != 1
-            or (int(opened.st_dev), int(opened.st_ino))
-            != (int(before.st_dev), int(before.st_ino))
+            or opened_identity != before_identity
         ):
             raise StorageConfigurationError(
                 f"{label} changed while it was opened."
@@ -106,6 +117,10 @@ def _read_private_regular_file(
             remaining -= len(chunk)
         payload = b"".join(chunks)
         after = os.fstat(descriptor)
+        after_identity = descriptor_file_identity(
+            descriptor,
+            details=after,
+        )
     except StorageConfigurationError:
         raise
     except OSError as exc:
@@ -119,12 +134,15 @@ def _read_private_regular_file(
     if (
         len(payload) > maximum_bytes
         or int(after.st_size) != len(payload)
-        or (int(after.st_dev), int(after.st_ino), int(after.st_nlink))
-        != (int(opened.st_dev), int(opened.st_ino), int(opened.st_nlink))
+        or after_identity != opened_identity
+        or int(after.st_nlink) != int(opened.st_nlink)
         or int(getattr(after, "st_mtime_ns", 0))
         != int(getattr(opened, "st_mtime_ns", 0))
-        or int(getattr(after, "st_ctime_ns", 0))
-        != int(getattr(opened, "st_ctime_ns", 0))
+        or (
+            os.name != "nt"
+            and int(getattr(after, "st_ctime_ns", 0))
+            != int(getattr(opened, "st_ctime_ns", 0))
+        )
     ):
         raise StorageConfigurationError(
             f"{label} changed while it was read."
@@ -136,16 +154,24 @@ def _read_private_regular_file(
         raise StorageConfigurationError(
             f"{label} changed after it was read."
         ) from exc
+    try:
+        current_identity = path_file_identity(path, details=current)
+    except OSError as exc:
+        raise StorageConfigurationError(
+            f"{label} changed after it was read."
+        ) from exc
     if (
         not stat.S_ISREG(current.st_mode)
         or int(current.st_nlink) != 1
-        or (int(current.st_dev), int(current.st_ino))
-        != (int(after.st_dev), int(after.st_ino))
+        or current_identity != after_identity
         or int(current.st_size) != int(after.st_size)
         or int(getattr(current, "st_mtime_ns", 0))
         != int(getattr(after, "st_mtime_ns", 0))
-        or int(getattr(current, "st_ctime_ns", 0))
-        != int(getattr(after, "st_ctime_ns", 0))
+        or (
+            os.name != "nt"
+            and int(getattr(current, "st_ctime_ns", 0))
+            != int(getattr(after, "st_ctime_ns", 0))
+        )
     ):
         raise StorageConfigurationError(
             f"{label} changed after it was read."
@@ -227,7 +253,7 @@ def _unlink_owned_marker_temporary(
         ) from exc
     if (
         not stat.S_ISREG(details.st_mode)
-        or (int(details.st_dev), int(details.st_ino)) != identity
+        or path_file_identity(path, details=details) != identity
     ):
         raise StorageConfigurationError(
             "Storage migration marker temporary was replaced and preserved."
@@ -275,7 +301,7 @@ def _create_storage_migration_marker(path: Path) -> None:
 
     try:
         opened = os.fstat(descriptor)
-        identity = (int(opened.st_dev), int(opened.st_ino))
+        identity = descriptor_file_identity(descriptor, details=opened)
         if (
             not stat.S_ISREG(opened.st_mode)
             or int(opened.st_nlink) != 1
@@ -294,7 +320,10 @@ def _create_storage_migration_marker(path: Path) -> None:
         if (
             not stat.S_ISREG(completed.st_mode)
             or int(completed.st_nlink) != 1
-            or (int(completed.st_dev), int(completed.st_ino)) != identity
+            or descriptor_file_identity(
+                descriptor,
+                details=completed,
+            ) != identity
             or int(completed.st_size)
             != len(STORAGE_MIGRATION_MARKER_PAYLOAD)
         ):
@@ -323,7 +352,7 @@ def _create_storage_migration_marker(path: Path) -> None:
         if (
             not stat.S_ISREG(current.st_mode)
             or int(current.st_nlink) != 1
-            or (int(current.st_dev), int(current.st_ino)) != identity
+            or path_file_identity(temporary, details=current) != identity
             or int(current.st_size)
             != len(STORAGE_MIGRATION_MARKER_PAYLOAD)
         ):
@@ -350,7 +379,7 @@ def _create_storage_migration_marker(path: Path) -> None:
         if (
             not stat.S_ISREG(published.st_mode)
             or int(published.st_nlink) != 2
-            or (int(published.st_dev), int(published.st_ino)) != identity
+            or path_file_identity(path, details=published) != identity
         ):
             raise StorageConfigurationError(
                 "Storage migration marker changed while published."

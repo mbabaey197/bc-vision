@@ -2,8 +2,8 @@
   "base_version": "2.2.0-rc30",
   "files": {
     "BUILD_PORTABLE_EXE.bat": "e2cbb1f62802961658fe495dccaff310627ef4646f99f7ef4b4621deffb6abf6",
-    "app/database.py": "cf071e2ce07aa4aed16173d256b06318ab78a04b6f70b5cc0c729ff43e064b19",
-    "launcher.py": "86ee5a79e2a5f3a3b39fe372f16a0fa56ed1389d888be23edeb4ccf8c32ac974",
+    "app/database.py": "db29b7cc163a992463917dc6d18fb51fd84ab0484548745300bb6e0570e18e44",
+    "launcher.py": "fd6e6ea2147ce37bcfb08967b009792f05921d892a10e19d41254af12641d7f0",
     "requirements-ai-lock.txt": "f57506bd19542566ba433a128fff1f71e03bc53ce56d97cc52f0d8bb98f432af",
     "requirements-lock.txt": "d4bd946441b9f6848efbf62d77e690ec1d9be41f3c9d520b29a4eca0f31ceda7",
     "runtime_payload.py": "8aa86757ee84d0dd3234e28abe0ece7c9454b1abf4a3bf5785b2770ce7c615e5"

@@ -4,6 +4,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from app.file_identity import path_file_identity
+
 from app import database, storage_policy
 from app.ai import video_test
 from app.async_jobs import _validate_transport_value
@@ -165,7 +167,7 @@ def test_accepted_parent_handle_commits_exact_child_inode_through_recovery(
     rebuilt.finalize()
 
     details = pending.path.lstat()
-    assert (int(details.st_dev), int(details.st_ino)) == pending.identity
+    assert path_file_identity(pending.path, details=details) == pending.identity
     assert int(details.st_nlink) == 1
     assert int(details.st_size) == pending.size_bytes
     assert load_intent(pending.acceptance_id) is None
