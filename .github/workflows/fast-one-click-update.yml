@@ -468,12 +468,6 @@ jobs:
           New-Item -ItemType Directory `
             $bootstrapDir,$customData,$diagnosticDir -Force |
             Out-Null
-          @{storage_root=$customData} | ConvertTo-Json |
-            Set-Content (Join-Path $bootstrapDir "storage_config.json") `
-              -Encoding utf8
-          $configHash = (
-            Get-FileHash (Join-Path $bootstrapDir "storage_config.json")
-          ).Hash
 
           $setup = Resolve-Path "base\BCVision_*_Setup.exe"
           Invoke-CheckedProcess `
@@ -491,7 +485,7 @@ jobs:
             -FilePath "$installDir\BCVision.exe" `
             -TimeoutSeconds 180 `
             -Arguments @(
-            "--self-test", "--self-test-data-dir", $bootstrapDir,
+            "--self-test", "--self-test-data-dir", $customData,
             "--self-test-output", $baseResult
           )
           $baseJson = Get-Content $baseResult -Raw | ConvertFrom-Json
@@ -499,6 +493,24 @@ jobs:
             $baseJson.runtime_version -ne
               "${{ needs.build-update.outputs.base_version }}"
           ) { throw "Base runtime version is incorrect" }
+          if (-not (Test-Path (Join-Path $customData "bcvision.db"))) {
+            throw "Base self-test did not initialize the isolated database"
+          }
+          if (
+            (Resolve-Path $baseJson.data_dir).Path -ne
+            (Resolve-Path $customData).Path
+          ) { throw "Base self-test did not use the isolated storage root" }
+
+          # A hardened RC30 storage pointer is valid only after its target
+          # database exists. Publish the pointer after the base self-test so
+          # this fixture represents a completed storage migration rather than
+          # an invalid partial migration that RC30 correctly refuses to open.
+          @{storage_root=$customData} | ConvertTo-Json |
+            Set-Content (Join-Path $bootstrapDir "storage_config.json") `
+              -Encoding utf8
+          $configHash = (
+            Get-FileHash (Join-Path $bootstrapDir "storage_config.json")
+          ).Hash
 
           $env:BCVISION_TEST_MARKER = "preserve-$([guid]::NewGuid())"
           $env:BCVISION_TEST_DB = Join-Path $customData "bcvision.db"
@@ -626,7 +638,8 @@ jobs:
           path: |
             ${{ runner.temp }}/bcvision-fast-integration
             ${{ runner.temp }}/*self-test.json
-            ${{ runner.temp }}/bcvision-bootstrap/bcvision.log
+            ${{ runner.temp }}/bcvision-bootstrap/BCVision.log
+            ${{ runner.temp }}/bcvision-custom-data/BCVision.log
 
   publish:
     needs:

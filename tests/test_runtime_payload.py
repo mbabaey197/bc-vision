@@ -419,6 +419,8 @@ def test_release_workflows_separate_fast_and_full_runtime_paths():
     assert "WaitForExit($TimeoutSeconds * 1000)" in fast
     assert "taskkill.exe /PID $process.Id /T /F" in fast
     assert "fast-base-integration-diagnostics" in fast
+    assert "Base self-test did not initialize the isolated database" in fast
+    assert "completed storage migration" in fast
     assert "[byte[]](77, 90)" not in fast
     assert "RUNTIME_CONTRACT_ID.txt" in fast
     assert "git merge-base --is-ancestor" in fast
