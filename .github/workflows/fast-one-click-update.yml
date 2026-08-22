@@ -385,7 +385,7 @@ jobs:
       (needs.build-update.outputs.first_fast == 'true' ||
        inputs.verify_base_install == true)
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       actions: read
       contents: read
@@ -427,10 +427,46 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          function Invoke-CheckedProcess {
+            param(
+              [Parameter(Mandatory=$true)][string]$Label,
+              [Parameter(Mandatory=$true)][string]$FilePath,
+              [Parameter(Mandatory=$true)][string[]]$Arguments,
+              [Parameter(Mandatory=$true)][int]$TimeoutSeconds
+            )
+            Write-Host "::group::$Label"
+            $process = $null
+            try {
+              $process = Start-Process $FilePath `
+                -ArgumentList $Arguments -PassThru
+              if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+                Write-Warning (
+                  "$Label timed out after $TimeoutSeconds seconds; " +
+                  "terminating process tree $($process.Id)."
+                )
+                & taskkill.exe /PID $process.Id /T /F 2>&1 |
+                  ForEach-Object { Write-Host $_ }
+                throw "$Label timed out after $TimeoutSeconds seconds"
+              }
+              # Flush asynchronous process state before reading ExitCode.
+              $process.WaitForExit()
+              Write-Host "$Label exited with $($process.ExitCode)"
+              if ($process.ExitCode -ne 0) {
+                throw "$Label exited with $($process.ExitCode)"
+              }
+            } finally {
+              Write-Host "::endgroup::"
+            }
+          }
+
           $installDir = Join-Path $env:RUNNER_TEMP "bcvision-fast-real"
           $bootstrapDir = Join-Path $env:RUNNER_TEMP "bcvision-bootstrap"
           $customData = Join-Path $env:RUNNER_TEMP "bcvision-custom-data"
-          New-Item -ItemType Directory $bootstrapDir,$customData -Force |
+          $diagnosticDir = Join-Path (
+            $env:RUNNER_TEMP
+          ) "bcvision-fast-integration"
+          New-Item -ItemType Directory `
+            $bootstrapDir,$customData,$diagnosticDir -Force |
             Out-Null
           @{storage_root=$customData} | ConvertTo-Json |
             Set-Content (Join-Path $bootstrapDir "storage_config.json") `
@@ -440,19 +476,24 @@ jobs:
           ).Hash
 
           $setup = Resolve-Path "base\BCVision_*_Setup.exe"
-          $installed = Start-Process $setup -ArgumentList @(
+          Invoke-CheckedProcess `
+            -Label "Install immutable full base" `
+            -FilePath $setup `
+            -TimeoutSeconds 600 `
+            -Arguments @(
             "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
-            "/DIR=$installDir"
-          ) -Wait -PassThru
-          if ($installed.ExitCode -ne 0) {
-            throw "Base Setup exited with $($installed.ExitCode)"
-          }
+            "/DIR=$installDir",
+            "/LOG=$(Join-Path $diagnosticDir 'base-setup.log')"
+          )
           $baseResult = Join-Path $env:RUNNER_TEMP "base-self-test.json"
-          $baseTest = Start-Process "$installDir\BCVision.exe" -ArgumentList @(
+          Invoke-CheckedProcess `
+            -Label "Run immutable base self-test" `
+            -FilePath "$installDir\BCVision.exe" `
+            -TimeoutSeconds 180 `
+            -Arguments @(
             "--self-test", "--self-test-data-dir", $bootstrapDir,
             "--self-test-output", $baseResult
-          ) -Wait -PassThru
-          if ($baseTest.ExitCode -ne 0) { throw "Base self-test failed" }
+          )
           $baseJson = Get-Content $baseResult -Raw | ConvertFrom-Json
           if (
             $baseJson.runtime_version -ne
@@ -477,20 +518,24 @@ jobs:
           }
 
           $update = Resolve-Path "release\BCVision_*_Update.exe"
-          $updated = Start-Process $update -ArgumentList @(
+          Invoke-CheckedProcess `
+            -Label "Apply transactional fast update" `
+            -FilePath $update `
+            -TimeoutSeconds 600 `
+            -Arguments @(
             "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
-            "/DIR=$installDir"
-          ) -Wait -PassThru
-          if ($updated.ExitCode -ne 0) {
-            throw "Fast updater exited with $($updated.ExitCode)"
-          }
+            "/DIR=$installDir",
+            "/LOG=$(Join-Path $diagnosticDir 'fast-update.log')"
+          )
           $updatedResult = Join-Path $env:RUNNER_TEMP "updated-self-test.json"
-          $updatedTest = Start-Process "$installDir\BCVision.exe" `
-            -ArgumentList @(
+          Invoke-CheckedProcess `
+            -Label "Run activated fast runtime self-test" `
+            -FilePath "$installDir\BCVision.exe" `
+            -TimeoutSeconds 180 `
+            -Arguments @(
               "--self-test", "--self-test-data-dir", $bootstrapDir,
               "--self-test-output", $updatedResult
-            ) -Wait -PassThru
-          if ($updatedTest.ExitCode -ne 0) { throw "Updated self-test failed" }
+            )
           $updatedJson = Get-Content $updatedResult -Raw | ConvertFrom-Json
           if (
             $updatedJson.runtime_version -ne
@@ -522,22 +567,24 @@ jobs:
 
           # Re-running the immutable full-base Setup must repair base files
           # without downgrading the already-confirmed fast runtime.
-          $repair = Start-Process $setup -ArgumentList @(
+          Invoke-CheckedProcess `
+            -Label "Repair with immutable full base" `
+            -FilePath $setup `
+            -TimeoutSeconds 600 `
+            -Arguments @(
             "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
-            "/DIR=$installDir"
-          ) -Wait -PassThru
-          if ($repair.ExitCode -ne 0) {
-            throw "Full-base repair exited with $($repair.ExitCode)"
-          }
+            "/DIR=$installDir",
+            "/LOG=$(Join-Path $diagnosticDir 'base-repair.log')"
+          )
           $repairResult = Join-Path $env:RUNNER_TEMP "repair-self-test.json"
-          $repairTest = Start-Process "$installDir\BCVision.exe" `
-            -ArgumentList @(
+          Invoke-CheckedProcess `
+            -Label "Run self-test after full-base repair" `
+            -FilePath "$installDir\BCVision.exe" `
+            -TimeoutSeconds 180 `
+            -Arguments @(
               "--self-test", "--self-test-data-dir", $bootstrapDir,
               "--self-test-output", $repairResult
-            ) -Wait -PassThru
-          if ($repairTest.ExitCode -ne 0) {
-            throw "Runtime failed after full-base repair"
-          }
+            )
           $repairJson = Get-Content $repairResult -Raw | ConvertFrom-Json
           if (
             $repairJson.runtime_version -ne
@@ -568,6 +615,18 @@ jobs:
                 $env:BCVISION_TEST_MARKER
             ) { throw "Full-base repair changed $relative" }
           }
+
+      - name: Upload base-integration diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-base-integration-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/bcvision-fast-integration
+            ${{ runner.temp }}/*self-test.json
+            ${{ runner.temp }}/bcvision-bootstrap/bcvision.log
 
   publish:
     needs:

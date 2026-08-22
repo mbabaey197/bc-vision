@@ -406,6 +406,7 @@ def test_release_workflows_separate_fast_and_full_runtime_paths():
 
     assert "timeout-minutes: 4" in fast
     assert "timeout-minutes: 20" in fast
+    assert "timeout-minutes: 45" in fast
     assert "timeout-minutes: 1" in fast
     assert "BUILD_PORTABLE_EXE.bat" not in fast
     assert "Wait for successful exact-SHA ANPR validation" in fast
@@ -414,6 +415,10 @@ def test_release_workflows_separate_fast_and_full_runtime_paths():
     assert "  push:" in fast
     assert "      - VERSION" in fast
     assert "Verify real base Setup to transactional fast update" in fast
+    assert "function Invoke-CheckedProcess" in fast
+    assert "WaitForExit($TimeoutSeconds * 1000)" in fast
+    assert "taskkill.exe /PID $process.Id /T /F" in fast
+    assert "fast-base-integration-diagnostics" in fast
     assert "[byte[]](77, 90)" not in fast
     assert "RUNTIME_CONTRACT_ID.txt" in fast
     assert "git merge-base --is-ancestor" in fast
