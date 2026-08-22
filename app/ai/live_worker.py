@@ -173,6 +173,7 @@ class _RetryLineage:
 
 @dataclass
 class _CameraState:
+    metrics_started_at: float = field(default_factory=time.monotonic)
     frame_counter: int = 0
     busy: bool = False
     retired: bool = False
@@ -202,6 +203,10 @@ class _CameraState:
     last_processing_error: str = ""
     last_event_at: float = 0.0
     processed_frames: int = 0
+    inference_calls: int = 0
+    inference_seconds: float = 0.0
+    last_inference_ms: float = 0.0
+    coalesced_frames: int = 0
     detected_candidates: int = 0
     emitted_events: int = 0
     whole_plate_ocr_attempts: int = 0
@@ -1463,6 +1468,11 @@ class LiveANPRWorker:
                     state.last_processing_error = ""
                     state.last_event_at = 0.0
                     state.processed_frames = 0
+                    state.inference_calls = 0
+                    state.inference_seconds = 0.0
+                    state.last_inference_ms = 0.0
+                    state.coalesced_frames = 0
+                    state.metrics_started_at = time.monotonic()
                     state.detected_candidates = 0
                     state.emitted_events = 0
                     state.whole_plate_ocr_attempts = 0
@@ -2294,7 +2304,11 @@ class LiveANPRWorker:
                     or selection_score >= pending_score
                     or now - pending_at >= 0.12
                 ):
+                    if state.pending is not None:
+                        state.coalesced_frames += 1
                     state.pending = payload
+                else:
+                    state.coalesced_frames += 1
                 return
             # Do not let a slow CPU run ANPR continuously with no breathing
             # room. Keep the newest frame and cap inference frequency
@@ -2338,7 +2352,11 @@ class LiveANPRWorker:
                     state.pending is None
                     or selection_score >= pending_score
                 ):
+                    if state.pending is not None:
+                        state.coalesced_frames += 1
                     state.pending = payload
+                else:
+                    state.coalesced_frames += 1
                 return
             if state.pending is not None:
                 pending_score = float(state.pending[4])
@@ -2348,6 +2366,7 @@ class LiveANPRWorker:
                     and now - pending_at < 0.30
                 ):
                     payload = state.pending
+                state.coalesced_frames += 1
                 state.pending = None
             state.last_submitted_at = now
             state.busy = True
@@ -2728,6 +2747,7 @@ class LiveANPRWorker:
             if pending is None:
                 return scheduled
             state.pending = None
+            state.coalesced_frames += 1
             current_generation = self._detector_generation
             scheduled_generation = (
                 int(scheduled[6])
@@ -2830,8 +2850,17 @@ class LiveANPRWorker:
                     **kwargs,
                 )
 
+            inference_started = time.monotonic()
+            try:
+                raw_primary_rows = baseline_process()
+            finally:
+                inference_seconds = time.monotonic() - inference_started
+                state.inference_calls += 1
+                state.inference_seconds += inference_seconds
+                state.last_inference_ms = inference_seconds * 1000.0
+
             primary_rows = []
-            for raw_row in baseline_process():
+            for raw_row in raw_primary_rows:
                 translated = self._translate(
                     raw_row,
                     offset_x,
@@ -3225,6 +3254,13 @@ class LiveANPRWorker:
                     "active": bool(detached_retry_count),
                     "received_frames": 0,
                     "processed_frames": 0,
+                    "inference_calls": 0,
+                    "inference_seconds": 0.0,
+                    "mean_inference_ms": 0.0,
+                    "last_inference_ms": 0.0,
+                    "inference_fps": 0.0,
+                    "coalesced_frames": 0,
+                    "worker_frame_drop_rate": 0.0,
                     "detected_candidates": 0,
                     "emitted_events": 0,
                     "pending_retry_count": detached_retry_count,
@@ -3268,10 +3304,31 @@ class LiveANPRWorker:
                     "threads_per_camera": threads_per_camera(),
                     "parallel_camera_limit": self._worker_capacity,
                 }
+            metrics_elapsed = max(
+                0.0,
+                time.monotonic() - state.metrics_started_at,
+            )
             return {
                 "active": bool(state.busy or state.config),
                 "received_frames": state.frame_counter,
                 "processed_frames": state.processed_frames,
+                "inference_calls": state.inference_calls,
+                "inference_seconds": round(state.inference_seconds, 6),
+                "mean_inference_ms": round(
+                    state.inference_seconds * 1000.0
+                    / max(1, state.inference_calls),
+                    6,
+                ),
+                "last_inference_ms": round(state.last_inference_ms, 6),
+                "inference_fps": round(
+                    state.inference_calls / max(metrics_elapsed, 1e-9),
+                    6,
+                ),
+                "coalesced_frames": state.coalesced_frames,
+                "worker_frame_drop_rate": round(
+                    state.coalesced_frames / max(1, state.frame_counter),
+                    6,
+                ),
                 "detected_candidates": state.detected_candidates,
                 "emitted_events": state.emitted_events,
                 "pending_retry_count": (

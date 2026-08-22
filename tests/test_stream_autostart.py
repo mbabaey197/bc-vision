@@ -159,6 +159,29 @@ def test_live_overlay_survives_stream_resize(monkeypatch):
     assert display.shape[:2] == (100, 160)
     # The green rectangle drawn before resize must still be visible.
     assert int(display[:, :, 1].max()) > 150
+    metrics = stream.metrics_snapshot()
+    assert metrics["jpeg_attempts"] == 1
+    assert metrics["jpeg_frames"] == 1
+    assert metrics["jpeg_bytes"] == 3
+    assert metrics["jpeg_seconds"] >= 0.0
+
+
+def test_stream_metrics_distinguish_decode_and_anpr_queue_coalescing(
+    monkeypatch,
+):
+    stream = CameraStream(8, "demo://camera", "Gate")
+    frame = np.zeros((8, 12, 3), dtype=np.uint8)
+    monkeypatch.setattr(stream, "_ensure_video_anpr_started", lambda: True)
+
+    stream._record_decode(0.012)
+    stream._queue_anpr(frame)
+    stream._queue_anpr(frame.copy())
+
+    metrics = stream.metrics_snapshot()
+    assert metrics["decoded_frames"] == 1
+    assert metrics["decode_seconds"] == 0.012
+    assert metrics["anpr_queue_frames"] == 2
+    assert metrics["anpr_queue_coalesced_frames"] == 1
 
 
 def test_live_overlay_tracks_plate_motion_between_inference_frames():
