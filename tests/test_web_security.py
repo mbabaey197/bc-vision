@@ -2293,15 +2293,19 @@ def test_camera_video_upload_registers_live_source_without_batch_processing(
         lambda camera_id: calls["remove"].append(camera_id),
     )
 
-    started = time.monotonic()
     with TestClient(main.app) as client, source_path.open("rb") as source:
+        # This assertion guards the upload request itself. Application
+        # startup/shutdown also reconciles storage and drains camera threads;
+        # those independent lifecycle costs vary substantially across OpenCV
+        # builds, especially on Windows.
+        started = time.monotonic()
         response = client.post(
             "/cameras/video-upload",
             data={"camera_id": str(camera_id)},
             files={"video": ("traffic.avi", source, "video/x-msvideo")},
             headers={"X-Requested-With": "XMLHttpRequest"},
         )
-    elapsed = time.monotonic() - started
+        elapsed = time.monotonic() - started
 
     assert response.status_code == 200
     payload = response.json()
@@ -2637,20 +2641,23 @@ def test_uploaded_video_flows_through_worker_to_sqlite_and_dashboard(
         return [result]
 
     monkeypatch.setattr(live_worker, "process_frame", detect)
-    monkeypatch.setattr(
-        live_worker.worker,
-        "_models",
-        lambda: {
-            "ready": True,
-            "detector_ready": True,
-            "crnn_ready": True,
-            "cnn_ready": True,
-        },
-    )
-
     virtual_id = None
     try:
         with TestClient(main.app) as client, source_path.open("rb") as source:
+            # The lifespan replaces a worker that a preceding TestClient has
+            # already stopped. Patch the active worker, not the pre-lifespan
+            # instance; otherwise the Windows suite can silently run the real
+            # model readiness path and finish the video without a test event.
+            monkeypatch.setattr(
+                live_worker.worker,
+                "_models",
+                lambda: {
+                    "ready": True,
+                    "detector_ready": True,
+                    "crnn_ready": True,
+                    "cnn_ready": True,
+                },
+            )
             response = client.post(
                 "/cameras/video-upload",
                 data={"camera_id": str(source_camera_id)},

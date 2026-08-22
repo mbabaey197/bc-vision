@@ -1007,13 +1007,19 @@ def _clean_journal_temps(
         if not _is_journal_temp_name(entry.name):
             unexpected.append(entry.name)
             continue
+        temporary = Path(entry.path)
         try:
-            entry_stat = entry.stat(follow_symlinks=False)
+            # A fresh path lookup is intentional here.  On Windows,
+            # ``DirEntry.stat(follow_symlinks=False)`` can retain incomplete
+            # reparse/link metadata for a file created after the directory
+            # handle was opened.  Recovery must still distinguish a private
+            # regular atomic-write leftover from a link before unlinking it.
+            entry_stat = temporary.lstat()
         except OSError:
             return False, False
         if not stat.S_ISREG(entry_stat.st_mode) or int(entry_stat.st_nlink) != 1:
             return False, False
-        temporary_paths.append(Path(entry.path))
+        temporary_paths.append(temporary)
     if unexpected:
         return False, False
     if journal.exists():
