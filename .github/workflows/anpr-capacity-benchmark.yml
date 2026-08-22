@@ -1,0 +1,207 @@
+name: ANPR dedicated capacity benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Measure only, or compare against the accepted fixed-host baseline
+        required: true
+        type: choice
+        default: measure
+        options:
+          - measure
+          - compare
+      detector:
+        description: Production detector to measure
+        required: true
+        type: choice
+        default: yolo11n
+        options:
+          - yolo11n
+          - yolov8n
+      live_fps:
+        description: Per-camera live ANPR target FPS
+        required: true
+        type: string
+        default: "5"
+      stream_width:
+        description: Stream processing width
+        required: true
+        type: string
+        default: "640"
+      jpeg_quality:
+        description: Preview JPEG quality
+        required: true
+        type: string
+        default: "70"
+      viewers_per_camera:
+        description: 0 proves headless cost; 1 measures active preview cost
+        required: true
+        type: choice
+        default: "0"
+        options:
+          - "0"
+          - "1"
+      max_cpu_regression_percent:
+        description: Maximum relative host CPU increase allowed in compare mode
+        required: true
+        type: string
+        default: "10"
+      max_latency_regression_percent:
+        description: Maximum relative decode/inference latency increase allowed
+        required: true
+        type: string
+        default: "10"
+      max_fps_regression_percent:
+        description: Maximum relative per-camera inference FPS decrease allowed
+        required: true
+        type: string
+        default: "10"
+      max_coalesced_rate_increase:
+        description: Maximum absolute application coalescing-rate increase (0..1)
+        required: true
+        type: string
+        default: "0.05"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bcvision-dedicated-capacity-benchmark
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    # This workflow intentionally never consumes a GitHub-hosted runner. The
+    # custom label keeps measurements on one controlled Windows workstation.
+    runs-on: [self-hosted, windows, x64, bcvision-benchmark]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate fixed benchmark workstation
+        shell: pwsh
+        run: |
+          $python = $env:BCVISION_BENCH_PYTHON
+          if ([string]::IsNullOrWhiteSpace($python)) { $python = "python" }
+          & $python --version
+          if ($LASTEXITCODE -ne 0) { throw "BCVISION_BENCH_PYTHON is not executable" }
+
+          if ([string]::IsNullOrWhiteSpace($env:BCVISION_BENCH_VIDEO)) {
+            throw "BCVISION_BENCH_VIDEO must point to the immutable local benchmark video"
+          }
+          if (-not (Test-Path -LiteralPath $env:BCVISION_BENCH_VIDEO -PathType Leaf)) {
+            throw "BCVISION_BENCH_VIDEO does not exist: $env:BCVISION_BENCH_VIDEO"
+          }
+
+          $modelRoot = $env:BCVISION_BENCH_MODEL_ROOT
+          if ([string]::IsNullOrWhiteSpace($modelRoot)) {
+            $modelRoot = "C:\ProgramData\BCVision\data\models"
+          }
+          $models = @{
+            BCVISION_PLATE_MODEL = Join-Path $modelRoot "plate\plate_yolo11n.onnx"
+            BCVISION_PLATE_YOLOV8N_MODEL = Join-Path $modelRoot "plate\plate_yolov8n.onnx"
+            BCVISION_PLATE_FALLBACK_MODEL = Join-Path $modelRoot "plate\plate_yolo_fallback.onnx"
+            BCVISION_HEZAR_MODEL = Join-Path $modelRoot "hezar\crnn_fa_v2.onnx"
+            BCVISION_CRNN_MODEL = Join-Path $modelRoot "crnn\ocr_crnn.onnx"
+            BCVISION_CNN_MODEL = Join-Path $modelRoot "cnn\ocr_cnn.onnx"
+          }
+          foreach ($entry in $models.GetEnumerator()) {
+            if (-not (Test-Path -LiteralPath $entry.Value -PathType Leaf)) {
+              throw "Required production model missing: $($entry.Value)"
+            }
+            "$($entry.Key)=$($entry.Value)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+          "BENCH_PYTHON=$python" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "BENCH_VIDEO=$env:BCVISION_BENCH_VIDEO" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "BENCH_REPORT=$env:RUNNER_TEMP\bcvision-capacity-${{ github.run_id }}-${{ github.run_attempt }}.json" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "BENCH_DECISION=$env:RUNNER_TEMP\bcvision-capacity-decision-${{ github.run_id }}-${{ github.run_attempt }}.json" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          & $python -c "import cv2, numpy, onnxruntime, pytest; print('benchmark runtime imports: OK')"
+          if ($LASTEXITCODE -ne 0) { throw "Benchmark Python environment is incomplete" }
+
+      - name: Verify benchmark contracts
+        shell: pwsh
+        run: |
+          & $env:BENCH_PYTHON -m pytest -q tests/test_capacity_baseline.py tests/test_capacity_compare.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run production 1/3/6-camera capacity evidence
+        shell: pwsh
+        run: |
+          $arguments = @(
+            "-m", "app.ai.capacity_baseline",
+            "--video", $env:BENCH_VIDEO,
+            "--output", $env:BENCH_REPORT,
+            "--detector", "${{ inputs.detector }}",
+            "--live-fps", "${{ inputs.live_fps }}",
+            "--stream-width", "${{ inputs.stream_width }}",
+            "--jpeg-quality", "${{ inputs.jpeg_quality }}",
+            "--viewers-per-camera", "${{ inputs.viewers_per_camera }}"
+          )
+          if (-not [string]::IsNullOrWhiteSpace($env:BCVISION_BENCH_PASSAGE_EVIDENCE)) {
+            if (-not (Test-Path -LiteralPath $env:BCVISION_BENCH_PASSAGE_EVIDENCE -PathType Leaf)) {
+              throw "BCVISION_BENCH_PASSAGE_EVIDENCE is configured but missing"
+            }
+            $arguments += @("--passage-evidence", $env:BCVISION_BENCH_PASSAGE_EVIDENCE)
+          }
+          & $env:BENCH_PYTHON @arguments
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path -LiteralPath $env:BENCH_REPORT -PathType Leaf)) {
+            throw "Capacity report was not created"
+          }
+
+      - name: Compare with accepted baseline
+        if: inputs.mode == 'compare'
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:BCVISION_BENCH_BASELINE)) {
+            throw "compare mode requires BCVISION_BENCH_BASELINE on the fixed workstation"
+          }
+          if (-not (Test-Path -LiteralPath $env:BCVISION_BENCH_BASELINE -PathType Leaf)) {
+            throw "Accepted baseline does not exist: $env:BCVISION_BENCH_BASELINE"
+          }
+          & $env:BENCH_PYTHON tools/compare_capacity_baseline.py `
+            $env:BCVISION_BENCH_BASELINE `
+            $env:BENCH_REPORT `
+            --output $env:BENCH_DECISION `
+            --max-cpu-regression-percent "${{ inputs.max_cpu_regression_percent }}" `
+            --max-latency-regression-percent "${{ inputs.max_latency_regression_percent }}" `
+            --max-fps-regression-percent "${{ inputs.max_fps_regression_percent }}" `
+            --max-coalesced-rate-increase "${{ inputs.max_coalesced_rate_increase }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Write benchmark summary
+        if: always()
+        shell: pwsh
+        run: |
+          "## BC Vision ANPR capacity benchmark" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "Fixed runner: ``$env:RUNNER_NAME``  " | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "Mode: ``${{ inputs.mode }}``  " | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "Detector: ``${{ inputs.detector }}``  " | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "Viewers/camera: ``${{ inputs.viewers_per_camera }}``" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          if (Test-Path -LiteralPath $env:BENCH_REPORT -PathType Leaf) {
+            $report = Get-Content -Raw -LiteralPath $env:BENCH_REPORT | ConvertFrom-Json
+            "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+            "| Cameras | Valid | Host CPU % | Decode FPS/cam | Inference FPS/cam | Inference ms | JPEG frames | Coalesced rate |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+            "|---:|:---:|---:|---:|---:|---:|---:|---:|" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+            foreach ($run in $report.runs) {
+              "| $($run.camera_count) | $($run.valid) | $($run.process_cpu_host_percent) | $($run.decode.per_camera_fps) | $($run.inference.per_camera_fps) | $($run.inference.mean_ms) | $($run.jpeg.frames) | $($run.frame_drop.application_coalesced_rate) |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+            }
+            "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+            "Passage 99% claim ready: ``$($report.passage_accuracy.claim_ready)``" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          }
+
+      - name: Upload compact benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anpr-capacity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}\bcvision-capacity-${{ github.run_id }}-${{ github.run_attempt }}.json
+            ${{ runner.temp }}\bcvision-capacity-decision-${{ github.run_id }}-${{ github.run_attempt }}.json
+          if-no-files-found: warn
+          retention-days: 14
