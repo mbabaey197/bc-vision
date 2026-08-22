@@ -201,7 +201,7 @@ jobs:
         with:
           name: anpr-capacity-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ env.BENCH_REPORT }}
-            ${{ env.BENCH_DECISION }}
+            ${{ runner.temp }}\bcvision-capacity-${{ github.run_id }}-${{ github.run_attempt }}.json
+            ${{ runner.temp }}\bcvision-capacity-decision-${{ github.run_id }}-${{ github.run_attempt }}.json
           if-no-files-found: warn
           retention-days: 14
