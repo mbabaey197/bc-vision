@@ -38,6 +38,31 @@ class StreamState:
     last_frame_at: float = 0.0
 
 
+@dataclass
+class StreamMetrics:
+    """Monotonic counters used by the repeatable capacity baseline.
+
+    These counters describe work performed by the production stream path.  In
+    particular, ``anpr_queue_coalesced_frames`` counts decoded frames replaced
+    by a newer frame before the live worker could receive them; it must not be
+    confused with RTSP packet loss, which OpenCV does not expose portably.
+    """
+
+    started_at: float = 0.0
+    source_fps: float = 0.0
+    decoded_frames: int = 0
+    decode_seconds: float = 0.0
+    capture_failures: int = 0
+    published_frames: int = 0
+    jpeg_attempts: int = 0
+    jpeg_frames: int = 0
+    jpeg_seconds: float = 0.0
+    jpeg_bytes: int = 0
+    anpr_queue_frames: int = 0
+    anpr_queue_coalesced_frames: int = 0
+    anpr_submitted_frames: int = 0
+
+
 class CameraStream:
     def __init__(
         self,
@@ -84,6 +109,8 @@ class CameraStream:
         self.pause_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.lock = threading.Lock()
+        self._metrics_lock = threading.Lock()
+        self._metrics = StreamMetrics(started_at=time.monotonic())
         self._lifecycle_lock = threading.Lock()
         self._stop_lock = threading.Lock()
         self._capture_lock = threading.Lock()
@@ -103,6 +130,75 @@ class CameraStream:
         self._anpr_submit_error = ""
         self._anpr_aborted = False
         self._anpr_thread = None
+
+    def _record_decode(self, seconds: float) -> None:
+        with self._metrics_lock:
+            self._metrics.decoded_frames += 1
+            self._metrics.decode_seconds += max(0.0, float(seconds))
+
+    def _record_capture_failure(self) -> None:
+        with self._metrics_lock:
+            self._metrics.capture_failures += 1
+
+    def _record_jpeg(self, seconds: float, payload: bytes | None) -> None:
+        with self._metrics_lock:
+            self._metrics.jpeg_attempts += 1
+            self._metrics.jpeg_seconds += max(0.0, float(seconds))
+            if payload:
+                self._metrics.jpeg_frames += 1
+                self._metrics.jpeg_bytes += len(payload)
+
+    def _set_source_fps(self, value: float) -> None:
+        try:
+            fps = float(value)
+        except (TypeError, ValueError, OverflowError):
+            fps = 0.0
+        if not 1.0 <= fps <= 120.0:
+            fps = 0.0
+        with self._metrics_lock:
+            self._metrics.source_fps = fps
+
+    def metrics_snapshot(self) -> dict:
+        """Return a stable JSON-safe snapshot without resetting counters."""
+
+        with self._metrics_lock:
+            values = StreamMetrics(**vars(self._metrics))
+        elapsed = max(0.0, time.monotonic() - values.started_at)
+        return {
+            "elapsed_seconds": round(elapsed, 6),
+            "source_fps": round(values.source_fps, 6),
+            "decoded_frames": values.decoded_frames,
+            "decode_seconds": round(values.decode_seconds, 6),
+            "mean_decode_ms": round(
+                values.decode_seconds * 1000.0
+                / max(1, values.decoded_frames),
+                6,
+            ),
+            "decode_fps": round(
+                values.decoded_frames / max(elapsed, 1e-9),
+                6,
+            ),
+            "capture_failures": values.capture_failures,
+            "published_frames": values.published_frames,
+            "jpeg_attempts": values.jpeg_attempts,
+            "jpeg_frames": values.jpeg_frames,
+            "jpeg_seconds": round(values.jpeg_seconds, 6),
+            "mean_jpeg_ms": round(
+                values.jpeg_seconds * 1000.0
+                / max(1, values.jpeg_attempts),
+                6,
+            ),
+            "jpeg_fps": round(
+                values.jpeg_frames / max(elapsed, 1e-9),
+                6,
+            ),
+            "jpeg_bytes": values.jpeg_bytes,
+            "anpr_queue_frames": values.anpr_queue_frames,
+            "anpr_queue_coalesced_frames": (
+                values.anpr_queue_coalesced_frames
+            ),
+            "anpr_submitted_frames": values.anpr_submitted_frames,
+        }
 
     def start(self) -> bool:
         with self._lifecycle_lock:
@@ -778,6 +874,7 @@ class CameraStream:
         return [dict(row) for row in self._overlay_rows]
 
     def _encode(self, frame):
+        started = time.perf_counter()
         display = frame.copy()
         try:
             for result in self._live_overlays(frame):
@@ -829,7 +926,9 @@ class CameraStream:
             display,
             [int(cv2.IMWRITE_JPEG_QUALITY), self.quality],
         )
-        return bytes(buffer) if ok else None
+        payload = bytes(buffer) if ok else None
+        self._record_jpeg(time.perf_counter() - started, payload)
+        return payload
 
 
     def _queue_anpr(self, frame):
@@ -846,6 +945,10 @@ class CameraStream:
                 return
             if self.stop_event.is_set() or self._anpr_aborted:
                 return
+            with self._metrics_lock:
+                self._metrics.anpr_queue_frames += 1
+                if self._anpr_pending_frame is not None:
+                    self._metrics.anpr_queue_coalesced_frames += 1
             self._anpr_pending_frame = frame
             self._anpr_condition.notify_all()
         self._anpr_event.set()
@@ -867,6 +970,8 @@ class CameraStream:
                 try:
                     from app.ai.live_worker import submit_live_frame
                     submit_live_frame(self.camera_id, self.name, frame)
+                    with self._metrics_lock:
+                        self._metrics.anpr_submitted_frames += 1
                 except Exception as exc:
                     with self._anpr_condition:
                         if not self._anpr_submit_error:
@@ -889,6 +994,8 @@ class CameraStream:
         # decoder. Neither OCR nor activity scoring can slow the video clock.
         if self.stop_event.is_set():
             return
+        with self._metrics_lock:
+            self._metrics.published_frames += 1
         now_mono = time.monotonic()
         display_fps = (
             min(20, max(self.fps, 15))
@@ -995,6 +1102,7 @@ class CameraStream:
                         source_fps = 0.0
                     if not 1.0 <= source_fps <= 120.0:
                         source_fps = max(1.0, float(self.fps))
+                    self._set_source_fps(source_fps)
                     frame_delay = 1.0 / source_fps
                     deadline = time.monotonic()
                     for video_frame in container.decode(video=0):
@@ -1003,7 +1111,11 @@ class CameraStream:
                         self._wait_while_paused()
                         if self.stop_event.is_set():
                             return
+                        decode_started = time.perf_counter()
                         frame = video_frame.to_ndarray(format="bgr24")
+                        self._record_decode(
+                            time.perf_counter() - decode_started
+                        )
                         self._publish(frame)
                         published += 1
                         deadline += frame_delay
@@ -1057,8 +1169,14 @@ class CameraStream:
                 capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
                 playback_delay = dashboard_delay
+                try:
+                    source_fps = float(
+                        capture.get(cv2.CAP_PROP_FPS) or 0.0
+                    )
+                except (AttributeError, TypeError, ValueError, OverflowError):
+                    source_fps = 0.0
+                self._set_source_fps(source_fps)
                 if is_video_file:
-                    source_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
                     if 1.0 <= source_fps <= 120.0:
                         playback_delay = 1.0 / source_fps
                 deadline = time.monotonic()
@@ -1067,7 +1185,9 @@ class CameraStream:
                     self._wait_while_paused()
                     if self.stop_event.is_set():
                         break
+                    decode_started = time.perf_counter()
                     ok, frame = capture.read()
+                    decode_seconds = time.perf_counter() - decode_started
                     if not ok or frame is None:
                         if is_video_file:
                             capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -1079,7 +1199,10 @@ class CameraStream:
                                 break
                             deadline = time.monotonic()
                             continue
+                        self._record_capture_failure()
                         raise RuntimeError("Camera stopped sending frames")
+
+                    self._record_decode(decode_seconds)
 
                     self._publish(frame)
                     published += 1
@@ -1326,6 +1449,7 @@ class StreamManager:
             "anpr_marker_error": "",
             "error": "stream not started",
             "last_frame_at": 0.0,
+            "stream_metrics": {},
         }
         if stream:
             base = {
@@ -1338,6 +1462,7 @@ class StreamManager:
                 "anpr_marker_error": stream.state.anpr_marker_error,
                 "error": stream.state.last_error,
                 "last_frame_at": stream.state.last_frame_at,
+                "stream_metrics": stream.metrics_snapshot(),
             }
         try:
             from app.ai.live_worker import live_anpr_status
