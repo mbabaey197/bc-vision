@@ -1,8 +1,8 @@
 # BC Vision transactional fast updates
 
-RC29 is the immutable full-runtime base. It installs Python, native libraries,
+RC30 is the immutable full-runtime base. It installs Python, native libraries,
 AI runtimes, `BCVision.exe`, the verified `app` payload and the stable runtime
-loader once. A normal update after RC29 contains only the versioned `app`
+loader once. A normal update after RC30 contains only the versioned `app`
 payload inside a small one-click updater.
 
 ## Release paths
@@ -23,7 +23,7 @@ payload inside a small one-click updater.
 - `Fast one-click update` is the routine path. Every push to `main` that changes
   `VERSION` starts it automatically at the same time as `ANPR tests`. A base
   version is detected as a successful no-op. A fast child such as
-  `2.2.0-rc29.1` downloads the contract from release `v2.2.0-rc29`, verifies
+  `2.2.0-rc30.1` downloads the contract from release `v2.2.0-rc30`, verifies
   that the base tag is an ancestor of the exact update SHA, rejects a version
   that is not newer than every existing valid fast release (except an exact-tag
   rerun of the same SHA), builds a payload below 10 MiB and an updater below
@@ -40,7 +40,7 @@ waits up to 18 minutes (inside a 20-minute job timeout) rather than rejecting a
 healthy commit at an unmeasured 210-second deadline, and it never publishes
 before the exact SHA succeeds. Commit statuses `bcvision/fast-release` and
 `bcvision/full-release` expose the final result to connected tooling. The first
-fast child additionally runs the slower mandatory real RC29
+fast child additionally runs the slower mandatory real RC30
 Setup-to-fast-update integration job; it is a one-time bootstrap gate. Manual
 runs may request it again with the `verify_base_install` input.
 
@@ -82,11 +82,11 @@ diagnostic to the normal writable application log. Marker cleanup/commit stays
 owned by an elevated installer, so a denied Program Files write cannot prevent
 the application from starting on its fallback.
 
-The full RC29 Setup/Update installer also excludes runtime pointers from its
+The full RC30 Setup/Update installer also excludes runtime pointers from its
 recursive file copy. When used as a repair after a confirmed fast release, it
 isolates and verifies the newest compatible fast payload and recommits that
 version after replacing base files. It refuses an incompatible or unverifiable
-newer pointer instead of activating bundled RC29 against a potentially migrated
+newer pointer instead of activating bundled RC30 against a potentially migrated
 database.
 
 ## Persistent customer data
@@ -100,7 +100,7 @@ also verifies they survive uninstall.
 
 ## Runtime compatibility rules
 
-After RC29 is published, do not modify any runtime-contract file for a fast
+After RC30 is published, do not modify any runtime-contract file for a fast
 release. Changes to these areas require a new full base, a new ABI and new
 immutable contract assets:
 

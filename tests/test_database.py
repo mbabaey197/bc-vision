@@ -1,5 +1,9 @@
 import importlib
 import sqlite3
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 
 def test_old_database_migrates_without_data_loss(
@@ -135,6 +139,11 @@ def test_old_database_migrates_without_data_loss(
             "SELECT COUNT(*) FROM sqlite_master "
             "WHERE type='table' AND name='anpr_training_runs'"
         ).fetchone()[0] == 1
+        assert con.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type='table' "
+            "AND name='anpr_persistence_receipts'"
+        ).fetchone()[0] == 1
         training_columns = {
             row[1]
             for row in con.execute(
@@ -178,6 +187,17 @@ def test_old_database_migrates_without_data_loss(
             "SELECT COUNT(*) FROM users "
             "WHERE username='existing'"
         ).fetchone()[0] == 1
+        assert {"must_change_password", "session_version"} <= {
+            row[1] for row in con.execute("PRAGMA table_info(users)")
+        }
+        assert {
+            "token_hash",
+            "expires_at",
+            "revoked_at",
+        } <= {
+            row[1]
+            for row in con.execute("PRAGMA table_info(revoked_sessions)")
+        }
         assert con.execute(
             "SELECT value FROM settings "
             "WHERE key='anpr_detector_model'"
@@ -192,6 +212,13 @@ def test_old_database_migrates_without_data_loss(
         assert "idx_plate_events_city_created" in indexes
         assert "idx_plate_events_region_created" in indexes
         assert "idx_plate_events_updated_at" in indexes
+        receipt_indexes = {
+            row[1]
+            for row in con.execute(
+                "PRAGMA index_list(anpr_persistence_receipts)"
+            )
+        }
+        assert "idx_anpr_receipts_event" in receipt_indexes
 
 
 def test_new_database_has_no_automatic_demo_camera(
@@ -217,6 +244,233 @@ def test_new_database_has_no_automatic_demo_camera(
             "SELECT value FROM settings "
             "WHERE key='migration_video_anpr_markers_rc29_v1'"
         ).fetchone()[0] == "1"
+        assert con.execute(
+            "SELECT must_change_password FROM users WHERE username='admin'"
+        ).fetchone()[0] == 1
+
+
+def test_legacy_bootstrap_password_requires_change_but_custom_password_does_not(
+    tmp_path,
+    monkeypatch,
+):
+    import app.database
+
+    db_path = tmp_path / "legacy-password.db"
+    monkeypatch.setattr(app.database, "DB_PATH", db_path)
+    app.database.init_db()
+    with app.database.connect() as con:
+        con.execute(
+            "UPDATE users SET must_change_password=0 WHERE username='admin'"
+        )
+
+    app.database.init_db()
+    with app.database.connect() as con:
+        assert con.execute(
+            "SELECT must_change_password FROM users WHERE username='admin'"
+        ).fetchone()[0] == 1
+        con.execute(
+            "UPDATE users SET password_hash=?,must_change_password=0 "
+            "WHERE username='admin'",
+            (app.database.hash_password("a-unique-strong-password"),),
+        )
+
+    app.database.init_db()
+    with app.database.connect() as con:
+        assert con.execute(
+            "SELECT must_change_password FROM users WHERE username='admin'"
+        ).fetchone()[0] == 0
+
+
+def test_duplicate_current_feedback_is_migrated_to_one_truth_row(
+    tmp_path,
+    monkeypatch,
+):
+    import app.database
+
+    db_path = tmp_path / "duplicate-feedback.db"
+    monkeypatch.setattr(app.database, "DB_PATH", db_path)
+    app.database.init_db()
+    with app.database.connect() as con:
+        con.execute("DROP INDEX idx_anpr_feedback_current_event")
+        event_id = con.execute(
+            "INSERT INTO plate_events(plate_text,plate_norm) VALUES(?,?)",
+            ("12ب34567", "12ب34567"),
+        ).lastrowid
+        con.executemany(
+            "INSERT INTO anpr_feedback("
+            "event_id,observed_text,corrected_text,corrected_norm,status"
+            ") VALUES(?,?,?,?,'confirmed')",
+            [
+                (event_id, "12ب34567", "12ب34567", "12ب34567"),
+                (event_id, "12ب34567", "12ب34568", "12ب34568"),
+            ],
+        )
+
+    app.database.init_db()
+
+    with app.database.connect() as con:
+        rows = con.execute(
+            "SELECT status,corrected_norm FROM anpr_feedback "
+            "WHERE event_id=? ORDER BY id",
+            (event_id,),
+        ).fetchall()
+        indexes = {
+            row[1]
+            for row in con.execute("PRAGMA index_list(anpr_feedback)")
+        }
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute(
+                "INSERT INTO anpr_feedback("
+                "event_id,observed_text,corrected_text,corrected_norm,status"
+                ") VALUES(?,?,?,?,'confirmed')",
+                (event_id, "12ب34567", "12ب34569", "12ب34569"),
+            )
+
+    assert [tuple(row) for row in rows] == [
+        ("superseded", "12ب34567"),
+        ("confirmed", "12ب34568"),
+    ]
+    assert "idx_anpr_feedback_current_event" in indexes
+
+
+def test_legacy_receipt_foreign_key_migrates_to_retention_tombstone(
+    tmp_path,
+    monkeypatch,
+):
+    import app.database
+
+    db_path = tmp_path / "legacy-receipt.db"
+    monkeypatch.setattr(app.database, "DB_PATH", db_path)
+    app.database.init_db()
+    with app.database.connect() as con:
+        camera_id = int(con.execute(
+            "INSERT INTO cameras(name,rtsp_url) VALUES(?,?)",
+            ("Gate", "rtsp://gate"),
+        ).lastrowid)
+        event_id = int(con.execute(
+            "INSERT INTO plate_events(camera_id,plate_norm) VALUES(?,?)",
+            (camera_id, "31ط55674"),
+        ).lastrowid)
+        con.execute("DROP TABLE anpr_persistence_receipts")
+        con.execute("""
+            CREATE TABLE anpr_persistence_receipts(
+                persistence_key TEXT PRIMARY KEY,
+                event_id INTEGER NOT NULL,
+                committed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(event_id) REFERENCES plate_events(id)
+                    ON DELETE CASCADE
+            )
+        """)
+        con.execute(
+            "INSERT INTO anpr_persistence_receipts(persistence_key,event_id) "
+            "VALUES(?,?)",
+            ("legacy-token", event_id),
+        )
+
+    app.database.init_db()
+
+    with app.database.connect() as con:
+        assert con.execute(
+            "PRAGMA foreign_key_list(anpr_persistence_receipts)"
+        ).fetchall() == []
+        assert tuple(con.execute(
+            "SELECT persistence_key,event_id "
+            "FROM anpr_persistence_receipts"
+        ).fetchone()) == ("legacy-token", event_id)
+        con.execute("DELETE FROM plate_events WHERE id=?", (event_id,))
+        assert con.execute(
+            "SELECT event_id FROM anpr_persistence_receipts "
+            "WHERE persistence_key='legacy-token'"
+        ).fetchone()[0] == event_id
+
+
+def test_legacy_feedback_cascade_migrates_to_retained_truth(
+    tmp_path,
+    monkeypatch,
+):
+    import app.database
+
+    db_path = tmp_path / "legacy-feedback.db"
+    monkeypatch.setattr(app.database, "DB_PATH", db_path)
+    app.database.init_db()
+    with app.database.connect() as con:
+        event_id = int(con.execute(
+            "INSERT INTO plate_events(plate_text,plate_norm) VALUES(?,?)",
+            ("31-ط-556-74", "31ط55674"),
+        ).lastrowid)
+        feedback_id = int(con.execute(
+            "INSERT INTO anpr_feedback("
+            "event_id,observed_text,observed_norm,corrected_text,"
+            "corrected_norm,status,training_status,sample_path,"
+            "sample_sha256"
+            ") VALUES(?,?,?,?,?,'confirmed','ready',?,?)",
+            (
+                event_id,
+                "31-ط-556-74",
+                "31ط55674",
+                "31-ط-556-74",
+                "31ط55674",
+                "/retained/sample.png",
+                "A" * 64,
+            ),
+        ).lastrowid)
+
+    # Recreate the exact pre-migration constraint while retaining every
+    # current column, then exercise the public init migration.
+    with sqlite3.connect(db_path) as con:
+        schema = con.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='anpr_feedback'"
+        ).fetchone()[0]
+        legacy_schema = schema.replace(
+            "event_id INTEGER,",
+            "event_id INTEGER NOT NULL,",
+        ).replace("ON DELETE SET NULL", "ON DELETE CASCADE")
+        columns = [
+            row[1]
+            for row in con.execute(
+                "PRAGMA table_info(anpr_feedback)"
+            ).fetchall()
+        ]
+        column_sql = ",".join(f'"{column}"' for column in columns)
+        con.execute(
+            "ALTER TABLE anpr_feedback "
+            "RENAME TO anpr_feedback_retained_source"
+        )
+        con.execute(legacy_schema)
+        con.execute(
+            f"INSERT INTO anpr_feedback({column_sql}) "
+            f"SELECT {column_sql} FROM anpr_feedback_retained_source"
+        )
+        con.execute("DROP TABLE anpr_feedback_retained_source")
+
+    app.database.init_db()
+
+    with app.database.connect() as con:
+        event_column = next(
+            row
+            for row in con.execute(
+                "PRAGMA table_info(anpr_feedback)"
+            ).fetchall()
+            if row[1] == "event_id"
+        )
+        feedback_fk = con.execute(
+            "PRAGMA foreign_key_list(anpr_feedback)"
+        ).fetchall()
+        assert int(event_column[3]) == 0
+        assert any(str(row[6]).upper() == "SET NULL" for row in feedback_fk)
+        con.execute("DELETE FROM plate_events WHERE id=?", (event_id,))
+        retained = con.execute(
+            "SELECT event_id,training_status,sample_path,sample_sha256 "
+            "FROM anpr_feedback WHERE id=?",
+            (feedback_id,),
+        ).fetchone()
+    assert tuple(retained) == (
+        None,
+        "ready",
+        "/retained/sample.png",
+        "A" * 64,
+    )
 
 
 def test_legacy_video_marker_backfill_is_one_time_and_preserves_interrupts(
@@ -437,6 +691,103 @@ def test_database_backup_is_atomic_and_valid(
         ).fetchone()[0] == "preserved"
 
 
+def test_database_backup_never_overwrites_existing_target(
+    tmp_path,
+    monkeypatch,
+):
+    import app.database
+
+    db_path = tmp_path / "live.db"
+    backup_path = tmp_path / "backups" / "snapshot.db"
+    backup_path.parent.mkdir()
+    backup_path.write_bytes(b"foreign-backup")
+    monkeypatch.setattr(app.database, "DB_PATH", db_path)
+    app.database.init_db()
+
+    with pytest.raises(FileExistsError):
+        app.database.backup_database(backup_path)
+
+    assert backup_path.read_bytes() == b"foreign-backup"
+    assert list(backup_path.parent.glob(".*.tmp")) == []
+
+
+def test_database_backup_does_not_follow_destination_symlink(
+    tmp_path,
+    monkeypatch,
+):
+    import app.database
+
+    db_path = tmp_path / "live.db"
+    backup_path = tmp_path / "backups" / "snapshot.db"
+    backup_path.parent.mkdir()
+    external = tmp_path / "external.db"
+    external.write_bytes(b"external")
+    try:
+        backup_path.symlink_to(external)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    monkeypatch.setattr(app.database, "DB_PATH", db_path)
+    app.database.init_db()
+
+    with pytest.raises(FileExistsError):
+        app.database.backup_database(backup_path)
+
+    assert backup_path.is_symlink()
+    assert external.read_bytes() == b"external"
+
+
+def test_database_backup_preserves_foreign_temp_collision(
+    tmp_path,
+    monkeypatch,
+):
+    import app.database
+
+    db_path = tmp_path / "live.db"
+    backup_path = tmp_path / "backups" / "snapshot.db"
+    backup_path.parent.mkdir()
+    collision = backup_path.parent / ".snapshot.db.fixed.tmp"
+    collision.write_bytes(b"foreign-temp")
+    monkeypatch.setattr(app.database, "DB_PATH", db_path)
+    monkeypatch.setattr(
+        app.database,
+        "uuid4",
+        lambda: SimpleNamespace(hex="fixed"),
+    )
+    app.database.init_db()
+
+    with pytest.raises(FileExistsError):
+        app.database.backup_database(backup_path)
+
+    assert collision.read_bytes() == b"foreign-temp"
+    assert not backup_path.exists()
+
+
+def test_database_backup_falls_back_when_hardlinks_are_unavailable(
+    tmp_path,
+    monkeypatch,
+):
+    import app.database
+
+    db_path = tmp_path / "live.db"
+    backup_path = tmp_path / "backups" / "snapshot.db"
+    monkeypatch.setattr(app.database, "DB_PATH", db_path)
+    monkeypatch.setattr(
+        app.database.os,
+        "link",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("hardlinks unsupported")
+        ),
+    )
+    app.database.init_db()
+
+    result = app.database.backup_database(backup_path)
+
+    assert result == backup_path.resolve()
+    assert backup_path.stat().st_nlink == 1
+    with sqlite3.connect(backup_path) as snapshot:
+        assert snapshot.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+
+
 def test_settings_can_be_updated_in_migrated_database(
     tmp_path,
     monkeypatch,
@@ -468,3 +819,36 @@ def test_settings_can_be_updated_in_migrated_database(
         assert new_db.execute(
             "SELECT value FROM settings WHERE key='video_path'"
         ).fetchone()[0] == str(migrated.parent / "videos")
+    assert not Path(str(migrated) + "-wal").exists()
+    assert not Path(str(migrated) + "-shm").exists()
+
+
+def test_settings_batch_rolls_back_if_update_is_interrupted(tmp_path):
+    import app.database
+
+    database = tmp_path / "atomic-settings.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO settings(key,value) VALUES(?,?)",
+            (("storage_root", "/old"), ("video_path", "/old/videos")),
+        )
+
+    class InterruptedValues(dict):
+        def items(self):
+            yield "storage_root", "/new"
+            raise RuntimeError("simulated power loss")
+
+    with pytest.raises(RuntimeError, match="simulated power loss"):
+        app.database.set_settings_for_database(
+            database,
+            InterruptedValues(),
+        )
+
+    with sqlite3.connect(database) as connection:
+        assert dict(connection.execute("SELECT key,value FROM settings")) == {
+            "storage_root": "/old",
+            "video_path": "/old/videos",
+        }

@@ -14,6 +14,19 @@ from app.ai.training_worker import _load_manifest
 from tools.prepare_cct_dataset import _load_rows
 
 
+@pytest.fixture(autouse=True)
+def _reset_pending_feedback_pins():
+    training.close_pending_feedback_source_pins()
+    yield
+    training.close_pending_feedback_source_pins()
+
+
+def test_training_digest_validation_requires_hexadecimal_sha256():
+    assert training._valid_sha256("A" * 64) is True
+    assert training._valid_sha256("G" * 64) is False
+    assert training._valid_sha256("A" * 63) is False
+
+
 def _isolated_database(tmp_path, monkeypatch):
     import app.config
     import app.database
@@ -24,6 +37,24 @@ def _isolated_database(tmp_path, monkeypatch):
     monkeypatch.setattr(app.config, "DATA_DIR", data_dir)
     monkeypatch.setattr(app.database, "DB_PATH", db_path)
     app.database.init_db()
+    # Feedback crops in these unit tests live directly below tmp_path. Model
+    # the same configured/current media-root invariant used in production so
+    # capture_feedback_sample exercises the real read-pin policy.
+    storage_root = tmp_path.parent
+    with app.database.connect() as connection:
+        connection.executemany(
+            "INSERT INTO settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (
+                ("storage_root", str(storage_root)),
+                ("plate_path", str(tmp_path)),
+                ("snapshot_path", str(storage_root / f"{tmp_path.name}-snapshots")),
+                ("video_path", str(storage_root / f"{tmp_path.name}-videos")),
+                ("backup_path", str(storage_root / f"{tmp_path.name}-backups")),
+                ("media_roots_history", "[]"),
+                ("max_storage_gb", "0"),
+            ),
+        )
     return app.database, data_dir
 
 
@@ -325,6 +356,160 @@ def test_confirmed_feedback_becomes_verified_training_sample(
     assert row["sample_sha256"] == result["sha256"]
 
 
+def test_transient_capture_failure_keeps_source_pinned_for_retry(
+    tmp_path,
+    monkeypatch,
+):
+    database, _data_dir = _isolated_database(tmp_path, monkeypatch)
+    image_path = tmp_path / "retry-source.jpg"
+    assert cv2.imwrite(
+        str(image_path),
+        np.full((48, 180, 3), 170, dtype=np.uint8),
+    )
+    with database.connect() as con:
+        event_id = con.execute(
+            "INSERT INTO plate_events(plate_text,plate_norm) VALUES(?,?)",
+            ("12-ب-345-67", "12ب34567"),
+        ).lastrowid
+        feedback_id = con.execute(
+            "INSERT INTO anpr_feedback("
+            "event_id,observed_text,observed_norm,corrected_text,"
+            "corrected_norm,plate_image_path,status"
+            ") VALUES(?,?,?,?,?,?,'confirmed')",
+            (
+                event_id,
+                "12-ب-345-67",
+                "12ب34567",
+                "12-ب-345-67",
+                "12ب34567",
+                str(image_path),
+            ),
+        ).lastrowid
+
+    original_capture = training._capture_feedback_sample
+
+    def fail_capture(_feedback_id):
+        raise RuntimeError("transient encoder failure")
+
+    monkeypatch.setattr(training, "_capture_feedback_sample", fail_capture)
+    with pytest.raises(RuntimeError, match="transient encoder failure"):
+        training.capture_feedback_sample(feedback_id)
+
+    assert feedback_id in training._PENDING_SOURCE_PINS
+    assert image_path.is_file()
+
+    monkeypatch.setattr(training, "_capture_feedback_sample", original_capture)
+    assert training.capture_feedback_sample(feedback_id)["ready"] is True
+    assert feedback_id not in training._PENDING_SOURCE_PINS
+
+
+def test_refresh_pending_pins_rejects_directory_row_individually(
+    tmp_path,
+    monkeypatch,
+):
+    database, _data_dir = _isolated_database(tmp_path, monkeypatch)
+    image_path = tmp_path / "valid-source.jpg"
+    assert cv2.imwrite(
+        str(image_path),
+        np.full((48, 180, 3), 170, dtype=np.uint8),
+    )
+    with database.connect() as con:
+        event_ids = [
+            con.execute(
+                "INSERT INTO plate_events(plate_text,plate_norm) VALUES(?,?)",
+                ("12-ب-345-67", "12ب34567"),
+            ).lastrowid
+            for _ in range(2)
+        ]
+        feedback_ids = [
+            con.execute(
+                "INSERT INTO anpr_feedback("
+                "event_id,observed_text,observed_norm,corrected_text,"
+                "corrected_norm,plate_image_path,status"
+                ") VALUES(?,?,?,?,?,?,'confirmed')",
+                (
+                    event_id,
+                    "12-ب-345-67",
+                    "12ب34567",
+                    "12-ب-345-67",
+                    "12ب34567",
+                    str(source),
+                ),
+            ).lastrowid
+            for event_id, source in zip(
+                event_ids,
+                (tmp_path, image_path),
+                strict=True,
+            )
+        ]
+
+    status = training.refresh_pending_feedback_source_pins()
+
+    assert status["pending"] == 2
+    assert status["pinned"] == 1
+    assert status["failed_ids"] == [feedback_ids[0]]
+    assert set(training._PENDING_SOURCE_PINS) == {feedback_ids[1]}
+
+
+def test_reconcile_corrupt_training_sample_recaptures_source(
+    tmp_path,
+    monkeypatch,
+):
+    database, _data_dir = _isolated_database(tmp_path, monkeypatch)
+    image_path = tmp_path / "reconcile-source.jpg"
+    assert cv2.imwrite(
+        str(image_path),
+        np.full((48, 180, 3), 170, dtype=np.uint8),
+    )
+    with database.connect() as con:
+        event_id = con.execute(
+            "INSERT INTO plate_events(plate_text,plate_norm) VALUES(?,?)",
+            ("12-ب-345-67", "12ب34567"),
+        ).lastrowid
+        feedback_id = con.execute(
+            "INSERT INTO anpr_feedback("
+            "event_id,observed_text,observed_norm,corrected_text,"
+            "corrected_norm,plate_image_path,status"
+            ") VALUES(?,?,?,?,?,?,'confirmed')",
+            (
+                event_id,
+                "12-ب-345-67",
+                "12ب34567",
+                "12-ب-345-67",
+                "12ب34567",
+                str(image_path),
+            ),
+        ).lastrowid
+
+    captured = training.capture_feedback_sample(feedback_id)
+    sample_path = Path(captured["path"])
+    sample_path.write_bytes(b"corrupt")
+    with database.connect() as con:
+        con.execute(
+            "UPDATE anpr_feedback SET training_status='trained',"
+            "trained_run_id=99 WHERE id=?",
+            (feedback_id,),
+        )
+
+    reconciled = training.reconcile_feedback_sample_files()
+    pinned = training.refresh_pending_feedback_source_pins()
+    recovered = training.recover_pending_feedback_samples(1)
+
+    assert reconciled["reset_ids"] == [feedback_id]
+    assert pinned["pinned"] == 1
+    assert recovered["recovered"] == 1
+    with database.connect() as con:
+        row = con.execute(
+            "SELECT training_status,trained_run_id,sample_path "
+            "FROM anpr_feedback WHERE id=?",
+            (feedback_id,),
+        ).fetchone()
+    assert row["training_status"] == "ready"
+    assert row["trained_run_id"] is None
+    assert Path(row["sample_path"]).is_file()
+    assert feedback_id not in training._PENDING_SOURCE_PINS
+
+
 def test_duplicate_confirmed_crop_is_not_counted_twice(
     tmp_path,
     monkeypatch,
@@ -383,6 +568,256 @@ def test_duplicate_confirmed_crop_is_not_counted_twice(
             (feedback_ids[1],),
         ).fetchone()[0]
     assert status == "duplicate"
+
+
+def test_conflicting_duplicate_quarantines_trained_and_duplicate_rows(
+    tmp_path,
+    monkeypatch,
+):
+    database, _data_dir = _isolated_database(tmp_path, monkeypatch)
+    image_path = tmp_path / "plate.jpg"
+    assert cv2.imwrite(
+        str(image_path),
+        np.full((48, 180, 3), 170, dtype=np.uint8),
+    )
+    labels = ("12ب34567", "12ب34567", "12پ34567")
+    with database.connect() as con:
+        feedback_ids = []
+        for label in labels:
+            event_id = con.execute(
+                "INSERT INTO plate_events(plate_text,plate_norm) VALUES(?,?)",
+                (label, label),
+            ).lastrowid
+            feedback_ids.append(
+                con.execute(
+                    "INSERT INTO anpr_feedback("
+                    "event_id,observed_text,observed_norm,corrected_text,"
+                    "corrected_norm,plate_image_path,status"
+                    ") VALUES(?,?,?,?,?,?,?)",
+                    (
+                        event_id,
+                        label,
+                        label,
+                        label,
+                        label,
+                        str(image_path),
+                        "confirmed",
+                    ),
+                ).lastrowid
+            )
+
+    first = training.capture_feedback_sample(feedback_ids[0])
+    assert first["ready"] is True
+    with database.connect() as con:
+        con.execute(
+            "UPDATE anpr_feedback SET training_status='trained' WHERE id=?",
+            (feedback_ids[0],),
+        )
+    duplicate = training.capture_feedback_sample(feedback_ids[1])
+    assert duplicate["reason"] == "duplicate-image"
+
+    conflict = training.capture_feedback_sample(feedback_ids[2])
+
+    assert conflict == {
+        "ready": False,
+        "reason": "duplicate-label-conflict",
+    }
+    with database.connect() as con:
+        statuses = [
+            row[0]
+            for row in con.execute(
+                "SELECT training_status FROM anpr_feedback ORDER BY id"
+            ).fetchall()
+        ]
+    assert statuses == ["label-conflict"] * 3
+    assert training._verified_samples() == []
+
+
+@pytest.mark.parametrize("letter", ["ف", "ک", "گ", "D", "S"])
+def test_capture_rejects_plate_letters_missing_from_crnn_alphabet(
+    tmp_path,
+    monkeypatch,
+    letter,
+):
+    database, data_dir = _isolated_database(tmp_path, monkeypatch)
+    label = f"12{letter}34567"
+    image_path = tmp_path / f"plate-{ord(letter):x}.jpg"
+    assert cv2.imwrite(
+        str(image_path),
+        np.full((48, 180, 3), 170, dtype=np.uint8),
+    )
+    with database.connect() as con:
+        event_id = con.execute(
+            "INSERT INTO plate_events(plate_text,plate_norm) VALUES(?,?)",
+            (label, label),
+        ).lastrowid
+        feedback_id = con.execute(
+            "INSERT INTO anpr_feedback("
+            "event_id,observed_text,observed_norm,corrected_text,"
+            "corrected_norm,plate_image_path,status"
+            ") VALUES(?,?,?,?,?,?,?)",
+            (
+                event_id,
+                label,
+                label,
+                label,
+                label,
+                str(image_path),
+                "confirmed",
+            ),
+        ).lastrowid
+
+    assert training.capture_feedback_sample(feedback_id) == {
+        "ready": False,
+        "reason": "unsupported-alphabet",
+    }
+    with database.connect() as con:
+        status = con.execute(
+            "SELECT training_status FROM anpr_feedback WHERE id=?",
+            (feedback_id,),
+        ).fetchone()[0]
+    assert status == "unsupported-alphabet"
+    assert not (data_dir / "anpr-training" / "samples").exists()
+
+
+def test_training_snapshot_rejects_legacy_unsupported_alphabet(
+    tmp_path,
+    monkeypatch,
+):
+    database, _data_dir = _isolated_database(tmp_path, monkeypatch)
+    label = "12ف34567"
+    with database.connect() as con:
+        event_id = con.execute(
+            "INSERT INTO plate_events(plate_text,plate_norm) VALUES(?,?)",
+            (label, label),
+        ).lastrowid
+        feedback_id = con.execute(
+            "INSERT INTO anpr_feedback("
+            "event_id,observed_text,observed_norm,corrected_text,"
+            "corrected_norm,status,training_status"
+            ") VALUES(?,?,?,?,?,'confirmed','ready')",
+            (event_id, label, label, label, label),
+        ).lastrowid
+    manifest = tmp_path / "dataset.json"
+    manifest_sha256 = _write_operator_manifest(manifest, plate=label)
+
+    with pytest.raises(ValueError, match="unsupported alphabet"):
+        training._reject_unsupported_manifest_labels(
+            manifest,
+            expected_sha256=manifest_sha256,
+        )
+
+    with database.connect() as con:
+        status = con.execute(
+            "SELECT training_status FROM anpr_feedback WHERE id=?",
+            (feedback_id,),
+        ).fetchone()[0]
+    assert status == "unsupported-alphabet"
+
+
+def test_pending_feedback_recovery_is_bounded_and_idempotent(
+    tmp_path,
+    monkeypatch,
+):
+    database, _data_dir = _isolated_database(tmp_path, monkeypatch)
+    good_image = tmp_path / "good.jpg"
+    assert cv2.imwrite(
+        str(good_image),
+        np.full((48, 180, 3), 170, dtype=np.uint8),
+    )
+    with database.connect() as con:
+        feedback_ids = []
+        for index, image_path in enumerate(
+            (tmp_path / "missing.jpg", good_image),
+            start=1,
+        ):
+            label = f"1{index}ب34{index}67"
+            event_id = con.execute(
+                "INSERT INTO plate_events(plate_text,plate_norm) VALUES(?,?)",
+                (label, label),
+            ).lastrowid
+            feedback_ids.append(
+                con.execute(
+                    "INSERT INTO anpr_feedback("
+                    "event_id,observed_text,observed_norm,corrected_text,"
+                    "corrected_norm,plate_image_path,status,training_status"
+                    ") VALUES(?,?,?,?,?,?,?,'pending')",
+                    (
+                        event_id,
+                        label,
+                        label,
+                        label,
+                        label,
+                        str(image_path),
+                        "confirmed",
+                    ),
+                ).lastrowid
+            )
+
+    first = training.recover_pending_feedback_samples(limit=2)
+    second = training.recover_pending_feedback_samples(limit=2)
+
+    assert first["selected"] == 2
+    assert first["recovered"] == 1
+    assert first["failed"] == 1
+    assert [row["feedback_id"] for row in first["results"]] == feedback_ids
+    assert first["results"][0]["reason"] == "missing-image"
+    assert first["results"][1]["ready"] is True
+    assert second == {
+        "selected": 0,
+        "recovered": 0,
+        "failed": 0,
+        "results": [],
+    }
+    with database.connect() as con:
+        statuses = [
+            row[0]
+            for row in con.execute(
+                "SELECT training_status FROM anpr_feedback ORDER BY id"
+            ).fetchall()
+        ]
+    assert statuses == ["missing-image", "ready"]
+
+
+def test_pending_feedback_recovery_continues_after_unexpected_error(
+    tmp_path,
+    monkeypatch,
+):
+    database, _data_dir = _isolated_database(tmp_path, monkeypatch)
+    with database.connect() as con:
+        feedback_ids = []
+        for index in range(3):
+            label = f"1{index}ب34{index}67"
+            event_id = con.execute(
+                "INSERT INTO plate_events(plate_text,plate_norm) VALUES(?,?)",
+                (label, label),
+            ).lastrowid
+            feedback_ids.append(
+                con.execute(
+                    "INSERT INTO anpr_feedback("
+                    "event_id,observed_text,observed_norm,corrected_text,"
+                    "corrected_norm,status,training_status"
+                    ") VALUES(?,?,?,?,?,'confirmed','pending')",
+                    (event_id, label, label, label, label),
+                ).lastrowid
+            )
+    calls = []
+
+    def capture(feedback_id):
+        calls.append(feedback_id)
+        if feedback_id == feedback_ids[0]:
+            raise RuntimeError("one broken sample")
+        return {"ready": True}
+
+    monkeypatch.setattr(training, "capture_feedback_sample", capture)
+
+    result = training.recover_pending_feedback_samples(limit=2)
+
+    assert calls == feedback_ids[:2]
+    assert result["selected"] == 2
+    assert result["recovered"] == 1
+    assert result["failed"] == 1
+    assert result["results"][0]["reason"] == "capture-error:RuntimeError"
 
 
 def test_conflicting_duplicate_label_is_rejected_if_old_copy_is_corrupt(
@@ -527,6 +962,10 @@ def test_verified_samples_deduplicate_legacy_rows_and_reject_conflicts(
 
     with database.connect() as con:
         for label in ("12ب34567", "12ب34567"):
+            duplicate_event_id = con.execute(
+                "INSERT INTO plate_events(plate_text,plate_norm) VALUES(?,?)",
+                (label, label),
+            ).lastrowid
             con.execute(
                 "INSERT INTO anpr_feedback("
                 "event_id,observed_text,observed_norm,"
@@ -534,7 +973,7 @@ def test_verified_samples_deduplicate_legacy_rows_and_reject_conflicts(
                 "sample_path,sample_sha256,dataset_split,training_status"
                 ") VALUES(?,?,?,?,?,?,?,?,?,'ready')",
                 (
-                    event_id,
+                    duplicate_event_id,
                     label,
                     label,
                     label,
@@ -600,6 +1039,30 @@ def test_exported_operator_manifest_is_portable_after_relocation(
     assert payload["distribution_allowed"] is False
     assert not Path(exported_path).is_absolute()
     assert exported_path.startswith("../samples/")
+
+    attested_manifest = training.export_manifest(
+        run_id=8,
+        rights_attested=True,
+        attested_by="admin",
+    )
+    attested_payload = json.loads(
+        attested_manifest.read_text(encoding="utf-8")
+    )
+    attested_digest = hashlib.sha256(
+        attested_manifest.read_bytes()
+    ).hexdigest().upper()
+    assert attested_payload["source_license"] == (
+        "operator-confirmed-company-owned"
+    )
+    assert attested_payload["ownership_attested"] is True
+    assert attested_payload["distribution_allowed"] is True
+    assert attested_payload["license_evidence"].startswith(
+        "bcvision-admin-attestation:admin:"
+    )
+    assert training._training_manifest_rights_verified(
+        attested_manifest,
+        expected_sha256=attested_digest,
+    ) is True
 
     relocated = tmp_path / "relocated-training"
     shutil.copytree(data_dir / "anpr-training", relocated)

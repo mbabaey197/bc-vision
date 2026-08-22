@@ -1,10 +1,13 @@
+import os
 import sqlite3
+import stat
+import time
 from contextlib import closing
 from pathlib import Path
 from uuid import uuid4
 
 from app.config import DB_PATH
-from app.security import hash_password
+from app.security import hash_password, verify_password
 
 
 def connect():
@@ -21,41 +24,241 @@ def connect():
 
 
 def backup_database(destination):
-    """Create an atomic, integrity-checked snapshot of the live database."""
-    target = Path(destination).expanduser().resolve()
+    """Create a no-clobber, integrity-checked snapshot of the live database."""
+
+    requested = Path(destination).expanduser()
+    target = requested.parent.resolve() / requested.name
     source_path = Path(DB_PATH).expanduser().resolve()
     if target == source_path:
         raise ValueError("Backup destination must differ from the live database.")
     target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(
-        f".{target.name}.{uuid4().hex}.tmp"
-    )
+    temporary = None
+    temporary_identity = None
+    published_identity = None
     try:
+        for _attempt in range(8):
+            candidate = target.with_name(
+                f".{target.name}.{uuid4().hex}.tmp"
+            )
+            try:
+                descriptor = os.open(
+                    candidate,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL
+                    | getattr(os, "O_BINARY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+            except FileExistsError:
+                continue
+            temporary = candidate
+            try:
+                opened = os.fstat(descriptor)
+                temporary_identity = (
+                    int(opened.st_dev), int(opened.st_ino),
+                )
+            finally:
+                os.close(descriptor)
+            break
+        if temporary is None or temporary_identity is None:
+            raise FileExistsError("could not reserve database backup temporary")
         with closing(connect()) as source, closing(
             sqlite3.connect(temporary)
         ) as snapshot:
+            snapshot.execute("PRAGMA synchronous=FULL")
             source.backup(snapshot)
             result = snapshot.execute("PRAGMA quick_check").fetchone()
             if not result or result[0] != "ok":
                 raise sqlite3.DatabaseError(
                     "SQLite backup integrity check failed."
                 )
-        temporary.replace(target)
+        with temporary.open("rb") as snapshot_file:
+            os.fsync(snapshot_file.fileno())
+        completed = temporary.lstat()
+        if (
+            not stat.S_ISREG(completed.st_mode)
+            or int(completed.st_nlink) != 1
+            or (int(completed.st_dev), int(completed.st_ino))
+            != temporary_identity
+        ):
+            raise OSError("database backup temporary changed before publish")
+        hardlinked = False
+        try:
+            os.link(temporary, target, follow_symlinks=False)
+            hardlinked = True
+        except FileExistsError:
+            raise
+        except OSError as link_error:
+            try:
+                current = target.lstat()
+            except FileNotFoundError:
+                current = None
+            if current is not None and (
+                stat.S_ISREG(current.st_mode)
+                and int(current.st_nlink) == 2
+                and (int(current.st_dev), int(current.st_ino))
+                == temporary_identity
+            ):
+                hardlinked = True
+            elif current is not None:
+                raise FileExistsError(
+                    f"database backup target already exists: {target}"
+                ) from link_error
+            else:
+                target_descriptor = None
+                try:
+                    target_descriptor = os.open(
+                        target,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                        | getattr(os, "O_BINARY", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                    )
+                    created = os.fstat(target_descriptor)
+                    published_identity = (
+                        int(created.st_dev), int(created.st_ino),
+                    )
+                    if (
+                        not stat.S_ISREG(created.st_mode)
+                        or int(created.st_nlink) != 1
+                    ):
+                        raise OSError("database backup target is unsafe")
+                    with temporary.open("rb") as source_file:
+                        source_details = os.fstat(source_file.fileno())
+                        if (
+                            not stat.S_ISREG(source_details.st_mode)
+                            or int(source_details.st_nlink) != 1
+                            or (
+                                int(source_details.st_dev),
+                                int(source_details.st_ino),
+                            ) != temporary_identity
+                        ):
+                            raise OSError(
+                                "database backup temporary changed during copy"
+                            )
+                        while chunk := source_file.read(1024 * 1024):
+                            remaining = memoryview(chunk)
+                            while remaining:
+                                written = os.write(
+                                    target_descriptor,
+                                    remaining,
+                                )
+                                if written <= 0:
+                                    raise OSError(
+                                        "database backup copy made no progress"
+                                    )
+                                remaining = remaining[written:]
+                    os.fsync(target_descriptor)
+                    copied = os.fstat(target_descriptor)
+                    if int(copied.st_size) != int(completed.st_size):
+                        raise OSError("database backup copy is incomplete")
+                finally:
+                    if target_descriptor is not None:
+                        os.close(target_descriptor)
+                temporary.unlink()
+                temporary = None
+        if hardlinked:
+            published = target.lstat()
+            if (
+                not stat.S_ISREG(published.st_mode)
+                or int(published.st_nlink) != 2
+                or (int(published.st_dev), int(published.st_ino))
+                != temporary_identity
+            ):
+                raise OSError("database backup target changed during publish")
+            published_identity = temporary_identity
+            temporary.unlink()
+            temporary = None
+        from app.storage_policy import fsync_parent_directory
+
+        fsync_parent_directory(target)
+        final = target.lstat()
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or int(final.st_nlink) != 1
+            or (int(final.st_dev), int(final.st_ino))
+            != published_identity
+        ):
+            raise OSError("database backup target failed final validation")
     except Exception:
-        temporary.unlink(missing_ok=True)
+        if published_identity is not None:
+            try:
+                current = target.lstat()
+            except FileNotFoundError:
+                current = None
+            if current is not None and (
+                stat.S_ISREG(current.st_mode)
+                and int(current.st_nlink) == 1
+                and (int(current.st_dev), int(current.st_ino))
+                == published_identity
+            ):
+                target.unlink()
+        if temporary is not None and temporary_identity is not None:
+            try:
+                current = temporary.lstat()
+            except FileNotFoundError:
+                current = None
+            if current is not None and (
+                stat.S_ISREG(current.st_mode)
+                and int(current.st_nlink) == 1
+                and (int(current.st_dev), int(current.st_ino))
+                == temporary_identity
+            ):
+                temporary.unlink()
         raise
     return target
 
 
-def set_settings_for_database(database_path, values):
+def set_settings_for_database(
+    database_path,
+    values,
+    *,
+    checkpoint_wal=True,
+):
     """Update settings in a selected database without changing global state."""
     path = Path(database_path).expanduser().resolve()
-    with sqlite3.connect(path, timeout=20) as con:
+    with closing(sqlite3.connect(path, timeout=20)) as con:
+        # Configuration commits must survive power loss even when the live DB
+        # normally uses the lower-latency WAL synchronous=NORMAL setting.
+        con.execute("PRAGMA synchronous=FULL")
         con.executemany(
             "INSERT INTO settings(key,value) VALUES(?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             ((key, str(value)) for key, value in values.items()),
         )
+        con.commit()
+        journal_mode = str(
+            con.execute("PRAGMA journal_mode").fetchone()[0]
+        ).lower()
+        if checkpoint_wal and journal_mode == "wal":
+            checkpoint = con.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            if checkpoint and int(checkpoint[0]) != 0:
+                raise sqlite3.OperationalError(
+                    "migrated settings WAL checkpoint was busy"
+                )
+            # This helper edits an offline migration copy. Leave every
+            # committed setting in the main database file and remove the WAL
+            # transport contract before the config pointer can be switched.
+            # The normal startup path enables WAL again after restart.
+            selected_mode = str(
+                con.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+            ).lower()
+            if selected_mode != "delete":
+                raise sqlite3.OperationalError(
+                    "migrated settings database could not leave WAL mode"
+                )
+        checked = con.execute("PRAGMA quick_check").fetchone()
+        if not checked or checked[0] != "ok":
+            raise sqlite3.DatabaseError(
+                "settings database integrity check failed"
+            )
+    if checkpoint_wal:
+        from app.storage_policy import fsync_parent_directory
+
+        with path.open("rb") as database_file:
+            os.fsync(database_file.fileno())
+        fsync_parent_directory(path)
 
 
 def _add_missing_columns(con, table, migrations):
@@ -70,6 +273,149 @@ def _add_missing_columns(con, table, migrations):
             con.execute(
                 f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}"
             )
+
+
+def _require_bootstrap_admin_password_change(con):
+    """Mark the built-in administrator unsafe while it uses the known secret."""
+
+    row = con.execute(
+        "SELECT id,password_hash,must_change_password FROM users "
+        "WHERE username='admin' LIMIT 1"
+    ).fetchone()
+    if (
+        row
+        and not int(row["must_change_password"] or 0)
+        and verify_password("123456", row["password_hash"])
+    ):
+        con.execute(
+            "UPDATE users SET must_change_password=1 WHERE id=?",
+            (int(row["id"]),),
+        )
+
+
+def _supersede_duplicate_current_feedback(con):
+    """Keep exactly one current operator truth row for each event."""
+
+    con.execute(
+        "UPDATE anpr_feedback AS older SET status='superseded' "
+        "WHERE older.status='confirmed' AND EXISTS("
+        "SELECT 1 FROM anpr_feedback AS newer "
+        "WHERE newer.event_id=older.event_id "
+        "AND newer.status='confirmed' AND newer.id>older.id)"
+    )
+
+
+def _migrate_persistence_receipts_to_tombstones(con):
+    """Remove legacy cascade semantics while preserving idempotency keys."""
+
+    if not con.execute(
+        "PRAGMA foreign_key_list(anpr_persistence_receipts)"
+    ).fetchall():
+        return
+    # A receipt must outlive retention of its event; otherwise a delayed
+    # outbox replay can resurrect (or duplicate) a deliberately expired row.
+    # SQLite cannot drop a foreign key in place, so rebuild the small table in
+    # the surrounding init_db transaction.
+    con.execute("DROP TABLE IF EXISTS anpr_persistence_receipts_legacy")
+    con.execute(
+        "ALTER TABLE anpr_persistence_receipts "
+        "RENAME TO anpr_persistence_receipts_legacy"
+    )
+    con.execute("""
+        CREATE TABLE anpr_persistence_receipts(
+            persistence_key TEXT PRIMARY KEY,
+            event_id INTEGER NOT NULL,
+            committed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    con.execute("""
+        INSERT INTO anpr_persistence_receipts(
+            persistence_key,event_id,committed_at
+        )
+        SELECT persistence_key,event_id,committed_at
+        FROM anpr_persistence_receipts_legacy
+    """)
+    con.execute("DROP TABLE anpr_persistence_receipts_legacy")
+
+
+def _migrate_feedback_to_retained_truth(con):
+    """Detach confirmed operator truth from event-retention lifecycle."""
+
+    table_info = con.execute(
+        "PRAGMA table_info(anpr_feedback)"
+    ).fetchall()
+    event_column = next(
+        (row for row in table_info if row[1] == "event_id"),
+        None,
+    )
+    foreign_keys = con.execute(
+        "PRAGMA foreign_key_list(anpr_feedback)"
+    ).fetchall()
+    has_set_null_event_fk = any(
+        row[3] == "event_id"
+        and row[2] == "plate_events"
+        and str(row[6]).upper() == "SET NULL"
+        for row in foreign_keys
+    )
+    if (
+        event_column is not None
+        and not int(event_column[3] or 0)
+        and has_set_null_event_fk
+    ):
+        return
+
+    # SQLite cannot alter a foreign key or NOT NULL constraint in place.
+    # All current columns have already been backfilled by init_db before this
+    # migration runs, so rebuild the table in the same connection.
+    con.execute("DROP TABLE IF EXISTS anpr_feedback_event_legacy")
+    con.execute(
+        "ALTER TABLE anpr_feedback "
+        "RENAME TO anpr_feedback_event_legacy"
+    )
+    con.execute("""
+        CREATE TABLE anpr_feedback(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER,
+            observed_text TEXT NOT NULL,
+            observed_norm TEXT NOT NULL DEFAULT '',
+            observed_engine TEXT NOT NULL DEFAULT '',
+            observed_confidence REAL NOT NULL DEFAULT 0,
+            observed_model_revision TEXT NOT NULL DEFAULT '',
+            corrected_text TEXT NOT NULL,
+            corrected_norm TEXT NOT NULL,
+            character_distance INTEGER NOT NULL DEFAULT 0,
+            exact_match INTEGER NOT NULL DEFAULT 0,
+            plate_image_path TEXT DEFAULT '',
+            image_path TEXT DEFAULT '',
+            submitted_by TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'confirmed',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            sample_path TEXT DEFAULT '',
+            sample_sha256 TEXT DEFAULT '',
+            dataset_split TEXT DEFAULT '',
+            training_status TEXT DEFAULT 'pending',
+            trained_run_id INTEGER,
+            FOREIGN KEY(event_id) REFERENCES plate_events(id)
+                ON DELETE SET NULL
+        )
+    """)
+    con.execute("""
+        INSERT INTO anpr_feedback(
+            id,event_id,observed_text,observed_norm,observed_engine,
+            observed_confidence,observed_model_revision,corrected_text,
+            corrected_norm,character_distance,exact_match,plate_image_path,
+            image_path,submitted_by,status,created_at,sample_path,
+            sample_sha256,dataset_split,training_status,trained_run_id
+        )
+        SELECT
+            id,event_id,observed_text,observed_norm,observed_engine,
+            observed_confidence,observed_model_revision,corrected_text,
+            corrected_norm,character_distance,exact_match,plate_image_path,
+            image_path,submitted_by,status,created_at,sample_path,
+            sample_sha256,dataset_split,training_status,trained_run_id
+        FROM anpr_feedback_event_legacy
+    """)
+    con.execute("DROP TABLE anpr_feedback_event_legacy")
 
 
 def _backfill_plate_norm(con):
@@ -211,6 +557,8 @@ def init_db():
             failed_attempts INTEGER NOT NULL DEFAULT 0,
             locked_until TEXT,
             last_login TEXT,
+            must_change_password INTEGER NOT NULL DEFAULT 0,
+            session_version INTEGER NOT NULL DEFAULT 0,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS audit_logs(
@@ -221,6 +569,13 @@ def init_db():
             ip_address TEXT DEFAULT '',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS revoked_sessions(
+            token_hash TEXT PRIMARY KEY,
+            expires_at INTEGER NOT NULL,
+            revoked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_revoked_sessions_expiry
+            ON revoked_sessions(expires_at);
         CREATE TABLE IF NOT EXISTS settings(
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -269,7 +624,7 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS anpr_feedback(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_id INTEGER NOT NULL,
+            event_id INTEGER,
             observed_text TEXT NOT NULL,
             observed_norm TEXT NOT NULL DEFAULT '',
             observed_engine TEXT NOT NULL DEFAULT '',
@@ -285,7 +640,7 @@ def init_db():
             status TEXT NOT NULL DEFAULT 'confirmed',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(event_id) REFERENCES plate_events(id)
-                ON DELETE CASCADE
+                ON DELETE SET NULL
         );
         CREATE TABLE IF NOT EXISTS anpr_training_runs(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -305,6 +660,24 @@ def init_db():
             applied_at TEXT,
             applied_by TEXT DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS anpr_persistence_receipts(
+            persistence_key TEXT PRIMARY KEY,
+            event_id INTEGER NOT NULL,
+            committed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS media_acceptance_intents(
+            acceptance_id TEXT PRIMARY KEY,
+            target_path TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending',
+            device INTEGER,
+            inode INTEGER,
+            size_bytes INTEGER,
+            owner_kind TEXT NOT NULL DEFAULT '',
+            owner_id TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            accepted_at TEXT,
+            CHECK(state IN ('pending','accepted'))
+        );
         """)
 
         _add_missing_columns(con, "users", {
@@ -313,8 +686,14 @@ def init_db():
             "failed_attempts": "INTEGER NOT NULL DEFAULT 0",
             "locked_until": "TEXT",
             "last_login": "TEXT",
+            "must_change_password": "INTEGER NOT NULL DEFAULT 0",
+            "session_version": "INTEGER NOT NULL DEFAULT 0",
             "created_at": "TEXT",
         })
+        con.execute(
+            "DELETE FROM revoked_sessions WHERE expires_at < ?",
+            (int(time.time()),),
+        )
         con.execute(
             "UPDATE users SET role='admin' "
             "WHERE is_admin=1 AND (role IS NULL OR role='')"
@@ -371,6 +750,8 @@ def init_db():
             "character_distance": "INTEGER NOT NULL DEFAULT 0",
             "exact_match": "INTEGER NOT NULL DEFAULT 0",
         })
+        _migrate_feedback_to_retained_truth(con)
+        _supersede_duplicate_current_feedback(con)
         _add_missing_columns(con, "anpr_training_runs", {
             "baseline_mean_character_error": "REAL DEFAULT 0",
             "candidate_mean_character_error": "REAL DEFAULT 0",
@@ -381,6 +762,7 @@ def init_db():
             "dataset_manifest_path": "TEXT DEFAULT ''",
             "dataset_manifest_sha256": "TEXT DEFAULT ''",
         })
+        _migrate_persistence_receipts_to_tombstones(con)
         _backfill_plate_norm(con)
         con.executescript("""
         CREATE INDEX IF NOT EXISTS idx_plate_events_created_at
@@ -395,10 +777,16 @@ def init_db():
             ON plate_events(plate_region,created_at,id);
         CREATE INDEX IF NOT EXISTS idx_plate_events_updated_at
             ON plate_events(updated_at,id);
+        CREATE INDEX IF NOT EXISTS idx_anpr_receipts_event
+            ON anpr_persistence_receipts(event_id);
+        CREATE INDEX IF NOT EXISTS idx_media_acceptance_state
+            ON media_acceptance_intents(state,created_at);
         CREATE INDEX IF NOT EXISTS idx_anpr_feedback_observed
             ON anpr_feedback(observed_norm,status);
         CREATE INDEX IF NOT EXISTS idx_anpr_feedback_event
             ON anpr_feedback(event_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_anpr_feedback_current_event
+            ON anpr_feedback(event_id) WHERE status='confirmed';
         CREATE INDEX IF NOT EXISTS idx_anpr_feedback_training
             ON anpr_feedback(training_status,dataset_split);
         CREATE INDEX IF NOT EXISTS idx_anpr_feedback_model_revision
@@ -431,14 +819,16 @@ def init_db():
         ).fetchone() is None:
             con.execute(
                 "INSERT INTO users(" 
-                "username,password_hash,display_name,is_admin"
-                ") VALUES(?,?,?,1)",
+                "username,password_hash,display_name,is_admin,"
+                "must_change_password"
+                ") VALUES(?,?,?,1,1)",
                 (
                     "admin",
                     hash_password("123456"),
                     "مدیر سیستم",
                 ),
             )
+        _require_bootstrap_admin_password_change(con)
 
         defaults = {
             "company_name": "گیلاس آبی البرز",

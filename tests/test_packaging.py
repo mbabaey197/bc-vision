@@ -104,8 +104,8 @@ def test_release_version_metadata_stays_consistent():
         assert f"VersionInfoVersion={version_info}" in source
 
     # RC28.1 shipped with Windows file version 2.2.0.281. Reserve the final
-    # digit zero for the immutable RC29 base; the fast workflow's existing
-    # dot-removal mapping then gives RC29.1 the next version, 2.2.0.291.
+    # digit zero for every immutable full base; the fast workflow's existing
+    # dot-removal mapping gives the first fast child the next file version.
     previous_version_info = (2, 2, 0, 281)
     base_version_info = tuple(int(part) for part in version_info.split("."))
     first_fast_version_info = (
@@ -254,7 +254,7 @@ def test_windows_gate_runs_detector_and_ocr_inside_installed_executable():
     assert "SHA256SUMS.txt" in full_release
     assert "5032e5a5801af5368af4c85476cbefbd1cd563e1" in full_release
     assert "E64DFCC90D8C9D17742591C7254D7176CB088C60F38C58C5930D42CAA529C2EC" in full_release
-    assert "immutable RC28.1 to RC29 upgrade" in full_release
+    assert "immutable RC28.1 to current full-base upgrade" in full_release
     assert "Publish or safely resume exact-SHA full release" in full_release
     assert "bcvision/full-release" in full_release
 

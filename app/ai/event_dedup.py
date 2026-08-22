@@ -51,6 +51,78 @@ def candidate_plate_key(result: dict) -> str:
     return ""
 
 
+def review_identity_can_migrate(old_key: str, new_key: str) -> bool:
+    """Allow only a one-slot OCR correction to reuse a review event."""
+
+    left = normalize_plate(old_key)
+    right = normalize_plate(new_key)
+    return bool(
+        plausible_plate(left)
+        and plausible_plate(right)
+        and sum(a != b for a, b in zip(left, right)) <= 1
+    )
+
+
+def _result_bbox(result: dict) -> tuple[float, float, float, float] | None:
+    raw = result.get("tracking_bbox") or result.get("bbox")
+    if not raw or len(raw) != 4:
+        return None
+    try:
+        x1, y1, x2, y2 = (float(value) for value in raw)
+    except (TypeError, ValueError):
+        return None
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
+def _spatially_continuous(left: tuple, right: tuple) -> bool:
+    lx1, ly1, lx2, ly2 = left
+    rx1, ry1, rx2, ry2 = right
+    ix1, iy1 = max(lx1, rx1), max(ly1, ry1)
+    ix2, iy2 = min(lx2, rx2), min(ly2, ry2)
+    intersection = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    left_area = max(1.0, (lx2 - lx1) * (ly2 - ly1))
+    right_area = max(1.0, (rx2 - rx1) * (ry2 - ry1))
+    iou = intersection / max(1.0, left_area + right_area - intersection)
+    if iou >= 0.08:
+        return True
+    left_center = ((lx1 + lx2) / 2.0, (ly1 + ly2) / 2.0)
+    right_center = ((rx1 + rx2) / 2.0, (ry1 + ry2) / 2.0)
+    distance = (
+        (left_center[0] - right_center[0]) ** 2
+        + (left_center[1] - right_center[1]) ** 2
+    ) ** 0.5
+    scale = max(
+        lx2 - lx1,
+        ly2 - ly1,
+        rx2 - rx1,
+        ry2 - ry1,
+    )
+    return distance <= scale * 0.45
+
+
+def fragmented_review_can_migrate(
+    old_result: dict,
+    new_result: dict,
+) -> bool:
+    """Validate a cross-track review-to-strict visit correction."""
+
+    old_key = candidate_plate_key(old_result)
+    new_key = strict_plate_key(new_result)
+    old_bbox = _result_bbox(old_result)
+    new_bbox = _result_bbox(new_result)
+    return bool(
+        old_key
+        and new_key
+        and not strict_plate_key(old_result)
+        and review_identity_can_migrate(old_key, new_key)
+        and old_bbox is not None
+        and new_bbox is not None
+        and _spatially_continuous(old_bbox, new_bbox)
+    )
+
+
 @dataclass
 class PlateVisitLedger:
     """Map one continuous camera visit to one durable event reference."""
@@ -59,20 +131,26 @@ class PlateVisitLedger:
     absence_seconds: float = 0.75
     seen: dict[str, float] = field(default_factory=dict)
     event_refs: dict[str, int] = field(default_factory=dict)
+    confirmed_keys: set[str] = field(default_factory=set)
     active: set[str] = field(default_factory=set)
     track_keys: dict[int, str] = field(default_factory=dict)
     plate_tracks: dict[str, set[int]] = field(default_factory=dict)
     missing_observations: dict[str, int] = field(default_factory=dict)
     absence_started: dict[str, float] = field(default_factory=dict)
+    last_bboxes: dict[str, tuple] = field(default_factory=dict)
+    provisional_owner_tracks: dict[str, int] = field(default_factory=dict)
 
     def clear(self) -> None:
         self.seen.clear()
         self.event_refs.clear()
+        self.confirmed_keys.clear()
         self.active.clear()
         self.track_keys.clear()
         self.plate_tracks.clear()
         self.missing_observations.clear()
         self.absence_started.clear()
+        self.last_bboxes.clear()
+        self.provisional_owner_tracks.clear()
 
     def reset_tracker_bindings(self) -> None:
         """Keep durable visit ids while discarding model-specific tracks."""
@@ -81,10 +159,13 @@ class PlateVisitLedger:
         self.plate_tracks.clear()
         self.missing_observations.clear()
         self.absence_started.clear()
+        self.provisional_owner_tracks.clear()
         self.active.intersection_update(self.event_refs)
+        self.confirmed_keys.intersection_update(self.event_refs)
         for key in tuple(self.seen):
             if key not in self.event_refs:
                 self.seen.pop(key, None)
+                self.last_bboxes.pop(key, None)
 
     def _unbind(self, track_id: int) -> None:
         key = self.track_keys.pop(int(track_id), "")
@@ -124,9 +205,86 @@ class PlateVisitLedger:
 
     def _touch(self, key: str, timestamp: float) -> None:
         self.active.add(key)
-        self.seen[key] = float(timestamp)
+        self.seen[key] = max(
+            float(timestamp),
+            self.seen.get(key, -1e12),
+        )
         self.missing_observations.pop(key, None)
         self.absence_started.pop(key, None)
+
+    def _remember_bbox(self, key: str, result: dict) -> None:
+        bbox = _result_bbox(result)
+        if bbox is not None:
+            self.last_bboxes[key] = bbox
+
+    @staticmethod
+    def _provisional_upgrade_source(result: dict) -> bool:
+        """Return whether a review identity is explicitly provisional."""
+
+        return bool(
+            result.get("visit_identity_stable") is False
+            or result.get("raw_guess_reason") in {
+                "below-camera-confidence",
+                "strict-decoder-rejected",
+                "multi-frame-rejected-hypotheses",
+            }
+        )
+
+    def _continuity_alias(
+        self,
+        key: str,
+        result: dict,
+        timestamp: float,
+    ) -> str:
+        """Link a fragmented track only with unique spatial OCR continuity."""
+
+        if not strict_plate_key(result):
+            return ""
+        current_bbox = _result_bbox(result)
+        if current_bbox is None:
+            return ""
+        max_gap = max(1.5, float(self.absence_seconds) * 2.0)
+        candidates = [
+            active_key
+            for active_key in self.active
+            if active_key not in self.confirmed_keys
+            and active_key != key
+            and review_identity_can_migrate(active_key, key)
+            and 0.0
+            <= timestamp - self.seen.get(active_key, -1e12)
+            <= max_gap
+            and active_key in self.last_bboxes
+            and _spatially_continuous(
+                self.last_bboxes[active_key],
+                current_bbox,
+            )
+        ]
+        return candidates[0] if len(candidates) == 1 else ""
+
+    def can_reuse_track_event(self, track_id: int, result: dict) -> bool:
+        """Reject a stale event id when the bound identity is incompatible."""
+
+        track_id = int(track_id or 0)
+        bound = self.track_keys.get(track_id, "")
+        if bound and result.get("visit_identity_stable") is False:
+            return bound in self.event_refs
+        key = candidate_plate_key(result)
+        if not bound or not key or bound == key:
+            return True
+        return bool(
+            bound not in self.confirmed_keys
+            and (
+                # A tracker-continuous strict read is stronger evidence than
+                # the provisional identity already owned by that same track.
+                # Cross-track corrections still reach this point only through
+                # the one-slot + spatial continuity gate in _continuity_alias.
+                (
+                    strict_plate_key(result)
+                    and self.provisional_owner_tracks.get(bound) == track_id
+                )
+                or review_identity_can_migrate(bound, key)
+            )
+        )
 
     def observe(
         self,
@@ -150,15 +308,32 @@ class PlateVisitLedger:
         retired_track_ids = set()
         for result in rows:
             track_id = int(result.get("track_id") or 0)
-            key = candidate_plate_key(result)
+            key = (
+                candidate_plate_key(result)
+                if result.get("visit_identity_stable", True)
+                else ""
+            )
             bound = self.track_keys.get(track_id, "") if track_id else ""
             # A complete conflicting identity is a vehicle boundary even
-            # when it is still review-only.  Never let a stale tracker
-            # binding merge two exact candidates that differ by one slot.
+            # when it follows a confirmed plate. A provisional review key may
+            # still be corrected by clearer evidence on the same track; keep
+            # its event reference until register() atomically migrates it.
             if bound and key and bound != key:
-                retired_track_ids.add(track_id)
-                self._unbind(track_id)
-                bound = ""
+                same_track_strict_upgrade = bool(
+                    bound not in self.confirmed_keys
+                    and strict_plate_key(result)
+                    and self.provisional_owner_tracks.get(bound) == track_id
+                )
+                if (
+                    bound in self.confirmed_keys
+                    or (
+                        not same_track_strict_upgrade
+                        and not review_identity_can_migrate(bound, key)
+                    )
+                ):
+                    retired_track_ids.add(track_id)
+                    self._unbind(track_id)
+                    bound = ""
             if not bound and key and self._reusable(
                 key,
                 timestamp,
@@ -166,6 +341,15 @@ class PlateVisitLedger:
             ):
                 bound = key
                 self._bind(track_id, key)
+            if not bound and key:
+                alias = self._continuity_alias(
+                    key,
+                    result,
+                    timestamp,
+                )
+                if alias:
+                    bound = alias
+                    self._bind(track_id, alias)
             if (
                 not bound
                 and not key
@@ -180,6 +364,7 @@ class PlateVisitLedger:
             if not bound or bound not in self.event_refs:
                 continue
             self._touch(bound, timestamp)
+            self._remember_bbox(bound, result)
             observed.add(bound)
 
         for key in list(self.active):
@@ -208,7 +393,10 @@ class PlateVisitLedger:
             if timestamp - self.seen.get(key, -1e12) < cooldown:
                 continue
             self.event_refs.pop(key, None)
+            self.confirmed_keys.discard(key)
             self.seen.pop(key, None)
+            self.last_bboxes.pop(key, None)
+            self.provisional_owner_tracks.pop(key, None)
             self.missing_observations.pop(key, None)
             self.absence_started.pop(key, None)
             for track_id in tuple(self.plate_tracks.get(key, ())):
@@ -249,20 +437,94 @@ class PlateVisitLedger:
     ) -> str:
         """Record a successfully persisted strict result as the visit owner."""
 
+        strict_key = strict_plate_key(result)
         key = (
             candidate_plate_key(result)
             if allow_candidate
-            else strict_plate_key(result)
+            else strict_key
         )
         if not key:
             return ""
+        event_ref = int(event_ref)
+        track_id = int(result.get("track_id") or 0)
+        aliases = [
+            existing_key
+            for existing_key, existing_ref in self.event_refs.items()
+            if existing_ref == event_ref and existing_key != key
+        ]
+        bound_alias = self.track_keys.get(track_id, "")
+        protected_alias = next(
+            (
+                alias
+                for alias in aliases
+                if (
+                    alias in self.confirmed_keys
+                    or (
+                        not review_identity_can_migrate(alias, key)
+                        and not (
+                            strict_key
+                            and alias == bound_alias
+                            and alias not in self.confirmed_keys
+                            and self.provisional_owner_tracks.get(alias)
+                            == track_id
+                        )
+                    )
+                )
+            ),
+            "",
+        )
+        if protected_alias:
+            # Neither a review candidate nor a conflicting strict identity
+            # may repurpose an unrelated/confirmed durable row.
+            self._bind(track_id, protected_alias)
+            self._touch(protected_alias, timestamp)
+            self._remember_bbox(protected_alias, result)
+            return protected_alias
+
+        migrated_tracks = set()
+        migrated_bbox = None
+        migrated_seen = -1e12
+        for alias in aliases:
+            migrated_tracks.update(self.plate_tracks.get(alias, ()))
+            migrated_bbox = self.last_bboxes.get(alias, migrated_bbox)
+            migrated_seen = max(
+                migrated_seen,
+                self.seen.get(alias, -1e12),
+            )
+            for alias_track_id in tuple(
+                self.plate_tracks.get(alias, ())
+            ):
+                self._unbind(alias_track_id)
+            self.event_refs.pop(alias, None)
+            self.confirmed_keys.discard(alias)
+            self.active.discard(alias)
+            self.seen.pop(alias, None)
+            self.last_bboxes.pop(alias, None)
+            self.provisional_owner_tracks.pop(alias, None)
+            self.missing_observations.pop(alias, None)
+            self.absence_started.pop(alias, None)
         previous = self.event_refs.get(key)
-        if previous is not None and previous != int(event_ref):
-            for track_id in tuple(self.plate_tracks.get(key, ())):
-                self._unbind(track_id)
-        self.event_refs[key] = int(event_ref)
-        self._bind(int(result.get("track_id") or 0), key)
-        self._touch(key, timestamp)
+        if previous is not None and previous != event_ref:
+            for previous_track_id in tuple(
+                self.plate_tracks.get(key, ())
+            ):
+                self._unbind(previous_track_id)
+            self.confirmed_keys.discard(key)
+        self.event_refs[key] = event_ref
+        if strict_key:
+            self.confirmed_keys.add(key)
+            self.provisional_owner_tracks.pop(key, None)
+        elif track_id and self._provisional_upgrade_source(result):
+            self.provisional_owner_tracks[key] = track_id
+        else:
+            self.provisional_owner_tracks.pop(key, None)
+        for migrated_track_id in migrated_tracks:
+            self._bind(migrated_track_id, key)
+        self._bind(track_id, key)
+        self._touch(key, max(float(timestamp), migrated_seen))
+        if migrated_bbox is not None:
+            self.last_bboxes[key] = migrated_bbox
+        self._remember_bbox(key, result)
         return key
 
     def track_event_refs(self) -> dict[int, int]:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import stat
 import threading
 import time
 from dataclasses import dataclass
-from typing import Iterator
+from pathlib import Path
+from typing import AsyncIterator
 
 try:
     import cv2
@@ -47,6 +50,7 @@ class CameraStream:
         video_anpr_started=False,
         video_anpr_completed=False,
         video_anpr_state_callback=None,
+        media_pin_factory=None,
     ):
         self.camera_id, self.url, self.name = camera_id, url, name
         self.width, self.fps, self.quality = (
@@ -63,6 +67,8 @@ class CameraStream:
             self._is_video_file and self._video_anpr_started
         )
         self._video_anpr_state_callback = video_anpr_state_callback
+        self._media_pin_factory = media_pin_factory
+        self._media_pin = None
         self._video_anpr_pass_token = None
         self.state = StreamState(
             anpr_preview_only=self._video_anpr_preview_only,
@@ -78,6 +84,11 @@ class CameraStream:
         self.pause_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._stop_lock = threading.Lock()
+        self._capture_lock = threading.Lock()
+        self._active_capture = None
+        self._live_worker_stopped = False
         self._overlay_rows: list[dict] = []
         self._overlay_gray = None
         self._overlay_revision = 0
@@ -92,46 +103,173 @@ class CameraStream:
         self._anpr_submit_error = ""
         self._anpr_aborted = False
         self._anpr_thread = None
-    def start(self):
-        if self.thread and self.thread.is_alive():
-            if not self._anpr_thread or not self._anpr_thread.is_alive():
-                self._anpr_thread = threading.Thread(
-                    target=self._anpr_loop,
-                    daemon=True,
-                    name=f"camera-anpr-submit-{self.camera_id}",
-                )
-                self._anpr_thread.start()
-            return
-        self.stop_event.clear()
-        self._anpr_event.clear()
-        self._anpr_thread = threading.Thread(
-            target=self._anpr_loop,
-            daemon=True,
-            name=f"camera-anpr-submit-{self.camera_id}",
-        )
-        self._anpr_thread.start()
-        self.thread = threading.Thread(
-            target=self._run,
-            daemon=True,
-            name=f"camera-{self.camera_id}",
-        )
-        self.thread.start()
 
-    def stop(self):
-        with self._anpr_condition:
-            # Abort is latched before pending work is discarded. EOF may be
-            # waiting on this same handoff condition, and must never mistake a
-            # stop-induced empty queue for a successfully drained video pass.
-            self._anpr_aborted = True
-            self.stop_event.set()
-            self._anpr_pending_frame = None
-            self._anpr_condition.notify_all()
-        self._anpr_event.set()
+    def start(self) -> bool:
+        with self._lifecycle_lock:
+            # A CameraStream is single-use. In particular, a StreamingResponse
+            # may not begin iterating frames until after the manager removed
+            # this object. Never let that delayed first iteration resurrect an
+            # unowned decoder or ANPR submitter.
+            if self.stop_event.is_set():
+                return False
+            if self.thread and self.thread.is_alive():
+                if not self._anpr_thread or not self._anpr_thread.is_alive():
+                    self._anpr_thread = threading.Thread(
+                        target=self._anpr_loop,
+                        daemon=True,
+                        name=f"camera-anpr-submit-{self.camera_id}",
+                    )
+                    self._anpr_thread.start()
+                return True
+            if (
+                self._is_video_file
+                and self._media_pin_factory is not None
+                and self._media_pin is None
+            ):
+                source = self.url[len("video://"):]
+                try:
+                    self._media_pin = self._media_pin_factory(source)
+                except Exception as exc:
+                    self.state.online = False
+                    self.state.last_error = (
+                        "uploaded-video read lease failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    return False
+            self._anpr_event.clear()
+            self._anpr_thread = threading.Thread(
+                target=self._anpr_loop,
+                daemon=True,
+                name=f"camera-anpr-submit-{self.camera_id}",
+            )
+            self._anpr_thread.start()
+            self.thread = threading.Thread(
+                target=self._run_with_media_pin,
+                daemon=True,
+                name=f"camera-{self.camera_id}",
+            )
+            try:
+                self.thread.start()
+            except Exception:
+                media_pin = self._media_pin
+                self._media_pin = None
+                if media_pin is not None:
+                    media_pin.close()
+                raise
+            return True
+
+    def _run_with_media_pin(self):
         try:
-            from app.ai.live_worker import stop_live_camera
-            stop_live_camera(self.camera_id)
+            self._run()
+        finally:
+            media_pin = self._media_pin
+            self._media_pin = None
+            if media_pin is not None:
+                media_pin.close()
+
+    @staticmethod
+    def _release_capture(capture) -> None:
+        if capture is None:
+            return
+        try:
+            closer = getattr(capture, "release", None)
+            if not callable(closer):
+                closer = getattr(capture, "close", None)
+            if callable(closer):
+                closer()
         except Exception:
             pass
+
+    def _register_capture(self, capture) -> bool:
+        """Publish a decoder handle so another thread can interrupt read()."""
+
+        should_release = False
+        with self._capture_lock:
+            if self.stop_event.is_set():
+                should_release = True
+            else:
+                self._active_capture = capture
+        if should_release:
+            self._release_capture(capture)
+            return False
+        return True
+
+    def _clear_capture(self, capture) -> bool:
+        with self._capture_lock:
+            if self._active_capture is capture:
+                self._active_capture = None
+                return True
+        return False
+
+    def _request_stop(self) -> None:
+        with self._lifecycle_lock:
+            with self._anpr_condition:
+                # Abort is latched before pending work is discarded. EOF may
+                # be waiting on this same handoff condition, and must never
+                # mistake a stop-induced empty queue for a successfully
+                # drained video pass.
+                self._anpr_aborted = True
+                self.stop_event.set()
+                self.state.online = False
+                self._anpr_pending_frame = None
+                self._anpr_condition.notify_all()
+            self._anpr_event.set()
+            with self._capture_lock:
+                capture = self._active_capture
+                self._active_capture = None
+        # OpenCV/FFmpeg may be blocked inside read(). Releasing its active
+        # handle is the only portable way to make that call return promptly.
+        self._release_capture(capture)
+
+    def _finish_stop(self, timeout=5.0) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        current = threading.current_thread()
+
+        with self._anpr_condition:
+            while self._anpr_submitting:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.state.last_error = "ANPR submission stop timed out"
+                    return False
+                self._anpr_condition.wait(min(0.10, remaining))
+
+        for worker_thread in (self._anpr_thread, self.thread):
+            if worker_thread is None or worker_thread is current:
+                continue
+            remaining = deadline - time.monotonic()
+            if worker_thread.is_alive() and remaining > 0:
+                worker_thread.join(remaining)
+
+        alive = any(
+            worker_thread is not None
+            and worker_thread is not current
+            and worker_thread.is_alive()
+            for worker_thread in (self._anpr_thread, self.thread)
+        )
+        if alive:
+            self.state.last_error = "stream stop timed out"
+            return False
+
+        if not self._live_worker_stopped:
+            try:
+                from app.ai.live_worker import stop_live_camera
+
+                worker_stopped = stop_live_camera(self.camera_id)
+            except Exception as exc:
+                self.state.last_error = (
+                    f"ANPR worker stop failed: {type(exc).__name__}: {exc}"
+                )
+                return False
+            if worker_stopped is False:
+                self.state.last_error = "ANPR worker stop timed out"
+                return False
+            self._live_worker_stopped = True
+        return True
+
+    def stop(self, timeout=5.0) -> bool:
+        with self._stop_lock:
+            self._request_stop()
+            return self._finish_stop(timeout)
 
     def pause(self):
         if self.url.startswith("video://"):
@@ -697,9 +835,17 @@ class CameraStream:
     def _queue_anpr(self, frame):
         # Keep only the newest decoded frame. No copy is needed here: OpenCV
         # and PyAV return a new ndarray for the next decoded frame.
-        if not self._ensure_video_anpr_started():
-            return
         with self._anpr_condition:
+            # Serialize the stop decision with the durable uploaded-video
+            # marker and the queue handoff. Otherwise a frame that finished
+            # encoding during stop could start a new ANPR pass after its
+            # submitter thread had already exited.
+            if self.stop_event.is_set() or self._anpr_aborted:
+                return
+            if not self._ensure_video_anpr_started():
+                return
+            if self.stop_event.is_set() or self._anpr_aborted:
+                return
             self._anpr_pending_frame = frame
             self._anpr_condition.notify_all()
         self._anpr_event.set()
@@ -741,6 +887,8 @@ class CameraStream:
     def _publish(self, frame):
         # Browser JPEG encoding and AI submission are fully detached from the
         # decoder. Neither OCR nor activity scoring can slow the video clock.
+        if self.stop_event.is_set():
+            return
         now_mono = time.monotonic()
         display_fps = (
             min(20, max(self.fps, 15))
@@ -754,14 +902,21 @@ class CameraStream:
         )
         if display_due:
             data = self._encode(frame)
+            if self.stop_event.is_set():
+                return
+        else:
+            data = None
+        with self._anpr_condition:
+            if self.stop_event.is_set() or self._anpr_aborted:
+                return
             if data:
                 with self.lock:
                     self.latest = data
                     self.latest_frame = frame
                 self._last_display_publish_at = now_mono
-        self.state.online = True
-        self.state.last_frame_at = time.time()
-        self.state.last_error = ""
+            self.state.online = True
+            self.state.last_frame_at = time.time()
+            self.state.last_error = ""
         self._queue_anpr(frame)
 
     def _demo_frame(self):
@@ -830,30 +985,35 @@ class CameraStream:
         while not self.stop_event.is_set():
             published = 0
             with av.open(str(source)) as container:
+                if not self._register_capture(container):
+                    return
                 stream = container.streams.video[0]
                 try:
-                    source_fps = float(stream.average_rate)
-                except (TypeError, ValueError, ZeroDivisionError):
-                    source_fps = 0.0
-                if not 1.0 <= source_fps <= 120.0:
-                    source_fps = max(1.0, float(self.fps))
-                frame_delay = 1.0 / source_fps
-                deadline = time.monotonic()
-                for video_frame in container.decode(video=0):
-                    if self.stop_event.is_set():
-                        return
-                    self._wait_while_paused()
-                    if self.stop_event.is_set():
-                        return
-                    frame = video_frame.to_ndarray(format="bgr24")
-                    self._publish(frame)
-                    published += 1
-                    deadline += frame_delay
-                    wait = deadline - time.monotonic()
-                    if wait > 0 and self.stop_event.wait(wait):
-                        return
-                    if wait < -0.75:
-                        deadline = time.monotonic()
+                    try:
+                        source_fps = float(stream.average_rate)
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        source_fps = 0.0
+                    if not 1.0 <= source_fps <= 120.0:
+                        source_fps = max(1.0, float(self.fps))
+                    frame_delay = 1.0 / source_fps
+                    deadline = time.monotonic()
+                    for video_frame in container.decode(video=0):
+                        if self.stop_event.is_set():
+                            return
+                        self._wait_while_paused()
+                        if self.stop_event.is_set():
+                            return
+                        frame = video_frame.to_ndarray(format="bgr24")
+                        self._publish(frame)
+                        published += 1
+                        deadline += frame_delay
+                        wait = deadline - time.monotonic()
+                        if wait > 0 and self.stop_event.wait(wait):
+                            return
+                        if wait < -0.75:
+                            deadline = time.monotonic()
+                finally:
+                    self._clear_capture(container)
             if not published:
                 raise RuntimeError(
                     "FFmpeg could not decode any frame from the video"
@@ -892,6 +1052,8 @@ class CameraStream:
                     capture = cv2.VideoCapture(capture_source)
                 if not capture.isOpened():
                     raise RuntimeError("Cannot open camera or video stream")
+                if not self._register_capture(capture):
+                    return
                 capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
                 playback_delay = dashboard_delay
@@ -932,6 +1094,8 @@ class CameraStream:
                     elif self.stop_event.wait(dashboard_delay):
                         return
             except Exception as exc:
+                if self.stop_event.is_set():
+                    return
                 if is_video_file and published == 0 and AV_OK:
                     try:
                         self._run_pyav_video(capture_source, dashboard_delay)
@@ -945,10 +1109,12 @@ class CameraStream:
                 self.stop_event.wait(1 if is_video_file else 3)
             finally:
                 if capture is not None:
-                    capture.release()
+                    if self._clear_capture(capture):
+                        self._release_capture(capture)
 
-    def frames(self) -> Iterator[bytes]:
-        self.start()
+    async def frames(self) -> AsyncIterator[bytes]:
+        if not self.start():
+            return
         while not self.stop_event.is_set():
             with self.lock:
                 frame = self.latest
@@ -965,12 +1131,32 @@ class CameraStream:
                 if self.url.startswith("video://")
                 else self.fps
             )
-            time.sleep(1.0 / max(1, display_fps))
+            await asyncio.sleep(1.0 / max(1, display_fps))
+
+def _pin_uploaded_video_source(source):
+    from app.storage_policy import pin_media_paths
+
+    lease = pin_media_paths((source,))
+    try:
+        details = Path(source).lstat()
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or int(details.st_nlink) != 1
+        ):
+            raise ValueError(
+                "uploaded video source is not a private regular file"
+            )
+    except BaseException:
+        lease.close()
+        raise
+    return lease
+
 
 class StreamManager:
-    def __init__(self):
+    def __init__(self, stop_timeout=5.0):
         self.streams = {}
         self.lock = threading.Lock()
+        self.stop_timeout = max(0.0, float(stop_timeout))
 
     @staticmethod
     def _persist_video_anpr_state(camera_id, state):
@@ -1011,7 +1197,19 @@ class StreamManager:
         with self.lock:
             old = self.streams.get(camera_id)
             if old and getattr(old, "_key", None) != key:
-                old.stop()
+                if not old.stop(timeout=self.stop_timeout):
+                    raise RuntimeError(
+                        f"camera stream {camera_id} did not stop; "
+                        "replacement refused"
+                    )
+                self.streams.pop(camera_id, None)
+                old = None
+            elif old and old.stop_event.is_set():
+                if not old.stop(timeout=self.stop_timeout):
+                    raise RuntimeError(
+                        f"camera stream {camera_id} is still stopping; "
+                        "restart refused"
+                    )
                 self.streams.pop(camera_id, None)
                 old = None
             if not old:
@@ -1029,10 +1227,20 @@ class StreamManager:
                         if str(url).startswith("video://")
                         else None
                     ),
+                    media_pin_factory=(
+                        _pin_uploaded_video_source
+                        if str(url).startswith("video://")
+                        else None
+                    ),
                 )
                 old._key = key
                 self.streams[camera_id] = old
-                old.start()
+                if not old.start():
+                    self.streams.pop(camera_id, None)
+                    raise RuntimeError(
+                        old.state.last_error
+                        or f"camera stream {camera_id} did not start"
+                    )
             return old
 
     def start_enabled_cameras(self):
@@ -1052,31 +1260,59 @@ class StreamManager:
 
         started = 0
         for row in rows:
-            self.get(
-                int(row["id"]),
-                str(row["rtsp_url"]),
-                str(row["name"]),
-                width,
-                fps,
-                quality,
-                bool(row["video_anpr_started"]),
-                bool(row["video_anpr_completed"]),
-            )
-            started += 1
+            try:
+                self.get(
+                    int(row["id"]),
+                    str(row["rtsp_url"]),
+                    str(row["name"]),
+                    width,
+                    fps,
+                    quality,
+                    bool(row["video_anpr_started"]),
+                    bool(row["video_anpr_completed"]),
+                )
+                started += 1
+            except Exception:
+                # One stale or unsafe uploaded-video path must not prevent all
+                # other cameras (or the web application) from starting.
+                continue
         return started
 
     def stop_all(self):
         with self.lock:
-            streams = list(self.streams.values())
-            self.streams.clear()
-        for stream in streams:
-            stream.stop()
+            streams = list(self.streams.items())
+            for _camera_id, stream in streams:
+                request_stop = getattr(stream, "_request_stop", None)
+                if callable(request_stop):
+                    request_stop()
+            deadline = time.monotonic() + self.stop_timeout
+            all_stopped = True
+            for camera_id, stream in streams:
+                finish_stop = getattr(stream, "_finish_stop", None)
+                stop_lock = getattr(stream, "_stop_lock", None)
+                if callable(finish_stop) and stop_lock is not None:
+                    remaining = max(0.0, deadline - time.monotonic())
+                    with stop_lock:
+                        stopped = finish_stop(remaining)
+                else:
+                    stopped = stream.stop() is not False
+                if stopped:
+                    if self.streams.get(camera_id) is stream:
+                        self.streams.pop(camera_id, None)
+                else:
+                    all_stopped = False
+            return all_stopped
 
     def remove(self, camera_id):
         with self.lock:
-            stream = self.streams.pop(camera_id, None)
-        if stream:
-            stream.stop()
+            stream = self.streams.get(camera_id)
+            if not stream:
+                return True
+            if not stream.stop(timeout=self.stop_timeout):
+                return False
+            if self.streams.get(camera_id) is stream:
+                self.streams.pop(camera_id, None)
+            return True
 
     def status(self, camera_id):
         stream = self.streams.get(camera_id)
