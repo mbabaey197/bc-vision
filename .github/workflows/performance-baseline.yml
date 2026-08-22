@@ -1,0 +1,254 @@
+name: RC30 performance evidence
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "app/streams.py"
+      - "app/ai/**"
+      - "tools/benchmark_runtime_capacity.py"
+      - "tests/test_runtime_capacity_benchmark.py"
+      - "docs/PERFORMANCE_BASELINE.md"
+      - ".github/workflows/performance-baseline.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rc30-performance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  RC30_SHA: 21bdc99ed1afdca7423117b79c785992b04f0768
+  PR70_SHA: b3949e5dba20cbe3691687cdbb7d60a4c50a3b6f
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUTF8: "1"
+
+jobs:
+  transport-compare:
+    name: RC30 vs PR70 transport/JPEG
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.0"
+          enable-cache: true
+          cache-python: true
+          cache-dependency-glob: requirements-test.txt
+
+      - name: Set up portable Python
+        shell: cmd
+        run: |
+          uv python install 3.13
+          uv venv --python 3.13 --seed .venv
+          echo %CD%\.venv\Scripts>>"%GITHUB_PATH%"
+
+      - name: Install benchmark test dependencies
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip --quiet
+          python -m pip install -r requirements-test.txt --quiet
+
+      - name: Verify measurement-only branch scope
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $changed = @(git diff --name-only "$env:RC30_SHA...HEAD")
+          $allowed = @(
+            "tools/benchmark_runtime_capacity.py",
+            "tests/test_runtime_capacity_benchmark.py",
+            "docs/PERFORMANCE_BASELINE.md",
+            ".github/workflows/performance-baseline.yml"
+          )
+          $unexpected = @($changed | Where-Object { $_ -notin $allowed })
+          if ($unexpected.Count -ne 0) {
+            throw "Measurement PR changes product/runtime files: $($unexpected -join ', ')"
+          }
+          python scripts\verify_runtime_contract.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ((Get-Content RUNTIME_ABI -Raw).Trim() -ne "2") {
+            throw "Measurement branch changed Runtime ABI"
+          }
+          if ((Get-Content FAST_UPDATE_BASE_VERSION -Raw).Trim() -ne "2.2.0-rc30") {
+            throw "Measurement branch changed fast-update base"
+          }
+
+      - name: Smoke-test benchmark schema
+        shell: cmd
+        run: |
+          python -m pytest -q tests/test_runtime_capacity_benchmark.py
+
+      - name: Prepare exact RC30 and PR70 worktrees
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          git cat-file -e "$env:RC30_SHA^{commit}"
+          if ($LASTEXITCODE -ne 0) { throw "Pinned RC30 commit is unavailable" }
+          git fetch --no-tags origin `
+            refs/pull/70/head:refs/remotes/origin/pr70-performance
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $fetchedPr70 = (git rev-parse refs/remotes/origin/pr70-performance).Trim()
+          if ($fetchedPr70 -ne $env:PR70_SHA) {
+            throw "PR70 moved from pinned evidence SHA $env:PR70_SHA to $fetchedPr70"
+          }
+          $baseDir = Join-Path $env:RUNNER_TEMP "bcvision-rc30-baseline"
+          $pr70Dir = Join-Path $env:RUNNER_TEMP "bcvision-pr70-candidate"
+          git worktree add --detach $baseDir $env:RC30_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git worktree add --detach $pr70Dir refs/remotes/origin/pr70-performance
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory (Join-Path $baseDir "tools") -Force | Out-Null
+          New-Item -ItemType Directory (Join-Path $pr70Dir "tools") -Force | Out-Null
+          Copy-Item tools\benchmark_runtime_capacity.py `
+            (Join-Path $baseDir "tools\benchmark_runtime_capacity.py") -Force
+          Copy-Item tools\benchmark_runtime_capacity.py `
+            (Join-Path $pr70Dir "tools\benchmark_runtime_capacity.py") -Force
+          "BASE_DIR=$baseDir" >> $env:GITHUB_ENV
+          "PR70_DIR=$pr70Dir" >> $env:GITHUB_ENV
+
+      - name: Run exact same transport harness
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $python = (Resolve-Path ".venv\Scripts\python.exe").Path
+          $results = Join-Path $env:RUNNER_TEMP "bcvision-performance-results"
+          New-Item -ItemType Directory $results -Force | Out-Null
+
+          Push-Location $env:BASE_DIR
+          & $python tools\benchmark_runtime_capacity.py transport `
+            --output (Join-Path $results "rc30-no-viewer.json") `
+            --ref $env:RC30_SHA --camera-counts 1,3,6
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+
+          Push-Location $env:PR70_DIR
+          & $python tools\benchmark_runtime_capacity.py transport `
+            --output (Join-Path $results "pr70-no-viewer.json") `
+            --ref $env:PR70_SHA --camera-counts 1,3,6
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $python tools\benchmark_runtime_capacity.py transport `
+            --output (Join-Path $results "pr70-viewer.json") `
+            --ref "$env:PR70_SHA+viewer" --camera-counts 1,3,6 --viewer
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+          "RESULT_DIR=$results" >> $env:GITHUB_ENV
+
+      - name: Summarize isolated transport evidence
+        shell: pwsh
+        run: |
+          $base = Get-Content (Join-Path $env:RESULT_DIR "rc30-no-viewer.json") -Raw | ConvertFrom-Json
+          $candidate = Get-Content (Join-Path $env:RESULT_DIR "pr70-no-viewer.json") -Raw | ConvertFrom-Json
+          $viewer = Get-Content (Join-Path $env:RESULT_DIR "pr70-viewer.json") -Raw | ConvertFrom-Json
+          "## RC30 vs pinned PR #70 transport isolation" >> $env:GITHUB_STEP_SUMMARY
+          "" >> $env:GITHUB_STEP_SUMMARY
+          "This is synthetic paced MJPEG transport evidence, not merge approval or passage-accuracy evidence." >> $env:GITHUB_STEP_SUMMARY
+          "" >> $env:GITHUB_STEP_SUMMARY
+          "| Cameras | RC30 CPU core-eq % | PR70 CPU core-eq % | RC30 decode FPS/cam | PR70 decode FPS/cam | RC30 JPEG | PR70 no-viewer JPEG | PR70 viewer JPEG | RC30 est. drop | PR70 est. drop |" >> $env:GITHUB_STEP_SUMMARY
+          "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|" >> $env:GITHUB_STEP_SUMMARY
+          for ($i = 0; $i -lt $base.scenarios.Count; $i++) {
+            $b = $base.scenarios[$i]
+            $c = $candidate.scenarios[$i]
+            $v = $viewer.scenarios[$i]
+            $line = "| $($b.camera_count) | $($b.core_equivalent_cpu_percent) | $($c.core_equivalent_cpu_percent) | $($b.decode_fps_per_camera) | $($c.decode_fps_per_camera) | $($b.jpeg_encodes) | $($c.jpeg_encodes) | $($v.jpeg_encodes) | $([math]::Round(100*$b.estimated_source_frame_drop_rate,1))% | $([math]::Round(100*$c.estimated_source_frame_drop_rate,1))% |"
+            $line >> $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Upload transport evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: rc30-transport-performance-evidence
+          path: ${{ env.RESULT_DIR }}\*.json
+          if-no-files-found: error
+          retention-days: 14
+
+  inference-baseline:
+    name: RC30 real-model 1-3-6 inference
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      BCVISION_RUN_AI_INTEGRATION: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.0"
+          enable-cache: true
+          cache-python: true
+          cache-dependency-glob: requirements-ai-lock.txt
+
+      - name: Set up portable Python
+        shell: cmd
+        run: |
+          uv python install 3.13
+          uv venv --python 3.13 --seed .venv
+          echo %CD%\.venv\Scripts>>"%GITHUB_PATH%"
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\bcvision-models
+          key: bcvision-anpr-models-v4-yolo11n-yolov8n-hezar
+          restore-keys: |
+            bcvision-anpr-models-v3-yolo11n-hezar
+
+      - name: Install real AI runtime
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip --quiet
+          python -m pip install -r requirements-ai-lock.txt --quiet
+          python -m pip check
+
+      - name: Run pinned RC30 model-capacity baseline
+        shell: pwsh
+        env:
+          BCVISION_DATA_DIR: ${{ runner.temp }}\bcvision-data\performance
+          BCVISION_PLATE_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo11n.onnx
+          BCVISION_PLATE_YOLOV8N_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolov8n.onnx
+          BCVISION_PLATE_FALLBACK_MODEL: ${{ runner.temp }}\bcvision-models\plate\plate_yolo_fallback.onnx
+          BCVISION_CRNN_MODEL: ${{ runner.temp }}\bcvision-models\crnn\ocr_crnn.onnx
+          BCVISION_CNN_MODEL: ${{ runner.temp }}\bcvision-models\cnn\ocr_cnn.onnx
+          BCVISION_HEZAR_MODEL: ${{ runner.temp }}\bcvision-models\hezar\crnn_fa_v2.onnx
+        run: |
+          $ErrorActionPreference = "Stop"
+          $results = Join-Path $env:RUNNER_TEMP "bcvision-inference-results"
+          New-Item -ItemType Directory $results -Force | Out-Null
+          python tools\benchmark_runtime_capacity.py inference `
+            --output (Join-Path $results "rc30-inference.json") `
+            --ref $env:RC30_SHA --camera-counts 1,3,6 `
+            --iterations 4 --detector yolo11n --include-platrix
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "INFERENCE_RESULT_DIR=$results" >> $env:GITHUB_ENV
+
+      - name: Summarize real-model capacity
+        shell: pwsh
+        run: |
+          $result = Get-Content (Join-Path $env:INFERENCE_RESULT_DIR "rc30-inference.json") -Raw | ConvertFrom-Json
+          "## RC30 pinned real-model capacity" >> $env:GITHUB_STEP_SUMMARY
+          "" >> $env:GITHUB_STEP_SUMMARY
+          "YOLO11n + Hezar v2 + fixed Platrix fallback microbenchmark; synthetic pixels, no passage-accuracy claim." >> $env:GITHUB_STEP_SUMMARY
+          "" >> $env:GITHUB_STEP_SUMMARY
+          "| Cameras | CPU core-eq % | Detector FPS | Detector p95 ms | Hezar reads/s | Hezar p95 ms | Platrix reads/s | Platrix p95 ms |" >> $env:GITHUB_STEP_SUMMARY
+          "|---:|---:|---:|---:|---:|---:|---:|---:|" >> $env:GITHUB_STEP_SUMMARY
+          foreach ($row in $result.scenarios) {
+            "| $($row.camera_count) | $($row.core_equivalent_cpu_percent) | $($row.detector_fps) | $($row.detector_ms_p95) | $($row.hezar_reads_per_second) | $($row.hezar_ms_p95) | $($row.platrix_reads_per_second) | $($row.platrix_ms_p95) |" >> $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Upload inference evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: rc30-inference-performance-evidence
+          path: ${{ env.INFERENCE_RESULT_DIR }}\*.json
+          if-no-files-found: error
+          retention-days: 14
