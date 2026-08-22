@@ -1,3 +1,5 @@
+import asyncio
+import inspect
 from pathlib import Path
 import threading
 import time
@@ -6,12 +8,51 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 import pytest
+from starlette.responses import StreamingResponse
 
 import app.ai.video_test as video_test
 from app.ai import model_manager
 import app.media_storage as media_storage
 import app.streams as streams
 from app.streams import CameraStream
+
+
+def _allow_unit_media_writes(monkeypatch):
+    class Reservation:
+        def close(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        media_storage,
+        "begin_media_write",
+        lambda *_args, **_kwargs: Reservation(),
+    )
+
+
+@pytest.mark.parametrize("kind", ["directory", "missing"])
+def test_uploaded_video_pin_rejects_non_file_without_leaking_lease(
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    source = tmp_path / "source"
+    if kind == "directory":
+        source.mkdir()
+    closed = []
+
+    class Lease:
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(
+        "app.storage_policy.pin_media_paths",
+        lambda _paths: Lease(),
+    )
+
+    with pytest.raises((FileNotFoundError, ValueError)):
+        streams._pin_uploaded_video_source(source)
+
+    assert closed == [True]
 
 
 def _write_video(path: Path, frames=8):
@@ -35,7 +76,324 @@ def _write_video(path: Path, frames=8):
     writer.release()
 
 
+def test_mjpeg_frames_are_async_and_not_wrapped_in_threadpool(monkeypatch):
+    stream = CameraStream(90, "rtsp://gate", "Gate", fps=5)
+    stream.latest = b"jpeg-payload"
+    monkeypatch.setattr(stream, "start", lambda: True)
+
+    async def consume_one():
+        generator = stream.frames()
+        assert inspect.isasyncgen(generator)
+        response = StreamingResponse(generator)
+        # Starlette preserves AsyncIterable objects. A synchronous generator
+        # would instead be wrapped by iterate_in_threadpool().
+        assert response.body_iterator is generator
+        chunk = await anext(response.body_iterator)
+        stream.stop_event.set()
+        await generator.aclose()
+        return chunk
+
+    chunk = asyncio.run(consume_one())
+
+    assert chunk.startswith(b"--frame\r\n")
+    assert b"jpeg-payload" in chunk
+
+
+def test_delayed_mjpeg_body_cannot_resurrect_removed_stream(monkeypatch):
+    import app.ai.live_worker as live_worker
+
+    monkeypatch.setattr(live_worker, "stop_live_camera", lambda _id: True)
+    manager = streams.StreamManager(stop_timeout=0.1)
+    stream = CameraStream(94, "rtsp://removed", "Removed", fps=5)
+    stream.latest = b"orphaned-jpeg"
+    manager.streams[94] = stream
+
+    # Creating an async generator does not execute its body. This models a
+    # StreamingResponse whose body begins only after the stream was removed.
+    generator = stream.frames()
+    assert manager.remove(94) is True
+
+    async def consume_after_removal():
+        with pytest.raises(StopAsyncIteration):
+            await anext(generator)
+
+    asyncio.run(consume_after_removal())
+
+    assert 94 not in manager.streams
+    assert stream.stop_event.is_set()
+    assert stream.thread is None
+    assert stream._anpr_thread is None
+
+
+def test_uploaded_video_read_lease_covers_decoder_thread(monkeypatch):
+    import app.ai.live_worker as live_worker
+
+    entered = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+    pinned_sources = []
+
+    class Lease:
+        def close(self):
+            closed.set()
+
+    def pin_source(source):
+        pinned_sources.append(source)
+        return Lease()
+
+    stream = CameraStream(
+        941,
+        "video:///managed/upload.avi",
+        "Pinned upload",
+        media_pin_factory=pin_source,
+    )
+
+    def blocked_run():
+        entered.set()
+        assert release.wait(2.0)
+
+    monkeypatch.setattr(stream, "_run", blocked_run)
+    monkeypatch.setattr(live_worker, "stop_live_camera", lambda _id: True)
+
+    assert stream.start() is True
+    assert entered.wait(1.0)
+    assert pinned_sources == ["/managed/upload.avi"]
+    assert not closed.is_set()
+
+    release.set()
+    stream.thread.join(timeout=1.0)
+    assert not stream.thread.is_alive()
+    assert closed.is_set()
+    assert stream.stop(timeout=1.0) is True
+
+
+def test_uploaded_video_refuses_to_start_without_read_lease():
+    def reject_pin(_source):
+        raise RuntimeError("unsafe media path")
+
+    stream = CameraStream(
+        942,
+        "video:///unmanaged/upload.avi",
+        "Unsafe upload",
+        media_pin_factory=reject_pin,
+    )
+
+    assert stream.start() is False
+    assert stream.thread is None
+    assert stream._anpr_thread is None
+    assert "read lease failed" in stream.state.last_error
+
+
+def test_stream_stop_releases_blocked_capture_and_joins_threads(monkeypatch):
+    import app.ai.live_worker as live_worker
+
+    read_started = threading.Event()
+    released = threading.Event()
+    stopped = []
+
+    class BlockingCapture:
+        def isOpened(self):
+            return True
+
+        def set(self, *_args):
+            return True
+
+        def read(self):
+            read_started.set()
+            assert released.wait(2.0)
+            return False, None
+
+        def release(self):
+            released.set()
+
+    capture = BlockingCapture()
+    monkeypatch.setattr(streams.cv2, "VideoCapture", lambda *_args: capture)
+    monkeypatch.setattr(
+        live_worker,
+        "stop_live_camera",
+        lambda camera_id: stopped.append(camera_id),
+    )
+    stream = CameraStream(92, "rtsp://blocked", "Blocked")
+    stream.start()
+    assert read_started.wait(1.0)
+
+    assert stream.stop(timeout=1.0) is True
+
+    assert released.is_set()
+    assert not stream.thread.is_alive()
+    assert not stream._anpr_thread.is_alive()
+    assert stopped == [92]
+
+
+def test_manager_refuses_replacement_while_old_decoder_is_alive(monkeypatch):
+    import app.ai.live_worker as live_worker
+
+    read_started = threading.Event()
+    allow_read_to_return = threading.Event()
+    release_calls = []
+    captures = []
+
+    class StubbornCapture:
+        def isOpened(self):
+            return True
+
+        def set(self, *_args):
+            return True
+
+        def read(self):
+            read_started.set()
+            assert allow_read_to_return.wait(2.0)
+            return False, None
+
+        def release(self):
+            # Some RTSP backends do not promptly unblock a read even after
+            # release. The manager must retain the old identity in that case.
+            release_calls.append(True)
+
+    def open_capture(*_args):
+        capture = StubbornCapture()
+        captures.append(capture)
+        return capture
+
+    monkeypatch.setattr(streams.cv2, "VideoCapture", open_capture)
+    monkeypatch.setattr(live_worker, "stop_live_camera", lambda _camera_id: None)
+    manager = streams.StreamManager(stop_timeout=0.05)
+    old = manager.get(93, "rtsp://old", "Old", 640, 5, 70)
+    assert read_started.wait(1.0)
+
+    with pytest.raises(RuntimeError, match="replacement refused"):
+        manager.get(93, "rtsp://new", "New", 640, 5, 70)
+
+    assert manager.streams[93] is old
+    assert len(captures) == 1
+    assert release_calls
+
+    allow_read_to_return.set()
+    old.thread.join(timeout=1.0)
+    old._anpr_thread.join(timeout=1.0)
+    assert manager.remove(93) is True
+    assert 93 not in manager.streams
+
+
+def test_manager_refuses_replacement_when_anpr_worker_stop_is_unconfirmed(
+    monkeypatch,
+):
+    import app.ai.live_worker as live_worker
+
+    monkeypatch.setattr(live_worker, "stop_live_camera", lambda _id: False)
+    manager = streams.StreamManager(stop_timeout=0.1)
+    old = CameraStream(95, "rtsp://old", "Old")
+    old._key = ("rtsp://old", "Old", 640, 5, 70)
+    manager.streams[95] = old
+
+    with pytest.raises(RuntimeError, match="replacement refused"):
+        manager.get(95, "rtsp://new", "New", 640, 5, 70)
+
+    assert manager.streams[95] is old
+    assert old.stop_event.is_set()
+    assert old._live_worker_stopped is False
+    assert old.state.last_error == "ANPR worker stop timed out"
+
+
+def test_stop_live_camera_propagates_worker_remove_failure(monkeypatch):
+    import app.ai.live_worker as live_worker
+
+    monkeypatch.setattr(live_worker.worker, "remove", lambda _id: False)
+
+    assert live_worker.stop_live_camera(95) is False
+
+
+def test_stop_during_encode_cannot_publish_or_start_video_anpr(monkeypatch):
+    import app.ai.live_worker as live_worker
+
+    encode_started = threading.Event()
+    release_encode = threading.Event()
+    marker_calls = []
+    stop_results = []
+    frame = np.zeros((40, 80, 3), dtype=np.uint8)
+    stream = CameraStream(
+        96,
+        "video:///tmp/stop-during-encode.avi",
+        "Stopping video",
+        video_anpr_state_callback=(
+            lambda camera_id, state: marker_calls.append((camera_id, state))
+        ),
+    )
+
+    def blocked_encode(_frame):
+        encode_started.set()
+        assert release_encode.wait(2.0)
+        return b"late-jpeg"
+
+    monkeypatch.setattr(stream, "_encode", blocked_encode)
+    monkeypatch.setattr(live_worker, "begin_live_video_pass", lambda _id: 1)
+    monkeypatch.setattr(live_worker, "stop_live_camera", lambda _id: True)
+    publish_thread = threading.Thread(target=stream._publish, args=(frame,))
+    stream.thread = publish_thread
+    publish_thread.start()
+    assert encode_started.wait(1.0)
+
+    stop_thread = threading.Thread(
+        target=lambda: stop_results.append(stream.stop(timeout=1.0)),
+    )
+    stop_thread.start()
+    assert stream.stop_event.wait(1.0)
+    release_encode.set()
+    publish_thread.join(timeout=1.0)
+    stop_thread.join(timeout=1.0)
+
+    assert not publish_thread.is_alive()
+    assert not stop_thread.is_alive()
+    assert stop_results == [True]
+    assert marker_calls == []
+    assert stream._video_anpr_started is False
+    assert stream._anpr_pending_frame is None
+    assert stream.latest is None
+    assert stream.state.online is False
+
+
+def test_stream_stop_waits_for_inflight_worker_submission(monkeypatch):
+    import app.ai.live_worker as live_worker
+
+    stream = CameraStream(91, "rtsp://gate", "Gate")
+    frame = np.zeros((40, 80, 3), dtype=np.uint8)
+    submitting = threading.Event()
+    release = threading.Event()
+    stopped = []
+
+    def submit(*_args):
+        submitting.set()
+        assert release.wait(2.0)
+
+    monkeypatch.setattr(live_worker, "submit_live_frame", submit)
+    monkeypatch.setattr(
+        live_worker,
+        "stop_live_camera",
+        lambda camera_id: stopped.append((camera_id, release.is_set())),
+    )
+    stream._anpr_thread = threading.Thread(
+        target=stream._anpr_loop,
+        daemon=True,
+    )
+    stream._anpr_thread.start()
+    stream._queue_anpr(frame)
+    assert submitting.wait(1.0)
+
+    stop_thread = threading.Thread(target=stream.stop)
+    stop_thread.start()
+    time.sleep(0.05)
+    assert stop_thread.is_alive()
+    assert stopped == []
+    release.set()
+    stop_thread.join(timeout=2.0)
+    stream._anpr_thread.join(timeout=2.0)
+
+    assert not stop_thread.is_alive()
+    assert stopped == [(91, True)]
+
+
 def test_video_emits_one_consensus_event(tmp_path, monkeypatch):
+    _allow_unit_media_writes(monkeypatch)
     video_path = tmp_path / "sample.avi"
     _write_video(video_path)
     calls = {"count": 0}
@@ -590,6 +948,92 @@ def test_video_shadow_request_cannot_affect_selected_baseline_events(
     assert events[0]["detector_selection_exclusive"] is True
     assert not events[0].get("experimental")
     assert info["candidate_shadow_enabled"] is False
+
+
+def test_isolated_video_transport_encodes_without_managed_media_writes(
+    tmp_path,
+    monkeypatch,
+):
+    video_path = tmp_path / "isolated.avi"
+    _write_video(video_path, frames=4)
+
+    def selected(frame, *_args, **_kwargs):
+        return [{
+            "plate": "31-ط-556-74",
+            "plate_norm": "31ط55674",
+            "valid": True,
+            "confidence": 0.91,
+            "detector_confidence": 0.90,
+            "ocr_confidence": 0.89,
+            "quality_score": 0.82,
+            "bbox": (80, 80, 240, 120),
+            "crop": frame[80:120, 80:240].copy(),
+            "method": "test",
+        }]
+
+    monkeypatch.setattr(video_test, "process_frame", selected)
+    monkeypatch.setattr(
+        video_test,
+        "save_event_images",
+        lambda *_args, **_kwargs: pytest.fail(
+            "isolated child attempted a managed-media write"
+        ),
+    )
+    plate_dir = tmp_path / "plates"
+    snapshot_dir = tmp_path / "snapshots"
+
+    envelope = video_test.process_video_transport(
+        video_path,
+        plate_dir,
+        snapshot_dir,
+        frame_step=1,
+        detector_variant="yolo8n",
+    )
+    info, events = video_test.restore_process_video_result(envelope)
+
+    assert info["detector_variant"] == "yolov8n"
+    assert len(events) == 1
+    assert not plate_dir.exists()
+    assert not snapshot_dir.exists()
+    assert "_pending_media" not in events[0]
+    assert events[0]["_transport_plate_jpeg"].startswith(b"\xff\xd8")
+    assert events[0]["_transport_vehicle_jpeg"].endswith(b"\xff\xd9")
+
+
+def test_isolated_video_transport_enforces_aggregate_media_bound(
+    tmp_path,
+    monkeypatch,
+):
+    video_path = tmp_path / "bounded.avi"
+    _write_video(video_path, frames=4)
+
+    def selected(frame, *_args, **_kwargs):
+        return [{
+            "plate": "31-ط-556-74",
+            "plate_norm": "31ط55674",
+            "valid": True,
+            "confidence": 0.91,
+            "bbox": (80, 80, 240, 120),
+            "crop": frame[80:120, 80:240].copy(),
+            "method": "test",
+        }]
+
+    monkeypatch.setattr(video_test, "process_frame", selected)
+    plate_dir = tmp_path / "plates"
+    snapshot_dir = tmp_path / "snapshots"
+
+    with pytest.raises(ValueError, match="بخش‌های کوتاه‌تر"):
+        video_test.process_video_transport(
+            video_path,
+            plate_dir,
+            snapshot_dir,
+            frame_step=1,
+            detector_variant="yolo8n",
+            transport_media_bytes=16,
+        )
+
+    assert not plate_dir.exists()
+    assert not snapshot_dir.exists()
 
 
 def test_uploaded_video_stream_pauses_at_end_for_stable_event_count(

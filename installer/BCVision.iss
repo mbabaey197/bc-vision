@@ -1,5 +1,5 @@
 #define MyAppName "BC Vision"
-#define MyAppVersion "2.2.0-rc29"
+#define MyAppVersion "2.2.0-rc30"
 #define MyAppPublisher "Gilas Abi Alborz"
 #define MyAppExeName "BCVision.exe"
 #define RequireExistingInstall 0
@@ -8,14 +8,14 @@
 AppId={{12FC1F39-4F29-4D61-A81D-66BD900AA4E8}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-VersionInfoVersion=2.2.0.290
+VersionInfoVersion=2.2.0.300
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\BC Vision
 DefaultGroupName=BC Vision
 DisableProgramGroupPage=yes
 UsePreviousAppDir=yes
 OutputDir=..\setup_output
-OutputBaseFilename=BCVision_RC29_Setup
+OutputBaseFilename=BCVision_RC30_Setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

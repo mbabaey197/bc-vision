@@ -127,6 +127,66 @@ def test_low_confidence_platrix_stays_unreadable(monkeypatch):
     ) == ("", 0.0, "none")
 
 
+def test_rejected_hezar_top_k_is_retained_as_temporal_evidence(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        ocr,
+        "read_plate_hezar_primary",
+        lambda *_args, **_kwargs: {
+            "accepted": False,
+            "plate_norm": "",
+            "confidence": 0.48,
+            "hypotheses": [
+                {
+                    "plate_norm": "31ط55874",
+                    "confidence": 0.48,
+                    "score": 1e-30,
+                },
+                {
+                    "plate_norm": "31ط55674",
+                    "confidence": 0.44,
+                    "score": 1e-40,
+                },
+                {
+                    "plate_norm": "31ط55974",
+                    "confidence": 0.20,
+                    "score": 1e-50,
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(ocr, "hezar_status", lambda: {"error": ""})
+    monkeypatch.setattr(
+        ocr,
+        "read_plate_platrix",
+        lambda *_args, **_kwargs: ("", 0.0),
+    )
+    monkeypatch.setattr(ocr, "get_crnn_status", lambda: {"error": ""})
+
+    candidate = ocr.read_plate_candidate(
+        np.zeros((32, 160, 3), dtype=np.uint8),
+        include_evidence=True,
+    )
+
+    assert candidate["plate"] == ""
+    assert candidate["plate_norm"] == ""
+    assert candidate["engine"] == "none"
+    assert [
+        row["plate_norm"] for row in candidate["hypotheses"]
+    ] == ["31ط55874", "31ط55674", "31ط55974"]
+    assert [
+        row["temporal_evidence"]
+        for row in candidate["hypotheses"]
+    ] == [True, True, False]
+    assert [
+        row["score"] for row in candidate["hypotheses"]
+    ] == [0.48, 0.44, 0.20]
+    assert [
+        row["ctc_path_score"] for row in candidate["hypotheses"]
+    ] == [1e-30, 1e-40, 1e-50]
+
+
 def test_platrix_production_runtime_ignores_promoted_custom_crnn(
     tmp_path,
     monkeypatch,

@@ -1,6 +1,6 @@
 name: Fast one-click update
 
-# RC29 installs the stable runtime once. A routine release reuses the exact-SHA
+# The full base installs the stable runtime once. A routine release reuses the exact-SHA
 # ANPR validation and builds only the small, transactional application update.
 
 on:
@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       verify_base_install:
-        description: Run the slower real RC29 Setup-to-fast-update integration
+        description: Run the slower real full-base Setup-to-fast-update integration
         required: false
         default: false
         type: boolean
@@ -520,14 +520,14 @@ jobs:
             }
           }
 
-          # Re-running the immutable full RC29 Setup must repair base files
+          # Re-running the immutable full-base Setup must repair base files
           # without downgrading the already-confirmed fast runtime.
           $repair = Start-Process $setup -ArgumentList @(
             "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
             "/DIR=$installDir"
           ) -Wait -PassThru
           if ($repair.ExitCode -ne 0) {
-            throw "Full RC29 repair exited with $($repair.ExitCode)"
+            throw "Full-base repair exited with $($repair.ExitCode)"
           }
           $repairResult = Join-Path $env:RUNNER_TEMP "repair-self-test.json"
           $repairTest = Start-Process "$installDir\BCVision.exe" `
@@ -536,14 +536,14 @@ jobs:
               "--self-test-output", $repairResult
             ) -Wait -PassThru
           if ($repairTest.ExitCode -ne 0) {
-            throw "Runtime failed after full RC29 repair"
+            throw "Runtime failed after full-base repair"
           }
           $repairJson = Get-Content $repairResult -Raw | ConvertFrom-Json
           if (
             $repairJson.runtime_version -ne
               "${{ needs.build-update.outputs.version }}" -or
             $repairJson.runtime_source -ne "external"
-          ) { throw "Full RC29 repair downgraded the active fast runtime" }
+          ) { throw "Full-base repair downgraded the active fast runtime" }
           python scripts\verify_installed_runtime.py `
             --install-dir $installDir `
             --version "${{ needs.build-update.outputs.version }}" `
@@ -554,11 +554,11 @@ jobs:
           if ((Get-FileHash (
             Join-Path $bootstrapDir "storage_config.json"
           )).Hash -ne $configHash) {
-            throw "Full RC29 repair changed storage configuration"
+            throw "Full-base repair changed storage configuration"
           }
           python -c "import os,sqlite3,sys; c=sqlite3.connect(os.environ['BCVISION_TEST_DB']); r=c.execute('SELECT value FROM settings WHERE key=?',('fast_update_marker',)).fetchone(); c.close(); sys.exit(0 if r and r[0]==os.environ['BCVISION_TEST_MARKER'] else 1)"
           if ($LASTEXITCODE -ne 0) {
-            throw "Full RC29 repair changed the database setting"
+            throw "Full-base repair changed the database setting"
           }
           foreach ($relative in $persistentMarkers) {
             $markerPath = Join-Path $customData $relative
@@ -566,7 +566,7 @@ jobs:
               -not (Test-Path $markerPath) -or
               (Get-Content $markerPath -Raw).Trim() -ne
                 $env:BCVISION_TEST_MARKER
-            ) { throw "Full RC29 repair changed $relative" }
+            ) { throw "Full-base repair changed $relative" }
           }
 
   publish:

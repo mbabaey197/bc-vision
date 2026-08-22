@@ -19,16 +19,31 @@ from .training_manifest import operator_dataset_fingerprint
 MIN_TRAIN_SAMPLES = 24
 MIN_VALIDATION_SAMPLES = 12
 MIN_UNIQUE_PLATES = 8
+MAX_PENDING_FEEDBACK_RECOVERY = 256
 _TRAINING_LOCK = threading.RLock()
 _TRAINING_THREAD: threading.Thread | None = None
+_PENDING_SOURCE_PINS: dict[int, object] = {}
 
 
 def _training_root() -> Path:
     from app.config import DATA_DIR
 
     root = Path(DATA_DIR) / "anpr-training"
-    root.mkdir(parents=True, exist_ok=True)
+    _mkdir_durable(root)
     return root
+
+
+def _mkdir_durable(directory: Path) -> None:
+    from app.storage_policy import fsync_parent_directory
+
+    missing = []
+    current = Path(directory)
+    while not current.exists() and current != current.parent:
+        missing.append(current)
+        current = current.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    for created in reversed(missing):
+        fsync_parent_directory(created)
 
 
 def _sha256(path: Path) -> str:
@@ -37,6 +52,121 @@ def _sha256(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest().upper()
+
+
+def _valid_sha256(value: str) -> bool:
+    return len(value) == 64 and all(
+        character in "0123456789ABCDEF" for character in value
+    )
+
+
+def _release_pending_source_pin(feedback_id: int) -> None:
+    with _TRAINING_LOCK:
+        lease = _PENDING_SOURCE_PINS.pop(int(feedback_id), None)
+    if lease is not None:
+        lease.close()
+
+
+def close_pending_feedback_source_pins() -> None:
+    """Release every process-local lease during orderly shutdown."""
+
+    with _TRAINING_LOCK:
+        leases = list(_PENDING_SOURCE_PINS.values())
+        _PENDING_SOURCE_PINS.clear()
+    for lease in leases:
+        lease.close()
+
+
+def _pin_pending_feedback_source(
+    feedback_id: int,
+    source_value: str | None = None,
+) -> bool:
+    """Retain one exact pending crop without allowing subtree/root pins."""
+
+    from app.database import connect
+    from app.storage_policy import StoragePolicyError, pin_media_paths
+
+    feedback_id = int(feedback_id)
+    with _TRAINING_LOCK:
+        if feedback_id in _PENDING_SOURCE_PINS:
+            return True
+    if source_value is None:
+        with connect() as con:
+            row = con.execute(
+                "SELECT plate_image_path FROM anpr_feedback "
+                "WHERE id=? AND status='confirmed' "
+                "AND training_status='pending'",
+                (feedback_id,),
+            ).fetchone()
+        if not row:
+            return False
+        source_value = row["plate_image_path"]
+    source_text = str(source_value or "").strip()
+    if not source_text:
+        return False
+    source = Path(source_text)
+    try:
+        lease = pin_media_paths((source,))
+    except (OSError, RuntimeError, StoragePolicyError, ValueError):
+        return False
+    # Acquire the policy lease first, then require an exact regular-file leaf.
+    # A hostile DB row pointing at the media root must never pin a subtree.
+    if not source.is_file():
+        lease.close()
+        return False
+    with _TRAINING_LOCK:
+        existing = _PENDING_SOURCE_PINS.get(feedback_id)
+        if existing is None:
+            _PENDING_SOURCE_PINS[feedback_id] = lease
+            return True
+    lease.close()
+    return True
+
+
+def refresh_pending_feedback_source_pins() -> dict:
+    """Individually protect all retryable feedback before retention starts."""
+
+    from app.database import connect
+
+    with connect() as con:
+        rows = con.execute(
+            "SELECT id,plate_image_path FROM anpr_feedback "
+            "WHERE status='confirmed' AND training_status='pending' "
+            "ORDER BY id"
+        ).fetchall()
+    pending_ids = {int(row["id"]) for row in rows}
+    with _TRAINING_LOCK:
+        stale_ids = set(_PENDING_SOURCE_PINS) - pending_ids
+    for feedback_id in stale_ids:
+        _release_pending_source_pin(feedback_id)
+    pinned = 0
+    failed = []
+    for row in rows:
+        feedback_id = int(row["id"])
+        if _pin_pending_feedback_source(
+            feedback_id,
+            row["plate_image_path"],
+        ):
+            pinned += 1
+        else:
+            failed.append(feedback_id)
+    return {
+        "pending": len(rows),
+        "pinned": pinned,
+        "failed_ids": failed,
+    }
+
+
+def _training_label_supported(label: str) -> bool:
+    """Return whether every canonical label character is trainable by CRNN."""
+
+    from .onnx_crnn import CRNN_LABELS
+
+    normalized = normalize_plate(label)
+    alphabet = set(CRNN_LABELS)
+    return plausible_plate(normalized) and all(
+        character in alphabet for character in normalized
+    )
 
 
 def _store_unique_feedback_sample(
@@ -54,31 +184,42 @@ def _store_unique_feedback_sample(
     # read check and inflate the verified dataset.
     with _TRAINING_LOCK:
         with connect() as con:
-            duplicate = con.execute(
-                "SELECT id,corrected_norm,sample_path,sample_sha256 "
-                "FROM anpr_feedback WHERE id<>? "
-                "AND training_status IN ('ready','trained') "
-                "AND sample_sha256=? ORDER BY id LIMIT 1",
+            duplicates = con.execute(
+                "SELECT id,corrected_norm,sample_path,sample_sha256,"
+                "training_status FROM anpr_feedback WHERE id<>? "
+                "AND sample_sha256=? ORDER BY id",
                 (int(feedback_id), digest),
-            ).fetchone()
-        if duplicate:
+            ).fetchall()
+        if any(
+            normalize_plate(row["corrected_norm"]) != label
+            for row in duplicates
+        ):
+            # A digest represents one immutable crop and may never carry two
+            # truths. Quarantine every historical copy, including rows that
+            # were already trained or recorded as duplicates, so the oldest
+            # label cannot silently remain in the verified dataset.
+            with connect() as con:
+                con.execute(
+                    "UPDATE anpr_feedback SET "
+                    "training_status='label-conflict' "
+                    "WHERE sample_sha256=?",
+                    (digest,),
+                )
+                con.execute(
+                    "UPDATE anpr_feedback SET sample_sha256=?,"
+                    "training_status='label-conflict' WHERE id=?",
+                    (digest, int(feedback_id)),
+                )
+            return {
+                "ready": False,
+                "reason": "duplicate-label-conflict",
+            }
+        for duplicate in duplicates:
             duplicate_path = Path(duplicate["sample_path"] or "")
-            duplicate_label = normalize_plate(duplicate["corrected_norm"])
             duplicate_valid = (
                 duplicate_path.is_file()
                 and _sha256(duplicate_path) == digest
             )
-            if duplicate_label != label:
-                with connect() as con:
-                    con.execute(
-                        "UPDATE anpr_feedback SET "
-                        "training_status='label-conflict' WHERE id=?",
-                        (int(feedback_id),),
-                    )
-                return {
-                    "ready": False,
-                    "reason": "duplicate-label-conflict",
-                }
             if duplicate_valid:
                 split = stable_split_for_group(label)
                 with connect() as con:
@@ -101,11 +242,17 @@ def _store_unique_feedback_sample(
 
         target = samples / f"{int(feedback_id):08d}-{digest[:16]}.png"
         temporary = target.with_suffix(".tmp")
-        temporary.write_bytes(payload)
+        with temporary.open("wb") as sample_file:
+            sample_file.write(payload)
+            sample_file.flush()
+            os.fsync(sample_file.fileno())
         if _sha256(temporary) != digest:
             temporary.unlink(missing_ok=True)
             return {"ready": False, "reason": "hash-mismatch"}
         os.replace(temporary, target)
+        from app.storage_policy import fsync_parent_directory
+
+        fsync_parent_directory(target)
         # All frames carrying the same confirmed plate stay in one split. The
         # previous image-hash split could put neighbouring frames of one
         # vehicle in both train and validation and inflate validation accuracy.
@@ -125,7 +272,7 @@ def _store_unique_feedback_sample(
         }
 
 
-def capture_feedback_sample(feedback_id: int) -> dict:
+def _capture_feedback_sample(feedback_id: int) -> dict:
     """Copy one confirmed plate crop into the immutable training dataset."""
 
     from app.database import connect
@@ -140,9 +287,36 @@ def capture_feedback_sample(feedback_id: int) -> dict:
 
     label = normalize_plate(row["corrected_norm"])
     if not plausible_plate(label):
+        with connect() as con:
+            con.execute(
+                "UPDATE anpr_feedback SET training_status='invalid-label' "
+                "WHERE id=?",
+                (int(feedback_id),),
+            )
         return {"ready": False, "reason": "invalid-label"}
+    if not _training_label_supported(label):
+        with connect() as con:
+            con.execute(
+                "UPDATE anpr_feedback SET "
+                "training_status='unsupported-alphabet' WHERE id=?",
+                (int(feedback_id),),
+            )
+        return {"ready": False, "reason": "unsupported-alphabet"}
     source = Path(row["plate_image_path"] or "")
-    if not source.is_file():
+    from app.storage_policy import StoragePolicyError, pin_media_paths
+
+    source_exists = False
+    image = None
+    try:
+        with pin_media_paths((source,)):
+            source_exists = source.is_file()
+            if source_exists:
+                image = cv2.imread(str(source), cv2.IMREAD_COLOR)
+    except StoragePolicyError:
+        # A DB value outside the configured current/history media roots is not
+        # trusted as training evidence, even if an attacker created that file.
+        source_exists = False
+    if not source_exists:
         with connect() as con:
             con.execute(
                 "UPDATE anpr_feedback SET training_status='missing-image' "
@@ -151,7 +325,6 @@ def capture_feedback_sample(feedback_id: int) -> dict:
             )
         return {"ready": False, "reason": "missing-image"}
 
-    image = cv2.imread(str(source), cv2.IMREAD_COLOR)
     if (
         image is None
         or getattr(image, "size", 0) == 0
@@ -167,7 +340,7 @@ def capture_feedback_sample(feedback_id: int) -> dict:
         return {"ready": False, "reason": "invalid-image"}
 
     samples = _training_root() / "samples"
-    samples.mkdir(parents=True, exist_ok=True)
+    _mkdir_durable(samples)
     encoded_ok, encoded = cv2.imencode(
         ".png",
         image,
@@ -186,6 +359,144 @@ def capture_feedback_sample(feedback_id: int) -> dict:
     )
 
 
+def capture_feedback_sample(feedback_id: int) -> dict:
+    """Capture one sample while retaining retryable source evidence."""
+
+    from app.database import connect
+
+    feedback_id = int(feedback_id)
+    _pin_pending_feedback_source(feedback_id)
+    try:
+        return _capture_feedback_sample(feedback_id)
+    finally:
+        # Expected outcomes all move the row out of pending. Unexpected
+        # failures deliberately retain the process-local lease for retry.
+        lookup_failed = False
+        try:
+            with connect() as con:
+                row = con.execute(
+                    "SELECT status,training_status FROM anpr_feedback "
+                    "WHERE id=?",
+                    (feedback_id,),
+                ).fetchone()
+        except Exception:
+            lookup_failed = True
+            row = None
+        if not lookup_failed and (
+            row is None
+            or row["status"] != "confirmed"
+            or row["training_status"] != "pending"
+        ):
+            _release_pending_source_pin(feedback_id)
+
+
+def reconcile_feedback_sample_files() -> dict:
+    """Move invalid ready/trained rows back to the recoverable state."""
+
+    from app.database import connect
+
+    samples_root = (_training_root() / "samples").resolve()
+    with _TRAINING_LOCK:
+        with connect() as con:
+            rows = con.execute(
+                "SELECT id,sample_path,sample_sha256 FROM anpr_feedback "
+                "WHERE status='confirmed' "
+                "AND training_status IN ('ready','trained') "
+                "ORDER BY id"
+            ).fetchall()
+        invalid_ids = []
+        for row in rows:
+            digest = str(row["sample_sha256"] or "").upper()
+            try:
+                path = Path(row["sample_path"] or "").resolve()
+                valid = (
+                    _valid_sha256(digest)
+                    and path.is_relative_to(samples_root)
+                    and path.is_file()
+                    and _sha256(path) == digest
+                )
+            except (OSError, RuntimeError, ValueError):
+                valid = False
+            if not valid:
+                invalid_ids.append(int(row["id"]))
+        if invalid_ids:
+            with connect() as con:
+                con.executemany(
+                    "UPDATE anpr_feedback SET training_status='pending',"
+                    "sample_path='',sample_sha256='',dataset_split='',"
+                    "trained_run_id=NULL WHERE id=? "
+                    "AND status='confirmed' "
+                    "AND training_status IN ('ready','trained')",
+                    ((feedback_id,) for feedback_id in invalid_ids),
+                )
+    return {
+        "checked": len(rows),
+        "reset": len(invalid_ids),
+        "reset_ids": invalid_ids,
+    }
+
+
+def recover_pending_feedback_samples(limit=64) -> dict:
+    """Retry a bounded batch of confirmed feedback still marked pending.
+
+    The recovery is safe to call repeatedly: terminal rows leave ``pending``
+    during capture and are not selected again. An unexpected failure remains
+    retryable, while processing continues for every other row in this batch.
+    """
+
+    from app.database import connect
+
+    try:
+        bounded_limit = int(limit)
+    except (OverflowError, TypeError, ValueError):
+        bounded_limit = 0
+    bounded_limit = max(
+        0,
+        min(MAX_PENDING_FEEDBACK_RECOVERY, bounded_limit),
+    )
+    if bounded_limit == 0:
+        return {
+            "selected": 0,
+            "recovered": 0,
+            "failed": 0,
+            "results": [],
+        }
+
+    with _TRAINING_LOCK:
+        with connect() as con:
+            feedback_ids = [
+                int(row["id"])
+                for row in con.execute(
+                    "SELECT id FROM anpr_feedback "
+                    "WHERE status='confirmed' "
+                    "AND training_status='pending' "
+                    "ORDER BY id LIMIT ?",
+                    (bounded_limit,),
+                ).fetchall()
+            ]
+
+        results = []
+        recovered = 0
+        for feedback_id in feedback_ids:
+            try:
+                outcome = dict(capture_feedback_sample(feedback_id))
+            except Exception as exc:
+                outcome = {
+                    "ready": False,
+                    "reason": "capture-error:"
+                    + type(exc).__name__,
+                }
+            recovered += int(bool(outcome.get("ready")))
+            results.append({"feedback_id": feedback_id, **outcome})
+
+    return {
+        "selected": len(feedback_ids),
+        "recovered": recovered,
+        "failed": len(feedback_ids) - recovered,
+        "results": results,
+    }
+
+
 def _verified_samples() -> list[dict]:
     from app.database import connect
 
@@ -197,27 +508,57 @@ def _verified_samples() -> list[dict]:
             "AND training_status IN ('ready','trained') "
             "ORDER BY id"
         ).fetchall()
+    unsupported_ids = [
+        int(row["id"])
+        for row in rows
+        if plausible_plate(normalize_plate(row["corrected_norm"]))
+        and not _training_label_supported(row["corrected_norm"])
+    ]
+    if unsupported_ids:
+        placeholders = ",".join("?" for _ in unsupported_ids)
+        with connect() as con:
+            con.execute(
+                "UPDATE anpr_feedback SET "
+                "training_status='unsupported-alphabet' "
+                f"WHERE id IN ({placeholders})",
+                unsupported_ids,
+            )
+        unsupported = set(unsupported_ids)
+        rows = [
+            row for row in rows if int(row["id"]) not in unsupported
+        ]
     labels_by_digest = {}
     for row in rows:
         digest = str(row["sample_sha256"] or "").upper()
         label = normalize_plate(row["corrected_norm"])
-        if len(digest) == 64 and plausible_plate(label):
+        if _valid_sha256(digest) and plausible_plate(label):
             labels_by_digest.setdefault(digest, set()).add(label)
     conflicting = {
         digest
         for digest, labels in labels_by_digest.items()
         if len(labels) != 1
     }
+    samples_root = (_training_root() / "samples").resolve()
     candidates = []
     for row in rows:
-        path = Path(row["sample_path"] or "")
+        try:
+            path = Path(row["sample_path"] or "").resolve()
+            path_is_trusted = path.is_relative_to(samples_root)
+        except (OSError, RuntimeError, ValueError):
+            path = Path()
+            path_is_trusted = False
         label = normalize_plate(row["corrected_norm"])
         digest = str(row["sample_sha256"] or "").upper()
+        try:
+            digest_matches = path.is_file() and _sha256(path) == digest
+        except OSError:
+            digest_matches = False
         if (
             not plausible_plate(label)
-            or not path.is_file()
+            or not _valid_sha256(digest)
+            or not path_is_trusted
+            or not digest_matches
             or digest in conflicting
-            or _sha256(path) != digest
         ):
             continue
         candidates.append({
@@ -262,7 +603,12 @@ def dataset_status() -> dict:
     }
 
 
-def export_manifest(run_id: int | None = None) -> Path:
+def export_manifest(
+    run_id: int | None = None,
+    *,
+    rights_attested: bool = False,
+    attested_by: str = "",
+) -> Path:
     samples = _verified_samples()
     root = _training_root()
     if run_id is None:
@@ -280,14 +626,25 @@ def export_manifest(run_id: int | None = None) -> Path:
         portable_samples.append(portable)
     temporary = manifest.with_suffix(".tmp")
     sample_fingerprint = operator_dataset_fingerprint(samples)
+    generated_at = datetime.now(timezone.utc).isoformat()
+    attester = str(attested_by or "").strip()[:120]
+    rights_verified = bool(rights_attested is True and attester)
     payload = {
         "schema": 2,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": generated_at,
         "training_source": "operator-confirmed-only",
-        "source_license": "operator-confirmed-rights-unverified",
-        "ownership_attested": False,
-        "distribution_allowed": False,
-        "license_evidence": "",
+        "source_license": (
+            "operator-confirmed-company-owned"
+            if rights_verified
+            else "operator-confirmed-rights-unverified"
+        ),
+        "ownership_attested": rights_verified,
+        "distribution_allowed": rights_verified,
+        "license_evidence": (
+            f"bcvision-admin-attestation:{attester}:{generated_at}"
+            if rights_verified
+            else ""
+        ),
         "golden_benchmark_data": False,
         "group_key": "group_id",
         "dataset_fingerprint": sample_fingerprint,
@@ -339,6 +696,38 @@ def _training_manifest_payload(
     ):
         raise ValueError("Training snapshot contract is invalid")
     return payload
+
+
+def _reject_unsupported_manifest_labels(
+    manifest: Path,
+    *,
+    expected_sha256: str,
+) -> None:
+    """Fail before CRNN target encoding and quarantine referenced feedback."""
+
+    from app.database import connect
+
+    payload = _training_manifest_payload(
+        manifest,
+        expected_sha256=expected_sha256,
+    )
+    unsupported_ids = sorted({
+        int(sample.get("feedback_id", 0))
+        for sample in payload["samples"]
+        if not _training_label_supported(sample.get("plate", ""))
+        and int(sample.get("feedback_id", 0)) > 0
+    })
+    if not unsupported_ids:
+        return
+    placeholders = ",".join("?" for _ in unsupported_ids)
+    with connect() as con:
+        con.execute(
+            "UPDATE anpr_feedback SET "
+            "training_status='unsupported-alphabet' "
+            f"WHERE id IN ({placeholders})",
+            unsupported_ids,
+        )
+    raise ValueError("Training snapshot contains an unsupported alphabet")
 
 
 def _training_manifest_rights_verified(
@@ -459,6 +848,10 @@ def _run_training(
             if snapshot
             else ""
         ).upper()
+        _reject_unsupported_manifest_labels(
+            manifest,
+            expected_sha256=manifest_sha256,
+        )
         result = train_candidate(
             manifest=manifest,
             output_dir=_training_root() / "candidates" / str(run_id),
@@ -734,7 +1127,13 @@ def evaluate_candidate_on_golden(run_id: int) -> dict:
     return {"run_id": int(run_id), "status": status, "report": report}
 
 
-def start_training(device="auto", epochs=12) -> dict:
+def start_training(
+    device="auto",
+    epochs=12,
+    *,
+    rights_attested=False,
+    attested_by="",
+) -> dict:
     global _TRAINING_THREAD
     from app.database import connect
 
@@ -775,7 +1174,11 @@ def start_training(device="auto", epochs=12) -> dict:
                 ),
             )
             run_id = int(cursor.lastrowid)
-        manifest = export_manifest(run_id)
+        manifest = export_manifest(
+            run_id,
+            rights_attested=bool(rights_attested),
+            attested_by=str(attested_by or ""),
+        )
         manifest_sha256 = _sha256(manifest)
         with connect() as con:
             con.execute(

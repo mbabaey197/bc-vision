@@ -45,6 +45,7 @@ _last_status = {
     "candidate_count": 0,
 }
 PLATRIX_MIN_CONFIDENCE = 0.55
+HEZAR_TEMPORAL_MIN_CONFIDENCE = 0.35
 
 # These replacements are only used in numeric positions.
 DIGIT_CONFUSIONS = {
@@ -531,7 +532,8 @@ def read_plate_candidate(
     image,
     engine_key=None,
     allow_legacy=True,
-) -> tuple[str, float, str]:
+    include_evidence=False,
+) -> tuple[str, float, str] | dict:
     """Run the immutable production policy: Hezar v2, then fixed Platrix.
 
     ``allow_legacy`` remains in the public signature for older integrations,
@@ -540,13 +542,72 @@ def read_plate_candidate(
     training APIs.
     """
 
+    def result(text, confidence, engine, hypotheses=()):
+        payload = {
+            "plate": str(text or ""),
+            "plate_norm": normalize_plate(text),
+            "confidence": _safe_confidence(confidence),
+            "engine": str(engine or "none"),
+            "hypotheses": list(hypotheses),
+        }
+        if include_evidence:
+            return payload
+        return (
+            payload["plate"],
+            payload["confidence"],
+            payload["engine"],
+        )
+
     if image is None or getattr(image, "size", 0) == 0:
-        return "", 0.0, "none"
+        return result("", 0.0, "none")
 
     hezar = read_plate_hezar_primary(
         image,
         engine_key=engine_key,
     )
+    hezar_hypotheses = []
+    for hypothesis in hezar.get("hypotheses", []):
+        normalized = normalize_plate(
+            hypothesis.get("plate_norm")
+            or hypothesis.get("plate")
+        )
+        confidence = _safe_confidence(
+            hypothesis.get(
+                "confidence",
+                hypothesis.get("score", 0.0),
+            )
+        )
+        ctc_path_score = _safe_confidence(
+            hypothesis.get("score", confidence)
+        )
+        if not plausible_plate(normalized):
+            continue
+        hezar_hypotheses.append({
+            "plate": format_iran_plate(normalized),
+            "plate_norm": normalized,
+            "engine": HEZAR_ENGINE,
+            "confidence": confidence,
+            # Consensus uses normalized sequence confidence. Raw CTC path
+            # probabilities can be vanishingly small, which would collapse
+            # distinct candidates to the same downstream weight floor.
+            "score": confidence,
+            "ctc_path_score": ctc_path_score,
+            # A rejected path is never accepted from one frame. Mature crops
+            # may retain sufficiently strong alternatives only as temporal
+            # evidence for the strict multi-frame consensus gate.
+            "temporal_evidence": bool(
+                confidence >= HEZAR_TEMPORAL_MIN_CONFIDENCE
+            ),
+        })
+    hezar_hypotheses.sort(
+        key=lambda row: (
+            row["score"],
+            row["confidence"],
+            row["plate_norm"],
+        ),
+        reverse=True,
+    )
+    hezar_hypotheses = hezar_hypotheses[:5]
     if hezar.get("accepted") and plausible_plate(
         hezar.get("plate_norm", "")
     ):
@@ -557,10 +618,11 @@ def read_plate_candidate(
             cnn_error="disabled-by-production-policy",
             candidate_count=len(hezar.get("hypotheses", [])),
         )
-        return (
+        return result(
             format_iran_plate(hezar["plate_norm"]),
             float(hezar.get("confidence", 0.0)),
             HEZAR_ENGINE,
+            hezar_hypotheses,
         )
 
     _last_status.update(
@@ -580,10 +642,25 @@ def read_plate_candidate(
             engine="platrix-crnn-onnx",
             crnn_error="",
         )
-        return (
+        platrix_norm = normalize_plate(platrix_text)
+        hypotheses = list(hezar_hypotheses)
+        if all(
+            row["plate_norm"] != platrix_norm
+            for row in hypotheses
+        ):
+            hypotheses.append({
+                "plate": format_iran_plate(platrix_norm),
+                "plate_norm": platrix_norm,
+                "engine": "platrix-crnn-onnx",
+                "confidence": _safe_confidence(platrix_confidence),
+                "score": _safe_confidence(platrix_confidence),
+                "temporal_evidence": False,
+            })
+        return result(
             format_iran_plate(platrix_text),
             float(platrix_confidence),
             "platrix-crnn-onnx",
+            hypotheses,
         )
     crnn_error = get_crnn_status().get("error", "")
     if plausible_plate(platrix_text) and not crnn_error:
@@ -593,7 +670,12 @@ def read_plate_candidate(
         crnn_error=crnn_error or "rejected",
     )
 
-    return "", 0.0, "none"
+    return result(
+        "",
+        0.0,
+        "none",
+        hezar_hypotheses,
+    )
 
 
 def read_plate(

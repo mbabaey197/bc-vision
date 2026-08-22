@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import multiprocessing
 import socket
 import sys
 import threading
@@ -20,6 +21,7 @@ from runtime_payload import (
     read_runtime_marker,
     recover_pending_activation,
     select_runtime_payload,
+    verify_runtime_payload,
 )
 
 
@@ -31,6 +33,10 @@ def app_dir() -> Path:
 
 BASE = app_dir()
 os.chdir(BASE)
+RUNTIME_PIN_SOURCE_ENV = "BCVISION_RUNTIME_PIN_SOURCE"
+RUNTIME_PIN_VERSION_ENV = "BCVISION_RUNTIME_PIN_VERSION"
+RUNTIME_PIN_ABI_ENV = "BCVISION_RUNTIME_PIN_ABI"
+RUNTIME_PIN_ROOT_ENV = "BCVISION_RUNTIME_PIN_ROOT"
 
 
 def _argument_value(name: str) -> str:
@@ -72,8 +78,94 @@ validate_runtime_candidate_request()
 configure_self_test_data_dir()
 
 
+def _is_multiprocessing_spawn_helper() -> bool:
+    """Recognize the frozen worker command that ``freeze_support`` handles."""
+    return any(value == "--multiprocessing-fork" for value in sys.argv[1:])
+
+
+def _publish_runtime_selection(
+    payload: RuntimePayload | None,
+    *,
+    source: str,
+    pin_for_children: bool,
+) -> None:
+    if source not in {"bundled", "external", "candidate"}:
+        raise RuntimePayloadError(f"Invalid runtime source: {source!r}")
+    os.environ["BCVISION_ACTIVE_RUNTIME_SOURCE"] = source
+    if payload is None:
+        if source != "bundled":
+            raise RuntimePayloadError("External runtime selection is missing")
+        os.environ.pop("BCVISION_ACTIVE_RUNTIME_VERSION", None)
+        os.environ.pop("BCVISION_ACTIVE_RUNTIME_ABI", None)
+    else:
+        if source == "bundled":
+            raise RuntimePayloadError("Bundled runtime cannot have a payload")
+        os.environ["BCVISION_ACTIVE_RUNTIME_VERSION"] = payload.version
+        os.environ["BCVISION_ACTIVE_RUNTIME_ABI"] = payload.runtime_abi
+
+    if not pin_for_children:
+        return
+    os.environ[RUNTIME_PIN_SOURCE_ENV] = source
+    if payload is None:
+        os.environ.pop(RUNTIME_PIN_VERSION_ENV, None)
+        os.environ.pop(RUNTIME_PIN_ABI_ENV, None)
+        os.environ.pop(RUNTIME_PIN_ROOT_ENV, None)
+    else:
+        os.environ[RUNTIME_PIN_VERSION_ENV] = payload.version
+        os.environ[RUNTIME_PIN_ABI_ENV] = payload.runtime_abi
+        os.environ[RUNTIME_PIN_ROOT_ENV] = str(payload.root)
+
+
+def _activate_pinned_spawn_runtime() -> RuntimePayload | None:
+    """Recreate the parent's exact runtime importer in a frozen child."""
+    source = os.environ.get(RUNTIME_PIN_SOURCE_ENV, "").strip()
+    if source == "bundled":
+        if any(
+            os.environ.get(name, "").strip()
+            for name in (
+                RUNTIME_PIN_VERSION_ENV,
+                RUNTIME_PIN_ABI_ENV,
+                RUNTIME_PIN_ROOT_ENV,
+            )
+        ):
+            raise RuntimePayloadError("Bundled runtime pin has payload fields")
+        _publish_runtime_selection(
+            None,
+            source="bundled",
+            pin_for_children=False,
+        )
+        return None
+    if source not in {"external", "candidate"}:
+        raise RuntimePayloadError("Multiprocessing runtime pin is missing")
+
+    version = os.environ.get(RUNTIME_PIN_VERSION_ENV, "").strip()
+    runtime_abi = os.environ.get(RUNTIME_PIN_ABI_ENV, "").strip()
+    root_value = os.environ.get(RUNTIME_PIN_ROOT_ENV, "").strip()
+    if not version or not runtime_abi or not root_value:
+        raise RuntimePayloadError("Multiprocessing runtime pin is incomplete")
+
+    expected_root = (BASE / "runtime" / version).resolve()
+    pinned_root = Path(root_value).resolve()
+    if pinned_root != expected_root:
+        raise RuntimePayloadError("Multiprocessing runtime source changed")
+    payload = verify_runtime_payload(
+        pinned_root,
+        expected_version=version,
+        expected_abi=runtime_abi,
+    )
+    install_runtime_importer(payload)
+    _publish_runtime_selection(
+        payload,
+        source=source,
+        pin_for_children=False,
+    )
+    return payload
+
+
 def activate_runtime_payload() -> RuntimePayload | None:
     """Prefer a verified versioned app payload in packaged installations."""
+    if _is_multiprocessing_spawn_helper():
+        return _activate_pinned_spawn_runtime()
     enabled = getattr(sys, "frozen", False) or os.environ.get(
         "BCVISION_ENABLE_RUNTIME_PAYLOAD",
         "0",
@@ -94,13 +186,17 @@ def activate_runtime_payload() -> RuntimePayload | None:
             raise RuntimePayloadError(
                 f"Requested runtime candidate is invalid: {requested}",
             )
-        os.environ["BCVISION_ACTIVE_RUNTIME_SOURCE"] = "bundled"
+        _publish_runtime_selection(
+            None,
+            source="bundled",
+            pin_for_children=True,
+        )
         return None
     install_runtime_importer(payload)
-    os.environ["BCVISION_ACTIVE_RUNTIME_VERSION"] = payload.version
-    os.environ["BCVISION_ACTIVE_RUNTIME_ABI"] = payload.runtime_abi
-    os.environ["BCVISION_ACTIVE_RUNTIME_SOURCE"] = (
-        "candidate" if requested is not None else "external"
+    _publish_runtime_selection(
+        payload,
+        source="candidate" if requested is not None else "external",
+        pin_for_children=True,
     )
     failed = read_runtime_marker(BASE, FAILED_MARKER)
     if failed:
@@ -109,6 +205,12 @@ def activate_runtime_payload() -> RuntimePayload | None:
 
 
 ACTIVE_RUNTIME = activate_runtime_payload()
+
+# PyInstaller re-enters this executable for spawn workers. Runtime activation
+# must happen first so the worker unpickles its target through the exact same
+# verified app importer as its parent. This still precedes every ``app.*``
+# import and all application/database/model initialization.
+multiprocessing.freeze_support()
 
 from app.cpu_budget import configure_process_cpu_budget
 
@@ -125,6 +227,71 @@ MODEL_PREPARATION_ERROR_ENV = "BCVISION_MODEL_PREPARATION_ERROR"
 MODEL_PREPARATION_ATTEMPT_ENV = "BCVISION_MODEL_PREPARATION_ATTEMPT"
 MODEL_PREPARATION_MAX_ATTEMPTS = 2
 MODEL_PREPARATION_RETRY_SECONDS = 4.0
+INSTANCE_LOCK_PATH = LOG.parent / "bcvision.instance.lock"
+
+
+class SingleInstanceLock:
+    """Cross-process lock held before any background producer is started."""
+
+    def __init__(self, path=INSTANCE_LOCK_PATH):
+        self.path = Path(path)
+        self._handle = None
+
+    def acquire(self) -> bool:
+        if self._handle is not None:
+            return True
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(
+                    handle.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+        except OSError:
+            handle.close()
+            return False
+        self._handle = handle
+        return True
+
+    def close(self) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+    def __enter__(self):
+        if not self.acquire():
+            raise RuntimeError("BC Vision instance lock is already held")
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        self.close()
+        return False
 
 
 def log(message):
@@ -299,7 +466,6 @@ def prepare_anpr_models(
 
 
 def run_server():
-    manager = None
     try:
         if sys.stdout is None:
             sys.stdout = open(
@@ -316,16 +482,6 @@ def run_server():
 
         import uvicorn
         from app.main import app
-        from app.streams import manager as stream_manager
-
-        manager = stream_manager
-        try:
-            started = manager.start_enabled_cameras()
-            log(f"Background camera streams started: {started}")
-        except Exception:
-            # A bad camera URL must not prevent the server and other cameras
-            # from starting. Stream threads handle their own reconnection.
-            log("Background camera startup failed:\n" + traceback.format_exc())
 
         log("Starting server")
         uvicorn.run(
@@ -338,12 +494,12 @@ def run_server():
     except Exception:
         log(traceback.format_exc())
     finally:
-        if manager is not None:
-            try:
-                manager.stop_all()
-                log("Background camera streams stopped")
-            except Exception:
-                log("Background camera shutdown failed:\n" + traceback.format_exc())
+        try:
+            from app.ai.live_worker import shutdown_live_anpr_worker
+
+            shutdown_live_anpr_worker(retry_timeout=5.0)
+        except Exception:
+            log("ANPR retry shutdown failed:\n" + traceback.format_exc())
 
 
 def run_self_test() -> int:
@@ -481,7 +637,6 @@ def run_self_test() -> int:
             "ok": (
                 DB_PATH.is_file()
                 and table_count >= 6
-                and user_count >= 1
                 and app is not None
                 and anpr_ready
                 and candidate_ready
@@ -493,6 +648,7 @@ def run_self_test() -> int:
             "web_app_ready": app is not None,
             "anpr_ready": anpr_ready,
             "candidate_ready": candidate_ready,
+            "administrator_setup_required": user_count == 0,
             "user_count": user_count,
             "table_count": table_count,
         })
@@ -521,9 +677,30 @@ def open_panel_when_ready():
 
 
 def main():
+    instance_lock = None
     try:
         hide_service_console()
 
+        if service_ready():
+            webbrowser.open(PANEL_URL)
+            return
+
+        instance_lock = SingleInstanceLock()
+        if not instance_lock.acquire():
+            # Another BC Vision process won the startup race but may not have
+            # bound its health endpoint yet. Wait for that exact service
+            # identity instead of importing/starting a second worker set.
+            for _ in range(40):
+                if service_ready():
+                    webbrowser.open(PANEL_URL)
+                    return
+                time.sleep(0.25)
+            raise RuntimeError(
+                "نمونه دیگری از BC Vision در حال راه‌اندازی است."
+            )
+
+        # Recheck under the interprocess lock: the initial health/port checks
+        # were deliberately advisory only.
         if service_ready():
             webbrowser.open(PANEL_URL)
             return
@@ -551,6 +728,9 @@ def main():
     except Exception as exc:
         log(traceback.format_exc())
         show_startup_error(str(exc))
+    finally:
+        if instance_lock is not None:
+            instance_lock.close()
 
 
 if __name__ == "__main__":

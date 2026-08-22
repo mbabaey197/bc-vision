@@ -187,22 +187,22 @@ jobs:
             )
           }
 
-      - name: Verify clean RC29 Setup and offline ANPR
+      - name: Verify clean current full-base Setup and offline ANPR
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $version = (Get-Content VERSION -Raw).Trim()
           $releaseLabel = "${{ steps.version.outputs.label }}"
-          $installDir = Join-Path $env:RUNNER_TEMP "bcvision-clean-rc29"
+          $installDir = Join-Path $env:RUNNER_TEMP "bcvision-clean-full-base"
           $dataDir = Join-Path $env:RUNNER_TEMP "bcvision-clean-data"
-          $resultPath = Join-Path $env:RUNNER_TEMP "clean-rc29.json"
+          $resultPath = Join-Path $env:RUNNER_TEMP "clean-full-base.json"
           $setup = Resolve-Path "setup_output\BCVision_${releaseLabel}_Setup.exe"
           $install = Start-Process -FilePath $setup -ArgumentList @(
             "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
             "/DIR=$installDir"
           ) -Wait -PassThru
           if ($install.ExitCode -ne 0) {
-            throw "Clean RC29 Setup exited with $($install.ExitCode)"
+            throw "Clean full-base Setup exited with $($install.ExitCode)"
           }
           $test = Start-Process -FilePath "$installDir\BCVision.exe" `
             -ArgumentList @(
@@ -210,13 +210,13 @@ jobs:
               "--self-test-data-dir", $dataDir,
               "--self-test-output", $resultPath
             ) -Wait -PassThru
-          if ($test.ExitCode -ne 0) { throw "Clean RC29 self-test failed" }
+          if ($test.ExitCode -ne 0) { throw "Clean full-base self-test failed" }
           $result = Get-Content $resultPath -Raw | ConvertFrom-Json
           if (-not $result.ok -or -not $result.anpr_ready -or
               $result.version -ne $version -or
               $result.runtime_version -ne $version -or
               $result.runtime_source -ne "external") {
-            throw "Clean RC29 Setup did not activate the packaged runtime"
+            throw "Clean full-base Setup did not activate the packaged runtime"
           }
           $uninstaller = Get-ChildItem $installDir -Filter "unins*.exe" |
             Select-Object -First 1
@@ -226,7 +226,7 @@ jobs:
           ) -Wait -PassThru
           if ($uninstall.ExitCode -ne 0) { throw "Clean uninstall failed" }
 
-      - name: Verify immutable RC28.1 to RC29 upgrade and persistent data
+      - name: Verify immutable RC28.1 to current full-base upgrade and persistent data
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"

@@ -2,6 +2,7 @@ import numpy as np
 
 from app.ai.pipeline import (
     PlateConsensusTracker,
+    _ocr_crop_maturity,
     image_quality,
     plate_similarity,
     process_frame,
@@ -145,6 +146,245 @@ def test_temporal_consensus_recovers_consistent_second_hypothesis():
 
     assert emitted == []
     assert tracker.flush() == []
+
+
+def test_mature_hezar_top_k_can_reach_strict_consensus():
+    tracker = PlateConsensusTracker(emit_cooldown=10)
+    correct = "31ط55674"
+    emitted = []
+    for index, wrong in enumerate((
+        "31ط55874",
+        "31ط55974",
+        "31ط55374",
+    )):
+        row = result(
+            wrong,
+            0.48,
+            bbox=(100 + index * 2, 100, 300 + index * 2, 150),
+        )
+        row.update({
+            "plate_norm": "",
+            "valid": False,
+            "needs_review": True,
+            "best_effort": True,
+            "raw_guess_text": row["plate"],
+            "raw_guess_norm": normalize_plate(row["plate"]),
+            # This is the actual process_frame provenance when Hezar rejects
+            # its primary path but exposes eligible Top-K temporal evidence.
+            "ocr_engine": "none",
+            "raw_guess_engine": "hezar-crnn-fa-v2-onnx",
+            "ocr_confidence": 0.48,
+            "detector_confidence": 0.90,
+            "ocr_crop_mature": True,
+            "hypotheses_accepted_for_consensus": True,
+            "plate_hypotheses": [
+                {
+                    "plate_norm": wrong,
+                    "confidence": 0.48,
+                    "score": 0.48,
+                    "engine": "hezar-crnn-fa-v2-onnx",
+                    "temporal_evidence": True,
+                },
+                {
+                    "plate_norm": correct,
+                    "confidence": 0.44,
+                    "score": 0.44,
+                    "engine": "hezar-crnn-fa-v2-onnx",
+                    "temporal_evidence": True,
+                },
+            ],
+        })
+        observed = tracker.update(
+            [row],
+            timestamp=index * 0.1,
+        )
+        if index < 2:
+            assert observed == []
+        emitted.extend(observed)
+
+    assert len(emitted) == 1
+    assert emitted[0]["plate_norm"] == correct
+    assert emitted[0]["plate"] == "31-ط-556-74"
+    assert emitted[0]["valid"] is True
+    assert emitted[0]["read_status"] == "confirmed-ai"
+    assert emitted[0]["needs_review"] is False
+    assert emitted[0]["guess_supporting_frames"] == 3
+    assert emitted[0]["ocr_engine"] == "hezar-crnn-fa-v2-onnx"
+    assert emitted[0]["raw_guess_engine"] == "hezar-crnn-fa-v2-onnx"
+
+
+def test_explicitly_ineligible_hypothesis_gets_no_strict_vote():
+    row = result("31-ط-556-74", 0.82)
+    row["ocr_confidence"] = 0.82
+    row["plate_hypotheses"] = [{
+        "plate_norm": "31ط55874",
+        "confidence": 0.99,
+        "score": 0.99,
+        "temporal_evidence": False,
+    }]
+
+    probabilities = PlateConsensusTracker._position_probabilities(row)
+
+    assert probabilities[5] == {"6": 1.0}
+
+
+def test_ineligible_hypothesis_cannot_inflate_consensus_or_engine():
+    def consensus(include_rejected):
+        tracker = PlateConsensusTracker(emit_cooldown=10)
+        emitted = []
+        for index in range(3):
+            row = result(
+                "31-ط-556-74",
+                0.82,
+                bbox=(100 + index * 2, 100, 300 + index * 2, 150),
+            )
+            row.update({
+                "ocr_confidence": 0.82,
+                "detector_confidence": 0.90,
+                "ocr_engine": "hezar-crnn-fa-v2-onnx",
+                "plate_hypotheses": (
+                    [{
+                        "plate_norm": "31ط55674",
+                        "confidence": 0.99,
+                        "score": 0.99,
+                        "engine": "dedicated-character-detector",
+                        "temporal_evidence": False,
+                    }]
+                    if include_rejected
+                    else []
+                ),
+            })
+            emitted.extend(tracker.update(
+                [row],
+                timestamp=index * 0.1,
+            ))
+        assert len(emitted) == 1
+        return emitted[0]
+
+    baseline = consensus(False)
+    injected = consensus(True)
+
+    assert injected["ocr_confidence"] == baseline["ocr_confidence"]
+    assert injected["confidence"] == baseline["confidence"]
+    assert injected["ocr_engine"] == baseline["ocr_engine"]
+    assert injected["ocr_engine"] == "hezar-crnn-fa-v2-onnx"
+
+
+def test_ocr_waits_for_native_crop_maturity_before_identity(
+    monkeypatch,
+):
+    rng = np.random.default_rng(42)
+    heights = iter((8, 12, 20, 32, 40))
+    ocr_calls = []
+
+    def detect(*_args, **_kwargs):
+        height = next(heights)
+        crop = rng.integers(
+            0,
+            256,
+            (height, height * 4, 3),
+            dtype=np.uint8,
+        )
+        return [{
+            "crop": crop,
+            "bbox": (100, 100, 300, 150),
+            "confidence": 0.90,
+            "method": "yolo11n",
+            "direct_text": "",
+            "direct_ocr_confidence": 0.0,
+            "direct_ocr_attempted": False,
+        }]
+
+    def read(*_args, **_kwargs):
+        ocr_calls.append(1)
+        return ("31-ط-556-74", 0.91, "hezar-crnn-fa-v2-onnx")
+
+    monkeypatch.setattr("app.ai.pipeline.detect_plates", detect)
+    monkeypatch.setattr("app.ai.pipeline.read_plate_candidate", read)
+    tracker = PlateConsensusTracker(emit_cooldown=10)
+    observations = []
+    emitted = []
+    frame = np.full((300, 500, 3), 120, dtype=np.uint8)
+
+    for index in range(5):
+        row = process_frame(
+            frame,
+            detector_variant="yolo11n",
+        )[0]
+        observations.append(row)
+        current = tracker.update(
+            [row],
+            timestamp=index * 0.1,
+        )
+        if index < 4:
+            assert current == []
+        emitted.extend(current)
+
+    assert [
+        row["ocr_crop_height"] for row in observations
+    ] == [8, 12, 20, 32, 40]
+    assert [
+        row["ocr_crop_mature"] for row in observations
+    ] == [False, False, True, True, True]
+    assert [
+        row["whole_plate_ocr_attempted"] for row in observations
+    ] == [False, False, True, True, True]
+    assert observations[0]["ocr_skip_reason"] == "crop-height"
+    assert observations[1]["ocr_skip_reason"] == "crop-height"
+    assert observations[0]["plate_norm"] == ""
+    assert observations[1]["plate_norm"] == ""
+    assert len(ocr_calls) == 3
+    assert len(emitted) == 1
+    assert emitted[0]["plate_norm"] == "31ط55674"
+
+
+def test_rejected_guess_below_temporal_floor_is_not_a_visit_key(
+    monkeypatch,
+):
+    crop = np.random.default_rng(9).integers(
+        0,
+        256,
+        (32, 128, 3),
+        dtype=np.uint8,
+    )
+    monkeypatch.setattr(
+        "app.ai.pipeline.detect_plates",
+        lambda *_args, **_kwargs: [{
+            "crop": crop,
+            "bbox": (10, 20, 138, 52),
+            "confidence": 0.90,
+            "method": "yolo11n",
+            "direct_text": "",
+            "direct_ocr_confidence": 0.0,
+            "direct_ocr_attempted": False,
+        }],
+    )
+    monkeypatch.setattr(
+        "app.ai.pipeline.read_plate_candidate",
+        lambda *_args, **_kwargs: {
+            "plate": "",
+            "plate_norm": "",
+            "confidence": 0.0,
+            "engine": "none",
+            "hypotheses": [{
+                "plate_norm": "31ط55874",
+                "confidence": 0.20,
+                "score": 0.20,
+                "engine": "hezar-crnn-fa-v2-onnx",
+                "temporal_evidence": False,
+            }],
+        },
+    )
+
+    row = process_frame(
+        np.full((100, 220, 3), 100, dtype=np.uint8),
+        detector_variant="yolo11n",
+    )[0]
+
+    assert row["raw_guess_norm"] == "31ط55874"
+    assert row["raw_guess_reason"] == "strict-decoder-rejected"
+    assert row["visit_identity_stable"] is False
+    assert row["hypotheses_accepted_for_consensus"] is False
 
 
 def test_equal_character_hypotheses_remain_unreadable():
@@ -692,6 +932,60 @@ def test_rejected_hypotheses_never_become_strict_consensus():
     assert auto_confirmed[0]["confirmation_source"] == "ai-auto-guess"
 
 
+def test_explicitly_rejected_hezar_evidence_never_auto_confirms():
+    tracker = PlateConsensusTracker(
+        emit_unreadable=True,
+        min_unreadable_observations=3,
+        min_unreadable_seconds=0.8,
+    )
+    frame = np.full((100, 220, 3), 130, dtype=np.uint8)
+    rejected = result(
+        "31-ط-556-74",
+        0.20,
+        bbox=(20, 30, 170, 70),
+        quality=0.7,
+    )
+    rejected.update({
+        "valid": False,
+        "needs_review": True,
+        "best_effort": True,
+        "plate_norm": "",
+        "raw_guess_text": "31-ط-556-74",
+        "raw_guess_norm": "31ط55674",
+        "visit_identity_stable": False,
+        "hypotheses_accepted_for_consensus": True,
+        "plate_hypotheses": [{
+            "plate_norm": "31ط55674",
+            "confidence": 0.20,
+            "score": 0.20,
+            "engine": "hezar-crnn-fa-v2-onnx",
+            "temporal_evidence": False,
+        }],
+    })
+
+    emitted = []
+    for index in range(5):
+        emitted.extend(tracker.update(
+            [rejected],
+            timestamp=index * 0.25,
+            frame=frame,
+            min_emit_confidence=0.85,
+        ))
+
+    suggestions = [
+        row
+        for row in emitted
+        if not row.get("capture_only")
+    ]
+    assert len(suggestions) == 1
+    assert suggestions[0]["valid"] is False
+    assert suggestions[0]["auto_confirmed"] is False
+    assert suggestions[0]["plate_norm"] == ""
+    assert suggestions[0]["raw_guess_norm"] == "31ط55674"
+    assert suggestions[0]["read_status"] == "experimental-guess"
+    assert suggestions[0]["tracker_finalized"] is True
+
+
 def test_partial_character_evidence_is_kept_instead_of_unreadable():
     tracker = PlateConsensusTracker(
         emit_unreadable=True,
@@ -781,6 +1075,78 @@ def test_no_duplicate_emission_during_cooldown():
     ], timestamp=0.4) == []
 
 
+def test_below_emit_gate_waits_for_clearer_consensus():
+    tracker = PlateConsensusTracker(emit_cooldown=5)
+    review_rows = []
+    for index in range(3):
+        low = result("31-ط-556-74", 0.55)
+        low.update({
+            "ocr_confidence": 0.45,
+            "detector_confidence": 0.55,
+        })
+        review_rows.extend(tracker.update(
+            [low],
+            timestamp=index * 0.1,
+            min_emit_confidence=0.85,
+        ))
+
+    track = next(iter(tracker._tracks.values()))
+    assert track.emitted_plate == ""
+    assert len(review_rows) == 1
+    assert review_rows[0]["below_emit_confidence"] is True
+
+    confirmed = []
+    for index in range(3, 6):
+        clear = result("31-ط-556-74", 0.98, quality=0.95)
+        clear.update({
+            "ocr_confidence": 0.96,
+            "detector_confidence": 0.98,
+        })
+        confirmed.extend(
+            row
+            for row in tracker.update(
+                [clear],
+                timestamp=index * 0.1,
+                min_emit_confidence=0.85,
+            )
+            if not row.get("below_emit_confidence")
+        )
+
+    assert len(confirmed) == 1
+    assert confirmed[0]["plate_norm"] == "31ط55674"
+    assert confirmed[0]["confidence"] >= 0.85
+    assert track.emitted_plate == "31ط55674"
+
+
+def test_expired_consensus_preserves_below_emit_gate_marker():
+    tracker = PlateConsensusTracker(
+        max_age_seconds=0.2,
+        emit_cooldown=5,
+    )
+    for index in range(3):
+        low = result("31-ط-556-74", 0.55)
+        low.update({
+            "ocr_confidence": 0.45,
+            "detector_confidence": 0.55,
+        })
+        tracker.update(
+            [low],
+            timestamp=index * 0.1,
+            min_emit_confidence=0.85,
+        )
+
+    expired = tracker.update(
+        [],
+        timestamp=1.0,
+        min_emit_confidence=0.85,
+    )
+
+    assert len(expired) == 1
+    assert expired[0]["valid"] is True
+    assert expired[0]["confidence"] < 0.85
+    assert expired[0]["below_emit_confidence"] is True
+
+
 def test_quality_extremes_are_bounded():
     for image in [
         np.zeros((50, 200, 3), dtype=np.uint8),
@@ -794,6 +1160,56 @@ def test_quality_extremes_are_bounded():
     ]:
         quality = image_quality(image)
         assert 0 <= quality["score"] <= 1
+
+
+def test_ocr_crop_maturity_boundaries_are_closed():
+    quality = {"score": 0.50}
+
+    assert _ocr_crop_maturity(
+        np.zeros((18, 64, 3), dtype=np.uint8),
+        0.25,
+        {"score": 0.20},
+    )["mature"] is True
+    assert _ocr_crop_maturity(
+        np.zeros((17, 68, 3), dtype=np.uint8),
+        0.90,
+        quality,
+    )["reason"] == "crop-height"
+    assert _ocr_crop_maturity(
+        np.zeros((18, 63, 3), dtype=np.uint8),
+        0.90,
+        quality,
+    )["reason"] == "crop-width"
+    assert _ocr_crop_maturity(
+        np.zeros((100, 179, 3), dtype=np.uint8),
+        0.90,
+        quality,
+    )["reason"] == "crop-aspect"
+    assert _ocr_crop_maturity(
+        np.zeros((100, 180, 3), dtype=np.uint8),
+        0.90,
+        quality,
+    )["mature"] is True
+    assert _ocr_crop_maturity(
+        np.zeros((20, 170, 3), dtype=np.uint8),
+        0.90,
+        quality,
+    )["mature"] is True
+    assert _ocr_crop_maturity(
+        np.zeros((100, 851, 3), dtype=np.uint8),
+        0.90,
+        quality,
+    )["reason"] == "crop-aspect"
+    assert _ocr_crop_maturity(
+        np.zeros((20, 80, 3), dtype=np.uint8),
+        0.249,
+        quality,
+    )["reason"] == "detector-confidence"
+    assert _ocr_crop_maturity(
+        np.zeros((20, 80, 3), dtype=np.uint8),
+        0.25,
+        {"score": 0.199},
+    )["reason"] == "crop-quality"
 
 
 def test_plate_similarity_handles_formatting():

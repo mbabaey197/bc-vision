@@ -245,7 +245,7 @@ begin
   begin
     ErrorMessage :=
       'Installed runtime ' + Version +
-      ' is newer but is not compatible with the RC29 base installer. ' +
+      ' is newer but is not compatible with this full-base installer. ' +
       'Downgrade was refused.';
     Result := False;
     Exit;
@@ -317,7 +317,7 @@ begin
     if InvalidRuntimeMarkerFound then
       Result :=
         'Runtime pointers are corrupt and no verified compatible newer ' +
-        'runtime can be proven. RC29 repair refused a possible downgrade; ' +
+        'runtime can be proven. Full-base repair refused a possible downgrade; ' +
         'restore the pointers from backup or contact support.';
     Exit;
   end;
@@ -325,7 +325,7 @@ begin
   begin
     Result :=
       'Installed newer runtime ' + SelectedNewer +
-      ' did not pass the isolated self-test. Full RC29 repair refused ' +
+      ' did not pass the isolated self-test. Full-base repair refused ' +
       'to activate an older runtime against newer customer data.';
     Exit;
   end;
