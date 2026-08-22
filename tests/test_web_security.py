@@ -17,6 +17,20 @@ from app import config
 from app.file_identity import path_file_identity
 
 
+@pytest.fixture(autouse=True)
+def _disable_network_camera_autostart(monkeypatch):
+    """Keep web tests from opening their synthetic RTSP URLs.
+
+    Lifespan behavior is exercised explicitly by the lifecycle tests below.
+    Other tests populate isolated databases with placeholder ``rtsp://``
+    values; allowing every TestClient to open them leaks capture-construction
+    threads on Windows because OpenCV cannot interrupt that constructor.
+    Individual lifecycle tests can, and do, replace this default stub.
+    """
+
+    monkeypatch.setattr(main.manager, "start_enabled_cameras", lambda: 0)
+
+
 def _as_role(monkeypatch, role):
     monkeypatch.setattr(main, "auth", lambda request: role)
     monkeypatch.setattr(
