@@ -623,6 +623,12 @@ class EngineV2LiveShadow:
             state.last_event = {
                 key: value for key, value in overlay.items() if key != "_shadow_seen_at"
             }
+            state.detections = [
+                row
+                for row in state.detections
+                if now - float(row.get("_shadow_seen_at", now))
+                <= self._detection_ttl
+            ][-31:]
             state.detections.append(overlay)
             state.detection_revision += 1
             self._expire_locked(state, event.ts)
