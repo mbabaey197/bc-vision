@@ -388,14 +388,14 @@ begin
   Result := '';
   if not FileExists(ExpandConstant('{app}\BCVision.exe')) then
   begin
-    Result := 'BC Vision RC29 or newer is not installed. Run the full installer once.';
+    Result := 'A compatible BC Vision full base is not installed. Run the full installer once.';
     Exit;
   end;
   if not LoadStringFromFile(
     ExpandConstant('{app}\runtime-abi.txt'), RuntimeAbi
   ) then
   begin
-    Result := 'This installation does not support fast updates. Install RC29 once.';
+    Result := 'This installation does not support fast updates. Install the current full base once.';
     Exit;
   end;
   if Trim(RuntimeAbi) <> '{#MyRuntimeAbi}' then
