@@ -68,23 +68,58 @@ def feedback_quality_summary(connection) -> dict:
     def summarize(items):
         guessed = [item for item in items if item["has_guess"]]
         exact = sum(item["exact"] for item in guessed)
+        reviewed = len(items)
+        guessed_count = len(guessed)
+        misses = reviewed - guessed_count
         return {
-            "reviewed": len(items),
-            "guessed": len(guessed),
+            "reviewed": reviewed,
+            "guessed": guessed_count,
             "exact": exact,
-            "wrong": len(guessed) - exact,
+            "wrong": guessed_count - exact,
+            # Accuracy is end-to-end over every operator-reviewed readable
+            # passage. A missing/invalid guess is therefore an error instead of
+            # disappearing from the denominator. ``accepted_precision`` keeps
+            # the former conditional-on-a-complete-guess view explicit.
             "exact_accuracy": (
-                round(exact / len(guessed), 6)
-                if guessed
+                round(exact / reviewed, 6)
+                if reviewed
                 else 0.0
             ),
+            "coverage": (
+                round(guessed_count / reviewed, 6)
+                if reviewed
+                else 0.0
+            ),
+            "accepted_precision": (
+                round(exact / guessed_count, 6)
+                if guessed_count
+                else 0.0
+            ),
+            "miss_count": misses,
+            "miss_rate": (
+                round(misses / reviewed, 6)
+                if reviewed
+                else 0.0
+            ),
+            # Preserve the historical conditional metric for callers that use
+            # it to diagnose accepted OCR strings, and expose the end-to-end
+            # value under an unambiguous new key.
             "mean_character_error": (
                 round(
                     sum(item["distance"] for item in guessed)
-                    / len(guessed),
+                    / guessed_count,
                     4,
                 )
-                if guessed
+                if guessed_count
+                else 0.0
+            ),
+            "mean_character_error_end_to_end": (
+                round(
+                    sum(item["distance"] for item in items)
+                    / reviewed,
+                    4,
+                )
+                if reviewed
                 else 0.0
             ),
         }
