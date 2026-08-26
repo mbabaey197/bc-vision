@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from app.engine_v2 import ir_lpr
 from app.engine_v2.ir_lpr import load_ir_lpr
 
 
@@ -126,3 +127,52 @@ def test_ir_lpr_reader_uses_dataset_root_name_as_official_split(
 
     assert index.samples[0].source_split == "test"
     assert index.samples[0].calibration_split == "holdout"
+
+
+def test_ir_lpr_reader_derives_missing_official_image_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    split = tmp_path / "test"
+    split.mkdir()
+    image = split / "sample.jpg"
+    image.write_bytes(b"image-size-is-read-through-the-helper")
+    annotation = split / "sample.xml"
+    _write_annotation(annotation, image.name)
+    annotation.write_text(
+        annotation.read_text(encoding="utf-8").replace(
+            "<size><width>200</width><height>60</height></size>",
+            "",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ir_lpr, "_image_dimensions", lambda _path: (200, 60))
+
+    index = load_ir_lpr(tmp_path)
+
+    assert len(index.samples) == 1
+    assert index.samples[0].image_width == 200
+    assert index.samples[0].image_height == 60
+
+
+def test_ir_lpr_reader_does_not_rescan_flat_directory_for_exact_sibling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    split = tmp_path / "train"
+    split.mkdir()
+    image = split / "sample.jpg"
+    image.write_bytes(b"image")
+    _write_annotation(split / "sample.xml", image.name)
+    original_iterdir = Path.iterdir
+
+    def guarded_iterdir(path: Path):
+        if path == split:
+            raise AssertionError("exact sibling lookup must not enumerate the directory")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", guarded_iterdir)
+
+    index = load_ir_lpr(tmp_path)
+
+    assert len(index.samples) == 1
