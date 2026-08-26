@@ -406,6 +406,7 @@ def test_release_workflows_separate_fast_and_full_runtime_paths():
 
     assert "timeout-minutes: 4" in fast
     assert "timeout-minutes: 20" in fast
+    assert "timeout-minutes: 45" in fast
     assert "timeout-minutes: 1" in fast
     assert "BUILD_PORTABLE_EXE.bat" not in fast
     assert "Wait for successful exact-SHA ANPR validation" in fast
@@ -414,6 +415,12 @@ def test_release_workflows_separate_fast_and_full_runtime_paths():
     assert "  push:" in fast
     assert "      - VERSION" in fast
     assert "Verify real base Setup to transactional fast update" in fast
+    assert "function Invoke-CheckedProcess" in fast
+    assert "WaitForExit($TimeoutSeconds * 1000)" in fast
+    assert "taskkill.exe /PID $process.Id /T /F" in fast
+    assert "fast-base-integration-diagnostics" in fast
+    assert "Base self-test did not initialize the isolated database" in fast
+    assert "completed storage migration" in fast
     assert "[byte[]](77, 90)" not in fast
     assert "RUNTIME_CONTRACT_ID.txt" in fast
     assert "git merge-base --is-ancestor" in fast
@@ -488,6 +495,12 @@ def test_committed_runtime_contract_matches_stable_base_files():
     contract = json.loads(
         (root / "RUNTIME_CONTRACT.json").read_text(encoding="utf-8")
     )
+    runtime_abi = (root / "RUNTIME_ABI").read_text(
+        encoding="utf-8"
+    ).strip()
+    base_version = (root / "FAST_UPDATE_BASE_VERSION").read_text(
+        encoding="utf-8"
+    ).strip()
     assert "app/database.py" in contract["files"]
     completed = subprocess.run(
         [sys.executable, "scripts/verify_runtime_contract.py"],
@@ -499,18 +512,24 @@ def test_committed_runtime_contract_matches_stable_base_files():
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert "ABI 1 base 2.2.0-rc29 verified" in completed.stdout
+    assert (
+        f"ABI {runtime_abi} base {base_version} verified"
+        in completed.stdout
+    )
 
 
 def test_release_contract_cli_enforces_monotonic_fast_versions():
     root = Path(__file__).resolve().parents[1]
+    base_version = (root / "FAST_UPDATE_BASE_VERSION").read_text(
+        encoding="utf-8"
+    ).strip()
     command = [
         sys.executable,
         "scripts/verify_runtime_contract.py",
         "--validate-update-version",
-        "2.2.0-rc29.10",
+        f"{base_version}.10",
         "--require-newer-than",
-        "2.2.0-rc29.9",
+        f"{base_version}.9",
     ]
     accepted = subprocess.run(
         command,
@@ -523,7 +542,7 @@ def test_release_contract_cli_enforces_monotonic_fast_versions():
     assert accepted.returncode == 0, accepted.stderr
 
     rejected = subprocess.run(
-        [*command[:-1], "2.2.0-rc29.11"],
+        [*command[:-1], f"{base_version}.11"],
         cwd=root,
         capture_output=True,
         text=True,
