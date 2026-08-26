@@ -1,5 +1,8 @@
 import json
+from pathlib import Path
 from urllib.error import URLError
+
+import pytest
 
 import launcher
 from app.ai import model_manager
@@ -103,6 +106,104 @@ def test_main_runs_server_in_foreground_without_keepalive_window(
 
     assert calls == ["server"]
     assert launcher.open_panel_when_ready in _Thread.targets
+
+
+def test_single_instance_lock_serializes_competing_launchers(tmp_path):
+    first = launcher.SingleInstanceLock(tmp_path / "instance.lock")
+    second = launcher.SingleInstanceLock(tmp_path / "instance.lock")
+
+    assert first.acquire() is True
+    assert second.acquire() is False
+    first.close()
+    assert second.acquire() is True
+    second.close()
+
+
+def test_spawn_helper_activates_exact_parent_runtime_pin(
+    tmp_path,
+    monkeypatch,
+):
+    version = "2.2.0-rc29.3"
+    runtime_root = (tmp_path / "runtime" / version).resolve()
+    runtime_root.mkdir(parents=True)
+    payload = launcher.RuntimePayload(
+        root=runtime_root,
+        version=version,
+        runtime_abi="2",
+        file_count=7,
+    )
+    installed = []
+    verified = []
+    monkeypatch.setattr(launcher, "BASE", tmp_path)
+    monkeypatch.setattr(
+        launcher,
+        "verify_runtime_payload",
+        lambda root, **kwargs: (
+            verified.append((Path(root), kwargs)) or payload
+        ),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "install_runtime_importer",
+        lambda selected: installed.append(selected),
+    )
+    monkeypatch.setenv(launcher.RUNTIME_PIN_SOURCE_ENV, "external")
+    monkeypatch.setenv(launcher.RUNTIME_PIN_VERSION_ENV, version)
+    monkeypatch.setenv(launcher.RUNTIME_PIN_ABI_ENV, "2")
+    monkeypatch.setenv(
+        launcher.RUNTIME_PIN_ROOT_ENV,
+        str(runtime_root),
+    )
+    for name in (
+        "BCVISION_ACTIVE_RUNTIME_SOURCE",
+        "BCVISION_ACTIVE_RUNTIME_VERSION",
+        "BCVISION_ACTIVE_RUNTIME_ABI",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    selected = launcher._activate_pinned_spawn_runtime()
+
+    assert selected == payload
+    assert verified == [(
+        runtime_root,
+        {"expected_version": version, "expected_abi": "2"},
+    )]
+    assert installed == [payload]
+    assert launcher.os.environ["BCVISION_ACTIVE_RUNTIME_SOURCE"] == "external"
+    assert launcher.os.environ["BCVISION_ACTIVE_RUNTIME_VERSION"] == version
+    assert launcher.os.environ["BCVISION_ACTIVE_RUNTIME_ABI"] == "2"
+
+
+def test_spawn_helper_rejects_runtime_root_substitution(
+    tmp_path,
+    monkeypatch,
+):
+    version = "2.2.0-rc29.3"
+    expected = (tmp_path / "runtime" / version).resolve()
+    expected.mkdir(parents=True)
+    foreign = (tmp_path / "foreign" / version).resolve()
+    foreign.mkdir(parents=True)
+    monkeypatch.setattr(launcher, "BASE", tmp_path)
+    monkeypatch.setenv(launcher.RUNTIME_PIN_SOURCE_ENV, "external")
+    monkeypatch.setenv(launcher.RUNTIME_PIN_VERSION_ENV, version)
+    monkeypatch.setenv(launcher.RUNTIME_PIN_ABI_ENV, "2")
+    monkeypatch.setenv(launcher.RUNTIME_PIN_ROOT_ENV, str(foreign))
+
+    with pytest.raises(
+        launcher.RuntimePayloadError,
+        match="runtime source changed",
+    ):
+        launcher._activate_pinned_spawn_runtime()
+
+
+def test_runtime_activation_precedes_frozen_spawn_dispatch():
+    source = Path(launcher.__file__).read_text(encoding="utf-8")
+
+    activation = source.index("ACTIVE_RUNTIME = activate_runtime_payload()")
+    dispatch = source.index("multiprocessing.freeze_support()")
+    first_app_import = source.index("from app.cpu_budget import")
+
+    assert activation < dispatch < first_app_import
 
 
 def test_main_reopens_existing_bcvision_without_second_server(
