@@ -106,6 +106,20 @@ class TemporalFusionConfig:
             raise ValueError("provisional_confidence cannot exceed lock_confidence")
         if self.lock_confidence > self.express_lock_confidence:
             raise ValueError("lock_confidence cannot exceed express_lock_confidence")
+        if self.min_slot_confidence > self.express_min_slot_confidence:
+            raise ValueError(
+                "min_slot_confidence cannot exceed express_min_slot_confidence"
+            )
+        if self.min_ocr_quality > self.express_min_quality:
+            raise ValueError("min_ocr_quality cannot exceed express_min_quality")
+        if self.min_plate_width_px > self.express_min_plate_width_px:
+            raise ValueError(
+                "min_plate_width_px cannot exceed express_min_plate_width_px"
+            )
+        if self.min_plate_height_px > self.express_min_plate_height_px:
+            raise ValueError(
+                "min_plate_height_px cannot exceed express_min_plate_height_px"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -647,6 +661,7 @@ class TrackRecognitionSession:
     accumulator: PlateEvidenceAccumulator = field(
         default_factory=PlateEvidenceAccumulator
     )
+    profile_name: str = "default"
     attempts: int = 0
     in_flight: bool = False
     event_claimed: bool = False

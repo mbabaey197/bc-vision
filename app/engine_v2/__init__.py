@@ -1,3 +1,16 @@
+from .calibration import (
+    CALIBRATION_SCHEMA,
+    STATIC_CONFIDENCE_THRESHOLDS,
+    CalibrationDataset,
+    CalibrationMetrics,
+    CalibrationReport,
+    CalibrationRequirements,
+    StaticOCRReport,
+    analyze_static_ocr,
+    calibrate,
+    evaluate_config,
+    load_calibration_dataset,
+)
 from .dedup import DuplicateSuppressor, DuplicateSuppressorConfig
 from .factory import (
     EngineV2RuntimeBundle,
@@ -7,6 +20,7 @@ from .factory import (
     build_shared_models,
 )
 from .inference import InferenceConfig, SharedInferenceBackend
+from .ir_lpr import IRLPRIndex, IRLPRSample, load_ir_lpr
 from .load import AdaptiveLoadController, LoadLevel, LoadPolicy, LoadSnapshot
 from .model_adapters import (
     CTCPlateOCR,
@@ -40,6 +54,8 @@ from .types import FramePacket, OCRResult, PlateCandidate, PlateEvent, TrackPhas
 from .validator import IranianPlateValidator, PlateValidation
 
 __all__ = [
+    "CALIBRATION_SCHEMA",
+    "STATIC_CONFIDENCE_THRESHOLDS",
     "AbandonedOCRTask",
     "AdaptiveFrameAdmissionController",
     "AdaptiveLoadController",
@@ -47,6 +63,10 @@ __all__ = [
     "BestPlateFrameSelector",
     "CTCPlateOCR",
     "CTCPlateOCRConfig",
+    "CalibrationDataset",
+    "CalibrationMetrics",
+    "CalibrationReport",
+    "CalibrationRequirements",
     "CameraState",
     "DualStreamRTSPProducer",
     "DuplicateSuppressor",
@@ -56,6 +76,8 @@ __all__ = [
     "EventDrivenANPREngine",
     "FramePacket",
     "FusionDecision",
+    "IRLPRIndex",
+    "IRLPRSample",
     "InferenceConfig",
     "IranianPlateValidator",
     "LatestOnlyPriorityQueue",
@@ -81,6 +103,7 @@ __all__ = [
     "SharedModelBundleConfig",
     "SharedOCRWorker",
     "SlotDecision",
+    "StaticOCRReport",
     "TemporalFusionConfig",
     "TemporalOCRVoter",
     "TrackPhase",
@@ -88,7 +111,12 @@ __all__ = [
     "TrackerConfig",
     "YOLOPlateDetector",
     "YOLOPlateDetectorConfig",
+    "analyze_static_ocr",
     "build_engine_v2",
     "build_shared_models",
+    "calibrate",
+    "evaluate_config",
     "evaluate_plate_quality",
+    "load_calibration_dataset",
+    "load_ir_lpr",
 ]

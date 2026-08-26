@@ -73,6 +73,10 @@ class EngineV2Config:
     # The legacy Engine V2 voting path remains the control in the same branch.
     track_temporal_fusion_enabled: bool = False
     temporal_fusion: TemporalFusionConfig = field(default_factory=TemporalFusionConfig)
+    temporal_fusion_profiles: dict[str, TemporalFusionConfig] = field(
+        default_factory=dict
+    )
+    default_temporal_fusion_profile: str = "default"
 
     def __post_init__(self) -> None:
         positive_ints = {
@@ -117,6 +121,10 @@ class EngineV2Config:
             or self.cross_camera_duplicate_seconds < 0
         ):
             raise ValueError("duplicate suppression windows cannot be negative")
+        if not str(self.default_temporal_fusion_profile).strip():
+            raise ValueError("default_temporal_fusion_profile cannot be empty")
+        if any(not str(name).strip() for name in self.temporal_fusion_profiles):
+            raise ValueError("temporal_fusion_profiles cannot contain empty names")
 
 
 @dataclass(slots=True)
@@ -267,14 +275,29 @@ class EventDrivenANPREngine:
     def policy(self) -> LoadPolicy:
         return self.load_controller.policy
 
-    def _new_recognition_session(self) -> TrackRecognitionSession | None:
+    def _new_recognition_session(
+        self, profile_name: str | None = None
+    ) -> TrackRecognitionSession | None:
         if not self.config.track_temporal_fusion_enabled:
             return None
+        selected_name = str(
+            profile_name or self.config.default_temporal_fusion_profile
+        ).strip()
+        if selected_name in self.config.temporal_fusion_profiles:
+            selected = self.config.temporal_fusion_profiles[selected_name]
+        else:
+            selected_name = self.config.default_temporal_fusion_profile
+            selected = self.config.temporal_fusion_profiles.get(
+                selected_name, self.config.temporal_fusion
+            )
         policy = replace(
-            self.config.temporal_fusion,
-            min_ocr_quality=self.config.min_quality,
+            selected,
+            min_ocr_quality=max(selected.min_ocr_quality, self.config.min_quality),
         )
-        return TrackRecognitionSession(PlateEvidenceAccumulator(self.validator, policy))
+        return TrackRecognitionSession(
+            PlateEvidenceAccumulator(self.validator, policy),
+            profile_name=selected_name,
+        )
 
     def set_roi(self, camera_id: str, roi: tuple[int, int, int, int] | None) -> None:
         with self._state_lock:
@@ -1157,7 +1180,14 @@ class EventDrivenANPREngine:
                     selector=BestPlateFrameSelector(
                         self.config.selector_capacity, min_sequence_gap=0
                     ),
-                    recognition=self._new_recognition_session(),
+                    recognition=self._new_recognition_session(
+                        str(
+                            packet.metadata.get(
+                                "illumination_profile",
+                                self.config.default_temporal_fusion_profile,
+                            )
+                        )
+                    ),
                 )
                 state.tracks[observation.track_id] = episode
             if episode.phase is TrackPhase.DONE or (
@@ -1550,6 +1580,7 @@ class EventDrivenANPREngine:
                 "soft_lock_reason": recognition.soft_lock_reason,
                 "finalization_reason": recognition.finalization_reason,
                 "audit_attempts": recognition.audit_attempts,
+                "calibration_profile": recognition.profile_name,
                 "independent_observations": decision.independent_observations,
                 "full_sequence_support": decision.full_sequence_support,
                 "slot_confidences": [slot.confidence for slot in decision.slots],

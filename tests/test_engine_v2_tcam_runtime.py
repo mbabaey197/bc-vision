@@ -136,3 +136,49 @@ def test_finalize_camera_commits_soft_lock_without_extra_inference() -> None:
     assert events[0].metadata["finalization_reason"] == "track_exit"
     assert ocr.calls == 1
     assert engine.finalize_camera("cam", final_seq=2, final_ts=1.04) == []
+
+
+def test_runtime_selects_operator_supplied_day_night_calibration_profile() -> None:
+    ocr = _OCR(0.97)
+    engine = EventDrivenANPREngine(
+        _Detector(),
+        ocr,
+        EngineV2Config(
+            idle_stride=1,
+            active_stride=1,
+            min_quality=0.0,
+            load_control_enabled=False,
+            track_temporal_fusion_enabled=True,
+            temporal_fusion_profiles={
+                "night": TemporalFusionConfig(
+                    min_plate_width_px=140,
+                    express_min_plate_width_px=160,
+                )
+            },
+        ),
+    )
+    engine.submit_frame(
+        FramePacket(
+            "cam",
+            1,
+            1.0,
+            _frame(0),
+            metadata={"illumination_profile": "night"},
+        )
+    )
+    engine.submit_frame(
+        FramePacket(
+            "cam",
+            2,
+            1.04,
+            _frame(100),
+            metadata={"illumination_profile": "night"},
+        )
+    )
+    assert engine.process_next() is None
+
+    episode = next(iter(engine.state_for("cam").tracks.values()))
+    assert episode.recognition is not None
+    assert episode.recognition.profile_name == "night"
+    assert episode.recognition.config.min_plate_width_px == 140
+    assert ocr.calls == 0

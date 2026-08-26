@@ -55,7 +55,8 @@ config = EngineV2Config(
 
 All thresholds are policy inputs and must be calibrated on held-out traffic
 footage. In particular, `0.75` is a provisional threshold, not an event
-acceptance threshold.
+acceptance threshold. The fail-closed IR-LPR plus day/night camera workflow is
+documented in [Engine V2 TCAM calibration](engine-v2-calibration.md).
 
 ## Event and telemetry contract
 
@@ -66,6 +67,7 @@ Fused events add the following metadata:
 - `soft_lock_reason`
 - `finalization_reason`
 - `audit_attempts`
+- `calibration_profile`
 - `independent_observations`
 - `full_sequence_support`
 - `slot_confidences`

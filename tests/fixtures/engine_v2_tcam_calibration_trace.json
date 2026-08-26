@@ -1,0 +1,83 @@
+{
+  "schema": "bcvision.anpr.tcam-calibration/v1",
+  "dataset_id": "synthetic-contract-example",
+  "label_scope": "exhaustive",
+  "metadata": {
+    "purpose": "schema and CLI smoke-test only",
+    "warning": "not production calibration evidence"
+  },
+  "tracks": [
+    {
+      "track_id": "day-train-positive",
+      "split": "train",
+      "profile": "day",
+      "expected_plate": "12ب34567",
+      "observations": [
+        {"seq": 1, "ts": 0.0, "text": "12ب34567", "confidence": 0.96, "quality": 0.9, "plate_width": 120, "plate_height": 30, "valid": true, "character_confidences": [0.96, 0.96, 0.96, 0.96, 0.96, 0.96, 0.96, 0.96], "candidates": []}
+      ]
+    },
+    {
+      "track_id": "day-train-negative",
+      "split": "train",
+      "profile": "day",
+      "expected_plate": null,
+      "observations": [
+        {"seq": 1, "ts": 0.0, "text": "12ب34568", "confidence": 0.9, "quality": 0.9, "plate_width": 120, "plate_height": 30, "valid": true, "character_confidences": [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9], "candidates": []}
+      ]
+    },
+    {
+      "track_id": "day-holdout-positive",
+      "split": "holdout",
+      "profile": "day",
+      "expected_plate": "12ب34567",
+      "observations": [
+        {"seq": 1, "ts": 0.0, "text": "12ب34567", "confidence": 0.96, "quality": 0.9, "plate_width": 120, "plate_height": 30, "valid": true, "character_confidences": [0.96, 0.96, 0.96, 0.96, 0.96, 0.96, 0.96, 0.96], "candidates": []}
+      ]
+    },
+    {
+      "track_id": "day-holdout-negative",
+      "split": "holdout",
+      "profile": "day",
+      "expected_plate": null,
+      "observations": [
+        {"seq": 1, "ts": 0.0, "text": "12ب34568", "confidence": 0.9, "quality": 0.9, "plate_width": 120, "plate_height": 30, "valid": true, "character_confidences": [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9], "candidates": []}
+      ]
+    },
+    {
+      "track_id": "night-train-positive",
+      "split": "train",
+      "profile": "night",
+      "expected_plate": "12ب34567",
+      "observations": [
+        {"seq": 1, "ts": 0.0, "text": "12ب34567", "confidence": 0.96, "quality": 0.9, "plate_width": 120, "plate_height": 30, "valid": true, "character_confidences": [0.96, 0.96, 0.96, 0.96, 0.96, 0.96, 0.96, 0.96], "candidates": []}
+      ]
+    },
+    {
+      "track_id": "night-train-negative",
+      "split": "train",
+      "profile": "night",
+      "expected_plate": null,
+      "observations": [
+        {"seq": 1, "ts": 0.0, "text": "12ب34568", "confidence": 0.9, "quality": 0.9, "plate_width": 120, "plate_height": 30, "valid": true, "character_confidences": [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9], "candidates": []}
+      ]
+    },
+    {
+      "track_id": "night-holdout-positive",
+      "split": "holdout",
+      "profile": "night",
+      "expected_plate": "12ب34567",
+      "observations": [
+        {"seq": 1, "ts": 0.0, "text": "12ب34567", "confidence": 0.96, "quality": 0.9, "plate_width": 120, "plate_height": 30, "valid": true, "character_confidences": [0.96, 0.96, 0.96, 0.96, 0.96, 0.96, 0.96, 0.96], "candidates": []}
+      ]
+    },
+    {
+      "track_id": "night-holdout-negative",
+      "split": "holdout",
+      "profile": "night",
+      "expected_plate": null,
+      "observations": [
+        {"seq": 1, "ts": 0.0, "text": "12ب34568", "confidence": 0.9, "quality": 0.9, "plate_width": 120, "plate_height": 30, "valid": true, "character_confidences": [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9], "candidates": []}
+      ]
+    }
+  ]
+}
