@@ -281,6 +281,30 @@ Reports separate V1 and V2 predictions and measure exact event-set accuracy,
 event recall/precision, false accepts, false-positive events, duplicate events,
 character error rate, and latency overall and per category.
 
+## Opt-in live Shadow test
+
+The current application can run V2 beside the production worker for a real
+camera test. This path is deliberately observational:
+
+1. Open **Settings → AI**.
+2. Enable **Engine V2 live Shadow test** and save.
+3. Return to the live dashboard. Purple boxes labelled `V2` are transient V2
+   results; green/amber boxes remain the production path.
+4. The camera status line reports V2 readiness, event count, agreement and
+   disagreement with the baseline.
+
+The live Shadow owns exactly one shared detector session and one shared Hezar
+session for the process. It keeps only the newest pending frame per camera,
+uses the camera ROI for motion gating, and scans the full frame for plates. The
+calibrated express thresholds are 0.999 sequence confidence and 0.98 minimum
+slot confidence. If the production detector is YOLOX, the independent Shadow
+lane uses YOLO11n because the V2 adapter supports YOLO11n/YOLOv8n.
+
+This mode has no persistence dependency, does not write plate events or media,
+does not send gate/barrier commands, and does not feed training data. Turning
+it off closes its model sessions. A Shadow failure is counted in V2 telemetry
+and cannot set the production worker's error state.
+
 ## Current evidence and remaining limitations
 
 The deterministic suite proves contracts and failure handling, not real ANPR
@@ -301,12 +325,12 @@ accuracy or real camera capacity. Promotion is still blocked by:
   rectification;
 - static provider priority rather than a startup micro-benchmark across every
   installed accelerator;
-- feature-flag/dashboard/database integration is intentionally not enabled.
+- production activation remains disabled; only the explicit, non-persistent live Shadow lane is integrated.
 
 ## Production compatibility rule
 
-Do not import V2 into the legacy camera worker and do not change the production
-engine selector until all of the following are true:
+Do not make V2 the persistence/control source or change the production engine
+selector until all of the following are true:
 
 1. V1 and V2 have run on the same immutable, verified media set.
 2. V2 has no unacceptable overall or per-category accuracy regression.
