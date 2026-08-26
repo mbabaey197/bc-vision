@@ -165,8 +165,6 @@ def read_ir_lpr_annotation(
 ) -> tuple[IRLPRSample, ...]:
     path = Path(annotation_path).resolve()
     root = ET.parse(path).getroot()
-    image_width = _positive_xml_integer(root.findtext("size/width"), "image width")
-    image_height = _positive_xml_integer(root.findtext("size/height"), "image height")
     image_path = _resolve_image(
         path,
         root.findtext("filename"),
@@ -174,6 +172,19 @@ def read_ir_lpr_annotation(
         source_split=source_split,
         dataset_root=Path(dataset_root).resolve() if dataset_root is not None else None,
     )
+    raw_width = root.findtext("size/width")
+    raw_height = root.findtext("size/height")
+    if raw_width is None and raw_height is None:
+        # The official IR-LPR archives omit Pascal-VOC's optional ``size``
+        # element.  Derive the dimensions from the paired image so bounding
+        # boxes are still validated against real pixels instead of trusting
+        # arbitrary coordinates from the annotation.
+        image_width, image_height = _image_dimensions(image_path)
+    elif raw_width is None or raw_height is None:
+        raise ValueError("image size must contain both width and height")
+    else:
+        image_width = _positive_xml_integer(raw_width, "image width")
+        image_height = _positive_xml_integer(raw_height, "image height")
     validator = IranianPlateValidator()
     regions: list[IRLPRBox] = []
     characters: list[IRLPRCharacter] = []
@@ -247,6 +258,19 @@ def read_ir_lpr_annotation(
     return tuple(output)
 
 
+def _image_dimensions(path: Path) -> tuple[int, int]:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            width, height = image.size
+    except (ImportError, OSError, ValueError) as exc:
+        raise ValueError(f"could not read image dimensions from {path.name}") from exc
+    if width < 1 or height < 1:
+        raise ValueError(f"invalid image dimensions in {path.name}")
+    return int(width), int(height)
+
+
 def _source_split(annotation_path: Path, root: Path) -> str:
     relative_parts = (root.name, *annotation_path.relative_to(root).parts[:-1])
     exact = {
@@ -303,14 +327,19 @@ def _resolve_image(
     if filename:
         candidates.append(annotation_path.parent / Path(filename).name)
     candidates.extend(annotation_path.with_suffix(suffix) for suffix in _IMAGE_SUFFIXES)
+    # Official IR-LPR archives are large, flat directories.  Resolve the
+    # overwhelmingly common exact sibling before constructing a directory
+    # index; doing the reverse rescans every sibling for every annotation and
+    # turns dataset loading into an O(n^2) operation.
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
     by_lower_name = {
         child.name.lower(): child
         for child in annotation_path.parent.iterdir()
         if child.is_file()
     }
     for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
         matched = by_lower_name.get(candidate.name.lower())
         if matched is not None:
             return matched.resolve()
