@@ -637,8 +637,9 @@ class EventDrivenANPREngine:
                         # retry. No inference has to be repeated in this branch.
                         episode.ocr_submitted = False
                         if discarded:
-                            episode.ocr_attempts = max(0, episode.ocr_attempts - 1)
-                            if episode.recognition is not None:
+                            if episode.recognition is None:
+                                episode.ocr_attempts = max(0, episode.ocr_attempts - 1)
+                            elif episode.recognition.in_flight:
                                 episode.recognition.release_ocr(retryable=True)
                                 episode.ocr_attempts = episode.recognition.attempts
                                 if episode.recognition.last_ocr_seq is not None:
@@ -962,7 +963,10 @@ class EventDrivenANPREngine:
                     RecognitionPhase.PROVISIONAL
                 ),
                 "fusion_locked_tracks": recognition_phases.count(
-                    RecognitionPhase.LOCKED
+                    RecognitionPhase.SOFT_LOCKED
+                ),
+                "fusion_finalized_tracks": recognition_phases.count(
+                    RecognitionPhase.FINALIZED
                 ),
                 "fusion_ocr_attempts": sum(
                     session.attempts for session in recognition_sessions
@@ -1203,8 +1207,10 @@ class EventDrivenANPREngine:
         accepted = self.ocr_worker.submit(task)
         if accepted is False:
             episode.ocr_submitted = False
-            episode.ocr_attempts -= 1
-            if episode.recognition is not None:
+            finalize_only = bool(task.metadata.get("fusion_finalize"))
+            if not finalize_only:
+                episode.ocr_attempts -= 1
+            if episode.recognition is not None and not finalize_only:
                 episode.recognition.release_ocr(retryable=True)
             episode.advance(TrackPhase.COLLECTING)
             self._states[camera_id].phase = TrackPhase.COLLECTING
@@ -1223,17 +1229,22 @@ class EventDrivenANPREngine:
 
         if episode.ocr_submitted or episode.phase is TrackPhase.DONE:
             return None
+        recognition = episode.recognition
+        if recognition is not None and recognition.decision.finalized:
+            return None
         attempt_limit = (
-            episode.recognition.config.max_ocr_attempts
-            if episode.recognition is not None
+            recognition.config.max_ocr_attempts
+            if recognition is not None
             else self.config.max_ocr_attempts
         )
-        if episode.ocr_attempts >= attempt_limit:
+        if episode.ocr_attempts >= attempt_limit and (
+            recognition is None or not recognition.decision.soft_locked
+        ):
             episode.advance(TrackPhase.DONE)
             return None
         selection_limit = (
             self.config.selector_capacity
-            if episode.recognition is not None
+            if recognition is not None
             else self.config.max_ocr_candidates
         )
         selected = episode.selector.selected(
@@ -1243,35 +1254,77 @@ class EventDrivenANPREngine:
         if not selected:
             return None
         schedule_reason: str | None = None
-        if episode.recognition is not None:
-            selected = [
+        finalize_only = False
+        finalization_reason: str | None = None
+        if recognition is not None:
+            evidence_frame = max(selected, key=lambda frame: frame.seq)
+            fresh = [
                 frame
                 for frame in selected
                 if frame.seq not in episode.ocr_sequences_seen
             ]
-            if not selected:
-                return None
-            # Read one fresh crop per attempt. Already-read crops live in the
-            # track accumulator and are never billed to OCR twice.
-            selected = [max(selected, key=lambda frame: frame.seq)]
-            frame = selected[0]
-            x1, y1, x2, y2 = frame.bbox
-            bbox_area = max(0, x2 - x1) * max(0, y2 - y1)
-            schedule = episode.recognition.should_schedule_ocr(
-                seq=frame.seq,
-                quality=frame.quality.score,
-                bbox_area=bbox_area,
-                near_exit=force,
-            )
-            if not schedule.run_ocr:
-                return None
-            schedule_reason = schedule.reason
-            episode.recognition.reserve_ocr(
-                seq=frame.seq,
-                quality=frame.quality.score,
-                bbox_area=bbox_area,
-            )
-            episode.last_ocr_schedule_reason = schedule_reason
+            current = recognition.decision
+            if current.soft_locked:
+                schedule = None
+                if fresh:
+                    audit_frame = max(fresh, key=lambda frame: frame.seq)
+                    x1, y1, x2, y2 = audit_frame.bbox
+                    schedule = recognition.should_schedule_ocr(
+                        seq=audit_frame.seq,
+                        ts=audit_frame.ts,
+                        quality=audit_frame.quality.score,
+                        bbox_area=max(0, x2 - x1) * max(0, y2 - y1),
+                        plate_width=max(0, x2 - x1),
+                        plate_height=max(0, y2 - y1),
+                        near_exit=force,
+                    )
+                if schedule is not None and schedule.run_ocr:
+                    selected = [audit_frame]
+                elif recognition.should_finalize(ts=episode.last_ts, near_exit=force):
+                    selected = [evidence_frame]
+                    finalize_only = True
+                    if force:
+                        finalization_reason = "track_exit"
+                    elif (
+                        recognition.config.max_audit_attempts > 0
+                        and recognition.audit_attempts
+                        >= recognition.config.max_audit_attempts
+                    ):
+                        finalization_reason = "audit_complete"
+                    else:
+                        finalization_reason = "soft_lock_hold_elapsed"
+                else:
+                    return None
+            else:
+                if not fresh:
+                    return None
+                selected = [max(fresh, key=lambda frame: frame.seq)]
+
+            if not finalize_only:
+                # Read one fresh crop per attempt. Already-read crops live in
+                # the accumulator and are never billed to OCR twice.
+                frame = selected[0]
+                x1, y1, x2, y2 = frame.bbox
+                bbox_area = max(0, x2 - x1) * max(0, y2 - y1)
+                schedule = recognition.should_schedule_ocr(
+                    seq=frame.seq,
+                    ts=frame.ts,
+                    quality=frame.quality.score,
+                    bbox_area=bbox_area,
+                    plate_width=max(0, x2 - x1),
+                    plate_height=max(0, y2 - y1),
+                    near_exit=force,
+                )
+                if not schedule.run_ocr:
+                    return None
+                schedule_reason = schedule.reason
+                recognition.reserve_ocr(
+                    seq=frame.seq,
+                    ts=frame.ts,
+                    quality=frame.quality.score,
+                    bbox_area=bbox_area,
+                )
+                episode.last_ocr_schedule_reason = schedule_reason
         else:
             age = episode.last_seq - episode.first_seq
             enough = len(selected) >= self.config.min_candidates_before_ocr
@@ -1293,18 +1346,31 @@ class EventDrivenANPREngine:
             limit = min(2, len(selected))
         selected = selected[: max(1, limit)]
         episode.ocr_submitted = True
-        episode.ocr_attempts += 1
-        if episode.recognition is not None:
-            episode.ocr_attempts = episode.recognition.attempts
+        if not finalize_only:
+            episode.ocr_attempts += 1
+        if recognition is not None:
+            episode.ocr_attempts = recognition.attempts
         episode.advance(TrackPhase.OCR)
         state = self._states[camera_id]
         state.phase = TrackPhase.OCR
         return OCRTask(
             key=episode.episode_id,
-            crops=[frame.crop for frame in selected],
-            qualities=[frame.quality.score for frame in selected],
-            sequences=[frame.seq for frame in selected],
-            priority=5 if force else 10,
+            crops=[] if finalize_only else [frame.crop for frame in selected],
+            qualities=[]
+            if finalize_only
+            else [frame.quality.score for frame in selected],
+            sequences=[] if finalize_only else [frame.seq for frame in selected],
+            timestamps=[] if finalize_only else [frame.ts for frame in selected],
+            bbox_sizes=[]
+            if finalize_only
+            else [
+                (
+                    max(0, frame.bbox[2] - frame.bbox[0]),
+                    max(0, frame.bbox[3] - frame.bbox[1]),
+                )
+                for frame in selected
+            ],
+            priority=0 if finalize_only else (5 if force else 10),
             metadata={
                 "camera_id": camera_id,
                 "track_id": episode.track_id,
@@ -1315,6 +1381,8 @@ class EventDrivenANPREngine:
                 "ts": episode.last_ts,
                 "quality": selected[0].quality.score,
                 "force": force,
+                "fusion_finalize": finalize_only,
+                "fusion_finalization_reason": finalization_reason,
                 "ocr_schedule_reason": schedule_reason,
             },
         )
@@ -1391,23 +1459,49 @@ class EventDrivenANPREngine:
         state.observations.extend(item.result for item in vote.results)
         episode.ocr_submitted = False
         decision = recognition.decision
-        if vote.results:
+        finalize_only = bool(task.metadata.get("fusion_finalize"))
+        if finalize_only:
+            decision = recognition.finalize(
+                reason=str(
+                    task.metadata.get(
+                        "fusion_finalization_reason", "soft_lock_hold_elapsed"
+                    )
+                )
+            )
+        elif vote.results:
             for item in vote.results:
+                width = item.bbox_size[0] if item.bbox_size is not None else None
+                height = item.bbox_size[1] if item.bbox_size is not None else None
                 decision = recognition.observe(
                     item.result,
                     quality=item.candidate_quality,
                     seq=item.seq,
+                    ts=item.ts,
+                    plate_width=width,
+                    plate_height=height,
                 )
         else:
             recognition.release_ocr()
         episode.ocr_attempts = recognition.attempts
 
-        if not decision.locked:
+        if decision.soft_locked and recognition.should_finalize(
+            ts=float(task.metadata["ts"]),
+            near_exit=episode.tracker_removed,
+        ):
+            if episode.tracker_removed:
+                reason = "track_exit"
+            elif recognition.audit_attempts:
+                reason = "audit_complete"
+            else:
+                reason = "soft_lock_hold_elapsed"
+            decision = recognition.finalize(reason=reason)
+
+        if not decision.finalized:
             terminal = (
                 episode.tracker_removed
                 or episode.ocr_attempts >= recognition.config.max_ocr_attempts
             )
-            if terminal:
+            if terminal and not decision.soft_locked:
                 recognition.close()
                 episode.advance(TrackPhase.DONE)
                 state.last_done_seq = int(task.metadata["seq"])
@@ -1451,8 +1545,11 @@ class EventDrivenANPREngine:
             episode_id=episode.episode_id,
             observations=decision.observations,
             metadata={
-                "recognition_phase": RecognitionPhase.LOCKED.value,
+                "recognition_phase": RecognitionPhase.FINALIZED.value,
                 "fusion_reason": decision.reason,
+                "soft_lock_reason": recognition.soft_lock_reason,
+                "finalization_reason": recognition.finalization_reason,
+                "audit_attempts": recognition.audit_attempts,
                 "independent_observations": decision.independent_observations,
                 "full_sequence_support": decision.full_sequence_support,
                 "slot_confidences": [slot.confidence for slot in decision.slots],
@@ -1535,6 +1632,12 @@ class EventDrivenANPREngine:
 
     def _reconcile_abandoned_ocr(self, abandoned: AbandonedOCRTask) -> None:
         task = abandoned.task
+        if task.metadata.get("fusion_finalize"):
+            # Finalization tasks contain no crop and consume no inference. They
+            # remain safe to apply after queue eviction/expiry and must not
+            # strand a soft-locked track that has already left the scene.
+            self._apply_ocr_result(task, OCRVote())
+            return
         camera_value = task.metadata.get("camera_id")
         track_value = task.metadata.get("track_id")
         if camera_value is None or track_value is None:

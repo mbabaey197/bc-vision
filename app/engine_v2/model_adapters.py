@@ -12,8 +12,9 @@ are hidden behind the small :class:`InferenceBackend` protocol.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping, Protocol, Sequence
+from typing import Any, Literal, Protocol
 
 import numpy as np
 
@@ -169,8 +170,8 @@ class YOLOPlateDetector:
         scale = min(input_width / original_width, input_height / original_height)
         if not self.config.scale_up:
             scale = min(1.0, scale)
-        resized_width = min(input_width, max(1, int(round(original_width * scale))))
-        resized_height = min(input_height, max(1, int(round(original_height * scale))))
+        resized_width = min(input_width, max(1, round(original_width * scale)))
+        resized_height = min(input_height, max(1, round(original_height * scale)))
         left = (input_width - resized_width) // 2
         top = (input_height - resized_height) // 2
 
@@ -184,7 +185,9 @@ class YOLOPlateDetector:
             dtype=np.float32,
         )
         canvas[top : top + resized_height, left : left + resized_width] = resized
-        tensor = np.ascontiguousarray(canvas.transpose(2, 0, 1)[None, ...], dtype=np.float32)
+        tensor = np.ascontiguousarray(
+            canvas.transpose(2, 0, 1)[None, ...], dtype=np.float32
+        )
         transform = _LetterboxTransform(
             original_height=original_height,
             original_width=original_width,
@@ -286,7 +289,9 @@ class YOLOPlateDetector:
 
         if output_format == "end_to_end":
             if rows.shape[1] < 6:
-                raise ValueError("end-to-end YOLO output requires [x1,y1,x2,y2,score,class]")
+                raise ValueError(
+                    "end-to-end YOLO output requires [x1,y1,x2,y2,score,class]"
+                )
             boxes = rows[:, :4].astype(np.float32, copy=True)
             scores = rows[:, 4].astype(np.float32, copy=False)
             class_ids = np.rint(rows[:, 5]).astype(np.int64, copy=False)
@@ -295,7 +300,9 @@ class YOLOPlateDetector:
             has_objectness = self._resolve_objectness(rows.shape[1], channels_first)
             class_offset = 5 if has_objectness else 4
             class_count = self.config.num_classes
-            class_end = rows.shape[1] if class_count is None else class_offset + class_count
+            class_end = (
+                rows.shape[1] if class_count is None else class_offset + class_count
+            )
             if class_end > rows.shape[1] or class_end <= class_offset:
                 raise ValueError(
                     "YOLO class count does not match the prediction channel count: "
@@ -393,7 +400,12 @@ OCRActivation = Literal["softmax", "probabilities"]
 
 @dataclass(frozen=True, slots=True)
 class CTCPlateOCRConfig:
-    """Input normalization and greedy CTC decoding configuration."""
+    """Input normalization and CTC decoding configuration.
+
+    ``beam_width=1`` preserves the original greedy decoder. Wider beams can
+    publish Top-K alternatives and optionally reject prefixes that cannot fit
+    the Iranian ``DD-L-DDDDD`` slot contract.
+    """
 
     input_size: tuple[int, int] = (32, 128)
     charset: tuple[str, ...] = IRANIAN_PLATE_CHARSET
@@ -414,6 +426,9 @@ class CTCPlateOCRConfig:
     activation: OCRActivation = "softmax"
     strict_class_count: bool = True
     min_confidence: float = 0.0
+    beam_width: int = 1
+    top_k: int = 1
+    constrain_iranian_layout: bool = False
 
     def __post_init__(self) -> None:
         height, width = self.input_size
@@ -441,15 +456,21 @@ class CTCPlateOCRConfig:
             raise ValueError("pad_value must be between 0 and 255")
         channels = 1 if self.color_mode == "grayscale" else 3
         if len(self.mean) not in {1, channels} or len(self.std) not in {1, channels}:
-            raise ValueError("OCR mean/std must have one value or one value per channel")
+            raise ValueError(
+                "OCR mean/std must have one value or one value per channel"
+            )
         if any(value == 0 for value in self.std):
             raise ValueError("OCR std values must be non-zero")
         if not 0.0 <= self.min_confidence <= 1.0:
             raise ValueError("min_confidence must be between 0 and 1")
+        if self.beam_width < 1:
+            raise ValueError("beam_width must be positive")
+        if self.top_k < 1 or self.top_k > self.beam_width:
+            raise ValueError("top_k must be within 1..beam_width")
 
 
 class CTCPlateOCR:
-    """Greedy CTC OCR adapter that reuses one central inference backend."""
+    """CTC OCR adapter that reuses one central inference backend."""
 
     def __init__(
         self,
@@ -508,8 +529,8 @@ class CTCPlateOCR:
 
         if self.config.preserve_aspect_ratio:
             scale = min(target_width / source_width, target_height / source_height)
-            resized_width = min(target_width, max(1, int(round(source_width * scale))))
-            resized_height = min(target_height, max(1, int(round(source_height * scale))))
+            resized_width = min(target_width, max(1, round(source_width * scale)))
+            resized_height = min(target_height, max(1, round(source_height * scale)))
         else:
             resized_width = target_width
             resized_height = target_height
@@ -596,6 +617,33 @@ class CTCPlateOCR:
 
         text = "".join(tokens)
         confidence = float(np.mean(confidences)) if confidences else 0.0
+        candidates: list[dict[str, object]] = []
+        if self.config.beam_width > 1:
+            beam = _ctc_prefix_beam_search(
+                probabilities,
+                charset=self.config.charset,
+                blank_index=self.config.blank_index,
+                beam_width=self.config.beam_width,
+                top_k=self.config.top_k,
+                constrain_iranian_layout=self.config.constrain_iranian_layout,
+            )
+            if beam:
+                text = beam[0][0]
+                confidences = list(beam[0][2])
+                confidence = float(np.mean(confidences)) if confidences else beam[0][1]
+                candidates = [
+                    {
+                        "text": candidate_text,
+                        "confidence": float(
+                            np.mean(candidate_char_confidences)
+                            if candidate_char_confidences
+                            else candidate_weight
+                        ),
+                        "weight": candidate_weight,
+                        "character_confidences": candidate_char_confidences,
+                    }
+                    for candidate_text, candidate_weight, candidate_char_confidences in beam
+                ]
         valid = bool(text) and confidence >= self.config.min_confidence
         reason = "ok" if valid else ("empty_decode" if not text else "below_confidence")
         return OCRResult(
@@ -608,9 +656,157 @@ class CTCPlateOCR:
                 "timesteps": int(logits.shape[0]),
                 "classes": int(logits.shape[1]),
                 "blank_index": self.config.blank_index,
-                "tokens": tuple(tokens),
+                "tokens": tuple(text),
+                "decoder": "prefix_beam" if self.config.beam_width > 1 else "greedy",
+                "candidates": candidates,
             },
         )
+
+
+def _ctc_prefix_beam_search(
+    probabilities: np.ndarray,
+    *,
+    charset: Sequence[str],
+    blank_index: int,
+    beam_width: int,
+    top_k: int,
+    constrain_iranian_layout: bool,
+) -> list[tuple[str, float, tuple[float, ...]]]:
+    """Return CTC prefix-beam alternatives with normalized beam weights."""
+
+    negative_infinity = float("-inf")
+    beams: dict[tuple[int, ...], tuple[float, float]] = {(): (0.0, negative_infinity)}
+    log_probabilities = np.log(np.clip(probabilities, 1e-12, 1.0))
+    class_count = probabilities.shape[1]
+
+    def add(
+        target: dict[tuple[int, ...], tuple[float, float]],
+        prefix: tuple[int, ...],
+        *,
+        blank: float | None = None,
+        nonblank: float | None = None,
+    ) -> None:
+        old_blank, old_nonblank = target.get(
+            prefix, (negative_infinity, negative_infinity)
+        )
+        target[prefix] = (
+            _logaddexp(old_blank, blank) if blank is not None else old_blank,
+            _logaddexp(old_nonblank, nonblank)
+            if nonblank is not None
+            else old_nonblank,
+        )
+
+    for timestep in range(log_probabilities.shape[0]):
+        next_beams: dict[tuple[int, ...], tuple[float, float]] = {}
+        blank_log_probability = float(log_probabilities[timestep, blank_index])
+        for prefix, (probability_blank, probability_nonblank) in beams.items():
+            total = _logaddexp(probability_blank, probability_nonblank)
+            add(
+                next_beams,
+                prefix,
+                blank=total + blank_log_probability,
+            )
+            for class_index in range(class_count):
+                if class_index == blank_index:
+                    continue
+                token_log_probability = float(log_probabilities[timestep, class_index])
+                if prefix and prefix[-1] == class_index:
+                    add(
+                        next_beams,
+                        prefix,
+                        nonblank=probability_nonblank + token_log_probability,
+                    )
+                    extended = prefix + (class_index,)
+                    if _ctc_prefix_allowed(
+                        extended,
+                        charset=charset,
+                        blank_index=blank_index,
+                        constrained=constrain_iranian_layout,
+                    ):
+                        add(
+                            next_beams,
+                            extended,
+                            nonblank=probability_blank + token_log_probability,
+                        )
+                else:
+                    extended = prefix + (class_index,)
+                    if _ctc_prefix_allowed(
+                        extended,
+                        charset=charset,
+                        blank_index=blank_index,
+                        constrained=constrain_iranian_layout,
+                    ):
+                        add(
+                            next_beams,
+                            extended,
+                            nonblank=total + token_log_probability,
+                        )
+        beams = dict(
+            sorted(
+                next_beams.items(),
+                key=lambda item: _logaddexp(*item[1]),
+                reverse=True,
+            )[:beam_width]
+        )
+
+    ranked = sorted(
+        (
+            (prefix, _logaddexp(probability_blank, probability_nonblank))
+            for prefix, (probability_blank, probability_nonblank) in beams.items()
+            if prefix and (not constrain_iranian_layout or len(prefix) == 8)
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:top_k]
+    if not ranked:
+        return []
+    normalizer = _logsumexp([score for _, score in ranked])
+    output: list[tuple[str, float, tuple[float, ...]]] = []
+    for prefix, score in ranked:
+        labels = [
+            charset[index if index < blank_index else index - 1] for index in prefix
+        ]
+        character_confidences = tuple(
+            float(np.max(probabilities[:, class_index])) for class_index in prefix
+        )
+        output.append(
+            (
+                "".join(labels),
+                float(math.exp(score - normalizer)),
+                character_confidences,
+            )
+        )
+    return output
+
+
+def _ctc_prefix_allowed(
+    prefix: tuple[int, ...],
+    *,
+    charset: Sequence[str],
+    blank_index: int,
+    constrained: bool,
+) -> bool:
+    if not constrained:
+        return True
+    if len(prefix) > 8:
+        return False
+    class_index = prefix[-1]
+    token = charset[class_index if class_index < blank_index else class_index - 1]
+    position = len(prefix) - 1
+    if position == 2:
+        return not (len(token) == 1 and token.isascii() and token.isdigit())
+    return len(token) == 1 and token.isascii() and token.isdigit()
+
+
+def _logaddexp(first: float, second: float | None) -> float:
+    if second is None:
+        return first
+    return float(np.logaddexp(first, second))
+
+
+def _logsumexp(values: Sequence[float]) -> float:
+    maximum = max(values)
+    return maximum + math.log(sum(math.exp(value - maximum) for value in values))
 
 
 def _resolve_model_name(explicit: str | None, names: Sequence[str], kind: str) -> str:
@@ -715,7 +911,9 @@ def _as_yolo_rows(
     array = np.asarray(output)
     while array.ndim > 2:
         if array.shape[0] != 1:
-            raise ValueError(f"YOLO adapter expects batch size 1; got output {array.shape}")
+            raise ValueError(
+                f"YOLO adapter expects batch size 1; got output {array.shape}"
+            )
         array = array[0]
     if array.ndim == 1:
         array = array[None, :]
@@ -793,7 +991,10 @@ def _non_maximum_suppression(
         intersection = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
         current_area = max(
             0.0,
-            float((boxes[current, 2] - boxes[current, 0]) * (boxes[current, 3] - boxes[current, 1])),
+            float(
+                (boxes[current, 2] - boxes[current, 0])
+                * (boxes[current, 3] - boxes[current, 1])
+            ),
         )
         remaining_area = np.maximum(
             0.0,
@@ -829,10 +1030,10 @@ def _map_box_to_original(
     x2 = float(np.clip(x2, 0.0, transform.original_width))
     y2 = float(np.clip(y2, 0.0, transform.original_height))
     mapped = (
-        int(math.floor(x1)),
-        int(math.floor(y1)),
-        int(math.ceil(x2)),
-        int(math.ceil(y2)),
+        math.floor(x1),
+        math.floor(y1),
+        math.ceil(x2),
+        math.ceil(y2),
     )
     if mapped[2] <= mapped[0] or mapped[3] <= mapped[1]:
         return None
@@ -856,36 +1057,50 @@ def _as_time_class_logits(
     array = np.asarray(output, dtype=np.float32)
     if layout == "btc":
         if array.ndim != 3 or array.shape[0] != 1:
-            raise ValueError(f"OCR btc output must have shape [1,time,classes]; got {array.shape}")
+            raise ValueError(
+                f"OCR btc output must have shape [1,time,classes]; got {array.shape}"
+            )
         result = array[0]
     elif layout == "bct":
         if array.ndim != 3 or array.shape[0] != 1:
-            raise ValueError(f"OCR bct output must have shape [1,classes,time]; got {array.shape}")
+            raise ValueError(
+                f"OCR bct output must have shape [1,classes,time]; got {array.shape}"
+            )
         result = array[0].T
     elif layout == "tbc":
         if array.ndim != 3 or array.shape[1] != 1:
-            raise ValueError(f"OCR tbc output must have shape [time,1,classes]; got {array.shape}")
+            raise ValueError(
+                f"OCR tbc output must have shape [time,1,classes]; got {array.shape}"
+            )
         result = array[:, 0, :]
     elif layout == "tc":
         if array.ndim != 2:
-            raise ValueError(f"OCR tc output must have shape [time,classes]; got {array.shape}")
+            raise ValueError(
+                f"OCR tc output must have shape [time,classes]; got {array.shape}"
+            )
         result = array
     elif layout == "ct":
         if array.ndim != 2:
-            raise ValueError(f"OCR ct output must have shape [classes,time]; got {array.shape}")
+            raise ValueError(
+                f"OCR ct output must have shape [classes,time]; got {array.shape}"
+            )
         result = array.T
     else:
         result = _auto_time_class_logits(array, expected_classes)
 
     if result.ndim != 2:
-        raise ValueError(f"OCR logits must reduce to [time,classes]; got {result.shape}")
+        raise ValueError(
+            f"OCR logits must reduce to [time,classes]; got {result.shape}"
+        )
     if strict_class_count and result.shape[1] != expected_classes:
         raise ValueError(
             f"OCR output exposes {result.shape[1]} classes, but charset + blank "
             f"requires {expected_classes}"
         )
     if result.shape[1] < 2:
-        raise ValueError("OCR output must expose at least blank and one character class")
+        raise ValueError(
+            "OCR output must expose at least blank and one character class"
+        )
     return np.asarray(result, dtype=np.float32)
 
 
@@ -896,7 +1111,9 @@ def _auto_time_class_logits(array: np.ndarray, expected_classes: int) -> np.ndar
         elif array.shape[1] == 1:
             array = array[:, 0, :]
         else:
-            raise ValueError(f"OCR adapter expects batch size 1; got output {array.shape}")
+            raise ValueError(
+                f"OCR adapter expects batch size 1; got output {array.shape}"
+            )
     if array.ndim == 1:
         array = array[None, :]
     if array.ndim != 2:
@@ -943,11 +1160,11 @@ CTCOCRAdapter = CTCPlateOCR
 
 
 __all__ = [
+    "IRANIAN_PLATE_CHARSET",
     "CTCOCRAdapter",
     "CTCOCRConfig",
     "CTCPlateOCR",
     "CTCPlateOCRConfig",
-    "IRANIAN_PLATE_CHARSET",
     "InferenceBackend",
     "YOLODetectorConfig",
     "YOLOPlateDetector",

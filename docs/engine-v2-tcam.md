@@ -10,18 +10,28 @@ crop as an isolated final answer.
 2. The first crop above the quality floor is sent to OCR immediately.
 3. Full-string votes and per-slot character evidence are accumulated together.
 4. A reading at the provisional threshold is retained but is not emitted.
-5. The track locks only through either:
+5. The track enters a reversible soft lock only through either:
    - one strict, high-confidence, high-quality express read; or
    - independent multi-frame agreement with slot confidence, margin, and
      support checks.
-6. A locked track emits at most one event. Expensive OCR stops, while the cheap
-   tracker continues to own the vehicle until its normal exit/removal.
+6. Routine OCR stops during the soft lock. At most one audit OCR is allowed
+   when the crop materially improves or the track is about to leave.
+7. The track is finalized after the audit, a short real-time hold, or track
+   exit. Only this finalized state can emit, and it emits at most one event.
 
-Correlated adjacent frames receive reduced weight and do not count as
-independent confirmation. A re-read is scheduled only for a concrete reason:
+Correlated observations are separated by timestamps rather than assumed frame
+rate; adjacent frames receive reduced weight and do not count as independent
+confirmation. A re-read is scheduled only for a concrete reason:
 first usable crop, unresolved/conflicting slots, material quality improvement,
 plate-area growth, periodic refresh, provisional confirmation, or final
-pre-exit evidence.
+pre-exit evidence. Absolute plate width/height gates also prevent a tiny,
+distant detection from taking the express path.
+
+The CTC adapter retains greedy decoding by default for compatibility. Setting
+`beam_width > 1` publishes Top-K candidates; `constrain_iranian_layout=True`
+prunes prefixes that cannot match two digits, a letter, and five digits. The
+fusion layer consumes those candidates as alternatives from the same source
+frame, so they add evidence without pretending to be independent frames.
 
 ## Enable for an A/B run
 
@@ -34,6 +44,10 @@ config = EngineV2Config(
         provisional_confidence=0.75,
         lock_confidence=0.86,
         express_lock_confidence=0.93,
+        independent_time_gap_seconds=0.08,
+        soft_lock_hold_seconds=0.12,
+        min_plate_width_px=80,
+        min_plate_height_px=20,
         max_ocr_attempts=4,
     ),
 )
@@ -49,6 +63,9 @@ Fused events add the following metadata:
 
 - `recognition_phase`
 - `fusion_reason`
+- `soft_lock_reason`
+- `finalization_reason`
+- `audit_attempts`
 - `independent_observations`
 - `full_sequence_support`
 - `slot_confidences`
@@ -56,6 +73,7 @@ Fused events add the following metadata:
 - `ocr_schedule_reason`
 - `ocr_attempts`
 
-Runtime telemetry also reports fusion track counts, provisional/locked counts,
-and total fusion OCR attempts. These fields support comparison of recall, CER,
-OCR calls per track, latency, and CPU before the feature flag is widened.
+Runtime telemetry also reports fusion track counts, provisional/soft-locked/
+finalized counts, and total fusion OCR attempts. These fields support
+comparison of recall, CER, OCR calls per track, latency, and CPU before the
+feature flag is widened.

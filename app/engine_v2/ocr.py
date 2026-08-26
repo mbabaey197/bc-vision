@@ -4,8 +4,8 @@ import math
 import threading
 import time
 from collections import OrderedDict, deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Callable, Sequence
 
 import numpy as np
 
@@ -19,6 +19,8 @@ class OCRObservation:
     result: OCRResult
     candidate_quality: float
     seq: int = -1
+    ts: float | None = None
+    bbox_size: tuple[int, int] | None = None
 
 
 @dataclass(slots=True)
@@ -128,20 +130,24 @@ class TemporalOCRVoter:
 
         text, members_by_seq = max(
             grouped.items(),
-            key=lambda item: (sum(member[2] for member in item[1].values()), len(item[1])),
+            key=lambda item: (
+                sum(member[2] for member in item[1].values()),
+                len(item[1]),
+            ),
         )
         members = list(members_by_seq.values())
         support = len(members)
         total_weight = sum(member[2] for member in members)
-        confidence = sum(
-            member[3] * member[2] for member in members
-        ) / max(1e-9, total_weight)
+        confidence = sum(member[3] * member[2] for member in members) / max(
+            1e-9, total_weight
+        )
         best_member = max(members, key=lambda member: member[2])
-        best_observation = best_member[0]
         best_confidence = best_member[3]
         best_quality = best_member[4]
 
-        accepted = support >= self.min_support and confidence >= self.min_consensus_confidence
+        accepted = (
+            support >= self.min_support and confidence >= self.min_consensus_confidence
+        )
         if support >= self.min_support:
             reason = "temporal_consensus" if accepted else "consensus_below_confidence"
         else:
@@ -151,7 +157,9 @@ class TemporalOCRVoter:
                 best_confidence >= self.single_accept_confidence
                 and best_quality >= self.single_accept_quality
             )
-            reason = "high_confidence_single" if accepted else "single_read_below_threshold"
+            reason = (
+                "high_confidence_single" if accepted else "single_read_below_threshold"
+            )
 
         return OCRVote(
             text=text,
@@ -171,6 +179,8 @@ class OCRTask:
     crops: list[np.ndarray]
     qualities: list[float]
     sequences: list[int] = field(default_factory=list)
+    timestamps: list[float] = field(default_factory=list)
+    bbox_sizes: list[tuple[int, int]] = field(default_factory=list)
     priority: int = 20
     metadata: dict[str, object] = field(default_factory=dict)
 
@@ -233,7 +243,9 @@ class SharedOCRWorker:
             self.max_task_age_seconds = None
         self.ocr = ocr
         self.voter = voter or TemporalOCRVoter()
-        self.queue: LatestOnlyPriorityQueue[OCRTask] = LatestOnlyPriorityQueue(queue_size)
+        self.queue: LatestOnlyPriorityQueue[OCRTask] = LatestOnlyPriorityQueue(
+            queue_size
+        )
         self.stats = OCRWorkerStats()
         self._inference_lock = threading.Lock()
         self._stats_lock = threading.Lock()
@@ -347,7 +359,11 @@ class SharedOCRWorker:
                         self.stats.last_error = error_text
                 quality = task.qualities[index] if index < len(task.qualities) else 0.0
                 seq = task.sequences[index] if index < len(task.sequences) else -1
-                observations.append(OCRObservation(result, quality, seq))
+                ts = task.timestamps[index] if index < len(task.timestamps) else None
+                bbox_size = (
+                    task.bbox_sizes[index] if index < len(task.bbox_sizes) else None
+                )
+                observations.append(OCRObservation(result, quality, seq, ts, bbox_size))
         with self._stats_lock:
             self.stats.task_count += 1
             if task.crops and failures == len(task.crops):

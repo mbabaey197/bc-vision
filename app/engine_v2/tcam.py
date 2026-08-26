@@ -14,7 +14,10 @@ class RecognitionPhase(str, Enum):
 
     READING = "reading"
     PROVISIONAL = "provisional"
+    SOFT_LOCKED = "soft_locked"
+    # Deprecated first-slice state; new decisions never enter this phase.
     LOCKED = "locked"
+    FINALIZED = "finalized"
     CLOSED = "closed"
 
 
@@ -35,12 +38,24 @@ class TemporalFusionConfig:
     min_slot_margin: float = 0.16
     min_independent_observations: int = 2
     min_winner_support: int = 2
+    independent_time_gap_seconds: float = 0.08
+    # Used only by callers that do not provide timestamps.
     independent_frame_gap: int = 2
     correlated_evidence_weight: float = 0.25
     min_ocr_quality: float = 0.32
     express_min_quality: float = 0.65
     reread_quality_gain: float = 0.08
     reread_area_gain: float = 0.20
+    max_seconds_between_reads: float = 0.20
+    soft_lock_hold_seconds: float = 0.12
+    max_audit_attempts: int = 1
+    audit_quality_gain: float = 0.06
+    audit_area_gain: float = 0.20
+    min_plate_width_px: int = 80
+    min_plate_height_px: int = 20
+    express_min_plate_width_px: int = 96
+    express_min_plate_height_px: int = 24
+    # Compatibility fallback for callers that do not provide timestamps.
     max_frames_between_reads: int = 3
     max_ocr_attempts: int = 4
 
@@ -57,6 +72,8 @@ class TemporalFusionConfig:
             "express_min_quality": self.express_min_quality,
             "reread_quality_gain": self.reread_quality_gain,
             "reread_area_gain": self.reread_area_gain,
+            "audit_quality_gain": self.audit_quality_gain,
+            "audit_area_gain": self.audit_area_gain,
         }
         for name, value in thresholds.items():
             number = float(value)
@@ -68,10 +85,23 @@ class TemporalFusionConfig:
             "independent_frame_gap": self.independent_frame_gap,
             "max_frames_between_reads": self.max_frames_between_reads,
             "max_ocr_attempts": self.max_ocr_attempts,
+            "min_plate_width_px": self.min_plate_width_px,
+            "min_plate_height_px": self.min_plate_height_px,
+            "express_min_plate_width_px": self.express_min_plate_width_px,
+            "express_min_plate_height_px": self.express_min_plate_height_px,
         }
         for name, value in positive.items():
             if int(value) < 1:
                 raise ValueError(f"{name} must be positive")
+        if int(self.max_audit_attempts) < 0:
+            raise ValueError("max_audit_attempts must be non-negative")
+        for name, value in {
+            "independent_time_gap_seconds": self.independent_time_gap_seconds,
+            "max_seconds_between_reads": self.max_seconds_between_reads,
+            "soft_lock_hold_seconds": self.soft_lock_hold_seconds,
+        }.items():
+            if not math.isfinite(float(value)) or float(value) < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
         if self.provisional_confidence > self.lock_confidence:
             raise ValueError("provisional_confidence cannot exceed lock_confidence")
         if self.lock_confidence > self.express_lock_confidence:
@@ -83,6 +113,9 @@ class TrackOCRObservation:
     result: OCRResult
     quality: float
     seq: int
+    ts: float | None = None
+    plate_width: int | None = None
+    plate_height: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,7 +146,19 @@ class FusionDecision:
 
     @property
     def locked(self) -> bool:
-        return self.phase is RecognitionPhase.LOCKED
+        return self.phase in {
+            RecognitionPhase.SOFT_LOCKED,
+            RecognitionPhase.LOCKED,
+            RecognitionPhase.FINALIZED,
+        }
+
+    @property
+    def soft_locked(self) -> bool:
+        return self.phase is RecognitionPhase.SOFT_LOCKED
+
+    @property
+    def finalized(self) -> bool:
+        return self.phase is RecognitionPhase.FINALIZED
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +174,7 @@ class _AlignedObservation:
     aligned: tuple[tuple[str, float] | None, ...]
     independent: bool
     novelty_weight: float
+    candidate_weight: float = 1.0
 
 
 class IranianPlateLayout:
@@ -248,15 +294,28 @@ class PlateEvidenceAccumulator:
         self.config = config or TemporalFusionConfig()
         self.layout = IranianPlateLayout(self.validator)
         self._by_seq: dict[int, TrackOCRObservation] = {}
-        self._locked: FusionDecision | None = None
 
     @property
     def observations(self) -> tuple[TrackOCRObservation, ...]:
         return tuple(self._by_seq[key] for key in sorted(self._by_seq))
 
-    def add(self, result: OCRResult, *, quality: float, seq: int) -> FusionDecision:
+    def add(
+        self,
+        result: OCRResult,
+        *,
+        quality: float,
+        seq: int,
+        ts: float | None = None,
+        plate_width: int | None = None,
+        plate_height: int | None = None,
+    ) -> FusionDecision:
         observation = TrackOCRObservation(
-            result=result, quality=_unit(quality), seq=int(seq)
+            result=result,
+            quality=_unit(quality),
+            seq=int(seq),
+            ts=_finite_optional(ts),
+            plate_width=_positive_optional(plate_width),
+            plate_height=_positive_optional(plate_height),
         )
         existing = self._by_seq.get(observation.seq)
         if existing is None or self._observation_strength(
@@ -266,8 +325,6 @@ class PlateEvidenceAccumulator:
         return self.decision()
 
     def decision(self) -> FusionDecision:
-        if self._locked is not None:
-            return self._locked
         aligned = self._aligned_observations()
         slots = self._slot_decisions(aligned)
         text = (
@@ -276,7 +333,10 @@ class PlateEvidenceAccumulator:
             else "".join(slot.character or "" for slot in slots)
         )
         valid = self.validator.validate(text).valid if text else False
-        independent = sum(item.independent for item in aligned)
+        source_sequences = {item.observation.seq for item in aligned}
+        independent = len(
+            {item.observation.seq for item in aligned if item.independent}
+        )
         full_text, full_support, full_confidence = self._full_sequence_vote(aligned)
 
         if not text:
@@ -286,7 +346,7 @@ class PlateEvidenceAccumulator:
                 0.0,
                 "unresolved_slots",
                 slots,
-                len(aligned),
+                len(source_sequences),
                 independent,
                 full_support,
             )
@@ -306,12 +366,27 @@ class PlateEvidenceAccumulator:
         min_margin = min(slot.margin for slot in slots)
         min_support = min(slot.support for slot in slots)
         best_quality = max((item.observation.quality for item in aligned), default=0.0)
+        best_width = max(
+            (item.observation.plate_width or 0 for item in aligned), default=0
+        )
+        best_height = max(
+            (item.observation.plate_height or 0 for item in aligned), default=0
+        )
+        express_size_ok = (
+            best_width == 0
+            or best_height == 0
+            or (
+                best_width >= self.config.express_min_plate_width_px
+                and best_height >= self.config.express_min_plate_height_px
+            )
+        )
         express = (
-            len(aligned) == 1
+            len(source_sequences) == 1
             and valid
             and confidence >= self.config.express_lock_confidence
             and min_slot >= self.config.express_min_slot_confidence
             and best_quality >= self.config.express_min_quality
+            and express_size_ok
         )
         consensus = (
             valid
@@ -328,16 +403,15 @@ class PlateEvidenceAccumulator:
                 else "independent_temporal_consensus"
             )
             decision = FusionDecision(
-                RecognitionPhase.LOCKED,
+                RecognitionPhase.SOFT_LOCKED,
                 text,
                 confidence,
                 reason,
                 slots,
-                len(aligned),
+                len(source_sequences),
                 independent,
                 full_support,
             )
-            self._locked = decision
             return decision
         if valid and confidence >= self.config.provisional_confidence:
             return FusionDecision(
@@ -346,7 +420,7 @@ class PlateEvidenceAccumulator:
                 confidence,
                 "awaiting_independent_confirmation",
                 slots,
-                len(aligned),
+                len(source_sequences),
                 independent,
                 full_support,
             )
@@ -356,7 +430,7 @@ class PlateEvidenceAccumulator:
             confidence,
             "invalid_fused_structure" if text else "unresolved_slots",
             slots,
-            len(aligned),
+            len(source_sequences),
             independent,
             full_support,
         )
@@ -371,40 +445,93 @@ class PlateEvidenceAccumulator:
         priors: list[dict[str, float]] = [{} for _ in range(self.layout.size)]
         output: list[_AlignedObservation] = []
         last_independent_seq: int | None = None
+        last_independent_ts: float | None = None
         for observation in self.observations:
-            if not observation.result.valid or not observation.result.text.strip():
+            candidates = self._candidate_results(observation.result)
+            if not candidates:
                 continue
-            normalized, aligned = self.layout.align(
-                observation.result.text,
-                observation.result.character_confidences,
-                priors,
-                observation.result.confidence,
-            )
-            independent = (
-                last_independent_seq is None
-                or observation.seq - last_independent_seq
-                >= self.config.independent_frame_gap
-            )
+            if observation.ts is not None and last_independent_ts is not None:
+                independent = (
+                    observation.ts - last_independent_ts
+                    >= self.config.independent_time_gap_seconds
+                )
+            else:
+                independent = (
+                    last_independent_seq is None
+                    or observation.seq - last_independent_seq
+                    >= self.config.independent_frame_gap
+                )
             novelty_weight = (
                 1.0 if independent else self.config.correlated_evidence_weight
             )
             if independent:
                 last_independent_seq = observation.seq
-            item = _AlignedObservation(
-                observation=observation,
-                normalized=normalized,
-                aligned=aligned,
-                independent=independent,
-                novelty_weight=novelty_weight,
-            )
-            output.append(item)
-            for index, value in enumerate(aligned):
-                if value is None:
-                    continue
-                char, char_confidence = value
-                prior = self._evidence_weight(item, char_confidence)
-                priors[index][char] = priors[index].get(char, 0.0) + prior
+                last_independent_ts = observation.ts
+            for candidate, candidate_weight in candidates:
+                normalized, aligned = self.layout.align(
+                    candidate.text,
+                    candidate.character_confidences,
+                    priors,
+                    candidate.confidence,
+                )
+                candidate_observation = TrackOCRObservation(
+                    result=candidate,
+                    quality=observation.quality,
+                    seq=observation.seq,
+                    ts=observation.ts,
+                    plate_width=observation.plate_width,
+                    plate_height=observation.plate_height,
+                )
+                item = _AlignedObservation(
+                    observation=candidate_observation,
+                    normalized=normalized,
+                    aligned=aligned,
+                    independent=independent,
+                    novelty_weight=novelty_weight,
+                    candidate_weight=candidate_weight,
+                )
+                output.append(item)
+                for index, value in enumerate(aligned):
+                    if value is None:
+                        continue
+                    char, char_confidence = value
+                    prior = self._evidence_weight(item, char_confidence)
+                    priors[index][char] = priors[index].get(char, 0.0) + prior
         return output
+
+    def _candidate_results(
+        self, result: OCRResult
+    ) -> tuple[tuple[OCRResult, float], ...]:
+        raw = result.metadata.get("candidates")
+        if not isinstance(raw, (list, tuple)):
+            return ((result, 1.0),) if result.valid and result.text.strip() else ()
+        candidates: list[tuple[OCRResult, float]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text", ""))
+            if not text.strip():
+                continue
+            confidence = _unit(item.get("confidence", result.confidence))
+            weight = _unit(item.get("weight", confidence))
+            raw_chars = item.get("character_confidences", ())
+            char_confidences = (
+                tuple(_unit(value) for value in raw_chars)
+                if isinstance(raw_chars, (list, tuple))
+                else ()
+            )
+            candidates.append(
+                (
+                    OCRResult(text, confidence, True, char_confidences),
+                    weight,
+                )
+            )
+        if not candidates:
+            return ((result, 1.0),) if result.valid and result.text.strip() else ()
+        total = sum(weight for _, weight in candidates)
+        return tuple(
+            (candidate, weight / max(1e-9, total)) for candidate, weight in candidates
+        )
 
     def _evidence_weight(
         self, item: _AlignedObservation, char_confidence: float
@@ -416,6 +543,7 @@ class PlateEvidenceAccumulator:
             * _unit(char_confidence)
             * quality_factor
             * item.novelty_weight
+            * item.candidate_weight
         )
 
     def _slot_decisions(
@@ -425,7 +553,7 @@ class PlateEvidenceAccumulator:
         for index, kind in enumerate(self.layout.slot_kinds):
             weights: dict[str, float] = {}
             reliability_sum: dict[str, float] = {}
-            support: dict[str, int] = {}
+            support: dict[str, set[int]] = {}
             for item in aligned:
                 value = item.aligned[index]
                 if value is None:
@@ -440,7 +568,7 @@ class PlateEvidenceAccumulator:
                     reliability_sum.get(char, 0.0) + reliability * weight
                 )
                 if item.independent:
-                    support[char] = support.get(char, 0) + 1
+                    support.setdefault(char, set()).add(item.observation.seq)
             if not weights:
                 decisions.append(SlotDecision(index, kind, None, 0.0, 0.0, 0))
                 continue
@@ -452,7 +580,7 @@ class PlateEvidenceAccumulator:
             runner_up = ranked[1][1] if len(ranked) > 1 else 0.0
             purity = top_weight / max(1e-9, total_weight)
             raw_confidence = reliability_sum[char] / max(1e-9, top_weight)
-            winner_support = support.get(char, 0)
+            winner_support = len(support.get(char, set()))
             confidence = raw_confidence * (0.70 + 0.30 * purity)
             confidence += 0.04 * min(2, max(0, winner_support - 1))
             alternatives = tuple(
@@ -490,18 +618,23 @@ class PlateEvidenceAccumulator:
                     self._observation_strength(item.observation) * item.novelty_weight
                     for item in pair[1]
                 ),
-                sum(item.independent for item in pair[1]),
+                len({item.observation.seq for item in pair[1] if item.independent}),
             ),
         )
-        independent_members = [item for item in members if item.independent]
+        independent_members = {
+            item.observation.seq for item in members if item.independent
+        }
         weight = sum(
-            self._observation_strength(item.observation) * item.novelty_weight
+            self._observation_strength(item.observation)
+            * item.novelty_weight
+            * item.candidate_weight
             for item in members
         )
         confidence = sum(
             _unit(item.observation.result.confidence)
             * self._observation_strength(item.observation)
             * item.novelty_weight
+            * item.candidate_weight
             for item in members
         ) / max(1e-9, weight)
         return text, len(independent_members), _unit(confidence)
@@ -519,8 +652,15 @@ class TrackRecognitionSession:
     event_claimed: bool = False
     closed: bool = False
     last_ocr_seq: int | None = None
+    last_ocr_ts: float | None = None
     last_ocr_quality: float = 0.0
     last_ocr_area: int = 0
+    audit_attempts: int = 0
+    audit_in_flight: bool = False
+    soft_locked_at_ts: float | None = None
+    soft_lock_reason: str | None = None
+    finalization_reason: str | None = None
+    _finalized: FusionDecision | None = None
 
     @property
     def config(self) -> TemporalFusionConfig:
@@ -528,6 +668,8 @@ class TrackRecognitionSession:
 
     @property
     def decision(self) -> FusionDecision:
+        if self._finalized is not None:
+            return self._finalized
         if self.closed:
             current = self.accumulator.decision()
             return FusionDecision(
@@ -546,22 +688,44 @@ class TrackRecognitionSession:
         self,
         *,
         seq: int,
+        ts: float | None = None,
         quality: float,
         bbox_area: int,
+        plate_width: int | None = None,
+        plate_height: int | None = None,
         near_exit: bool = False,
     ) -> OCRScheduleDecision:
         if self.closed:
             return OCRScheduleDecision(False, "track_closed")
-        if self.decision.locked:
-            return OCRScheduleDecision(False, "recognition_locked")
+        current = self.decision
+        if current.finalized:
+            return OCRScheduleDecision(False, "recognition_finalized")
         if self.in_flight:
             return OCRScheduleDecision(False, "ocr_in_flight")
         if self.attempts >= self.config.max_ocr_attempts:
             return OCRScheduleDecision(False, "attempt_budget_exhausted")
         quality = _unit(quality)
         area = max(0, int(bbox_area))
+        width = _positive_optional(plate_width)
+        height = _positive_optional(plate_height)
+        if width is not None and width < self.config.min_plate_width_px:
+            return OCRScheduleDecision(False, "plate_width_below_floor")
+        if height is not None and height < self.config.min_plate_height_px:
+            return OCRScheduleDecision(False, "plate_height_below_floor")
         if quality < self.config.min_ocr_quality:
             return OCRScheduleDecision(False, "quality_below_floor")
+        if current.soft_locked:
+            if self.audit_attempts >= self.config.max_audit_attempts:
+                return OCRScheduleDecision(False, "soft_lock_audit_complete")
+            if near_exit:
+                return OCRScheduleDecision(True, "soft_lock_exit_audit")
+            if quality >= self.last_ocr_quality + self.config.audit_quality_gain:
+                return OCRScheduleDecision(True, "soft_lock_quality_audit")
+            if self.last_ocr_area > 0 and area >= math.ceil(
+                self.last_ocr_area * (1.0 + self.config.audit_area_gain)
+            ):
+                return OCRScheduleDecision(True, "soft_lock_area_audit")
+            return OCRScheduleDecision(False, "soft_lock_hold")
         if self.attempts == 0:
             return OCRScheduleDecision(True, "first_usable_crop")
         if near_exit:
@@ -572,29 +736,44 @@ class TrackRecognitionSession:
             self.last_ocr_area * (1.0 + self.config.reread_area_gain)
         ):
             return OCRScheduleDecision(True, "plate_area_grew")
-        frame_gap = int(seq) - int(
-            self.last_ocr_seq if self.last_ocr_seq is not None else seq
-        )
-        current = self.decision
-        if (
-            current.phase is RecognitionPhase.PROVISIONAL
-            and frame_gap >= self.config.independent_frame_gap
-        ):
+        timestamp = _finite_optional(ts)
+        if timestamp is not None and self.last_ocr_ts is not None:
+            evidence_gap = timestamp - self.last_ocr_ts
+            independent_due = evidence_gap >= self.config.independent_time_gap_seconds
+            periodic_due = evidence_gap >= self.config.max_seconds_between_reads
+        else:
+            frame_gap = int(seq) - int(
+                self.last_ocr_seq if self.last_ocr_seq is not None else seq
+            )
+            independent_due = frame_gap >= self.config.independent_frame_gap
+            periodic_due = frame_gap >= self.config.max_frames_between_reads
+        if current.phase is RecognitionPhase.PROVISIONAL and independent_due:
             return OCRScheduleDecision(True, "provisional_confirmation_due")
-        if current.reason == "invalid_fused_structure" and frame_gap >= 1:
+        if current.reason == "invalid_fused_structure" and independent_due:
             return OCRScheduleDecision(True, "conflicting_evidence")
-        if current.unresolved_slots and frame_gap >= 1:
+        if current.unresolved_slots and independent_due:
             return OCRScheduleDecision(True, "unresolved_slots")
-        if frame_gap >= self.config.max_frames_between_reads:
+        if periodic_due:
             return OCRScheduleDecision(True, "periodic_refresh")
         return OCRScheduleDecision(False, "no_material_gain")
 
-    def reserve_ocr(self, *, seq: int, quality: float, bbox_area: int) -> None:
+    def reserve_ocr(
+        self,
+        *,
+        seq: int,
+        ts: float | None = None,
+        quality: float,
+        bbox_area: int,
+    ) -> None:
         if self.in_flight:
             raise RuntimeError("OCR is already in flight for this track")
         self.in_flight = True
         self.attempts += 1
+        self.audit_in_flight = self.decision.soft_locked
+        if self.audit_in_flight:
+            self.audit_attempts += 1
         self.last_ocr_seq = int(seq)
+        self.last_ocr_ts = _finite_optional(ts)
         self.last_ocr_quality = _unit(quality)
         self.last_ocr_area = max(0, int(bbox_area))
 
@@ -602,13 +781,72 @@ class TrackRecognitionSession:
         self.in_flight = False
         if retryable and self.attempts > 0:
             self.attempts -= 1
+            if self.audit_in_flight and self.audit_attempts > 0:
+                self.audit_attempts -= 1
+        self.audit_in_flight = False
 
-    def observe(self, result: OCRResult, *, quality: float, seq: int) -> FusionDecision:
+    def observe(
+        self,
+        result: OCRResult,
+        *,
+        quality: float,
+        seq: int,
+        ts: float | None = None,
+        plate_width: int | None = None,
+        plate_height: int | None = None,
+    ) -> FusionDecision:
         self.in_flight = False
-        return self.accumulator.add(result, quality=quality, seq=seq)
+        self.audit_in_flight = False
+        decision = self.accumulator.add(
+            result,
+            quality=quality,
+            seq=seq,
+            ts=ts,
+            plate_width=plate_width,
+            plate_height=plate_height,
+        )
+        if decision.soft_locked:
+            if self.soft_locked_at_ts is None:
+                self.soft_locked_at_ts = _finite_optional(ts)
+                self.soft_lock_reason = decision.reason
+        else:
+            self.soft_locked_at_ts = None
+            self.soft_lock_reason = None
+        return decision
+
+    def should_finalize(self, *, ts: float | None, near_exit: bool = False) -> bool:
+        if self.closed or self._finalized is not None or not self.decision.soft_locked:
+            return False
+        audit_complete = (
+            self.config.max_audit_attempts > 0
+            and self.audit_attempts >= self.config.max_audit_attempts
+        )
+        if near_exit or audit_complete:
+            return True
+        timestamp = _finite_optional(ts)
+        if timestamp is None or self.soft_locked_at_ts is None:
+            return False
+        return timestamp - self.soft_locked_at_ts >= self.config.soft_lock_hold_seconds
+
+    def finalize(self, *, reason: str) -> FusionDecision:
+        current = self.accumulator.decision()
+        if not current.soft_locked:
+            raise RuntimeError("only a soft-locked recognition can be finalized")
+        self.finalization_reason = str(reason)
+        self._finalized = FusionDecision(
+            RecognitionPhase.FINALIZED,
+            current.text,
+            current.confidence,
+            current.reason,
+            current.slots,
+            current.observations,
+            current.independent_observations,
+            current.full_sequence_support,
+        )
+        return self._finalized
 
     def claim_event(self) -> bool:
-        if not self.decision.locked or self.event_claimed:
+        if not self.decision.finalized or self.event_claimed:
             return False
         self.event_claimed = True
         return True
@@ -623,3 +861,17 @@ def _unit(value: float) -> float:
     if not math.isfinite(number):
         return 0.0
     return max(0.0, min(1.0, number))
+
+
+def _finite_optional(value: float | None) -> float | None:
+    if value is None:
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _positive_optional(value: int | None) -> int | None:
+    if value is None:
+        return None
+    number = int(value)
+    return number if number > 0 else None
