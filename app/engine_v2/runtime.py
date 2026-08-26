@@ -3,8 +3,8 @@ from __future__ import annotations
 import math
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Callable
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -22,10 +22,23 @@ from .ocr import (
 from .quality import BestPlateFrameSelector
 from .scheduler import LatestOnlyPriorityQueue
 from .streams import ProducerActivity, ProducerCadencePolicy
-from .tracking import LightweightMultiObjectTracker, TrackObservation, TrackerConfig
-from .types import FramePacket, OCRResult, PlateCandidate, PlateDetector, PlateEvent, PlateOCR, TrackPhase
+from .tcam import (
+    PlateEvidenceAccumulator,
+    RecognitionPhase,
+    TemporalFusionConfig,
+    TrackRecognitionSession,
+)
+from .tracking import LightweightMultiObjectTracker, TrackerConfig, TrackObservation
+from .types import (
+    FramePacket,
+    OCRResult,
+    PlateCandidate,
+    PlateDetector,
+    PlateEvent,
+    PlateOCR,
+    TrackPhase,
+)
 from .validator import IranianPlateValidator
-
 
 _RUNTIME_EPOCH_METADATA_KEY = "_engine_v2_runtime_epoch"
 
@@ -56,6 +69,10 @@ class EngineV2Config:
     load_control_enabled: bool = True
     same_camera_duplicate_seconds: float = 20.0
     cross_camera_duplicate_seconds: float = 1.5
+    # Opt-in while the new track-centric policy is calibrated against V1.
+    # The legacy Engine V2 voting path remains the control in the same branch.
+    track_temporal_fusion_enabled: bool = False
+    temporal_fusion: TemporalFusionConfig = field(default_factory=TemporalFusionConfig)
 
     def __post_init__(self) -> None:
         positive_ints = {
@@ -95,7 +112,10 @@ class EngineV2Config:
             raise ValueError("max_main_stream_skew_ms cannot be negative")
         if self.max_queue_age_seconds < 0:
             raise ValueError("max_queue_age_seconds cannot be negative")
-        if self.same_camera_duplicate_seconds < 0 or self.cross_camera_duplicate_seconds < 0:
+        if (
+            self.same_camera_duplicate_seconds < 0
+            or self.cross_camera_duplicate_seconds < 0
+        ):
             raise ValueError("duplicate suppression windows cannot be negative")
 
 
@@ -109,7 +129,11 @@ class TrackEpisode:
     phase: TrackPhase = TrackPhase.TRACKING
     selector: BestPlateFrameSelector = field(default_factory=BestPlateFrameSelector)
     transitions: list[TrackPhase] = field(
-        default_factory=lambda: [TrackPhase.IDLE, TrackPhase.ACTIVE, TrackPhase.TRACKING]
+        default_factory=lambda: [
+            TrackPhase.IDLE,
+            TrackPhase.ACTIVE,
+            TrackPhase.TRACKING,
+        ]
     )
     ocr_submitted: bool = False
     ocr_attempts: int = 0
@@ -119,6 +143,9 @@ class TrackEpisode:
     tracker_removed: bool = False
     last_bbox: tuple[int, int, int, int] | None = None
     observations: list[OCRResult] = field(default_factory=list)
+    recognition: TrackRecognitionSession | None = None
+    ocr_sequences_seen: set[int] = field(default_factory=set)
+    last_ocr_schedule_reason: str | None = None
 
     def advance(self, phase: TrackPhase) -> None:
         if self.phase is phase:
@@ -210,7 +237,9 @@ class EventDrivenANPREngine:
         self.validator = validator or IranianPlateValidator()
         self.load_controller = load_controller or AdaptiveLoadController()
         self.load_sampler = SystemLoadSampler()
-        self.queue: LatestOnlyPriorityQueue[FramePacket] = LatestOnlyPriorityQueue(self.config.queue_size)
+        self.queue: LatestOnlyPriorityQueue[FramePacket] = LatestOnlyPriorityQueue(
+            self.config.queue_size
+        )
         self.ocr_worker = SharedOCRWorker(
             ocr,
             TemporalOCRVoter(self.validator),
@@ -237,6 +266,15 @@ class EventDrivenANPREngine:
     @property
     def policy(self) -> LoadPolicy:
         return self.load_controller.policy
+
+    def _new_recognition_session(self) -> TrackRecognitionSession | None:
+        if not self.config.track_temporal_fusion_enabled:
+            return None
+        policy = replace(
+            self.config.temporal_fusion,
+            min_ocr_quality=self.config.min_quality,
+        )
+        return TrackRecognitionSession(PlateEvidenceAccumulator(self.validator, policy))
 
     def set_roi(self, camera_id: str, roi: tuple[int, int, int, int] | None) -> None:
         with self._state_lock:
@@ -269,7 +307,9 @@ class EventDrivenANPREngine:
             stride = max(1, self.config.idle_stride * policy.idle_stride_multiplier)
             scale = policy.idle_fps_scale
         else:
-            stride = max(1, self.config.active_stride * policy.detector_stride_multiplier)
+            stride = max(
+                1, self.config.active_stride * policy.detector_stride_multiplier
+            )
             scale = policy.active_fps_scale
         return max(0.05, float(source_fps) * scale / stride)
 
@@ -310,11 +350,15 @@ class EventDrivenANPREngine:
             gate = self._gates.setdefault(packet.camera_id, AdaptiveMotionGate())
             tracker = self._trackers.setdefault(
                 packet.camera_id,
-                LightweightMultiObjectTracker(TrackerConfig(max_missed=self.config.tracker_max_missed)),
+                LightweightMultiObjectTracker(
+                    TrackerConfig(max_missed=self.config.tracker_max_missed)
+                ),
             )
 
             source_epoch_value = packet.metadata.get("producer_epoch")
-            source_epoch = None if source_epoch_value is None else str(source_epoch_value)
+            source_epoch = (
+                None if source_epoch_value is None else str(source_epoch_value)
+            )
             resume_after_restart = False
             reopen_finalized = (
                 state.input_finalized
@@ -343,7 +387,10 @@ class EventDrivenANPREngine:
                 if state.source_epoch is None:
                     state.source_epoch = source_epoch
                 elif state.source_epoch != source_epoch:
-                    resume_after_restart = state.phase not in (TrackPhase.IDLE, TrackPhase.DONE)
+                    resume_after_restart = state.phase not in (
+                        TrackPhase.IDLE,
+                        TrackPhase.DONE,
+                    )
                     self._discard_pending_ocr(state)
                     state.runtime_epoch += 1
                     state.reset()
@@ -356,7 +403,11 @@ class EventDrivenANPREngine:
                 return False
             state.last_received_seq = int(packet.seq)
             packet.metadata[_RUNTIME_EPOCH_METADATA_KEY] = state.runtime_epoch
-            detector_frame = packet.detector_frame if packet.detector_frame is not None else packet.frame
+            detector_frame = (
+                packet.detector_frame
+                if packet.detector_frame is not None
+                else packet.frame
+            )
             roi = self._rois.get(packet.camera_id)
             adaptive_admission = packet.metadata.get("adaptive_admission") is True
             detector_due = packet.metadata.get("detector_due")
@@ -373,10 +424,14 @@ class EventDrivenANPREngine:
                 return self.queue.submit(packet.camera_id, packet, priority=5)
 
             if state.phase is TrackPhase.DONE:
-                return self._handle_done_frame(packet, detector_frame, roi, state, gate, tracker)
+                return self._handle_done_frame(
+                    packet, detector_frame, roi, state, gate, tracker
+                )
 
             if state.phase is TrackPhase.IDLE:
-                stride = max(1, self.config.idle_stride * self.policy.idle_stride_multiplier)
+                stride = max(
+                    1, self.config.idle_stride * self.policy.idle_stride_multiplier
+                )
                 if not adaptive_cadence and packet.seq % stride != 0:
                     return False
                 score = gate.score(detector_frame, roi)
@@ -393,9 +448,13 @@ class EventDrivenANPREngine:
                 self.metrics.motion_wakeups += 1
                 return self.queue.submit(packet.camera_id, packet, priority=10)
 
-            detector_stride = max(1, self.config.active_stride * self.policy.detector_stride_multiplier)
+            detector_stride = max(
+                1, self.config.active_stride * self.policy.detector_stride_multiplier
+            )
             tracking_only = adaptive_cadence and detector_due is False
-            if tracking_only or (not adaptive_cadence and packet.seq % detector_stride != 0):
+            if tracking_only or (
+                not adaptive_cadence and packet.seq % detector_stride != 0
+            ):
                 # Tracking prediction is deliberately cheaper than a detector
                 # call and lets us keep gathering high-resolution crops.
                 observations = tracker.predict(packet.seq)
@@ -411,7 +470,9 @@ class EventDrivenANPREngine:
                 state.last_activity_seq = packet.seq
             else:
                 state.quiet_samples += 1
-            priority = 5 if any(len(track.selector) for track in state.tracks.values()) else 10
+            priority = (
+                5 if any(len(track.selector) for track in state.tracks.values()) else 10
+            )
             return self.queue.submit(packet.camera_id, packet, priority=priority)
 
     def process_next(self) -> PlateEvent | None:
@@ -500,7 +561,11 @@ class EventDrivenANPREngine:
                     state.final_seq = (
                         normalized_final_seq
                         if normalized_final_seq is not None
-                        else (state.last_received_seq if state.last_received_seq >= 0 else None)
+                        else (
+                            state.last_received_seq
+                            if state.last_received_seq >= 0
+                            else None
+                        )
                     )
                     state.final_ts = normalized_final_ts
 
@@ -573,6 +638,13 @@ class EventDrivenANPREngine:
                         episode.ocr_submitted = False
                         if discarded:
                             episode.ocr_attempts = max(0, episode.ocr_attempts - 1)
+                            if episode.recognition is not None:
+                                episode.recognition.release_ocr(retryable=True)
+                                episode.ocr_attempts = episode.recognition.attempts
+                                if episode.recognition.last_ocr_seq is not None:
+                                    episode.ocr_sequences_seen.discard(
+                                        episode.recognition.last_ocr_seq
+                                    )
 
                     task = self._prepare_ocr_task(
                         normalized_camera_id,
@@ -586,10 +658,14 @@ class EventDrivenANPREngine:
                     # No real candidate survives the configured quality floor.
                     # The episode is terminal and its crops can be released.
                     episode.ocr_submitted = False
+                    if episode.recognition is not None:
+                        episode.recognition.close()
                     episode.advance(TrackPhase.DONE)
                     state.last_done_seq = max(
                         state.last_done_seq,
-                        state.final_seq if state.final_seq is not None else episode.last_seq,
+                        state.final_seq
+                        if state.final_seq is not None
+                        else episode.last_seq,
                     )
                     episode.selector.clear()
 
@@ -610,8 +686,13 @@ class EventDrivenANPREngine:
                             track_id = int(track_value)
                         except (TypeError, ValueError):
                             track_id = -1
-                        episode = state.tracks.get(track_id) if state is not None else None
-                        if episode is not None and episode.episode_id == processed_task.key:
+                        episode = (
+                            state.tracks.get(track_id) if state is not None else None
+                        )
+                        if (
+                            episode is not None
+                            and episode.episode_id == processed_task.key
+                        ):
                             if episode.phase is TrackPhase.DONE:
                                 # An exception raised after the state commit
                                 # must not hide or retry an already-emitted
@@ -669,8 +750,13 @@ class EventDrivenANPREngine:
                             track_id = int(track_value)
                         except (TypeError, ValueError):
                             track_id = -1
-                        episode = state.tracks.get(track_id) if state is not None else None
-                        if episode is not None and episode.episode_id == processed_task.key:
+                        episode = (
+                            state.tracks.get(track_id) if state is not None else None
+                        )
+                        if (
+                            episode is not None
+                            and episode.episode_id == processed_task.key
+                        ):
                             if episode.phase is TrackPhase.DONE:
                                 applied_event = episode.emitted_event
                                 episode.pending_ocr_result = None
@@ -696,6 +782,8 @@ class EventDrivenANPREngine:
                     for episode in state.tracks.values():
                         self.ocr_worker.queue.discard(episode.episode_id)
                         episode.ocr_submitted = False
+                        if episode.recognition is not None:
+                            episode.recognition.release_ocr()
                         if episode.episode_id in failed_episode_ids:
                             if episode.pending_ocr_result is None:
                                 episode.ocr_attempts = max(0, episode.ocr_attempts - 1)
@@ -709,11 +797,15 @@ class EventDrivenANPREngine:
                     state.finalization_complete = not failed_episode_ids
                     if state.finalization_complete:
                         if state.final_seq is not None:
-                            state.last_done_seq = max(state.last_done_seq, state.final_seq)
+                            state.last_done_seq = max(
+                                state.last_done_seq, state.final_seq
+                            )
                         state.best_quality = 0.0
                         state.best_crop = None
                         state.best_bbox = None
-                        state.phase = TrackPhase.DONE if state.tracks else TrackPhase.IDLE
+                        state.phase = (
+                            TrackPhase.DONE if state.tracks else TrackPhase.IDLE
+                        )
                     else:
                         state.phase = TrackPhase.COLLECTING
                     tracker = self._trackers.get(normalized_camera_id)
@@ -744,7 +836,9 @@ class EventDrivenANPREngine:
 
         return events
 
-    def notify_stream_restart(self, camera_id: str, *, preserve_activity: bool = True) -> None:
+    def notify_stream_restart(
+        self, camera_id: str, *, preserve_activity: bool = True
+    ) -> None:
         """Reset producer sequence/tracking state after an external decoder restart.
 
         ``DualStreamRTSPProducer`` supplies a ``producer_epoch`` automatically;
@@ -753,7 +847,10 @@ class EventDrivenANPREngine:
 
         with self._state_lock:
             state = self._state_for_locked(camera_id)
-            was_active = preserve_activity and state.phase not in (TrackPhase.IDLE, TrackPhase.DONE)
+            was_active = preserve_activity and state.phase not in (
+                TrackPhase.IDLE,
+                TrackPhase.DONE,
+            )
             self._discard_pending_ocr(state)
             state.runtime_epoch += 1
             state.episode_number += 1
@@ -774,7 +871,9 @@ class EventDrivenANPREngine:
             gate.reset()
             tracker = self._trackers.setdefault(
                 camera_id,
-                LightweightMultiObjectTracker(TrackerConfig(max_missed=self.config.tracker_max_missed)),
+                LightweightMultiObjectTracker(
+                    TrackerConfig(max_missed=self.config.tracker_max_missed)
+                ),
             )
             tracker.reset()
 
@@ -826,13 +925,23 @@ class EventDrivenANPREngine:
                 for state in self._states.values()
             )
             total = len(self._states)
+            recognition_sessions = [
+                episode.recognition
+                for state in self._states.values()
+                for episode in state.tracks.values()
+                if episode.recognition is not None
+            ]
+            recognition_phases = [
+                session.decision.phase for session in recognition_sessions
+            ]
             return {
                 "frames_received": self.metrics.frames_received,
                 "motion_evaluations": self.metrics.motion_evaluations,
                 "motion_wakeups": self.metrics.motion_wakeups,
                 "detector_inferences": self.metrics.detector_inferences,
                 "detector_mean_ms": self.metrics.mean_detector_seconds * 1_000.0,
-                "detector_latency_ema_ms": self.metrics.detector_latency_ema_seconds * 1_000.0,
+                "detector_latency_ema_ms": self.metrics.detector_latency_ema_seconds
+                * 1_000.0,
                 "ocr_inferences": self.ocr_worker.stats.inference_count,
                 "ocr_mean_ms": self.ocr_worker.stats.mean_inference_seconds * 1_000.0,
                 "ocr_abandoned_tasks": self.ocr_worker.stats.abandoned_task_count,
@@ -847,6 +956,17 @@ class EventDrivenANPREngine:
                 "duplicates_suppressed": self.metrics.duplicates_suppressed,
                 "restart_stale_frames": self.metrics.restart_stale_frames,
                 "restart_stale_ocr_tasks": self.metrics.restart_stale_ocr_tasks,
+                "track_temporal_fusion_enabled": self.config.track_temporal_fusion_enabled,
+                "fusion_tracks": len(recognition_sessions),
+                "fusion_provisional_tracks": recognition_phases.count(
+                    RecognitionPhase.PROVISIONAL
+                ),
+                "fusion_locked_tracks": recognition_phases.count(
+                    RecognitionPhase.LOCKED
+                ),
+                "fusion_ocr_attempts": sum(
+                    session.attempts for session in recognition_sessions
+                ),
                 "active_cameras": active,
                 "idle_cameras": total - active,
                 "load_level": self.load_controller.level.name.lower(),
@@ -918,7 +1038,9 @@ class EventDrivenANPREngine:
                 return
             was_done = state.phase is TrackPhase.DONE
 
-        detector_frame = packet.detector_frame if packet.detector_frame is not None else packet.frame
+        detector_frame = (
+            packet.detector_frame if packet.detector_frame is not None else packet.frame
+        )
         started = time.perf_counter()
         with self._detector_lock:
             detected = list(self.detector.detect(detector_frame))
@@ -933,7 +1055,9 @@ class EventDrivenANPREngine:
             )
 
         candidates = [
-            self._map_candidate(candidate, detector_frame.shape[:2], packet.frame.shape[:2])
+            self._map_candidate(
+                candidate, detector_frame.shape[:2], packet.frame.shape[:2]
+            )
             for candidate in detected
             if candidate.confidence >= self.config.min_detector_confidence
         ]
@@ -947,7 +1071,9 @@ class EventDrivenANPREngine:
                 return
             tracker = self._trackers.setdefault(
                 packet.camera_id,
-                LightweightMultiObjectTracker(TrackerConfig(max_missed=self.config.tracker_max_missed)),
+                LightweightMultiObjectTracker(
+                    TrackerConfig(max_missed=self.config.tracker_max_missed)
+                ),
             )
             state.last_detection_seq = packet.seq
             update = tracker.update(candidates, packet.seq)
@@ -960,7 +1086,9 @@ class EventDrivenANPREngine:
                 episode = state.tracks.get(track_id)
                 if episode is not None:
                     episode.tracker_removed = True
-                    submitted = self._maybe_submit_ocr(packet.camera_id, episode, force=True)
+                    submitted = self._maybe_submit_ocr(
+                        packet.camera_id, episode, force=True
+                    )
                     if (
                         not submitted
                         and not episode.ocr_submitted
@@ -973,7 +1101,8 @@ class EventDrivenANPREngine:
                         state.last_done_seq = max(state.last_done_seq, episode.last_seq)
 
             active_episodes = [
-                episode for episode in state.tracks.values()
+                episode
+                for episode in state.tracks.values()
                 if episode.phase is not TrackPhase.DONE
             ]
             if state.tracks and not active_episodes:
@@ -983,7 +1112,11 @@ class EventDrivenANPREngine:
                 # to a completed track. Preserve camera DONE so active-cadence
                 # detection cannot repeatedly OCR or spin on the same vehicle.
                 state.phase = TrackPhase.DONE
-            if not candidates and not active_episodes and state.quiet_samples >= self.config.active_quiet_samples:
+            if (
+                not candidates
+                and not active_episodes
+                and state.quiet_samples >= self.config.active_quiet_samples
+            ):
                 state.reset()
                 tracker.reset()
 
@@ -994,9 +1127,14 @@ class EventDrivenANPREngine:
         observations: list[TrackObservation],
     ) -> None:
         skew = packet.metadata.get("main_detector_skew_ms")
-        if skew is None and isinstance(packet.metadata.get("main_age_seconds"), (int, float)):
+        if skew is None and isinstance(
+            packet.metadata.get("main_age_seconds"), (int, float)
+        ):
             skew = float(packet.metadata["main_age_seconds"]) * 1_000.0
-        if isinstance(skew, (int, float)) and abs(float(skew)) > self.config.max_main_stream_skew_ms:
+        if (
+            isinstance(skew, (int, float))
+            and abs(float(skew)) > self.config.max_main_stream_skew_ms
+        ):
             return
 
         for observation in observations:
@@ -1012,10 +1150,15 @@ class EventDrivenANPREngine:
                     first_seq=packet.seq,
                     last_seq=packet.seq,
                     last_ts=packet.ts,
-                    selector=BestPlateFrameSelector(self.config.selector_capacity, min_sequence_gap=0),
+                    selector=BestPlateFrameSelector(
+                        self.config.selector_capacity, min_sequence_gap=0
+                    ),
+                    recognition=self._new_recognition_session(),
                 )
                 state.tracks[observation.track_id] = episode
-            if episode.phase in (TrackPhase.DONE, TrackPhase.OCR):
+            if episode.phase is TrackPhase.DONE or (
+                episode.phase is TrackPhase.OCR and episode.recognition is None
+            ):
                 continue
 
             # A detector may finish after a newer tracking-only packet was
@@ -1025,7 +1168,9 @@ class EventDrivenANPREngine:
                 episode.last_seq = packet.seq
                 episode.last_ts = packet.ts
                 episode.last_bbox = observation.bbox
-            episode.advance(TrackPhase.PLATE_FOUND)
+            ocr_in_flight = episode.ocr_submitted
+            if not ocr_in_flight:
+                episode.advance(TrackPhase.PLATE_FOUND)
             padded = self._pad_bbox(observation.bbox, packet.frame.shape[:2])
             crop = self._crop_bbox(packet.frame, padded)
             added = episode.selector.add(
@@ -1038,16 +1183,20 @@ class EventDrivenANPREngine:
             )
             if added is None:
                 continue
-            episode.advance(TrackPhase.COLLECTING)
-            state.phase = TrackPhase.COLLECTING
+            if not ocr_in_flight:
+                episode.advance(TrackPhase.COLLECTING)
+                state.phase = TrackPhase.COLLECTING
             best = episode.selector.best
             if best is not None and best.quality.score >= state.best_quality:
                 state.best_quality = best.quality.score
                 state.best_crop = best.crop.copy()
                 state.best_bbox = best.bbox
-            self._maybe_submit_ocr(packet.camera_id, episode)
+            if not ocr_in_flight:
+                self._maybe_submit_ocr(packet.camera_id, episode)
 
-    def _maybe_submit_ocr(self, camera_id: str, episode: TrackEpisode, force: bool = False) -> bool:
+    def _maybe_submit_ocr(
+        self, camera_id: str, episode: TrackEpisode, force: bool = False
+    ) -> bool:
         task = self._prepare_ocr_task(camera_id, episode, force=force)
         if task is None:
             return False
@@ -1055,9 +1204,12 @@ class EventDrivenANPREngine:
         if accepted is False:
             episode.ocr_submitted = False
             episode.ocr_attempts -= 1
+            if episode.recognition is not None:
+                episode.recognition.release_ocr(retryable=True)
             episode.advance(TrackPhase.COLLECTING)
             self._states[camera_id].phase = TrackPhase.COLLECTING
             return False
+        episode.ocr_sequences_seen.update(task.sequences)
         return True
 
     def _prepare_ocr_task(
@@ -1071,32 +1223,79 @@ class EventDrivenANPREngine:
 
         if episode.ocr_submitted or episode.phase is TrackPhase.DONE:
             return None
-        if episode.ocr_attempts >= self.config.max_ocr_attempts:
+        attempt_limit = (
+            episode.recognition.config.max_ocr_attempts
+            if episode.recognition is not None
+            else self.config.max_ocr_attempts
+        )
+        if episode.ocr_attempts >= attempt_limit:
             episode.advance(TrackPhase.DONE)
             return None
+        selection_limit = (
+            self.config.selector_capacity
+            if episode.recognition is not None
+            else self.config.max_ocr_candidates
+        )
         selected = episode.selector.selected(
-            self.config.max_ocr_candidates,
+            selection_limit,
             min_quality=self.config.min_quality,
         )
         if not selected:
             return None
-        age = episode.last_seq - episode.first_seq
-        enough = len(selected) >= self.config.min_candidates_before_ocr
-        excellent = selected[0].quality.score >= self.config.early_ocr_quality
-        timed_out = age >= self.config.max_collection_frames
-        if not (force or enough or excellent or timed_out):
-            return None
+        schedule_reason: str | None = None
+        if episode.recognition is not None:
+            selected = [
+                frame
+                for frame in selected
+                if frame.seq not in episode.ocr_sequences_seen
+            ]
+            if not selected:
+                return None
+            # Read one fresh crop per attempt. Already-read crops live in the
+            # track accumulator and are never billed to OCR twice.
+            selected = [max(selected, key=lambda frame: frame.seq)]
+            frame = selected[0]
+            x1, y1, x2, y2 = frame.bbox
+            bbox_area = max(0, x2 - x1) * max(0, y2 - y1)
+            schedule = episode.recognition.should_schedule_ocr(
+                seq=frame.seq,
+                quality=frame.quality.score,
+                bbox_area=bbox_area,
+                near_exit=force,
+            )
+            if not schedule.run_ocr:
+                return None
+            schedule_reason = schedule.reason
+            episode.recognition.reserve_ocr(
+                seq=frame.seq,
+                quality=frame.quality.score,
+                bbox_area=bbox_area,
+            )
+            episode.last_ocr_schedule_reason = schedule_reason
+        else:
+            age = episode.last_seq - episode.first_seq
+            enough = len(selected) >= self.config.min_candidates_before_ocr
+            excellent = selected[0].quality.score >= self.config.early_ocr_quality
+            timed_out = age >= self.config.max_collection_frames
+            if not (force or enough or excellent or timed_out):
+                return None
 
         limit = min(self.config.max_ocr_candidates, self.policy.max_ocr_candidates)
         # During critical load a mediocre single crop is deferred or, when the
         # vehicle is leaving, paired with one more candidate to protect accuracy.
-        if limit == 1 and selected[0].quality.score < self.config.early_ocr_quality:
+        if (
+            episode.recognition is None
+            and limit == 1
+            and selected[0].quality.score < self.config.early_ocr_quality
+        ):
             if not force:
                 return None
             limit = min(2, len(selected))
         selected = selected[: max(1, limit)]
         episode.ocr_submitted = True
         episode.ocr_attempts += 1
+        if episode.recognition is not None:
+            episode.ocr_attempts = episode.recognition.attempts
         episode.advance(TrackPhase.OCR)
         state = self._states[camera_id]
         state.phase = TrackPhase.OCR
@@ -1116,6 +1315,7 @@ class EventDrivenANPREngine:
                 "ts": episode.last_ts,
                 "quality": selected[0].quality.score,
                 "force": force,
+                "ocr_schedule_reason": schedule_reason,
             },
         )
 
@@ -1152,58 +1352,185 @@ class EventDrivenANPREngine:
                 or episode.event_emitted
             ):
                 return None
-            episode.observations.extend(item.result for item in vote.results)
-            state.observations.extend(item.result for item in vote.results)
-            episode.ocr_submitted = False
-
-            if not vote.valid or vote.confidence < self.config.min_ocr_confidence:
-                terminal = (
-                    episode.tracker_removed
-                    or episode.ocr_attempts >= self.config.max_ocr_attempts
+            if episode.recognition is not None:
+                event = self._apply_temporal_fusion_result(
+                    camera_id,
+                    track_id,
+                    state,
+                    episode,
+                    task,
+                    vote,
                 )
-                if terminal:
-                    episode.advance(TrackPhase.DONE)
-                    state.last_done_seq = int(task.metadata["seq"])
-                    unfinished = any(item.phase is not TrackPhase.DONE for item in state.tracks.values())
-                    state.phase = TrackPhase.TRACKING if unfinished else TrackPhase.DONE
-                else:
-                    episode.advance(TrackPhase.COLLECTING)
-                    state.phase = TrackPhase.COLLECTING
-                return None
+            else:
+                event = self._apply_compatibility_vote_result(
+                    camera_id,
+                    track_id,
+                    state,
+                    episode,
+                    task,
+                    vote,
+                )
 
-            episode.advance(TrackPhase.VALIDATED)
-            duplicate = self.deduplicator.check_and_record(camera_id, vote.text, float(task.metadata["ts"]))
-            episode.advance(TrackPhase.DONE)
-            episode.event_emitted = not duplicate.duplicate
-            state.last_done_seq = int(task.metadata["seq"])
-            unfinished = any(item.phase is not TrackPhase.DONE for item in state.tracks.values())
-            state.phase = TrackPhase.TRACKING if unfinished else TrackPhase.DONE
-            if duplicate.duplicate:
-                self.metrics.duplicates_suppressed += 1
-                return None
-
-            event = PlateEvent(
-                camera_id=camera_id,
-                frame_seq=int(task.metadata["seq"]),
-                ts=float(task.metadata["ts"]),
-                text=vote.text,
-                confidence=float(vote.confidence),
-                bbox=tuple(task.metadata["bbox"]),
-                quality=float(task.metadata["quality"]),
-                track_id=str(track_id),
-                episode_id=episode.episode_id,
-                observations=vote.observations,
-                metadata={
-                    "vote_reason": vote.reason,
-                    "vote_support": vote.support,
-                    "load_level": self.load_controller.level.name.lower(),
-                },
-            )
-            episode.emitted_event = event
-            self.metrics.events_emitted += 1
-
-        if notify_event and self.on_event is not None:
+        if notify_event and self.on_event is not None and event is not None:
             self.on_event(event)
+        return event
+
+    def _apply_temporal_fusion_result(
+        self,
+        camera_id: str,
+        track_id: int,
+        state: CameraState,
+        episode: TrackEpisode,
+        task: OCRTask,
+        vote: OCRVote,
+    ) -> PlateEvent | None:
+        recognition = episode.recognition
+        if recognition is None:
+            raise RuntimeError("temporal fusion result requires a recognition session")
+        episode.observations.extend(item.result for item in vote.results)
+        state.observations.extend(item.result for item in vote.results)
+        episode.ocr_submitted = False
+        decision = recognition.decision
+        if vote.results:
+            for item in vote.results:
+                decision = recognition.observe(
+                    item.result,
+                    quality=item.candidate_quality,
+                    seq=item.seq,
+                )
+        else:
+            recognition.release_ocr()
+        episode.ocr_attempts = recognition.attempts
+
+        if not decision.locked:
+            terminal = (
+                episode.tracker_removed
+                or episode.ocr_attempts >= recognition.config.max_ocr_attempts
+            )
+            if terminal:
+                recognition.close()
+                episode.advance(TrackPhase.DONE)
+                state.last_done_seq = int(task.metadata["seq"])
+                unfinished = any(
+                    item.phase is not TrackPhase.DONE for item in state.tracks.values()
+                )
+                state.phase = TrackPhase.TRACKING if unfinished else TrackPhase.DONE
+            else:
+                episode.advance(TrackPhase.COLLECTING)
+                state.phase = TrackPhase.COLLECTING
+            return None
+
+        if not recognition.claim_event():
+            return None
+        episode.advance(TrackPhase.VALIDATED)
+        duplicate = self.deduplicator.check_and_record(
+            camera_id,
+            decision.text,
+            float(task.metadata["ts"]),
+        )
+        episode.advance(TrackPhase.DONE)
+        episode.event_emitted = not duplicate.duplicate
+        state.last_done_seq = int(task.metadata["seq"])
+        unfinished = any(
+            item.phase is not TrackPhase.DONE for item in state.tracks.values()
+        )
+        state.phase = TrackPhase.TRACKING if unfinished else TrackPhase.DONE
+        if duplicate.duplicate:
+            self.metrics.duplicates_suppressed += 1
+            return None
+
+        event = PlateEvent(
+            camera_id=camera_id,
+            frame_seq=int(task.metadata["seq"]),
+            ts=float(task.metadata["ts"]),
+            text=decision.text,
+            confidence=float(decision.confidence),
+            bbox=tuple(task.metadata["bbox"]),
+            quality=float(task.metadata["quality"]),
+            track_id=str(track_id),
+            episode_id=episode.episode_id,
+            observations=decision.observations,
+            metadata={
+                "recognition_phase": RecognitionPhase.LOCKED.value,
+                "fusion_reason": decision.reason,
+                "independent_observations": decision.independent_observations,
+                "full_sequence_support": decision.full_sequence_support,
+                "slot_confidences": [slot.confidence for slot in decision.slots],
+                "slot_margins": [slot.margin for slot in decision.slots],
+                "ocr_schedule_reason": task.metadata.get("ocr_schedule_reason"),
+                "ocr_attempts": episode.ocr_attempts,
+                "load_level": self.load_controller.level.name.lower(),
+            },
+        )
+        episode.emitted_event = event
+        self.metrics.events_emitted += 1
+        return event
+
+    def _apply_compatibility_vote_result(
+        self,
+        camera_id: str,
+        track_id: int,
+        state: CameraState,
+        episode: TrackEpisode,
+        task: OCRTask,
+        vote: OCRVote,
+    ) -> PlateEvent | None:
+        episode.observations.extend(item.result for item in vote.results)
+        state.observations.extend(item.result for item in vote.results)
+        episode.ocr_submitted = False
+        if not vote.valid or vote.confidence < self.config.min_ocr_confidence:
+            terminal = (
+                episode.tracker_removed
+                or episode.ocr_attempts >= self.config.max_ocr_attempts
+            )
+            if terminal:
+                episode.advance(TrackPhase.DONE)
+                state.last_done_seq = int(task.metadata["seq"])
+                unfinished = any(
+                    item.phase is not TrackPhase.DONE for item in state.tracks.values()
+                )
+                state.phase = TrackPhase.TRACKING if unfinished else TrackPhase.DONE
+            else:
+                episode.advance(TrackPhase.COLLECTING)
+                state.phase = TrackPhase.COLLECTING
+            return None
+
+        episode.advance(TrackPhase.VALIDATED)
+        duplicate = self.deduplicator.check_and_record(
+            camera_id,
+            vote.text,
+            float(task.metadata["ts"]),
+        )
+        episode.advance(TrackPhase.DONE)
+        episode.event_emitted = not duplicate.duplicate
+        state.last_done_seq = int(task.metadata["seq"])
+        unfinished = any(
+            item.phase is not TrackPhase.DONE for item in state.tracks.values()
+        )
+        state.phase = TrackPhase.TRACKING if unfinished else TrackPhase.DONE
+        if duplicate.duplicate:
+            self.metrics.duplicates_suppressed += 1
+            return None
+
+        event = PlateEvent(
+            camera_id=camera_id,
+            frame_seq=int(task.metadata["seq"]),
+            ts=float(task.metadata["ts"]),
+            text=vote.text,
+            confidence=float(vote.confidence),
+            bbox=tuple(task.metadata["bbox"]),
+            quality=float(task.metadata["quality"]),
+            track_id=str(track_id),
+            episode_id=episode.episode_id,
+            observations=vote.observations,
+            metadata={
+                "vote_reason": vote.reason,
+                "vote_support": vote.support,
+                "load_level": self.load_controller.level.name.lower(),
+            },
+        )
+        episode.emitted_event = event
+        self.metrics.events_emitted += 1
         return event
 
     def _reconcile_abandoned_ocr(self, abandoned: AbandonedOCRTask) -> None:
@@ -1231,10 +1558,17 @@ class EventDrivenANPREngine:
                 return
 
             episode.ocr_submitted = False
-            terminal = (
-                episode.tracker_removed
-                or episode.ocr_attempts >= self.config.max_ocr_attempts
+            if episode.recognition is not None:
+                episode.recognition.release_ocr(retryable=True)
+                episode.ocr_attempts = episode.recognition.attempts
+                for seq in task.sequences:
+                    episode.ocr_sequences_seen.discard(seq)
+            attempt_limit = (
+                episode.recognition.config.max_ocr_attempts
+                if episode.recognition is not None
+                else self.config.max_ocr_attempts
             )
+            terminal = episode.tracker_removed or episode.ocr_attempts >= attempt_limit
             if terminal:
                 episode.advance(TrackPhase.DONE)
                 try:
