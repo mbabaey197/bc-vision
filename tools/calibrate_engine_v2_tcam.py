@@ -21,6 +21,21 @@ from app.engine_v2.inference import InferenceConfig, SharedInferenceBackend
 from app.engine_v2.ir_lpr import load_ir_lpr
 from app.engine_v2.model_adapters import CTCPlateOCR, CTCPlateOCRConfig
 from app.engine_v2.quality import evaluate_plate_quality
+from app.engine_v2.types import OCRResult
+
+_CCT_RUNTIME = "fast-plate-ocr-cct"
+_HEZAR_RUNTIME = "hezar-v2"
+_CCT_REQUIRED_SPEC_KEYS = frozenset(
+    {
+        "alphabet",
+        "max_plate_slots",
+        "input_width",
+        "input_height",
+        "input_layout",
+        "input_dtype",
+        "image_color_mode",
+    }
+)
 
 
 def _sha256(path: Path) -> str:
@@ -37,6 +52,277 @@ def _read_image(path: Path) -> np.ndarray:
     if image is None or not image.size:
         raise ValueError(f"OpenCV could not decode {path}")
     return image
+
+
+def _verify_model_file(
+    model_path: Path,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+    model_name: str,
+) -> None:
+    digest = expected_sha256.strip().lower()
+    if expected_size < 1 or len(digest) != 64:
+        raise ValueError(f"{model_name} has an invalid pinned model contract")
+    if model_path.stat().st_size != expected_size or _sha256(model_path) != digest:
+        raise ValueError(
+            f"{model_name} does not match its pinned size/SHA-256 contract"
+        )
+
+
+def _load_hezar_spec(
+    model_path: Path,
+    *,
+    beam_width: int | None,
+    top_k: int | None,
+) -> dict[str, object]:
+    # Load the contract lazily so the calibration CLI remains importable in
+    # minimal Engine V2 test environments without the production AI package.
+    from app.ai.model_manager import HEZAR_ONNX_SHA256, HEZAR_ONNX_SIZE
+    from app.ai.onnx_hezar import HEZAR_V2_SPEC
+
+    _verify_model_file(
+        model_path,
+        expected_size=int(HEZAR_ONNX_SIZE),
+        expected_sha256=str(HEZAR_ONNX_SHA256),
+        model_name="Hezar v2",
+    )
+    spec = dict(HEZAR_V2_SPEC)
+    if beam_width is not None:
+        spec["beam_width"] = beam_width
+    if top_k is not None:
+        spec["top_k"] = top_k
+    if int(spec.get("beam_width", 10)) < 1:
+        raise ValueError("Hezar beam_width must be positive")
+    if not 1 <= int(spec.get("top_k", 5)) <= int(spec.get("beam_width", 10)):
+        raise ValueError("Hezar top_k must be within 1..beam_width")
+    return spec
+
+
+def _load_cct_spec(
+    model_path: Path,
+    manifest_path: Path | None,
+    *,
+    beam_width: int | None,
+    top_k: int | None,
+) -> tuple[dict[str, object], Path]:
+    source = (
+        manifest_path.resolve()
+        if manifest_path is not None
+        else model_path.parent.joinpath("active-models.json").resolve()
+    )
+    payload: Any = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError("CCT manifest root must be an object")
+    if isinstance(payload.get("models"), dict):
+        raw_spec = payload["models"].get("ocr")
+    else:
+        raw_spec = payload
+    if not isinstance(raw_spec, dict):
+        raise TypeError("CCT manifest must contain models.ocr")
+    spec = dict(raw_spec)
+    if str(spec.get("runtime", "")).strip().lower() != _CCT_RUNTIME:
+        raise ValueError(f"CCT manifest runtime must be {_CCT_RUNTIME!r}")
+    missing = sorted(_CCT_REQUIRED_SPEC_KEYS - set(spec))
+    if missing:
+        raise ValueError(f"CCT manifest is missing contract keys: {missing}")
+    expected_size = spec.get("size")
+    expected_sha256 = str(spec.get("sha256", "")).strip().lower()
+    if (
+        isinstance(expected_size, bool)
+        or not isinstance(expected_size, int)
+        or expected_size < 1
+        or len(expected_sha256) != 64
+    ):
+        raise ValueError("CCT manifest must bind model size and SHA-256")
+    _verify_model_file(
+        model_path,
+        expected_size=expected_size,
+        expected_sha256=expected_sha256,
+        model_name="CCT",
+    )
+    if beam_width is not None:
+        spec["beam_width"] = beam_width
+    if top_k is not None:
+        spec["top_k"] = top_k
+    if int(spec.get("beam_width", 16)) < 1:
+        raise ValueError("CCT beam_width must be positive")
+    if not 1 <= int(spec.get("top_k", 5)) <= int(spec.get("beam_width", 16)):
+        raise ValueError("CCT top_k must be within 1..beam_width")
+    return spec, source
+
+
+def _hypothesis_candidates(
+    hypotheses: object,
+    *,
+    accepted: bool,
+) -> list[dict[str, object]]:
+    if not accepted or not isinstance(hypotheses, list):
+        return []
+    candidates: list[dict[str, object]] = []
+    for hypothesis in hypotheses:
+        if not isinstance(hypothesis, dict):
+            continue
+        text = str(
+            hypothesis.get("plate_norm") or hypothesis.get("plate") or ""
+        ).strip()
+        if not text:
+            continue
+        raw_positions = hypothesis.get("positions", {})
+        positions = raw_positions if isinstance(raw_positions, dict) else {}
+        character_confidences = tuple(
+            float(value.get("confidence", 0.0))
+            for _, value in sorted(positions.items(), key=lambda item: int(item[0]))
+            if isinstance(value, dict)
+        )
+        confidence = float(hypothesis.get("confidence", 0.0))
+        candidates.append(
+            {
+                "text": text,
+                "confidence": confidence,
+                "weight": confidence,
+                "character_confidences": character_confidences,
+            }
+        )
+    return candidates
+
+
+def _cct_result_to_ocr(payload: dict[str, object]) -> OCRResult:
+    raw_hypotheses = payload.get("hypotheses", [])
+    accepted = bool(payload.get("accepted", False))
+    candidates = _hypothesis_candidates(raw_hypotheses, accepted=accepted)
+    text = str(
+        payload.get("raw_plate_norm")
+        or payload.get("plate_norm")
+        or (candidates[0]["text"] if candidates else "")
+    ).strip()
+    character_confidences = (
+        tuple(candidates[0]["character_confidences"]) if candidates else ()
+    )
+    return OCRResult(
+        text=text,
+        confidence=float(payload.get("confidence", 0.0)),
+        valid=accepted,
+        character_confidences=character_confidences,
+        metadata={
+            "candidates": candidates,
+            "decoder": _CCT_RUNTIME,
+            "rejection_reason": str(payload.get("reason", "")),
+        },
+    )
+
+
+def _hezar_result_to_ocr(payload: dict[str, object]) -> OCRResult:
+    raw_hypotheses = payload.get("hypotheses", [])
+    hypotheses = raw_hypotheses if isinstance(raw_hypotheses, list) else []
+    accepted = bool(payload.get("accepted", False))
+    candidates = _hypothesis_candidates(hypotheses, accepted=accepted)
+    raw_details = payload.get("position_details", [])
+    position_details = raw_details if isinstance(raw_details, list) else []
+    character_confidences = tuple(
+        float(item.get("probability", 0.0))
+        for item in position_details
+        if isinstance(item, dict)
+    )
+    raw_text = str(
+        payload.get("plate_norm")
+        or (hypotheses[0].get("plate_norm", "") if hypotheses else "")
+    ).strip()
+    return OCRResult(
+        text=raw_text,
+        confidence=float(payload.get("confidence", 0.0)),
+        valid=accepted,
+        character_confidences=character_confidences,
+        metadata={
+            "candidates": candidates,
+            "decoder": _HEZAR_RUNTIME,
+            "rejection_reason": str(payload.get("reason", "")),
+        },
+    )
+
+
+class _BackendSessionFacade:
+    """Expose ONNX Runtime's small ``run`` surface over Engine V2."""
+
+    def __init__(self, backend: SharedInferenceBackend) -> None:
+        self.backend = backend
+
+    def run(
+        self,
+        output_names: list[str] | tuple[str, ...] | None,
+        input_feed: dict[str, object],
+    ) -> list[object]:
+        return self.backend.infer(input_feed, output_names)
+
+
+class _CCTPlateOCR:
+    def __init__(
+        self,
+        backend: SharedInferenceBackend,
+        spec: dict[str, object],
+    ) -> None:
+        self.backend = backend
+        self.spec = spec
+
+    def read(self, crop: np.ndarray) -> OCRResult:
+        # Import lazily: the complete BC Vision tree contains the production
+        # CCT adapter, while isolated Engine V2 unit tests intentionally do not.
+        from app.ai.onnx_cct import infer_cct_session
+
+        result = infer_cct_session(
+            _BackendSessionFacade(self.backend),
+            self.backend.input_names[0],
+            crop,
+            self.spec,
+        )
+        if not isinstance(result, dict):
+            raise TypeError("CCT inference result must be an object")
+        return _cct_result_to_ocr(result)
+
+
+class _HezarPlateOCR:
+    def __init__(
+        self,
+        backend: SharedInferenceBackend,
+        spec: dict[str, object],
+    ) -> None:
+        self.backend = backend
+        self.spec = spec
+
+    def read(self, crop: np.ndarray) -> OCRResult:
+        from app.ai.onnx_hezar import (
+            accept_hypotheses,
+            ctc_beam_hypotheses,
+            prepare_hezar_input,
+        )
+
+        tensor = prepare_hezar_input(crop, self.spec)
+        if tensor is None:
+            raise ValueError("Empty Hezar OCR crop")
+        outputs = self.backend.infer({self.backend.input_names[0]: tensor})
+        if not outputs:
+            raise ValueError("Hezar inference returned no outputs")
+        logits = np.asarray(outputs[0])
+        if logits.ndim == 3:
+            logits = logits[0]
+        if bool(self.spec.get("reverse_output_digits", False)):
+            logits = logits[::-1]
+        labels = list(self.spec.get("labels") or [])
+        hypotheses = ctc_beam_hypotheses(
+            logits,
+            labels=labels,
+            blank_index=int(self.spec.get("blank_index", 0)),
+            beam_width=int(self.spec.get("beam_width", 10)),
+            top_k=int(self.spec.get("top_k", 5)),
+        )
+        result = accept_hypotheses(
+            hypotheses,
+            min_confidence=float(self.spec.get("min_confidence", 0.56)),
+            min_position_margin=float(self.spec.get("min_position_margin", 0.12)),
+        )
+        if not isinstance(result, dict):
+            raise TypeError("Hezar inference result must be an object")
+        return _hezar_result_to_ocr(result)
 
 
 def collect_ir_lpr(args: argparse.Namespace) -> int:
@@ -61,14 +347,55 @@ def collect_ir_lpr(args: argparse.Namespace) -> int:
         device=args.device,
         allow_fallback=args.allow_inference_fallback,
     )
-    ocr_config = CTCPlateOCRConfig(
-        beam_width=args.beam_width,
-        top_k=args.top_k,
-        constrain_iranian_layout=args.constrain_iranian_layout,
-    )
+    cct_spec: dict[str, object] | None = None
+    hezar_spec: dict[str, object] | None = None
+    ctc_config: CTCPlateOCRConfig | None = None
+    ocr_config_metadata: dict[str, object]
+    if args.ocr_runtime == "hezar":
+        hezar_spec = _load_hezar_spec(
+            model_path,
+            beam_width=args.beam_width,
+            top_k=args.top_k,
+        )
+        ocr_config_metadata = {
+            "runtime": _HEZAR_RUNTIME,
+            "contract": "app.ai.onnx_hezar.HEZAR_V2_SPEC",
+            "spec": hezar_spec,
+        }
+    elif args.ocr_runtime == "cct":
+        cct_spec, cct_manifest = _load_cct_spec(
+            model_path,
+            Path(args.ocr_manifest) if args.ocr_manifest is not None else None,
+            beam_width=args.beam_width,
+            top_k=args.top_k,
+        )
+        ocr_config_metadata = {
+            "runtime": _CCT_RUNTIME,
+            "manifest": str(cct_manifest),
+            "spec": cct_spec,
+        }
+    else:
+        beam_width = args.beam_width if args.beam_width is not None else 8
+        top_k = args.top_k if args.top_k is not None else 3
+        ctc_config = CTCPlateOCRConfig(
+            beam_width=beam_width,
+            top_k=top_k,
+            constrain_iranian_layout=args.constrain_iranian_layout,
+        )
+        ocr_config_metadata = {
+            "runtime": "ctc",
+            "config": asdict(ctc_config),
+        }
     tracks: list[dict[str, object]] = []
     with SharedInferenceBackend(backend_config) as backend:
-        ocr = CTCPlateOCR(backend, ocr_config)
+        if cct_spec is not None:
+            ocr = _CCTPlateOCR(backend, cct_spec)
+        elif hezar_spec is not None:
+            ocr = _HezarPlateOCR(backend, hezar_spec)
+        elif ctc_config is not None:
+            ocr = CTCPlateOCR(backend, ctc_config)
+        else:  # pragma: no cover - guarded by argparse choices
+            raise AssertionError("unconfigured OCR runtime")
         for sample in index.samples:
             image = _read_image(sample.image_path)
             box = sample.plate_bbox
@@ -105,7 +432,10 @@ def collect_ir_lpr(args: argparse.Namespace) -> int:
                     ],
                 }
             )
-        runtime_metadata = asdict(backend.metadata)
+        runtime_metadata = {
+            "session": asdict(backend.metadata),
+            "telemetry": asdict(backend.telemetry_snapshot()),
+        }
 
     payload = {
         "schema": CALIBRATION_SCHEMA,
@@ -117,7 +447,7 @@ def collect_ir_lpr(args: argparse.Namespace) -> int:
             "ir_lpr_fingerprint_sha256": index.fingerprint_sha256,
             "ocr_model_sha256": _sha256(model_path),
             "runtime": runtime_metadata,
-            "ocr_config": asdict(ocr_config),
+            "ocr_config": ocr_config_metadata,
             "profile_assignment": args.profile,
             "assumed_detector_confidence": args.assumed_detector_confidence,
             "limitations": [
@@ -279,13 +609,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     collect.add_argument("--dataset-root", required=True)
     collect.add_argument("--ocr-model", required=True)
+    collect.add_argument(
+        "--ocr-runtime",
+        choices=("hezar", "cct", "ctc"),
+        default="hezar",
+        help=(
+            "Hezar v2 is the current production baseline; CCT is a signed "
+            "Shadow candidate and ctc is the legacy generic adapter"
+        ),
+    )
+    collect.add_argument(
+        "--ocr-manifest",
+        help="CCT active-models.json; defaults to the model's sibling file",
+    )
     collect.add_argument("--output", required=True)
     collect.add_argument("--static-report-output")
     collect.add_argument("--backend", default="auto")
     collect.add_argument("--device", default="AUTO")
     collect.add_argument("--profile", choices=("day", "night"), default="day")
-    collect.add_argument("--beam-width", type=int, default=8)
-    collect.add_argument("--top-k", type=int, default=3)
+    collect.add_argument("--beam-width", type=int)
+    collect.add_argument("--top-k", type=int)
     collect.add_argument(
         "--constrain-iranian-layout",
         action=argparse.BooleanOptionalAction,
