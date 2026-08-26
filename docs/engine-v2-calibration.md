@@ -80,12 +80,13 @@ This command uses ground-truth plate crops. It does not evaluate the detector,
 and the report records that limitation explicitly. The static report includes
 exact-match accuracy, CER, Brier score, expected calibration error, ten
 confidence bins, and coverage/error sweeps at thresholds from 0.50 through
-0.99. These values diagnose whether an OCR confidence such as `0.75` is
+0.999. These values diagnose whether an OCR confidence such as `0.75` is
 trustworthy; they are not sufficient to make `0.75` an event threshold.
 
 The loader searches nested official XML directories and sibling image
 directories, maps `train` to calibration train and `validation`/`test` to
-holdout, rejects ambiguous split paths, and fails on unknown annotation labels.
+holdout, derives dimensions from the paired image when the official XML omits
+`size`, rejects ambiguous split paths, and fails on unknown annotation labels.
 Use `--skip-invalid` only for an exploratory report; every skipped annotation
 is retained in provenance.
 
