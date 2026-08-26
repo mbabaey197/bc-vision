@@ -314,3 +314,16 @@ def test_default_runtime_opens_exactly_one_detector_and_one_hezar_session():
 
     runtime.close()
     assert all(backend.closed for backend in opened)
+
+
+def test_transient_overlay_buffer_is_bounded():
+    shadow = EngineV2LiveShadow(lambda _variant: _FakeRuntime())
+    try:
+        shadow.configure(True)
+        for index in range(40):
+            event = _event(ts=time.monotonic())
+            event.frame_seq = index
+            shadow._record_event(event)
+        assert len(shadow.detections(7)) == 32
+    finally:
+        shadow.shutdown()
