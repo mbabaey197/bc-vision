@@ -39,16 +39,42 @@ rejects malformed or unsupported labels by default.
 ```bash
 python tools/calibrate_engine_v2_tcam.py collect-ir-lpr \
   --dataset-root /data/IR-LPR/license-plate \
-  --ocr-model /models/iran-plate-ocr.onnx \
+  --ocr-runtime hezar \
+  --ocr-model /models/crnn_fa_v2.onnx \
   --backend onnxruntime \
   --device CPU \
   --profile day \
-  --beam-width 8 \
-  --top-k 3 \
-  --constrain-iranian-layout \
   --output /data/calibration/ir-lpr-day.json \
   --static-report-output /data/calibration/ir-lpr-day-report.json
 ```
+
+`hezar` is the default because Hezar v2 is the current production-first OCR
+reader. The collector imports its exact mirrored `32x384`, blank-index-zero
+contract from `app.ai.onnx_hezar` and fails closed unless the supplied ONNX
+file matches the size and SHA-256 pinned by the production model manager.
+
+Run a newer fixed-slot CCT only as a separate Shadow comparison. Its signed
+manifest selects the exact model revision and preprocessing profile, including
+the dual-view `stretch-letterbox-geomean-v1` profile when present:
+
+```bash
+python tools/calibrate_engine_v2_tcam.py collect-ir-lpr \
+  --dataset-root /data/IR-LPR/license-plate \
+  --ocr-runtime cct \
+  --ocr-model /models/cct-candidate.onnx \
+  --ocr-manifest /models/active-models.json \
+  --backend onnxruntime \
+  --device CPU \
+  --profile day \
+  --output /data/calibration/ir-lpr-cct-shadow.json \
+  --static-report-output /data/calibration/ir-lpr-cct-shadow-report.json
+```
+
+Do not merge traces from different OCR revisions into one threshold search.
+Compare their static reports, then collect real temporal day/night traces with
+the selected revision. The generic `ctc` runtime remains available only for
+an explicitly described legacy/custom CTC graph; it is not the Hezar v2
+production contract.
 
 This command uses ground-truth plate crops. It does not evaluate the detector,
 and the report records that limitation explicitly. The static report includes
