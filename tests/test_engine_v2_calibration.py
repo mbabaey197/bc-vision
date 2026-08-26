@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from app.engine_v2.calibration import (
+    STATIC_CONFIDENCE_THRESHOLDS,
     CalibrationDataset,
     CalibrationObservation,
     CalibrationRequirements,
@@ -15,6 +16,10 @@ from app.engine_v2.tcam import TemporalFusionConfig
 
 PLATE = "12ب34567"
 WRONG = "12ب34568"
+
+
+def test_default_static_thresholds_cover_high_confidence_express_tail() -> None:
+    assert STATIC_CONFIDENCE_THRESHOLDS[-5:] == (0.99, 0.995, 0.997, 0.998, 0.999)
 
 
 def _track(
