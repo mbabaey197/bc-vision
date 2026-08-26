@@ -818,7 +818,7 @@ def dashboard(
     )
     js=f"""<script>
 const ids=[{ids}];
-async function cameraStatus(){{for(const id of ids){{try{{let r=await fetch('/api/cameras/'+id+'/status');let s=await r.json();let e=document.getElementById('st-'+id),a=document.getElementById('anpr-'+id),n=v=>Number(v||0).toLocaleString('fa-IR');e.textContent=s.ended?'پایان ویدئو':(s.paused?'متوقف':(s.online?'آنلاین':'آفلاین'));e.className='badge '+(s.online?'online':'');const play=document.getElementById('play-'+id),pause=document.getElementById('pause-'+id);if(play)play.classList.toggle('active',!s.paused);if(pause)pause.classList.toggle('active',!!s.paused);const p=s.anpr||{{}},m=p.models||{{}},engine=m.selected_detector==='yolov8n'?'YOLOv8n':'YOLO11n';if(p.last_error){{a.textContent='خطای '+engine+': '+p.last_error;a.className='anpr-status bad'}}else if(s.anpr_marker_error){{a.textContent='خطای تکمیل پردازش ویدئو: '+s.anpr_marker_error;a.className='anpr-status bad'}}else if(s.anpr_preview_only){{a.textContent=s.anpr_completed?'بازپخش فقط نمایشی است؛ پلاک‌خوان این ویدئو یک‌بار کامل شده است':'پردازش قبلی ناتمام بود؛ برای جلوگیری از ثبت تکراری، پخش فقط نمایشی است';a.className='anpr-status'}}else if(m.preparation_error){{a.textContent='خطای آماده‌سازی مدل: '+m.preparation_error;a.className='anpr-status bad'}}else if(!m.ready){{a.textContent=engine+' آماده نیست: مدل تشخیص یا OCR نصب نشده است';a.className='anpr-status bad'}}else{{const idle=p.idle_mode?' | حالت کم‌مصرف':'';a.textContent=engine+' | پردازش: '+n(p.processed_frames)+' فریم | تشخیص: '+n(p.detected_candidates)+' | ثبت: '+n(p.emitted_events)+idle;a.className='anpr-status'}}}}catch(e){{}}}}}}
+async function cameraStatus(){{for(const id of ids){{try{{let r=await fetch('/api/cameras/'+id+'/status');let s=await r.json();let e=document.getElementById('st-'+id),a=document.getElementById('anpr-'+id),n=v=>Number(v||0).toLocaleString('fa-IR');e.textContent=s.ended?'پایان ویدئو':(s.paused?'متوقف':(s.online?'آنلاین':'آفلاین'));e.className='badge '+(s.online?'online':'');const play=document.getElementById('play-'+id),pause=document.getElementById('pause-'+id);if(play)play.classList.toggle('active',!s.paused);if(pause)pause.classList.toggle('active',!!s.paused);const p=s.anpr||{{}},m=p.models||{{}},sh=p.shadow||{{}},engine=m.selected_detector==='yolov8n'?'YOLOv8n':'YOLO11n',v2=sh.enabled?(' | V2: '+(sh.ready?'آماده':'در حال آماده‌سازی')+'، خوانش '+n(sh.events)+'، توافق '+n(sh.agreements)+'، اختلاف '+n(sh.disagreements)+(sh.last_error?'، خطا':'')):'';if(p.last_error){{a.textContent='خطای '+engine+': '+p.last_error;a.className='anpr-status bad'}}else if(s.anpr_marker_error){{a.textContent='خطای تکمیل پردازش ویدئو: '+s.anpr_marker_error;a.className='anpr-status bad'}}else if(s.anpr_preview_only){{a.textContent=s.anpr_completed?'بازپخش فقط نمایشی است؛ پلاک‌خوان این ویدئو یک‌بار کامل شده است':'پردازش قبلی ناتمام بود؛ برای جلوگیری از ثبت تکراری، پخش فقط نمایشی است';a.className='anpr-status'}}else if(m.preparation_error){{a.textContent='خطای آماده‌سازی مدل: '+m.preparation_error;a.className='anpr-status bad'}}else if(!m.ready){{a.textContent=engine+' آماده نیست: مدل تشخیص یا OCR نصب نشده است';a.className='anpr-status bad'}}else{{const idle=p.idle_mode?' | حالت کم‌مصرف':'';a.textContent=engine+' | پردازش: '+n(p.processed_frames)+' فریم | تشخیص: '+n(p.detected_candidates)+' | ثبت: '+n(p.emitted_events)+idle+v2;a.className='anpr-status'}}}}catch(e){{}}}}}}
 async function videoPlayback(id,action){{try{{const r=await fetch('/api/cameras/'+id+'/playback',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action}})}});if(!r.ok)throw new Error();await cameraStatus()}}catch(e){{alert('تغییر وضعیت پخش انجام نشد.')}}}}
 let latestEventId={latest_event_id};
 let latestEventUpdated={json.dumps(latest_event_updated)};
@@ -1815,6 +1815,14 @@ name='anpr_auto_confirm_guesses' value='1'
 ثبت حدس‌های کامل چندفریمی به‌عنوان «تأیید خودکار مدل»</label>
 <p class='muted'>این نتایج وارد گزارش تردد می‌شوند، اما تا تأیید یا اصلاح
 اپراتور به دیتاست آموزشی اضافه نخواهند شد.</p>
+<label><input style='width:auto' type='checkbox'
+name='anpr_engine_v2_shadow' value='1'
+{checked('anpr_engine_v2_shadow')}>
+آزمایش زنده Engine V2 در حالت Shadow</label>
+<p class='muted'>موتور جدید هم‌زمان روی تصویر زنده اجرا می‌شود، اما هیچ
+رویدادی در دیتابیس ثبت نمی‌کند و فرمان گیت نمی‌دهد. کادرهای بنفش با برچسب
+V2 فقط برای مقایسه هستند؛ آمار توافق و اختلاف نیز در وضعیت دوربین قرار
+می‌گیرد.</p>
 <button>ذخیره تنظیمات AI</button>
 </form>
 </div>
@@ -1948,7 +1956,7 @@ def export_events(request:Request):
     return FileResponse(out,media_type='text/csv',filename=out.name)
 
 @app.post('/settings/ai')
-def save_ai_settings(request:Request, ai_accelerator:str=Form('auto'), ai_quality:str=Form('balanced'), ai_confidence:int=Form(85), ai_frames:int=Form(5), anpr_auto_confirm_guesses:str|None=Form(None), anpr_detector_model:str=Form('yolo11n')):
+def save_ai_settings(request:Request, ai_accelerator:str=Form('auto'), ai_quality:str=Form('balanced'), ai_confidence:int=Form(85), ai_frames:int=Form(5), anpr_auto_confirm_guesses:str|None=Form(None), anpr_detector_model:str=Form('yolo11n'), anpr_engine_v2_shadow:str|None=Form(None)):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
     if not has_permission(request,'system.manage'):return access_denied()
@@ -1969,6 +1977,11 @@ def save_ai_settings(request:Request, ai_accelerator:str=Form('auto'), ai_qualit
         'anpr_auto_confirm_guesses',
         '1' if anpr_auto_confirm_guesses else '0',
     )
+    shadow_enabled=bool(anpr_engine_v2_shadow)
+    set_setting(
+        'anpr_engine_v2_shadow',
+        '1' if shadow_enabled else '0',
+    )
     if detector_changed:
         from app.ai.live_worker import switch_live_anpr_detector
         switch_live_anpr_detector(
@@ -1982,6 +1995,16 @@ def save_ai_settings(request:Request, ai_accelerator:str=Form('auto'), ai_qualit
         )
     else:
         set_setting('anpr_detector_model',detector_model)
+    from app.ai.live_worker import configure_live_engine_v2_shadow
+    configure_live_engine_v2_shadow(shadow_enabled)
+    audit(
+        request,
+        'anpr_engine_v2_shadow',
+        (
+            ('enabled' if shadow_enabled else 'disabled')
+            + '; persistence=false; detector=' + detector_model
+        ),
+    )
     return RedirectResponse('/settings?saved=1',302)
 
 
