@@ -19,6 +19,13 @@ from .review_policy import auto_confirm_guess
 from .vehicle_intelligence import analyze_vehicle
 
 
+MIN_OCR_CROP_HEIGHT = 18
+MIN_OCR_CROP_WIDTH = 64
+MIN_OCR_CROP_ASPECT = 1.8
+MAX_OCR_CROP_ASPECT = 8.5
+MIN_OCR_CROP_QUALITY = 0.20
+
+
 def image_quality(image) -> dict:
     if image is None or getattr(image, "size", 0) == 0:
         return {
@@ -72,6 +79,49 @@ def _combined_confidence(
     return round(min(1.0, max(0.0, combined)), 4)
 
 
+def _ocr_crop_maturity(
+    crop,
+    detector_confidence: float,
+    quality: dict,
+) -> dict:
+    """Decide whether a native detector crop contains enough OCR evidence.
+
+    Small distant boxes remain useful for visual tracking, but stretching
+    them to the OCR input size can repeat one invented character sequence
+    across adjacent frames. Identity evidence therefore starts only after the
+    native crop reaches conservative size, shape, detector and quality gates.
+    """
+
+    if crop is None or getattr(crop, "size", 0) == 0:
+        return {
+            "mature": False,
+            "reason": "empty-crop",
+            "width": 0,
+            "height": 0,
+            "aspect_ratio": 0.0,
+        }
+    height, width = (int(value) for value in crop.shape[:2])
+    aspect_ratio = float(width) / max(1.0, float(height))
+    reason = ""
+    if height < MIN_OCR_CROP_HEIGHT:
+        reason = "crop-height"
+    elif width < MIN_OCR_CROP_WIDTH:
+        reason = "crop-width"
+    elif not MIN_OCR_CROP_ASPECT <= aspect_ratio <= MAX_OCR_CROP_ASPECT:
+        reason = "crop-aspect"
+    elif float(detector_confidence) < 0.25:
+        reason = "detector-confidence"
+    elif float(quality.get("score", 0.0)) < MIN_OCR_CROP_QUALITY:
+        reason = "crop-quality"
+    return {
+        "mature": not reason,
+        "reason": reason,
+        "width": width,
+        "height": height,
+        "aspect_ratio": round(aspect_ratio, 4),
+    }
+
+
 def _partial_plate_text(positions: dict[int, str]) -> str:
     """Format visible OCR evidence without inventing a missing character."""
 
@@ -92,6 +142,9 @@ def process_frame(
     max_results=8,
     max_candidates=None,
     detector_variant=None,
+    inference_key=None,
+    expected_detector_revision=None,
+    runtime_metadata=None,
 ):
     results = []
     detector_kwargs = {
@@ -103,31 +156,59 @@ def process_frame(
         detector_kwargs["max_results"] = max(
             1, int(max_candidates)
         )
-    if engine_key is not None:
-        detector_kwargs["engine_key"] = engine_key
+    model_key = inference_key if inference_key is not None else engine_key
+    if model_key is not None:
+        detector_kwargs["engine_key"] = model_key
     if detector_variant is not None:
         detector_kwargs["detector_variant"] = detector_variant
-    for item in detect_plates(frame, **detector_kwargs):
+    detector_metadata = (
+        runtime_metadata if runtime_metadata is not None else {}
+    )
+    if runtime_metadata is not None:
+        detector_kwargs["runtime_metadata"] = detector_metadata
+    if expected_detector_revision:
+        detector_kwargs["expected_model_revision"] = (
+            expected_detector_revision
+        )
+    detected_items = detect_plates(frame, **detector_kwargs)
+    call_detector_revision = str(
+        detector_metadata.get("detector_model_revision", "")
+    ).strip()
+    for item in detected_items:
         crop = item["crop"]
         quality = image_quality(crop)
-        text = item.get("direct_text", "")
-        ocr_confidence = float(
-            item.get("direct_ocr_confidence", 0.0)
+        # Engine V3 has one authoritative OCR route. Detector-attached or
+        # promoted custom OCR evidence is deliberately excluded from both the
+        # selected plate and temporal hypotheses; it can still be inspected by
+        # explicit training/diagnostic tools outside this production path.
+        production_policy = detector_variant is not None
+        text = "" if production_policy else item.get("direct_text", "")
+        ocr_confidence = (
+            0.0
+            if production_policy
+            else float(item.get("direct_ocr_confidence", 0.0))
         )
         direct_valid = plausible_plate(text)
         direct_norm = normalize_plate(text) if direct_valid else ""
         ocr_engine = (
             "dedicated-character-detector"
-            if item.get("direct_ocr_attempted")
+            if item.get("direct_ocr_attempted") and not production_policy
             else "none"
         )
         whole_plate_ocr_attempted = False
         generic_ocr_attempted = False
-        # Hezar CRNN is the preferred whole-plate reader. The prior CRNN and
-        # lightweight character CNN remain fail-safe readers for credible
-        # crops when Hezar has no accepted full-plate result.
+        maturity = _ocr_crop_maturity(
+            crop,
+            float(item.get("confidence", 0.0)),
+            quality,
+        )
+        ocr_mature = bool(maturity["mature"])
+        # Production OCR is immutable: Hezar v2 first, then the fixed Platrix
+        # CRNN only after a Hezar rejection/error. Promoted custom CRNNs,
+        # detector-attached text and the character CNN are diagnostic-only.
         generic_fallback_eligible = bool(
             not direct_valid
+            and ocr_mature
             and (
                 not item.get("direct_ocr_attempted")
                 or (
@@ -139,31 +220,47 @@ def process_frame(
             )
         )
         whole_plate_ocr_eligible = bool(
-            float(item.get("confidence", 0.0)) >= 0.25
-            and quality["score"] >= 0.12
-            and crop.shape[0] >= 12
-            and crop.shape[1] >= 48
+            ocr_mature
         )
         fallback_text = ""
         fallback_confidence = 0.0
         fallback_engine = "none"
+        ocr_evidence_hypotheses = []
         if whole_plate_ocr_eligible or generic_fallback_eligible:
             whole_plate_ocr_attempted = True
-            (
-                fallback_text,
-                fallback_confidence,
-                fallback_engine,
-            ) = read_plate_candidate(
+            candidate = read_plate_candidate(
                 crop,
-                engine_key=engine_key,
+                engine_key=model_key,
                 allow_legacy=generic_fallback_eligible,
+                include_evidence=True,
             )
+            if isinstance(candidate, dict):
+                fallback_text = str(candidate.get("plate", ""))
+                fallback_confidence = float(
+                    candidate.get("confidence", 0.0)
+                )
+                fallback_engine = str(
+                    candidate.get("engine", "none")
+                )
+                ocr_evidence_hypotheses = list(
+                    candidate.get("hypotheses") or []
+                )
+            else:
+                (
+                    fallback_text,
+                    fallback_confidence,
+                    fallback_engine,
+                ) = candidate
             generic_ocr_attempted = bool(
                 generic_fallback_eligible
                 and fallback_engine in {"cnn-onnx", "none"}
             )
         plate_hypotheses = []
-        for hypothesis in item.get("plate_hypotheses", []):
+        for hypothesis in (
+            ()
+            if production_policy
+            else item.get("plate_hypotheses", [])
+        ):
             normalized = normalize_plate(
                 hypothesis.get("plate_norm")
                 or hypothesis.get("plate")
@@ -214,6 +311,76 @@ def process_frame(
                     max(0.0, float(ocr_confidence)),
                 ),
             })
+        for hypothesis in ocr_evidence_hypotheses:
+            normalized = normalize_plate(
+                hypothesis.get("plate_norm")
+                or hypothesis.get("plate")
+            )
+            if not plausible_plate(normalized):
+                continue
+            evidence = {
+                "plate": format_iran_plate(normalized),
+                "plate_norm": normalized,
+                "engine": str(
+                    hypothesis.get("engine", fallback_engine)
+                ),
+                "confidence": min(
+                    1.0,
+                    max(
+                        0.0,
+                        float(hypothesis.get("confidence", 0.0)),
+                    ),
+                ),
+                "score": min(
+                    1.0,
+                    max(
+                        0.0,
+                        float(
+                            hypothesis.get(
+                                "score",
+                                hypothesis.get("confidence", 0.0),
+                            )
+                        ),
+                    ),
+                ),
+                "ctc_path_score": min(
+                    1.0,
+                    max(
+                        0.0,
+                        float(
+                            hypothesis.get("ctc_path_score", 0.0)
+                        ),
+                    ),
+                ),
+                "temporal_evidence": bool(
+                    ocr_mature
+                    and hypothesis.get("temporal_evidence")
+                ),
+            }
+            matched = next(
+                (
+                    row
+                    for row in plate_hypotheses
+                    if row["plate_norm"] == normalized
+                    and row.get("engine") == evidence["engine"]
+                ),
+                None,
+            )
+            if matched is None:
+                plate_hypotheses.append(evidence)
+            else:
+                matched["confidence"] = max(
+                    float(matched.get("confidence", 0.0)),
+                    evidence["confidence"],
+                )
+                matched["score"] = max(
+                    float(matched.get("score", 0.0)),
+                    evidence["score"],
+                )
+                matched["temporal_evidence"] = bool(
+                    matched.get("temporal_evidence")
+                    or evidence["temporal_evidence"]
+                )
         fallback_valid = plausible_plate(fallback_text)
         fallback_norm = (
             normalize_plate(fallback_text)
@@ -255,7 +422,11 @@ def process_frame(
                 if fallback_engine not in matched["engine"]:
                     matched["engine"] += "+" + fallback_engine
         position_hypotheses = []
-        for hypothesis in item.get("position_hypotheses", []):
+        for hypothesis in (
+            ()
+            if production_policy
+            else item.get("position_hypotheses", [])
+        ):
             positions = {}
             for raw_position, raw_value in hypothesis.get(
                 "positions",
@@ -419,6 +590,30 @@ def process_frame(
             ),
             reverse=True,
         )
+        unstable_review_identity = bool(
+            not valid
+            and raw_guess_reason == "strict-decoder-rejected"
+        )
+        detector_model_revision = str(
+            item.get("model_revision", "") or call_detector_revision
+        ).strip()
+        ocr_model_revision = str(
+            raw_guess_engine or ocr_engine
+        ).strip()
+        detector_revision_label = str(
+            detector_metadata.get("detector_variant")
+            or detector_variant
+            or "detector"
+        ).strip().lower()
+        runtime_model_revision = (
+            detector_revision_label
+            + ":"
+            + detector_model_revision
+            + "+ocr:"
+            + ocr_model_revision
+            if detector_model_revision
+            else ocr_model_revision
+        )
         results.append({
             "plate": text or "ناخوانا",
             "plate_norm": normalize_plate(text) if valid else "",
@@ -442,8 +637,22 @@ def process_frame(
             "ocr_alternative": ocr_alternative,
             "ocr_disagreement": ocr_disagreement,
             "whole_plate_ocr_attempted": whole_plate_ocr_attempted,
+            "ocr_crop_mature": ocr_mature,
+            "ocr_skip_reason": maturity["reason"],
+            "ocr_crop_width": maturity["width"],
+            "ocr_crop_height": maturity["height"],
+            "ocr_crop_aspect_ratio": maturity["aspect_ratio"],
             "dedicated_ocr_attempted": bool(
                 item.get("direct_ocr_attempted")
+            ),
+            "dedicated_ocr_ignored": bool(
+                production_policy
+                and (
+                    item.get("direct_ocr_attempted")
+                    or item.get("direct_text")
+                    or item.get("plate_hypotheses")
+                    or item.get("position_hypotheses")
+                )
             ),
             "generic_ocr_attempted": generic_ocr_attempted,
             "plate_hypotheses": plate_hypotheses[:5],
@@ -476,10 +685,23 @@ def process_frame(
             "raw_guess_confidence": raw_guess_confidence,
             "raw_guess_engine": raw_guess_engine,
             "raw_guess_reason": raw_guess_reason,
-            "model_revision": raw_guess_engine or ocr_engine,
+            "detector_model_revision": detector_model_revision,
+            "ocr_model_revision": ocr_model_revision,
+            "model_revision": runtime_model_revision,
             "experimental": bool(best_effort and needs_review),
+            # Any strict-decoder rejection may change between adjacent
+            # frames, even below the temporal-vote threshold. It remains
+            # review evidence, but is not yet a physical visit key.
+            "visit_identity_stable": not unstable_review_identity,
             "hypotheses_accepted_for_consensus": bool(
                 (valid and not needs_review)
+                or (
+                    ocr_mature
+                    and any(
+                        hypothesis.get("temporal_evidence")
+                        for hypothesis in plate_hypotheses
+                    )
+                )
                 or (
                     not plate_hypotheses
                     and bool(position_hypotheses)
@@ -625,6 +847,8 @@ class _Track:
     capture_event_emitted: bool = False
     unreadable_finalized: bool = False
     capture_event_score: float = -1.0
+    review_candidate_plate: str = ""
+    review_candidate_confidence: float = -1.0
     best_capture_score: float = -1.0
     best_capture_result: dict | None = None
     best_frame: object | None = None
@@ -1163,14 +1387,60 @@ class PlateConsensusTracker:
             assigned[index] = track
         return assigned
 
-    def _expire(self, timestamp: float):
+    def _expire(
+        self,
+        timestamp: float,
+        min_emit_confidence=0.0,
+    ):
         stale = [
             track_id
             for track_id, track in self._tracks.items()
             if timestamp - track.last_seen > self.max_age_seconds * 2.2
         ]
+        finalized = []
         for track_id in stale:
-            self._tracks.pop(track_id, None)
+            track = self._tracks.pop(track_id, None)
+            if track is None:
+                continue
+            final_read = self._final_track_result(
+                track,
+                timestamp,
+                force=True,
+            )
+            if final_read is not None:
+                if (
+                    final_read.get("valid")
+                    and float(final_read.get("confidence", 0.0))
+                    < float(min_emit_confidence)
+                ):
+                    final_read["below_emit_confidence"] = True
+                track.unreadable_finalized = True
+                finalized.append(final_read)
+        return finalized
+
+    def _final_track_result(
+        self,
+        track: _Track,
+        timestamp: float,
+        force=False,
+    ) -> dict | None:
+        if track.emitted_plate or track.unreadable_finalized:
+            return None
+        consensus = self._consensus(track)
+        if consensus is not None:
+            return consensus
+        if not self.emit_unreadable:
+            return None
+        if not force and not self._unreadable_ready(track, timestamp):
+            return None
+        return (
+            self._best_effort_result(track)
+            or self._capture_result(
+                track,
+                refresh=True,
+                final_unreadable=True,
+            )
+        )
 
     @staticmethod
     def _observation_weight(row: dict) -> float:
@@ -1225,6 +1495,12 @@ class PlateConsensusTracker:
             if include_rejected or consensus_allowed
             else []
         ):
+            if (
+                not include_rejected
+                and "temporal_evidence" in hypothesis
+                and not hypothesis.get("temporal_evidence")
+            ):
+                continue
             normalized = normalize_plate(
                 hypothesis.get("plate_norm")
                 or hypothesis.get("plate")
@@ -1403,12 +1679,26 @@ class PlateConsensusTracker:
         # frames. This prevents a synthetic hybrid that never existed.
         whole_plate_support = []
         for row in evidence:
-            candidates = {
-                normalize_plate(row.get("plate_norm")),
-                normalize_plate(row.get("plate")),
-                normalize_plate(row.get("raw_guess_norm")),
-                normalize_plate(row.get("raw_guess_text")),
-            }
+            candidates = set()
+            if row.get("valid") and not row.get("needs_review"):
+                candidates.update({
+                    normalize_plate(row.get("plate_norm")),
+                    normalize_plate(row.get("plate")),
+                    normalize_plate(row.get("raw_guess_norm")),
+                    normalize_plate(row.get("raw_guess_text")),
+                })
+            if row.get("hypotheses_accepted_for_consensus"):
+                candidates.update(
+                    normalize_plate(
+                        hypothesis.get("plate_norm")
+                        or hypothesis.get("plate")
+                    )
+                    for hypothesis in row.get(
+                        "plate_hypotheses",
+                        [],
+                    )
+                    if hypothesis.get("temporal_evidence")
+                )
             if winner_norm in candidates:
                 whole_plate_support.append(row)
         support_times = [
@@ -1428,7 +1718,7 @@ class PlateConsensusTracker:
             return None
 
         matching_scores = []
-        for row in evidence:
+        for row in whole_plate_support:
             support = sum(
                 row["_position_probabilities"][position].get(
                     character,
@@ -1444,10 +1734,76 @@ class PlateConsensusTracker:
             key=lambda row: (row.get("confidence", 0.0), row.get("quality_score", 0.0)),
         )
 
-        total_weight = sum(self._observation_weight(row) for row in evidence)
+        support_confidences = []
+        for row in whole_plate_support:
+            winner_confidences = []
+            if (
+                row.get("valid")
+                and winner_norm in {
+                    normalize_plate(row.get("plate_norm")),
+                    normalize_plate(row.get("plate")),
+                }
+            ):
+                winner_confidences.append(float(
+                    row.get("ocr_confidence")
+                    or row.get("confidence", 0.0)
+                ))
+            for hypothesis in row.get("plate_hypotheses", []):
+                candidate = normalize_plate(
+                    hypothesis.get("plate_norm")
+                    or hypothesis.get("plate")
+                )
+                if candidate != winner_norm:
+                    continue
+                if (
+                    "temporal_evidence" in hypothesis
+                    and not hypothesis.get("temporal_evidence")
+                ):
+                    continue
+                winner_confidences.append(float(
+                    hypothesis.get(
+                        "confidence",
+                        hypothesis.get("score", 0.0),
+                    )
+                ))
+            winner_confidence = min(
+                1.0,
+                max(0.0, max(winner_confidences, default=0.0)),
+            )
+            quality_score = min(
+                1.0,
+                max(0.0, float(row.get("quality_score", 0.0))),
+            )
+            detector_confidence = float(
+                row.get(
+                    "detector_confidence",
+                    row.get("confidence", 0.0),
+                )
+            )
+            support_weight = max(
+                0.02,
+                winner_confidence * max(0.25, quality_score),
+            )
+            support_confidences.append((
+                support_weight,
+                winner_confidence,
+                _combined_confidence(
+                    detector_confidence,
+                    winner_confidence,
+                    quality_score,
+                    True,
+                ),
+            ))
+        total_weight = sum(
+            weight for weight, _ocr, _combined in support_confidences
+        )
+        weighted_ocr_confidence = sum(
+            ocr_confidence * weight
+            for weight, ocr_confidence, _combined in support_confidences
+        ) / max(total_weight, 1e-9)
         weighted_confidence = sum(
-            float(row.get("confidence", 0.0)) * self._observation_weight(row)
-            for row in evidence
+            combined_confidence * weight
+            for weight, _ocr, combined_confidence in support_confidences
         ) / max(total_weight, 1e-9)
         average_agreement = sum(agreement_ratios) / len(agreement_ratios)
         minimum_margin = min(position_margins)
@@ -1456,6 +1812,7 @@ class PlateConsensusTracker:
         result.pop("_position_probabilities", None)
         result["plate"] = format_iran_plate(winner_norm)
         result["plate_norm"] = winner_norm
+        result["valid"] = True
         result["confidence"] = round(
             min(
                 1.0,
@@ -1473,11 +1830,17 @@ class PlateConsensusTracker:
         result["needs_review"] = False
         result["read_status"] = "confirmed-ai"
         result["experimental"] = False
+        result["visit_identity_stable"] = True
+        result["hypotheses_accepted_for_consensus"] = True
+        result["ocr_confidence"] = round(
+            weighted_ocr_confidence,
+            4,
+        )
         result["raw_guess_text"] = result["plate"]
         result["raw_guess_norm"] = winner_norm
-        result["raw_guess_confidence"] = float(
-            result.get("ocr_confidence", result["confidence"])
-        )
+        result["raw_guess_confidence"] = result["ocr_confidence"]
+        if not best.get("valid"):
+            result["raw_guess_reason"] = "strict-temporal-consensus"
         result["raw_guess_engine"] = str(
             result.get("ocr_engine", "")
         )
@@ -1500,9 +1863,20 @@ class PlateConsensusTracker:
             row_weight = self._observation_weight(row)
             primary = normalize_plate(row.get("plate", ""))
             primary_engine = str(row.get("ocr_engine", "")).strip()
-            if primary == winner_norm and primary_engine:
+            if (
+                row.get("valid")
+                and not row.get("needs_review")
+                and primary == winner_norm
+                and primary_engine
+                and primary_engine != "none"
+            ):
                 engine_support[primary_engine] += row_weight
             for hypothesis in row.get("plate_hypotheses", []):
+                if (
+                    "temporal_evidence" in hypothesis
+                    and not hypothesis.get("temporal_evidence")
+                ):
+                    continue
                 candidate = normalize_plate(
                     hypothesis.get("plate_norm")
                     or hypothesis.get("plate")
@@ -1573,6 +1947,9 @@ class PlateConsensusTracker:
                 alternative
             )
         result["ocr_disagreement"] = saw_ab_disagreement
+        result["raw_guess_engine"] = str(
+            result.get("ocr_engine", "")
+        )
 
         centers = [
             (
@@ -1735,21 +2112,33 @@ class PlateConsensusTracker:
         full_support = []
         if complete:
             for row, _probabilities in evidence:
-                candidates = {
-                    normalize_plate(row.get("plate")),
-                    normalize_plate(row.get("raw_guess_norm")),
-                    normalize_plate(row.get("raw_guess_text")),
-                }
-                candidates.update(
-                    normalize_plate(
-                        hypothesis.get("plate_norm")
-                        or hypothesis.get("plate")
-                    )
-                    for hypothesis in row.get(
-                        "plate_hypotheses",
-                        [],
-                    )
+                hypotheses = row.get("plate_hypotheses", [])
+                explicit_temporal_policy = any(
+                    "temporal_evidence" in hypothesis
+                    for hypothesis in hypotheses
                 )
+                candidates = set()
+                if row.get("valid") and not row.get("needs_review"):
+                    candidates.update({
+                        normalize_plate(row.get("plate")),
+                        normalize_plate(row.get("plate_norm")),
+                    })
+                elif not explicit_temporal_policy:
+                    # Preserve the legacy candidate-shadow review workflow.
+                    # Production Hezar evidence has explicit temporal flags
+                    # and may only auto-confirm through strict consensus.
+                    candidates.update({
+                        normalize_plate(row.get("plate")),
+                        normalize_plate(row.get("raw_guess_norm")),
+                        normalize_plate(row.get("raw_guess_text")),
+                    })
+                    candidates.update(
+                        normalize_plate(
+                            hypothesis.get("plate_norm")
+                            or hypothesis.get("plate")
+                        )
+                        for hypothesis in hypotheses
+                    )
                 if normalized in candidates:
                     full_support.append(row)
         support_times = [
@@ -1777,10 +2166,22 @@ class PlateConsensusTracker:
             basis["bbox"] = tuple(track.best_capture_result["bbox"])
         return basis
 
-    def update(self, results, timestamp=None, frame=None):
+    def update(
+        self,
+        results,
+        timestamp=None,
+        frame=None,
+        min_emit_confidence=0.0,
+    ):
         timestamp = time.monotonic() if timestamp is None else float(timestamp)
-        self._expire(timestamp)
-        emitted = []
+        min_emit_confidence = min(
+            1.0,
+            max(0.0, float(min_emit_confidence)),
+        )
+        emitted = self._expire(
+            timestamp,
+            min_emit_confidence,
+        )
         results = list(results)
         assigned = self._associate(results, timestamp)
 
@@ -1847,6 +2248,7 @@ class PlateConsensusTracker:
                         )
                     )
                     if final_read is not None:
+                        final_read["tracker_finalized"] = True
                         track.unreadable_finalized = True
                         emitted.append(final_read)
                 continue
@@ -1855,6 +2257,24 @@ class PlateConsensusTracker:
             # for that same identity may refresh its media, but it must reuse
             # the event_id in LiveANPRWorker rather than create a duplicate.
             if not track.emitted_plate:
+                if consensus["confidence"] < min_emit_confidence:
+                    should_refresh_review = bool(
+                        track.review_candidate_plate
+                        != consensus["plate_norm"]
+                        or consensus["confidence"]
+                        > track.review_candidate_confidence + 0.02
+                        or capture_improved
+                    )
+                    if should_refresh_review:
+                        track.review_candidate_plate = consensus[
+                            "plate_norm"
+                        ]
+                        track.review_candidate_confidence = float(
+                            consensus["confidence"]
+                        )
+                        consensus["below_emit_confidence"] = True
+                        emitted.append(consensus)
+                    continue
                 track.emitted_plate = consensus["plate_norm"]
                 track.emitted_at = timestamp
                 track.capture_event_score = track.best_capture_score
@@ -1871,36 +2291,64 @@ class PlateConsensusTracker:
 
         return emitted
 
+    def retry_emission(self, result: dict) -> bool:
+        """Release a pre-persistence latch after a failed durable write."""
+
+        track_id = int(result.get("track_id") or 0)
+        track = self._tracks.get(track_id)
+        if track is None:
+            return False
+        if result.get("below_emit_confidence"):
+            candidate = normalize_plate(
+                result.get("raw_guess_norm")
+                or result.get("plate_norm")
+                or result.get("plate")
+            )
+            if (
+                not candidate
+                or track.review_candidate_plate == candidate
+            ):
+                track.review_candidate_plate = ""
+                track.review_candidate_confidence = -1.0
+        if (
+            result.get("unreadable_final")
+            or result.get("partial_final")
+            or result.get("tracker_finalized")
+        ):
+            track.unreadable_finalized = False
+        candidate = normalize_plate(
+            result.get("plate_norm") or result.get("plate")
+        )
+        if (
+            not result.get("capture_refresh")
+            and candidate
+            and track.emitted_plate == candidate
+        ):
+            track.emitted_plate = ""
+            track.emitted_at = 0.0
+        return True
+
     def active_track_ids(self) -> set[int]:
         return set(self._tracks)
+
+    def retire_tracks(self, track_ids) -> None:
+        """End tracker fragments after the visit ledger confirms absence."""
+
+        for track_id in track_ids:
+            self._tracks.pop(int(track_id), None)
 
     def flush(self):
         rows = []
         for track in list(self._tracks.values()):
-            if track.emitted_plate:
-                continue
-            consensus = self._consensus(track)
-            if consensus is not None:
-                rows.append(consensus)
-            elif (
-                self.emit_unreadable
-                and self._unreadable_ready(
-                    track,
-                    max(
-                        track.last_seen,
-                        track.first_seen + self.min_unreadable_seconds,
-                    ),
-                )
-            ):
-                final_read = (
-                    self._best_effort_result(track)
-                    or self._capture_result(
-                        track,
-                        refresh=True,
-                        final_unreadable=True,
-                    )
-                )
-                if final_read is not None:
-                    track.unreadable_finalized = True
-                    rows.append(final_read)
+            final_read = self._final_track_result(
+                track,
+                max(
+                    track.last_seen,
+                    track.first_seen + self.min_unreadable_seconds,
+                ),
+                force=True,
+            )
+            if final_read is not None:
+                track.unreadable_finalized = True
+                rows.append(final_read)
         return rows
