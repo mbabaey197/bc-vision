@@ -909,6 +909,8 @@ def detect_plates(
     engine_key=None,
     exclusion_mask=None,
     detector_variant=None,
+    expected_model_revision=None,
+    runtime_metadata=None,
 ):
     if frame is None or getattr(frame, "size", 0) == 0:
         return []
@@ -922,6 +924,8 @@ def detect_plates(
         engine_key=engine_key,
         detector_variant=detector_variant,
         raise_on_error=selected_inference,
+        expected_model_revision=expected_model_revision,
+        runtime_metadata=runtime_metadata,
     )
     if light_rows:
         return _exclude_static_overlays(
