@@ -209,6 +209,11 @@ def test_live_worker_observes_v2_before_baseline_persistence():
     assert observe_at < persist_at
     assert "submit_live_shadow_frame" in source
     assert "configure_live_engine_v2_shadow" in source
+    shadow_helpers = source[
+        source.index("    def _submit_engine_v2_shadow(") :
+        source.index("    def _shadow_status(")
+    ]
+    assert "state.last_error" not in shadow_helpers
 
 
 def test_default_runtime_opens_exactly_one_detector_and_one_hezar_session():
