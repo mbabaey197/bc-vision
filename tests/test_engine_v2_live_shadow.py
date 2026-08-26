@@ -205,7 +205,10 @@ def test_live_worker_observes_v2_before_baseline_persistence():
     process_source = source[source.index("    def _process(") :]
 
     observe_at = process_source.index("self._observe_engine_v2_baseline(")
-    persist_at = process_source.index("self._persist(", observe_at)
+    persist_at = process_source.index(
+        "self._enqueue_persistence_retry(",
+        observe_at,
+    )
     assert observe_at < persist_at
     assert "submit_live_shadow_frame" in source
     assert "configure_live_engine_v2_shadow" in source
