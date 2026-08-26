@@ -1,6 +1,6 @@
 name: Fast one-click update
 
-# RC29 installs the stable runtime once. A routine release reuses the exact-SHA
+# The full base installs the stable runtime once. A routine release reuses the exact-SHA
 # ANPR validation and builds only the small, transactional application update.
 
 on:
@@ -9,10 +9,12 @@ on:
       - main
     paths:
       - VERSION
+      # Commit-only fallback when workflow dispatch is unavailable.
+      - FAST_UPDATE_TRIGGER
   workflow_dispatch:
     inputs:
       verify_base_install:
-        description: Run the slower real RC29 Setup-to-fast-update integration
+        description: Run the slower real full-base Setup-to-fast-update integration
         required: false
         default: false
         type: boolean
@@ -227,6 +229,8 @@ jobs:
           "runtime_contract=$releasedId" >> $env:GITHUB_OUTPUT
           "base_version=$baseVersion" >> $env:GITHUB_OUTPUT
           "first_fast=$firstFast" >> $env:GITHUB_OUTPUT
+          # Missing candidate tags are expected for new fast releases.
+          exit 0
 
       - name: Build and size-check verified application payload
         if: steps.metadata.outputs.eligible == 'true'
@@ -381,7 +385,7 @@ jobs:
       (needs.build-update.outputs.first_fast == 'true' ||
        inputs.verify_base_install == true)
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       actions: read
       contents: read
@@ -423,37 +427,90 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          function Invoke-CheckedProcess {
+            param(
+              [Parameter(Mandatory=$true)][string]$Label,
+              [Parameter(Mandatory=$true)][string]$FilePath,
+              [Parameter(Mandatory=$true)][string[]]$Arguments,
+              [Parameter(Mandatory=$true)][int]$TimeoutSeconds
+            )
+            Write-Host "::group::$Label"
+            $process = $null
+            try {
+              $process = Start-Process $FilePath `
+                -ArgumentList $Arguments -PassThru
+              if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+                Write-Warning (
+                  "$Label timed out after $TimeoutSeconds seconds; " +
+                  "terminating process tree $($process.Id)."
+                )
+                & taskkill.exe /PID $process.Id /T /F 2>&1 |
+                  ForEach-Object { Write-Host $_ }
+                throw "$Label timed out after $TimeoutSeconds seconds"
+              }
+              # Flush asynchronous process state before reading ExitCode.
+              $process.WaitForExit()
+              Write-Host "$Label exited with $($process.ExitCode)"
+              if ($process.ExitCode -ne 0) {
+                throw "$Label exited with $($process.ExitCode)"
+              }
+            } finally {
+              Write-Host "::endgroup::"
+            }
+          }
+
           $installDir = Join-Path $env:RUNNER_TEMP "bcvision-fast-real"
           $bootstrapDir = Join-Path $env:RUNNER_TEMP "bcvision-bootstrap"
           $customData = Join-Path $env:RUNNER_TEMP "bcvision-custom-data"
-          New-Item -ItemType Directory $bootstrapDir,$customData -Force |
+          $diagnosticDir = Join-Path (
+            $env:RUNNER_TEMP
+          ) "bcvision-fast-integration"
+          New-Item -ItemType Directory `
+            $bootstrapDir,$customData,$diagnosticDir -Force |
             Out-Null
+
+          $setup = Resolve-Path "base\BCVision_*_Setup.exe"
+          Invoke-CheckedProcess `
+            -Label "Install immutable full base" `
+            -FilePath $setup `
+            -TimeoutSeconds 600 `
+            -Arguments @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+            "/DIR=$installDir",
+            "/LOG=$(Join-Path $diagnosticDir 'base-setup.log')"
+          )
+          $baseResult = Join-Path $env:RUNNER_TEMP "base-self-test.json"
+          Invoke-CheckedProcess `
+            -Label "Run immutable base self-test" `
+            -FilePath "$installDir\BCVision.exe" `
+            -TimeoutSeconds 180 `
+            -Arguments @(
+            "--self-test", "--self-test-data-dir", $customData,
+            "--self-test-output", $baseResult
+          )
+          $baseJson = Get-Content $baseResult -Raw | ConvertFrom-Json
+          if (
+            $baseJson.runtime_version -ne
+              "${{ needs.build-update.outputs.base_version }}"
+          ) { throw "Base runtime version is incorrect" }
+          if (-not (Test-Path (Join-Path $customData "bcvision.db"))) {
+            throw "Base self-test did not initialize the isolated database"
+          }
+          if (
+            (Resolve-Path $baseJson.data_dir).Path -ne
+            (Resolve-Path $customData).Path
+          ) { throw "Base self-test did not use the isolated storage root" }
+
+          # A hardened RC30 storage pointer is valid only after its target
+          # database exists. Publish the pointer after the base self-test so
+          # this fixture represents a completed storage migration rather than
+          # an invalid partial migration that RC30 correctly refuses to open.
           @{storage_root=$customData} | ConvertTo-Json |
             Set-Content (Join-Path $bootstrapDir "storage_config.json") `
               -Encoding utf8
           $configHash = (
             Get-FileHash (Join-Path $bootstrapDir "storage_config.json")
           ).Hash
-
-          $setup = Resolve-Path "base\BCVision_*_Setup.exe"
-          $installed = Start-Process $setup -ArgumentList @(
-            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
-            "/DIR=$installDir"
-          ) -Wait -PassThru
-          if ($installed.ExitCode -ne 0) {
-            throw "Base Setup exited with $($installed.ExitCode)"
-          }
-          $baseResult = Join-Path $env:RUNNER_TEMP "base-self-test.json"
-          $baseTest = Start-Process "$installDir\BCVision.exe" -ArgumentList @(
-            "--self-test", "--self-test-data-dir", $bootstrapDir,
-            "--self-test-output", $baseResult
-          ) -Wait -PassThru
-          if ($baseTest.ExitCode -ne 0) { throw "Base self-test failed" }
-          $baseJson = Get-Content $baseResult -Raw | ConvertFrom-Json
-          if (
-            $baseJson.runtime_version -ne
-              "${{ needs.build-update.outputs.base_version }}"
-          ) { throw "Base runtime version is incorrect" }
 
           $env:BCVISION_TEST_MARKER = "preserve-$([guid]::NewGuid())"
           $env:BCVISION_TEST_DB = Join-Path $customData "bcvision.db"
@@ -473,20 +530,24 @@ jobs:
           }
 
           $update = Resolve-Path "release\BCVision_*_Update.exe"
-          $updated = Start-Process $update -ArgumentList @(
+          Invoke-CheckedProcess `
+            -Label "Apply transactional fast update" `
+            -FilePath $update `
+            -TimeoutSeconds 600 `
+            -Arguments @(
             "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
-            "/DIR=$installDir"
-          ) -Wait -PassThru
-          if ($updated.ExitCode -ne 0) {
-            throw "Fast updater exited with $($updated.ExitCode)"
-          }
+            "/DIR=$installDir",
+            "/LOG=$(Join-Path $diagnosticDir 'fast-update.log')"
+          )
           $updatedResult = Join-Path $env:RUNNER_TEMP "updated-self-test.json"
-          $updatedTest = Start-Process "$installDir\BCVision.exe" `
-            -ArgumentList @(
+          Invoke-CheckedProcess `
+            -Label "Run activated fast runtime self-test" `
+            -FilePath "$installDir\BCVision.exe" `
+            -TimeoutSeconds 180 `
+            -Arguments @(
               "--self-test", "--self-test-data-dir", $bootstrapDir,
               "--self-test-output", $updatedResult
-            ) -Wait -PassThru
-          if ($updatedTest.ExitCode -ne 0) { throw "Updated self-test failed" }
+            )
           $updatedJson = Get-Content $updatedResult -Raw | ConvertFrom-Json
           if (
             $updatedJson.runtime_version -ne
@@ -516,30 +577,32 @@ jobs:
             }
           }
 
-          # Re-running the immutable full RC29 Setup must repair base files
+          # Re-running the immutable full-base Setup must repair base files
           # without downgrading the already-confirmed fast runtime.
-          $repair = Start-Process $setup -ArgumentList @(
+          Invoke-CheckedProcess `
+            -Label "Repair with immutable full base" `
+            -FilePath $setup `
+            -TimeoutSeconds 600 `
+            -Arguments @(
             "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
-            "/DIR=$installDir"
-          ) -Wait -PassThru
-          if ($repair.ExitCode -ne 0) {
-            throw "Full RC29 repair exited with $($repair.ExitCode)"
-          }
+            "/DIR=$installDir",
+            "/LOG=$(Join-Path $diagnosticDir 'base-repair.log')"
+          )
           $repairResult = Join-Path $env:RUNNER_TEMP "repair-self-test.json"
-          $repairTest = Start-Process "$installDir\BCVision.exe" `
-            -ArgumentList @(
+          Invoke-CheckedProcess `
+            -Label "Run self-test after full-base repair" `
+            -FilePath "$installDir\BCVision.exe" `
+            -TimeoutSeconds 180 `
+            -Arguments @(
               "--self-test", "--self-test-data-dir", $bootstrapDir,
               "--self-test-output", $repairResult
-            ) -Wait -PassThru
-          if ($repairTest.ExitCode -ne 0) {
-            throw "Runtime failed after full RC29 repair"
-          }
+            )
           $repairJson = Get-Content $repairResult -Raw | ConvertFrom-Json
           if (
             $repairJson.runtime_version -ne
               "${{ needs.build-update.outputs.version }}" -or
             $repairJson.runtime_source -ne "external"
-          ) { throw "Full RC29 repair downgraded the active fast runtime" }
+          ) { throw "Full-base repair downgraded the active fast runtime" }
           python scripts\verify_installed_runtime.py `
             --install-dir $installDir `
             --version "${{ needs.build-update.outputs.version }}" `
@@ -550,11 +613,11 @@ jobs:
           if ((Get-FileHash (
             Join-Path $bootstrapDir "storage_config.json"
           )).Hash -ne $configHash) {
-            throw "Full RC29 repair changed storage configuration"
+            throw "Full-base repair changed storage configuration"
           }
           python -c "import os,sqlite3,sys; c=sqlite3.connect(os.environ['BCVISION_TEST_DB']); r=c.execute('SELECT value FROM settings WHERE key=?',('fast_update_marker',)).fetchone(); c.close(); sys.exit(0 if r and r[0]==os.environ['BCVISION_TEST_MARKER'] else 1)"
           if ($LASTEXITCODE -ne 0) {
-            throw "Full RC29 repair changed the database setting"
+            throw "Full-base repair changed the database setting"
           }
           foreach ($relative in $persistentMarkers) {
             $markerPath = Join-Path $customData $relative
@@ -562,8 +625,21 @@ jobs:
               -not (Test-Path $markerPath) -or
               (Get-Content $markerPath -Raw).Trim() -ne
                 $env:BCVISION_TEST_MARKER
-            ) { throw "Full RC29 repair changed $relative" }
+            ) { throw "Full-base repair changed $relative" }
           }
+
+      - name: Upload base-integration diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-base-integration-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/bcvision-fast-integration
+            ${{ runner.temp }}/*self-test.json
+            ${{ runner.temp }}/bcvision-bootstrap/BCVision.log
+            ${{ runner.temp }}/bcvision-custom-data/BCVision.log
 
   publish:
     needs:
@@ -601,6 +677,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           $ErrorActionPreference = "Stop"
           function Assert-ExactReleaseAssets(
