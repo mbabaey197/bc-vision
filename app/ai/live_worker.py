@@ -203,11 +203,8 @@ class LiveANPRWorker:
                 detector_variant=self._selected_detector_variant(),
             )
             state.shadow_frames += int(bool(accepted))
-        except Exception as exc:
+        except Exception:
             state.shadow_errors += 1
-            state.last_error = (
-                f"EngineV2Shadow {type(exc).__name__}: {exc}"
-            )
 
     def _observe_engine_v2_baseline(
         self,
@@ -226,11 +223,8 @@ class LiveANPRWorker:
                 rows,
                 ts=timestamp,
             )
-        except Exception as exc:
+        except Exception:
             state.shadow_errors += 1
-            state.last_error = (
-                f"EngineV2Shadow {type(exc).__name__}: {exc}"
-            )
 
     def _shadow_status(
         self,
