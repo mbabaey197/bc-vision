@@ -41,6 +41,14 @@ from app.storage_policy import (
     validate_storage_layout,
 )
 from app.upload_limits import VideoUploadBodyLimitMiddleware
+from app.update_package import (
+    MAX_UPDATE_ZIP_BYTES,
+    UpdatePackageError,
+    exit_after_update_launch,
+    launch_staged_update,
+    stage_update_zip,
+    validate_update_target,
+)
 from html import escape
 import asyncio, time, shutil, os, json, secrets, stat, tempfile, threading
 from contextlib import asynccontextmanager
@@ -100,6 +108,7 @@ _VIDEO_UPLOAD_PATHS = frozenset({
     "/cameras/video-upload",
     "/ai/video-test/upload",
 })
+_UPDATE_UPLOAD_PATHS = frozenset({"/settings/update"})
 MAX_VIDEO_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 MAX_VIDEO_MULTIPART_OVERHEAD_BYTES = 1024 * 1024
 VIDEO_TEST_JOB_TIMEOUT_SECONDS = 30 * 60
@@ -107,6 +116,8 @@ VIDEO_TEST_MEDIA_RESULT_BYTES = 48 * 1024 * 1024
 VIDEO_TEST_PROCESS_RESULT_BYTES = 64 * 1024 * 1024
 _VIDEO_CAMERA_HANDOFF_LOCK = threading.Lock()
 _VIDEO_TEST_PROCESS_SLOT = threading.BoundedSemaphore(1)
+_UPDATE_STAGE_ROOT = DATA_DIR / "updates"
+_UPDATE_UPLOAD_LOCK = threading.Lock()
 
 
 def _max_declared_video_upload_bytes() -> int:
@@ -358,6 +369,11 @@ async def security_headers(request: Request, call_next):
             response = RedirectResponse('/login', 302)
         elif not has_permission(request, 'video.process'):
             response = access_denied()
+    if response is None and request.url.path in _UPDATE_UPLOAD_PATHS:
+        if not auth(request):
+            response = RedirectResponse('/login', 302)
+        elif not has_permission(request, 'system.manage'):
+            response = access_denied()
     if response is None and request.url.path == '/settings/storage':
         if not auth(request):
             response = RedirectResponse('/login', 302)
@@ -406,7 +422,10 @@ async def security_headers(request: Request, call_next):
 app.add_middleware(
     VideoUploadBodyLimitMiddleware,
     max_body_bytes=_max_declared_video_upload_bytes,
-    paths=_VIDEO_UPLOAD_PATHS,
+    paths=_VIDEO_UPLOAD_PATHS | _UPDATE_UPLOAD_PATHS,
+    path_body_limits={
+        "/settings/update": MAX_UPDATE_ZIP_BYTES + 1024 * 1024,
+    },
 )
 
 
@@ -3023,8 +3042,105 @@ name='anpr_engine_v2_shadow' value='1'
 </div>
 <div class='table-wrap'><table><tr><th>نسخه مدل</th><th>تردد بررسی‌شده</th><th>پوشش</th><th>دقت سرتاسری</th><th>خطای کاراکتر سرتاسری</th></tr>{quality_models}</table></div>
 </div>
+<div class='card' id='software-update'>
+<h3>⬆️ به‌روزرسانی نرم‌افزار</h3>
+<p class='muted'>فایل ZIP رسمی BC Vision را انتخاب کنید. برنامه هش فایل را
+بررسی می‌کند، Updater را با دسترسی مدیر اجرا می‌کند و برای تکمیل عملیات بسته
+می‌شود. دیتابیس، دوربین‌ها، تصاویر و مدل‌ها حذف نمی‌شوند.</p>
+<form method='post' action='/settings/update' enctype='multipart/form-data'>
+<input type='file' name='update_zip' accept='.zip,application/zip' required>
+<button>نصب فایل ZIP و راه‌اندازی مجدد</button>
+</form></div>
 <div class='card'><form method='post' action='/backup'><button class='secondary'>دریافت نسخه پشتیبان دیتابیس</button></form></div><div class='card'><b>وضعیت موتور تصویر:</b> {'آماده' if CV_OK else 'OpenCV بارگذاری نشده است'}</div></div>"""
     return page('تنظیمات',body,u,request)
+
+
+@app.post('/settings/update', response_class=HTMLResponse)
+async def install_update_zip(
+    request: Request,
+    update_zip: UploadFile = File(...),
+):
+    u = auth(request)
+    if not u:
+        return RedirectResponse('/login', 302)
+    if not has_permission(request, 'system.manage'):
+        return access_denied()
+    filename = Path(update_zip.filename or '').name
+    if not filename.lower().endswith('.zip'):
+        return RedirectResponse(
+            '/settings?error=' + quote('فقط فایل ZIP رسمی قابل قبول است.'),
+            303,
+        )
+    if not _UPDATE_UPLOAD_LOCK.acquire(blocking=False):
+        return RedirectResponse(
+            '/settings?error=' + quote('یک به‌روزرسانی دیگر در حال آماده‌سازی است.'),
+            303,
+        )
+    archive = None
+    try:
+        _UPDATE_STAGE_ROOT.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix='.upload-',
+            suffix='.zip',
+            dir=_UPDATE_STAGE_ROOT,
+        )
+        archive = Path(temporary)
+        total = 0
+        try:
+            with os.fdopen(descriptor, 'wb') as target:
+                while True:
+                    chunk = await update_zip.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_UPDATE_ZIP_BYTES:
+                        raise UpdatePackageError('Update ZIP is too large')
+                    target.write(chunk)
+                target.flush()
+                os.fsync(target.fileno())
+            staged = await asyncio.to_thread(
+                stage_update_zip,
+                archive,
+                _UPDATE_STAGE_ROOT,
+            )
+            validate_update_target(staged, APP_VERSION)
+        finally:
+            await update_zip.close()
+            if archive is not None:
+                archive.unlink(missing_ok=True)
+        backup_root = _configured_storage_child('backup_path', BACKUP_DIR)
+        _mkdir_durable(backup_root)
+        backup_file = backup_root / (
+            f"bcvision-before-update-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            f"-{secrets.token_hex(4)}.db"
+        )
+        create_database_backup(backup_file)
+        launch_staged_update(staged)
+        audit(
+            request,
+            'software_update',
+            f'{staged.version_label} SHA256={staged.sha256}',
+        )
+        threading.Thread(
+            target=exit_after_update_launch,
+            name='bcvision-update-exit',
+            daemon=True,
+        ).start()
+        return page(
+            'به‌روزرسانی نرم‌افزار',
+            "<div class='wrap'><div class='card ok'><h2>به‌روزرسانی تأیید شد</h2>"
+            "<p>پیام UAC ویندوز را تأیید کنید. برنامه بسته می‌شود و پس از "
+            "نصب نسخه جدید دوباره اجرا خواهد شد.</p></div></div>",
+            u,
+            request,
+        )
+    except (OSError, UpdatePackageError) as exc:
+        return RedirectResponse(
+            '/settings?error=' + quote(f'فایل آپدیت رد شد: {exc}'),
+            303,
+        )
+    finally:
+        _UPDATE_UPLOAD_LOCK.release()
 
 @app.post('/settings/display')
 def save_display_settings(request:Request,dashboard_grid:int=Form(2),dashboard_event_rows:int=Form(12),live_fps:int=Form(5),stream_width:int=Form(640),jpeg_quality:int=Form(70),new_password:str=Form('')):
