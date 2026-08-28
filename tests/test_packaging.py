@@ -140,6 +140,24 @@ def test_windows_build_and_source_launch_are_windowless():
     assert "python launcher.py" not in source_launcher
 
 
+def test_fast_updater_restarts_app_after_silent_in_app_install():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "installer"
+        / "BCVision_Fast_Update.iss"
+    ).read_text(encoding="utf-8")
+    run_line = next(
+        line
+        for line in source.splitlines()
+        if line.startswith('Filename: "{app}\\{#MyAppExeName}"')
+    )
+
+    assert "nowait" in run_line
+    assert "runasoriginaluser" in run_line
+    assert "skipifsilent" not in run_line
+    assert "postinstall" not in run_line
+
+
 def test_pe_subsystem_reader_accepts_gui_executable(tmp_path):
     executable = tmp_path / "BCVision.exe"
     image = bytearray(512)
