@@ -121,9 +121,74 @@ def test_low_confidence_platrix_stays_unreadable(monkeypatch):
         lambda *_args, **_kwargs: (PLATE, ocr.PLATRIX_MIN_CONFIDENCE - 0.01),
     )
     monkeypatch.setattr(ocr, "get_crnn_status", lambda: {"error": ""})
+    monkeypatch.setattr(
+        ocr,
+        "read_plate_cnn",
+        lambda *_args, **_kwargs: ("", 0.0),
+    )
+    monkeypatch.setattr(ocr, "get_cnn_status", lambda: {"error": ""})
 
     assert ocr.read_plate_candidate(
         np.zeros((32, 160, 3), dtype=np.uint8)
+    ) == ("", 0.0, "none")
+
+
+def test_rejected_whole_plate_models_use_character_cnn(monkeypatch):
+    monkeypatch.setattr(
+        ocr,
+        "read_plate_hezar_primary",
+        lambda *_args, **_kwargs: _rejected_hezar(),
+    )
+    monkeypatch.setattr(ocr, "hezar_status", lambda: {"error": "rejected"})
+    monkeypatch.setattr(
+        ocr,
+        "read_plate_platrix",
+        lambda *_args, **_kwargs: ("", 0.0),
+    )
+    monkeypatch.setattr(ocr, "get_crnn_status", lambda: {"error": "rejected"})
+    monkeypatch.setattr(
+        ocr,
+        "read_plate_cnn",
+        lambda *_args, **_kwargs: (PLATE, 0.72),
+    )
+
+    candidate = ocr.read_plate_candidate(
+        np.zeros((32, 160, 3), dtype=np.uint8),
+        allow_legacy=True,
+        include_evidence=True,
+    )
+
+    assert candidate["plate"] == PLATE
+    assert candidate["plate_norm"] == "31ط55674"
+    assert candidate["confidence"] == 0.72
+    assert candidate["engine"] == "cnn-onnx"
+    assert candidate["hypotheses"][-1]["plate_norm"] == "31ط55674"
+
+
+def test_character_cnn_can_be_explicitly_disabled(monkeypatch):
+    monkeypatch.setattr(
+        ocr,
+        "read_plate_hezar_primary",
+        lambda *_args, **_kwargs: _rejected_hezar(),
+    )
+    monkeypatch.setattr(ocr, "hezar_status", lambda: {"error": "rejected"})
+    monkeypatch.setattr(
+        ocr,
+        "read_plate_platrix",
+        lambda *_args, **_kwargs: ("", 0.0),
+    )
+    monkeypatch.setattr(ocr, "get_crnn_status", lambda: {"error": "rejected"})
+    monkeypatch.setattr(
+        ocr,
+        "read_plate_cnn",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("character CNN must stay disabled")
+        ),
+    )
+
+    assert ocr.read_plate_candidate(
+        np.zeros((32, 160, 3), dtype=np.uint8),
+        allow_legacy=False,
     ) == ("", 0.0, "none")
 
 
