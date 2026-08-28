@@ -8,7 +8,7 @@
 AppId={{12FC1F39-4F29-4D61-A81D-66BD900AA4E8}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-VersionInfoVersion=2.2.0.300
+VersionInfoVersion=2.2.0.310
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\BC Vision
 DisableDirPage=auto
