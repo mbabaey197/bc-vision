@@ -132,7 +132,7 @@ def load_ir_lpr(
                 raise ValueError(
                     f"invalid IR-LPR annotation {annotation_path}: {exc}"
                 ) from exc
-            skipped.append((str(annotation_path.relative_to(source_root)), str(exc)))
+            skipped.append((annotation_path.relative_to(source_root).as_posix(), str(exc)))
             continue
         samples.extend(parsed)
     if not samples:
