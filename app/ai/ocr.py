@@ -38,7 +38,7 @@ from .onnx_hezar import (
 
 _last_status = {
     "engine": "none",
-    "policy": "hezar-v2-then-fixed-platrix",
+    "policy": "hezar-v2-then-fixed-platrix-then-character-cnn",
     "hezar_error": "",
     "crnn_error": "",
     "cnn_error": "",
@@ -534,12 +534,11 @@ def read_plate_candidate(
     allow_legacy=True,
     include_evidence=False,
 ) -> tuple[str, float, str] | dict:
-    """Run the immutable production policy: Hezar v2, then fixed Platrix.
+    """Read a plate with whole-plate OCR and character-by-character fallback.
 
-    ``allow_legacy`` remains in the public signature for older integrations,
-    but cannot enable the promoted custom CRNN or character CNN in production.
-    Those models remain available only through their explicit diagnostic and
-    training APIs.
+    Hezar v2 and the fixed Platrix model remain the preferred readers.  When
+    both reject a mature live crop, ``allow_legacy`` enables the bundled
+    character CNN so existing cameras keep the proven per-position fallback.
     """
 
     def result(text, confidence, engine, hypotheses=()):
@@ -615,7 +614,7 @@ def read_plate_candidate(
             engine=HEZAR_ENGINE,
             hezar_error="",
             crnn_error="",
-            cnn_error="disabled-by-production-policy",
+            cnn_error="",
             candidate_count=len(hezar.get("hypotheses", [])),
         )
         return result(
@@ -628,7 +627,7 @@ def read_plate_candidate(
     _last_status.update(
         hezar_error=hezar_status().get("error", "") or "rejected",
         candidate_count=len(hezar.get("hypotheses", [])),
-        cnn_error="disabled-by-production-policy",
+        cnn_error="",
     )
     platrix_text, platrix_confidence = read_plate_platrix(
         image,
@@ -665,9 +664,45 @@ def read_plate_candidate(
     crnn_error = get_crnn_status().get("error", "")
     if plausible_plate(platrix_text) and not crnn_error:
         crnn_error = "below-production-confidence"
+
+    if allow_legacy:
+        cnn_text, cnn_confidence = read_plate_cnn(
+            image,
+            engine_key=engine_key,
+        )
+        if plausible_plate(cnn_text):
+            cnn_norm = normalize_plate(cnn_text)
+            hypotheses = list(hezar_hypotheses)
+            if all(
+                row["plate_norm"] != cnn_norm
+                for row in hypotheses
+            ):
+                hypotheses.append({
+                    "plate": format_iran_plate(cnn_norm),
+                    "plate_norm": cnn_norm,
+                    "engine": "cnn-onnx",
+                    "confidence": _safe_confidence(cnn_confidence),
+                    "score": _safe_confidence(cnn_confidence),
+                    "temporal_evidence": False,
+                })
+            _last_status.update(
+                engine="cnn-onnx",
+                crnn_error=crnn_error or "rejected",
+                cnn_error="",
+            )
+            return result(
+                format_iran_plate(cnn_norm),
+                float(cnn_confidence),
+                "cnn-onnx",
+                hypotheses,
+            )
+        cnn_error = get_cnn_status().get("error", "") or "rejected"
+    else:
+        cnn_error = "disabled"
     _last_status.update(
         engine="none",
         crnn_error=crnn_error or "rejected",
+        cnn_error=cnn_error,
     )
 
     return result(
