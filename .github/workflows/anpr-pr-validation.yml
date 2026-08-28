@@ -45,13 +45,16 @@ jobs:
         with:
           version: "0.12.0"
           enable-cache: true
-          cache-python: true
+          cache-python: false
           cache-dependency-glob: requirements-test.txt
       - name: Set up portable Python
         shell: cmd
         run: |
+          set "UV_PYTHON_INSTALL_DIR=%RUNNER_TEMP%\uv-python-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%-regression"
           uv python install 3.13
+          if errorlevel 1 exit /b %errorlevel%
           uv venv --python 3.13 --seed .venv
+          if errorlevel 1 exit /b %errorlevel%
           echo %CD%\.venv\Scripts>>"%GITHUB_PATH%"
       - name: Install test dependencies
         shell: cmd
@@ -83,13 +86,16 @@ jobs:
         with:
           version: "0.12.0"
           enable-cache: true
-          cache-python: true
+          cache-python: false
           cache-dependency-glob: requirements-ai-lock.txt
       - name: Set up portable Python
         shell: cmd
         run: |
+          set "UV_PYTHON_INSTALL_DIR=%RUNNER_TEMP%\uv-python-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%-ai"
           uv python install 3.13
+          if errorlevel 1 exit /b %errorlevel%
           uv venv --python 3.13 --seed .venv
+          if errorlevel 1 exit /b %errorlevel%
           echo %CD%\.venv\Scripts>>"%GITHUB_PATH%"
       - uses: actions/cache@v4
         with:
