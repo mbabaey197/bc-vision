@@ -269,6 +269,63 @@ def test_camera_edit_preserves_db_config_when_stream_will_not_stop(
     assert tuple(row) == ("Original", "rtsp://original")
 
 
+def test_camera_toggle_disables_stream_and_hides_from_dashboard_query(
+    tmp_path,
+    monkeypatch,
+):
+    camera_id = _camera_row(tmp_path, monkeypatch)
+    _as_role(monkeypatch, "system")
+    removed = []
+    monkeypatch.setattr(
+        main.manager,
+        "remove",
+        lambda value: removed.append(int(value)) or True,
+    )
+
+    response = main.toggle_camera(
+        camera_id,
+        SimpleNamespace(client=None),
+    )
+
+    assert response.status_code == 303
+    assert removed == [camera_id]
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT enabled FROM cameras WHERE id=?",
+            (camera_id,),
+        ).fetchone()["enabled"] == 0
+    assert list(main.camera_rows(enabled_only=True)) == []
+
+
+def test_camera_toggle_enables_and_starts_camera(tmp_path, monkeypatch):
+    camera_id = _camera_row(tmp_path, monkeypatch)
+    _as_role(monkeypatch, "system")
+    with database.connect() as connection:
+        connection.execute(
+            "UPDATE cameras SET enabled=0 WHERE id=?",
+            (camera_id,),
+        )
+    starts = []
+    monkeypatch.setattr(
+        main.manager,
+        "start_enabled_cameras",
+        lambda: starts.append(True) or 1,
+    )
+
+    response = main.toggle_camera(
+        camera_id,
+        SimpleNamespace(client=None),
+    )
+
+    assert response.status_code == 303
+    assert starts == [True]
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT enabled FROM cameras WHERE id=?",
+            (camera_id,),
+        ).fetchone()["enabled"] == 1
+
+
 def test_operator_cannot_change_system_or_camera_settings(monkeypatch):
     _as_role(monkeypatch, "operator")
     writes = []
@@ -2467,7 +2524,33 @@ def test_video_upload_serializes_with_old_camera_mutation(
             "ORDER BY id"
         ).fetchall()
     assert len(video_rows) == 1
-    assert int(video_rows[0]["id"]) != old_id
+    assert int(video_rows[-1]["id"]) != old_id
+
+
+def test_multiple_test_video_uploads_are_kept_as_separate_cameras(
+    tmp_path,
+    monkeypatch,
+):
+    _as_role(monkeypatch, "system")
+    db_path = tmp_path / "multiple-test-videos.db"
+    video_dir = tmp_path / "videos"
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setattr(main, "DB_PATH", db_path)
+    database.init_db()
+    _fake_camera_upload_dependencies(monkeypatch, video_dir)
+    monkeypatch.setattr(main.manager, "get", lambda *_args: None)
+
+    first = _run_camera_upload(0)
+    second = _run_camera_upload(0)
+
+    assert first.status_code == second.status_code == 200
+    with database.connect() as connection:
+        rows = connection.execute(
+            "SELECT id,name,enabled FROM cameras "
+            "WHERE rtsp_url LIKE 'video://%' ORDER BY id"
+        ).fetchall()
+    assert len(rows) == 2
+    assert all(int(row["enabled"]) == 1 for row in rows)
 
 
 def test_video_upload_preserves_old_owner_when_stream_will_not_stop(
@@ -2510,7 +2593,7 @@ def test_video_upload_preserves_old_owner_when_stream_will_not_stop(
     new_id = int(rows[-1]["id"])
     assert [int(row["id"]) for row in rows] == [old_id, new_id]
     assert rows[0]["rtsp_url"] == "video:///old.avi"
-    assert remove_calls == [old_id]
+    assert remove_calls == []
 
 
 def test_failed_virtual_stream_start_preserves_previous_camera(

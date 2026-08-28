@@ -1577,13 +1577,14 @@ async def camera_playback(camera_id:int,request:Request):
     return JSONResponse({'ok':True,'action':action})
 
 @app.get('/cameras')
-def cameras(request:Request,msg:str=''):
+def cameras(request:Request,msg:str='',error:str=''):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
     if not has_permission(request,'camera.manage'):return access_denied()
-    rows=camera_rows(); trs=''.join(f"<tr><td>{c['id']}</td><td>{escape(c['name'])}</td><td>{escape(c['city'] or '—')}</td><td>{escape(c['location'])}</td><td>{'فعال' if c['enabled'] else 'غیرفعال'}</td><td>{'ویدئوی آپلودی' if str(c['rtsp_url']).startswith('video://') else ('آزمایشی' if c['is_demo'] else 'RTSP')}</td><td><a class='btn' href='/cameras/{c['id']}/edit'>ویرایش</a> <form style='display:inline' method='post' action='/cameras/{c['id']}/delete' onsubmit=\"return confirm('حذف شود؟')\"><button class='danger'>حذف</button></form></td></tr>" for c in rows) or "<tr><td colspan='7'>دوربینی ثبت نشده است.</td></tr>"
+    rows=camera_rows(); trs=''.join(f"<tr><td>{c['id']}</td><td>{escape(c['name'])}</td><td>{escape(c['city'] or '—')}</td><td>{escape(c['location'])}</td><td><span class='status-pill {'ok' if c['enabled'] else ''}'>{'فعال' if c['enabled'] else 'غیرفعال'}</span></td><td>{'ویدئوی آپلودی' if str(c['rtsp_url']).startswith('video://') else ('آزمایشی' if c['is_demo'] else 'RTSP')}</td><td><form style='display:inline' method='post' action='/cameras/{c['id']}/toggle'><button class='{'danger' if c['enabled'] else 'secondary'}'>{'غیرفعال‌کردن' if c['enabled'] else 'فعال‌کردن'}</button></form> <a class='btn' href='/cameras/{c['id']}/edit'>ویرایش</a> <form style='display:inline' method='post' action='/cameras/{c['id']}/delete' onsubmit=\"return confirm('حذف شود؟')\"><button class='danger'>حذف</button></form></td></tr>" for c in rows) or "<tr><td colspan='7'>دوربینی ثبت نشده است.</td></tr>"
     notice="<div class='card ok'>عملیات انجام شد.</div>" if msg else ''
-    return page('دوربین‌ها',f"""<div class='wrap'><div class='toolbar'><h1 style='margin-left:auto'>مدیریت دوربین‌ها</h1><a class='btn' href='/cameras/new'>افزودن دوربین</a></div>{notice}<div class='card'><div class='table-wrap'><table><tr><th>ID</th><th>نام</th><th>شهر</th><th>موقعیت</th><th>وضعیت</th><th>نوع</th><th>عملیات</th></tr>{trs}</table></div></div><div class='card'><h2>🎞️ نمایش ویدئو به‌صورت دوربین زنده</h2><p class='muted'>پس از پایان آپلود، ویدئو به‌عنوان یک دوربین مجازی در داشبورد پخش می‌شود و پلاک‌خوان در پس‌زمینه روی آن کار می‌کند.</p><form id='videoUploadForm' action='/cameras/video-upload' method='post' enctype='multipart/form-data'><label>تنظیمات کدام دوربین استفاده شود؟</label><select name='camera_id'>{''.join(f"<option value='{c['id']}'>{escape(c['name'])}</option>" for c in rows if not str(c['rtsp_url']).startswith('video://'))}</select><br><label>فایل ویدئو</label><input type='file' name='video' accept='.mp4,.avi,.mkv,.mov' required><div id='uploadState' class='muted' style='display:none;margin:10px 0'>در حال آپلود: <b id='uploadPercent'>۰٪</b><progress id='uploadProgress' value='0' max='100' style='width:100%'></progress></div><br><button id='uploadButton'>آپلود و نمایش در پخش زنده</button></form></div></div>
+    if error: notice += f"<div class='alert'>{escape(error)}</div>"
+    return page('دوربین‌ها',f"""<div class='wrap'><div class='toolbar'><h1 style='margin-left:auto'>مدیریت دوربین‌ها</h1><a class='btn' href='/cameras/new'>افزودن دوربین</a></div>{notice}<div class='card'><div class='table-wrap'><table><tr><th>ID</th><th>نام</th><th>شهر</th><th>موقعیت</th><th>وضعیت</th><th>نوع</th><th>عملیات</th></tr>{trs}</table></div></div><div class='card'><h2>🎞️ افزودن فایل تست به دوربین‌ها</h2><p class='muted'>هر فایل به‌عنوان یک دوربین مجازی جداگانه ذخیره و در داشبورد نمایش داده می‌شود.</p><form id='videoUploadForm' action='/cameras/video-upload' method='post' enctype='multipart/form-data'><label>پروفایل تنظیمات پلاک‌خوان</label><select name='camera_id'><option value='0'>تنظیمات پیش‌فرض</option>{''.join(f"<option value='{c['id']}'>{escape(c['name'])}</option>" for c in rows if not str(c['rtsp_url']).startswith('video://'))}</select><br><label>فایل ویدئو</label><input type='file' name='video' accept='.mp4,.avi,.mkv,.mov' required><div id='uploadState' class='muted' style='display:none;margin:10px 0'>در حال آپلود: <b id='uploadPercent'>۰٪</b><progress id='uploadProgress' value='0' max='100' style='width:100%'></progress></div><br><button id='uploadButton'>افزودن فایل تست</button></form></div></div>
 <script>
 const uploadForm=document.getElementById('videoUploadForm');
 uploadForm?.addEventListener('submit',event=>{{
@@ -1672,6 +1673,52 @@ def delete_cam(camera_id:int,request:Request):
         except Exception:
             manager.start_enabled_cameras()
             raise
+    return RedirectResponse('/cameras?msg=1',303)
+
+
+@app.post('/cameras/{camera_id}/toggle')
+def toggle_camera(camera_id:int,request:Request):
+    if not auth(request):return RedirectResponse('/login',302)
+    if not has_permission(request,'camera.manage'):return access_denied()
+    with _VIDEO_CAMERA_HANDOFF_LOCK:
+        with connect() as con:
+            camera=con.execute(
+                'SELECT id,name,enabled FROM cameras WHERE id=?',
+                (camera_id,),
+            ).fetchone()
+        if not camera:
+            return RedirectResponse(
+                '/cameras?error='+quote('دوربین پیدا نشد.'),
+                303,
+            )
+        enable=not bool(camera['enabled'])
+        if not enable and manager.remove(camera_id) is not True:
+            return RedirectResponse(
+                '/cameras?error='+quote(
+                    'جریان دوربین متوقف نشد؛ غیرفعال‌سازی لغو شد.'
+                ),
+                303,
+            )
+        with connect() as con:
+            con.execute(
+                'UPDATE cameras SET enabled=? WHERE id=?',
+                (1 if enable else 0,camera_id),
+            )
+        if enable:
+            try:
+                manager.start_enabled_cameras()
+            except Exception:
+                with connect() as con:
+                    con.execute(
+                        'UPDATE cameras SET enabled=0 WHERE id=?',
+                        (camera_id,),
+                    )
+                raise
+    audit(
+        request,
+        'camera_toggle',
+        f"camera={camera_id}; enabled={1 if enable else 0}",
+    )
     return RedirectResponse('/cameras?msg=1',303)
 
 @app.get('/media')
@@ -3805,7 +3852,7 @@ def backup_database(request:Request):
 
 
 @app.post('/cameras/video-upload', response_class=HTMLResponse)
-async def cameras_video_upload(request: Request, camera_id: int = Form(...), video: UploadFile = File(...)):
+async def cameras_video_upload(request: Request, camera_id: int = Form(0), video: UploadFile = File(...)):
     u=auth(request)
     if not u: return RedirectResponse('/login',302)
     if not has_permission(request,'video.process'):return access_denied()
@@ -3819,15 +3866,20 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(...), vid
     suffix=_video_suffix(video.filename)
     if not suffix:
         return upload_error('فرمت فایل پشتیبانی نمی‌شود.')
-    with connect() as con:
-        source_camera=con.execute(
-            "SELECT * FROM cameras WHERE id=? AND rtsp_url NOT LIKE 'video://%'",
-            (camera_id,),
-        ).fetchone()
-    if not source_camera:
-        return upload_error('دوربین انتخاب‌شده پیدا نشد.')
-    if not source_camera['lpr_enabled']:
-        return upload_error('پلاک‌خوان دوربین انتخاب‌شده غیرفعال است.')
+    if camera_id:
+        with connect() as con:
+            source_camera=con.execute(
+                "SELECT * FROM cameras WHERE id=? AND rtsp_url NOT LIKE 'video://%'",
+                (camera_id,),
+            ).fetchone()
+        if not source_camera:
+            return upload_error('دوربین انتخاب‌شده پیدا نشد.')
+    else:
+        source_camera={
+            'name':'پیش‌فرض','city':'','lpr_confidence':60,
+            'frame_step':5,'duplicate_seconds':30,
+            'roi_x':0,'roi_y':0,'roi_w':100,'roi_h':100,'line_y':50,
+        }
     try:
         pending_upload=await _stage_video_upload(
             video,
@@ -3854,11 +3906,6 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(...), vid
             from app.media_acceptance import require_full_synchronous
 
             require_full_synchronous(con)
-            old_stream_ids=[
-                int(row['id']) for row in con.execute(
-                    "SELECT id FROM cameras WHERE rtsp_url LIKE 'video://%'"
-                ).fetchall()
-            ]
             cursor=con.execute(
                 "INSERT INTO cameras("
                 "name,rtsp_url,location,city,enabled,is_demo,sort_order,"
@@ -3902,30 +3949,6 @@ async def cameras_video_upload(request: Request, camera_id: int = Form(...), vid
         # The new camera row and its active decoder now durably own the file.
         # Only at this acceptance boundary may quota eviction be committed.
         pending_upload.commit()
-        stopped_old_ids=[]
-        for old_id in old_stream_ids:
-            try:
-                if manager.remove(old_id) is True:
-                    stopped_old_ids.append(old_id)
-            except Exception:
-                pass
-        if stopped_old_ids:
-            placeholders=','.join('?' for _ in stopped_old_ids)
-            try:
-                with connect() as con:
-                    con.execute(
-                        "DELETE FROM cameras WHERE rtsp_url LIKE 'video://%' "
-                        f"AND id IN ({placeholders})",
-                        tuple(stopped_old_ids),
-                    )
-            except Exception:
-                # A stopped stream whose database owner survived must be made
-                # runnable again; never widen the DELETE beyond the exact IDs
-                # whose stop was confirmed.
-                try:
-                    manager.start_enabled_cameras()
-                except Exception:
-                    pass
         dashboard_redirect=(
             f'/dashboard?video=1&events_camera={virtual_camera_id}'
         )
