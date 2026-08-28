@@ -145,6 +145,39 @@ def test_live_shadow_publishes_transient_v2_overlay_and_ab_agreement():
         shadow.shutdown()
 
 
+def test_primary_callback_receives_validated_event_and_latest_frame():
+    runtime = _FakeRuntime()
+    delivered = []
+    shadow = EngineV2LiveShadow(
+        lambda _variant: runtime,
+        event_callback=lambda event, frame: delivered.append((event, frame)),
+        retry_seconds=0.01,
+    )
+    frame = np.full((80, 120, 3), 17, dtype=np.uint8)
+    stamp = time.monotonic()
+    try:
+        shadow.configure(True)
+        assert shadow.submit(7, frame, ts=stamp)
+        _wait_for(lambda: runtime.engine.packets)
+        runtime.engine.events.append(_event(ts=stamp))
+        assert shadow.submit(7, frame, ts=stamp + 0.1)
+        _wait_for(lambda: delivered)
+
+        event, delivered_frame = delivered[0]
+        assert event.text == "12ب34567"
+        assert np.array_equal(delivered_frame, frame)
+        rows = shadow.detections(7)
+        assert rows[0]["engine_lane"] == "primary-v2"
+        assert rows[0]["experimental"] is False
+        assert rows[0]["needs_review"] is False
+        status = shadow.status(7)
+        assert status["mode"] == "primary-v2"
+        assert status["persistence"] is True
+        assert status["side_effects"] is True
+    finally:
+        shadow.shutdown()
+
+
 def test_live_shadow_model_failure_stays_inside_shadow_lane():
     attempts = []
 
@@ -197,7 +230,8 @@ def test_shadow_module_has_no_database_or_persistence_dependency():
     assert "app.database" not in source
     assert "._persist" not in source
     assert "set_setting" not in source
-    assert '"persistence": False' in source
+    assert '"persistence": primary' in source
+    assert "callback(event, callback_frame)" in source
 
 
 def test_live_worker_observes_v2_before_baseline_persistence():

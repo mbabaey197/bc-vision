@@ -12,6 +12,7 @@ from pathlib import Path
 import os
 import threading
 import time
+import zlib
 from uuid import uuid4
 
 import cv2
@@ -584,7 +585,7 @@ class LiveANPRWorker:
         with self._lock:
             if timestamp - self._shadow_setting_at >= 2.0:
                 self._shadow_enabled_cache = self._truthy_setting(
-                    self._setting("anpr_engine_v2_shadow", "0")
+                    self._setting("anpr_engine_v2_shadow", "1")
                 )
                 self._shadow_setting_at = timestamp
             return self._shadow_enabled_cache
@@ -594,8 +595,14 @@ class LiveANPRWorker:
             self._shadow_enabled_cache = bool(enabled)
             self._shadow_setting_at = time.monotonic()
             detector_variant = self._selected_detector_variant()
-        from app.engine_v2.live_shadow import configure_live_shadow
+        from app.engine_v2.live_shadow import (
+            configure_live_event_callback,
+            configure_live_shadow,
+        )
 
+        configure_live_event_callback(
+            self._ingest_engine_v2_event if enabled else None
+        )
         configure_live_shadow(bool(enabled), detector_variant)
 
     def _submit_engine_v2_shadow(
@@ -605,11 +612,17 @@ class LiveANPRWorker:
         timestamp: float,
         roi: tuple[int, int, int, int],
         state: _CameraState,
-    ) -> None:
+    ) -> bool:
         if not self._engine_v2_shadow_enabled(timestamp):
-            return
+            return False
         try:
-            from app.engine_v2.live_shadow import submit_live_shadow_frame
+            from app.engine_v2.live_shadow import (
+                configure_live_event_callback,
+                live_shadow_status,
+                submit_live_shadow_frame,
+            )
+
+            configure_live_event_callback(self._ingest_engine_v2_event)
 
             accepted = submit_live_shadow_frame(
                 camera_id,
@@ -619,8 +632,83 @@ class LiveANPRWorker:
                 detector_variant=self._selected_detector_variant(),
             )
             state.shadow_frames += int(bool(accepted))
+            status = live_shadow_status(camera_id)
+            return bool(accepted and status.get("ready"))
         except Exception:
             state.shadow_errors += 1
+            return False
+
+    def _ingest_engine_v2_event(self, event, frame) -> None:
+        """Commit one validated V2 event through the durable live path."""
+
+        if not self._engine_v2_shadow_enabled():
+            return
+        try:
+            camera_id = int(event.camera_id)
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            state = self._states.get(camera_id)
+            if state is None or state.retired:
+                return
+            config = dict(state.config or {})
+            detector_generation = self._detector_generation
+        camera_name = str(config.get("name") or f"Camera {camera_id}")
+        duplicate_seconds = max(
+            0.0,
+            float(config.get("duplicate_seconds", 30)),
+        )
+        plate_text = normalize_plate(event.text)
+        if not split_iran_plate(plate_text):
+            return
+        track_source = str(event.track_id or event.episode_id or event.frame_seq)
+        track_id = int(zlib.crc32(track_source.encode("utf-8")) & 0x7FFFFFFF)
+        confidence = max(0.0, min(1.0, float(event.confidence)))
+        result = {
+            "bbox": tuple(int(value) for value in event.bbox),
+            "plate": plate_text,
+            "plate_norm": plate_text,
+            "confidence": confidence,
+            "ocr_confidence": confidence,
+            "quality_score": max(0.0, min(1.0, float(event.quality))),
+            "track_id": track_id,
+            "valid": True,
+            "auto_confirmed": True,
+            "needs_review": False,
+            "best_effort": False,
+            "consensus_votes": max(1, int(event.observations)),
+            "ocr_engine": "engine-v2-hezar-primary",
+            "raw_guess_text": plate_text,
+            "raw_guess_norm": plate_text,
+            "raw_guess_confidence": confidence,
+            "raw_guess_engine": "engine-v2-hezar-primary",
+            "raw_guess_reason": str(event.metadata.get("fusion_reason", "")),
+            "confirmation_source": "engine-v2-temporal-consensus",
+            "model_revision": "engine-v2-primary-rc30.3",
+            "method": "engine-v2-track-centric",
+            "engine_lane": "primary-v2",
+            "experimental": False,
+        }
+        event_commit_lock = self._event_commit_lock(camera_id)
+        with state.model_switch_lock:
+            if state.retired or detector_generation != self._detector_generation:
+                return
+            entry = self._make_persistence_retry(
+                camera_id,
+                camera_name,
+                result,
+                frame,
+                None,
+                plate_text,
+                float(event.ts),
+                0.0,
+                duplicate_seconds,
+                detector_generation,
+                "engine-v2-primary-rc30.3",
+                time.time(),
+            )
+            self._enqueue_persistence_retry(state, entry)
+            self._drain_persistence_retry_locked(state, event_commit_lock)
 
     def _observe_engine_v2_baseline(
         self,
@@ -1635,6 +1723,14 @@ class LiveANPRWorker:
                     state.model_switch_lock.release()
 
     def _exclusive_engine_status(self) -> dict:
+        if self._engine_v2_shadow_enabled():
+            return {
+                "mode": "primary-v2",
+                "detector_variant": self._selected_detector_variant(),
+                "exclusive_detector": True,
+                "candidate_inference": False,
+                "baseline_fallback": True,
+            }
         return {
             "mode": "baseline",
             "detector_variant": self._selected_detector_variant(),
@@ -2394,13 +2490,20 @@ class LiveANPRWorker:
                 roi_x + int(activity_source.shape[1]),
                 roi_y + int(activity_source.shape[0]),
             )
-            self._submit_engine_v2_shadow(
+            engine_v2_ready = self._submit_engine_v2_shadow(
                 int(camera_id),
                 frame,
                 now,
                 shadow_roi,
                 state,
             )
+            if engine_v2_ready:
+                # V2 owns detector, tracking, temporal consensus and event
+                # emission once its shared runtime is ready. The baseline is
+                # retained only as a startup/error fallback.
+                state.last_submitted_at = now
+                state.no_plate_streak = 0
+                return
             activity = state.activity.observe(activity_source)
             state.motion_score = float(activity.motion_score)
             state.overlay_mask_pixels = (

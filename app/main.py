@@ -2881,6 +2881,7 @@ def settings(request:Request,saved:int=0,restart:int=0,error:str='',password_req
     usage=_path_usage(root)
     usage_html=(f"<div class='drive-card'><div class='meter-label'><b>{escape(usage['path'])}</b><span>{usage['percent']}٪</span></div><div class='storage-progress'><span style='width:{usage['percent']}%'></span></div><span class='muted'>آزاد: {_fmt_bytes(usage['free'])} از {_fmt_bytes(usage['total'])}</span></div>" if usage['ok'] else f"<div class='alert'>مسیر ذخیره‌سازی در دسترس نیست: {escape(usage.get('error',''))}</div>")
     checked=lambda k: 'checked' if get_setting(k,'0')=='1' else ''
+    checked_on=lambda k: 'checked' if get_setting(k,'1')=='1' else ''
     selected=lambda k,v: 'selected' if get_setting(k,'')==v else ''
     training=latest_training_status(); training_run=training.get('run')
     with connect() as con:
@@ -2990,12 +2991,11 @@ name='anpr_auto_confirm_guesses' value='1'
 اپراتور به دیتاست آموزشی اضافه نخواهند شد.</p>
 <label><input style='width:auto' type='checkbox'
 name='anpr_engine_v2_shadow' value='1'
-{checked('anpr_engine_v2_shadow')}>
-آزمایش زنده Engine V2 در حالت Shadow</label>
-<p class='muted'>موتور جدید هم‌زمان روی تصویر زنده اجرا می‌شود، اما هیچ
-رویدادی در دیتابیس ثبت نمی‌کند و فرمان گیت نمی‌دهد. کادرهای بنفش با برچسب
-V2 فقط برای مقایسه هستند؛ آمار توافق و اختلاف نیز در وضعیت دوربین قرار
-می‌گیرد. اگر Baseline روی YOLOX باشد، Shadow مستقل با YOLO11n اجرا می‌شود.</p>
+{checked_on('anpr_engine_v2_shadow')}>
+استفاده از Engine V2 به‌عنوان موتور اصلی</label>
+<p class='muted'>Engine V2 تشخیص، رهگیری و رأی‌گیری چندفریمی را انجام می‌دهد
+و رویداد نهایی را از مسیر پایدار فعلی در دیتابیس ثبت می‌کند. موتور قبلی فقط
+هنگام آماده‌سازی یا خطای V2 به‌عنوان fallback اجرا می‌شود.</p>
 <button>ذخیره تنظیمات AI</button>
 </form>
 </div>
@@ -3579,7 +3579,9 @@ def save_ai_settings(request:Request, ai_accelerator:str=Form('auto'), ai_qualit
         'anpr_engine_v2_shadow',
         (
             ('enabled' if shadow_enabled else 'disabled')
-            + '; persistence=false; detector=' + detector_model
+            + '; persistence=' + ('true' if shadow_enabled else 'false')
+            + '; mode=' + ('primary-v2' if shadow_enabled else 'baseline')
+            + '; detector=' + detector_model
         ),
     )
     return RedirectResponse('/settings?saved=1',302)
