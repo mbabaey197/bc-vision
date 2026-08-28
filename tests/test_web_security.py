@@ -382,10 +382,16 @@ def test_system_role_can_change_ai_settings(monkeypatch):
     assert ("ai_confidence", 80) in writes
     assert ("anpr_detector_model", "yolov8n") in writes
     assert switches == ["yolov8n"]
-    assert audits == [(
-        "anpr_detector_switch",
-        "yolov8n; execution=exclusive-baseline",
-    )]
+    assert audits == [
+        (
+            "anpr_detector_switch",
+            "yolov8n; execution=exclusive-baseline",
+        ),
+        (
+            "anpr_engine_v2_shadow",
+            "disabled; persistence=false; detector=yolov8n",
+        ),
+    ]
 
 
 def test_ai_settings_reject_unknown_detector_model(monkeypatch):
