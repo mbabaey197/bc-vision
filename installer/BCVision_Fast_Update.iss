@@ -54,7 +54,10 @@ Source: "..\fast_update_payload\{#MyAppVersion}\runtime-manifest.json"; DestDir:
 Type: filesandordirs; Name: "{app}\runtime\{#MyAppVersion}"
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "Run BC Vision"; Flags: nowait postinstall skipifsilent
+; The in-app updater is deliberately launched with /SILENT.  This entry must
+; therefore run unconditionally after the candidate self-test commits, and it
+; must return to the desktop user's token instead of keeping setup elevation.
+Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Description: "Run BC Vision"; Flags: nowait runasoriginaluser
 
 [Code]
 const
