@@ -1,5 +1,5 @@
 {
-  "base_version": "2.2.0-rc30",
+  "base_version": "2.2.0-rc31",
   "files": {
     "BUILD_PORTABLE_EXE.bat": "e2cbb1f62802961658fe495dccaff310627ef4646f99f7ef4b4621deffb6abf6",
     "app/database.py": "db29b7cc163a992463917dc6d18fb51fd84ab0484548745300bb6e0570e18e44",
