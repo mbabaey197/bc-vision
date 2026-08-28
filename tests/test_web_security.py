@@ -517,7 +517,8 @@ def test_system_role_can_change_ai_settings(monkeypatch):
         ),
         (
             "anpr_engine_v2_shadow",
-            "disabled; persistence=false; mode=baseline; detector=yolov8n",
+            "disabled; persistence=false; mode=shadow-v2; "
+            "primary=baseline; detector=yolov8n",
         ),
     ]
 
@@ -3692,3 +3693,22 @@ def test_engine_v3_selects_yolo11n_once_without_overriding_later_choice(
     settings["anpr_detector_model"] = "yolov8n"
     assert main._migrate_anpr_v3_detector_selection() is False
     assert settings["anpr_detector_model"] == "yolov8n"
+
+
+def test_v2_safety_migration_demotes_existing_primary_setting(monkeypatch):
+    settings = {"anpr_engine_v2_shadow": "1"}
+    monkeypatch.setattr(
+        main,
+        "get_setting",
+        lambda key, default="": settings.get(key, default),
+    )
+    monkeypatch.setattr(
+        main,
+        "set_setting",
+        lambda key, value: settings.__setitem__(key, str(value)),
+    )
+
+    assert main._migrate_anpr_v2_to_safe_shadow() is True
+    assert settings["anpr_engine_v2_shadow"] == "0"
+    assert settings[main._ANPR_V2_SAFE_SHADOW_MIGRATION] == "1"
+    assert main._migrate_anpr_v2_to_safe_shadow() is False
