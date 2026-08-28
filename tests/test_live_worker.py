@@ -4153,13 +4153,12 @@ def test_two_cameras_receive_independent_worker_slots(monkeypatch):
     assert first["threads_per_camera"] == 2
     assert first["parallel_camera_limit"] == 2
     assert first["anpr_engine"] == {
-        "mode": "primary-v2",
+        "mode": "baseline",
         "detector_variant": "yolov8n",
         "exclusive_detector": True,
         "candidate_inference": False,
-        "baseline_fallback": True,
     }
-    assert first["shadow"]["enabled"] is True
+    assert first["shadow"]["enabled"] is False
     assert second["processed_frames"] == 1
 
 
