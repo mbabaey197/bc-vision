@@ -1,9 +1,10 @@
-"""Side-effect-free Engine V2 runner for opt-in live-camera evaluation.
+"""Engine V2 live runner with an optional production event callback.
 
-The production live worker owns persistence and operator-visible baseline
-events.  This module deliberately owns neither: it keeps one detector session
-and one OCR session for the whole process, consumes newest live frames on a
-background thread, and exposes only transient overlays and A/B telemetry.
+The runner keeps one detector session and one OCR session for the whole
+process and consumes newest live frames on a background thread.  Without an
+event callback it remains side-effect-free; with the callback installed, only
+validated, deduplicated final events are handed to the existing durable live
+ANPR persistence path.
 """
 
 from __future__ import annotations
@@ -49,6 +50,7 @@ class _RuntimeLike(Protocol):
 
 
 RuntimeFactory = Callable[[str], _RuntimeLike]
+EventCallback = Callable[[PlateEvent, np.ndarray | None], None]
 
 
 @dataclass(slots=True)
@@ -75,6 +77,7 @@ class _CameraShadowState:
     pending_baseline: list[_ComparisonRecord] = field(default_factory=list)
     pending_v2: list[_ComparisonRecord] = field(default_factory=list)
     detections: list[dict[str, object]] = field(default_factory=list)
+    latest_frame: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -266,18 +269,20 @@ def _default_runtime_factory(detector_variant: str) -> _LiveRuntime:
 
 
 class EngineV2LiveShadow:
-    """Newest-frame, background Shadow service with no persistence path."""
+    """Newest-frame V2 service with an optional durable-event callback."""
 
     def __init__(
         self,
         runtime_factory: RuntimeFactory | None = None,
         *,
+        event_callback: EventCallback | None = None,
         match_window_seconds: float = 4.0,
         detection_ttl_seconds: float = 3.0,
         retry_seconds: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._runtime_factory = runtime_factory or _default_runtime_factory
+        self._event_callback = event_callback
         self._match_window = max(0.1, float(match_window_seconds))
         self._detection_ttl = max(0.1, float(detection_ttl_seconds))
         self._retry_seconds = max(0.1, float(retry_seconds))
@@ -298,6 +303,10 @@ class EngineV2LiveShadow:
         self._states: dict[str, _CameraShadowState] = {}
         self._pending: dict[str, FramePacket] = {}
         self._finalize: set[str] = set()
+
+    def set_event_callback(self, callback: EventCallback | None) -> None:
+        with self._lock:
+            self._event_callback = callback
 
     def configure(self, enabled: bool, detector_variant: str = "yolo11n") -> None:
         variant = str(detector_variant or "yolo11n").strip().lower()
@@ -343,11 +352,13 @@ class EngineV2LiveShadow:
             }
             if roi is not None:
                 metadata["motion_roi"] = tuple(int(value) for value in roi)
+            packet_frame = np.ascontiguousarray(frame.copy())
+            state.latest_frame = packet_frame
             self._pending[camera_key] = FramePacket(
                 camera_id=camera_key,
                 seq=state.seq,
                 ts=self._clock() if ts is None else float(ts),
-                frame=np.ascontiguousarray(frame.copy()),
+                frame=packet_frame,
                 metadata=metadata,
             )
             self._ensure_thread_locked()
@@ -421,12 +432,14 @@ class EngineV2LiveShadow:
             state = self._states.get(str(camera_id)) or _CameraShadowState()
             self._expire_locked(state, now)
             telemetry = self._runtime_telemetry_locked()
+            primary = self._event_callback is not None
             return {
                 "enabled": self._enabled,
                 "ready": self._runtime is not None and not self._rebuild_requested,
                 "initializing": self._initializing,
-                "side_effects": False,
-                "persistence": False,
+                "side_effects": primary,
+                "persistence": primary,
+                "mode": "primary-v2" if primary else "shadow-v2",
                 "detector_variant": self._requested_variant,
                 "ocr_engine": SHADOW_OCR_ENGINE,
                 "policy": SHADOW_POLICY_NAME,
@@ -596,6 +609,15 @@ class EngineV2LiveShadow:
             return
         now = self._clock()
         camera_id = str(event.camera_id)
+        with self._lock:
+            callback = self._event_callback
+            state = self._states.setdefault(camera_id, _CameraShadowState())
+            callback_frame = (
+                state.latest_frame.copy()
+                if state.latest_frame is not None
+                else None
+            )
+        primary = callback is not None
         overlay = {
             "bbox": tuple(int(value) for value in event.bbox),
             "plate": validated.normalized,
@@ -605,16 +627,18 @@ class EngineV2LiveShadow:
             "tracking_engine": "engine-v2-track-centric",
             "valid": True,
             "best_effort": False,
-            "needs_review": True,
-            "ocr_engine": SHADOW_OCR_ENGINE,
+            "needs_review": not primary,
+            "ocr_engine": (
+                "engine-v2-hezar-primary" if primary else SHADOW_OCR_ENGINE
+            ),
             "ocr_alternative": "",
             "ocr_disagreement": False,
             "raw_guess_text": validated.normalized,
             "raw_guess_confidence": _unit(event.confidence),
             "raw_guess_reason": str(event.metadata.get("fusion_reason", "")),
             "model_revision": SHADOW_POLICY_NAME,
-            "engine_lane": "shadow-v2",
-            "experimental": True,
+            "engine_lane": "primary-v2" if primary else "shadow-v2",
+            "experimental": not primary,
             "_shadow_seen_at": now,
         }
         with self._lock:
@@ -637,6 +661,11 @@ class EngineV2LiveShadow:
                 side="v2",
                 record=_ComparisonRecord(float(event.ts), validated.normalized),
             )
+        if callback is not None:
+            try:
+                callback(event, callback_frame)
+            except Exception as exc:
+                self._record_error(camera_id, exc)
 
     def _match_or_queue_locked(
         self,
@@ -730,6 +759,10 @@ def _json_safe(value: object) -> object:
 live_shadow = EngineV2LiveShadow()
 
 
+def configure_live_event_callback(callback: EventCallback | None) -> None:
+    live_shadow.set_event_callback(callback)
+
+
 def configure_live_shadow(enabled: bool, detector_variant: str = "yolo11n") -> None:
     live_shadow.configure(enabled, detector_variant)
 
@@ -786,6 +819,7 @@ __all__ = [
     "SHADOW_OCR_ENGINE",
     "SHADOW_POLICY_NAME",
     "configure_live_shadow",
+    "configure_live_event_callback",
     "live_shadow_detections",
     "live_shadow_status",
     "observe_live_shadow_baseline",

@@ -389,7 +389,7 @@ def test_system_role_can_change_ai_settings(monkeypatch):
         ),
         (
             "anpr_engine_v2_shadow",
-            "disabled; persistence=false; detector=yolov8n",
+            "disabled; persistence=false; mode=baseline; detector=yolov8n",
         ),
     ]
 
