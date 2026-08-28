@@ -848,7 +848,7 @@ def init_db():
             "retention_videos_days": "7",
             "retention_events_days": "0",
             "anpr_auto_confirm_guesses": "1",
-            "anpr_detector_model": "yolo11n",
+            "anpr_detector_model": "yolov8n",
         }
         for key, value in defaults.items():
             con.execute(
