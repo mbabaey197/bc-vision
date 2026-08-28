@@ -8,6 +8,6 @@
     "requirements-lock.txt": "d4bd946441b9f6848efbf62d77e690ec1d9be41f3c9d520b29a4eca0f31ceda7",
     "runtime_payload.py": "8aa86757ee84d0dd3234e28abe0ece7c9454b1abf4a3bf5785b2770ce7c615e5"
   },
-  "runtime_abi": "2",
-  "schema": 1
+  "schema": 1,
+  "runtime_abi": "2"
 }
