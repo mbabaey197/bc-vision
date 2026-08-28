@@ -282,6 +282,12 @@ jobs:
           if ((Get-Item $update).Length -gt 15MB) {
             throw "Fast updater exceeds the 15 MiB release budget."
           }
+          $package = Join-Path $env:RUNNER_TEMP "bcvision-update-zip"
+          New-Item -ItemType Directory $package -Force | Out-Null
+          Copy-Item $update $package
+          $updateHash = (Get-FileHash $update -Algorithm SHA256).Hash
+          Set-Content (Join-Path $package "SHA256SUMS.txt") "$updateHash  $([IO.Path]::GetFileName($update))" -Encoding ascii
+          Compress-Archive -Path (Join-Path $package "*") -DestinationPath "release\BCVision_${label}_Update.zip" -CompressionLevel Optimal
           Copy-Item $update release
           $lines = foreach ($file in Get-ChildItem release -File) {
             $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash
@@ -759,6 +765,7 @@ jobs:
             $assetNames = @($release.assets | ForEach-Object { $_.name })
             $expected = @(
               "BCVision_${{ needs.build-update.outputs.release_label }}_Update.exe",
+              "BCVision_${{ needs.build-update.outputs.release_label }}_Update.zip",
               "SHA256SUMS.txt"
             )
             $missing = @($expected | Where-Object { $_ -notin $assetNames })
@@ -797,6 +804,7 @@ jobs:
           $verifiedNames = @($verified.assets | ForEach-Object { $_.name })
           $expected = @(
             "BCVision_${{ needs.build-update.outputs.release_label }}_Update.exe",
+            "BCVision_${{ needs.build-update.outputs.release_label }}_Update.zip",
             "SHA256SUMS.txt"
           )
           $missing = @($expected | Where-Object { $_ -notin $verifiedNames })

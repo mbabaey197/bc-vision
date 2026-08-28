@@ -254,6 +254,11 @@ def test_windows_gate_runs_detector_and_ocr_inside_installed_executable():
     assert "v2.2.0-rc28.1" in full_release
     assert "BCVision_RC28.1_Setup.exe" in full_release
     assert "SHA256SUMS.txt" in full_release
+    fast_release = (
+        root / ".github" / "workflows" / "fast-one-click-update.yml"
+    ).read_text(encoding="utf-8")
+    assert "BCVision_${label}_Update.zip" in fast_release
+    assert "Compress-Archive" in fast_release
     assert "5032e5a5801af5368af4c85476cbefbd1cd563e1" in full_release
     assert "E64DFCC90D8C9D17742591C7254D7176CB088C60F38C58C5930D42CAA529C2EC" in full_release
     assert "immutable RC28.1 to current full-base upgrade" in full_release

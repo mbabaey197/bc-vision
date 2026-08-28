@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from typing import Any
 
 ASGIMessage = dict[str, Any]
@@ -128,6 +128,7 @@ class VideoUploadBodyLimitMiddleware:
         max_other_body_bytes: BodyLimit | None = 1024 * 1024,
         max_concurrent: int = 2,
         paths: Collection[str] = DEFAULT_VIDEO_UPLOAD_PATHS,
+        path_body_limits: Mapping[str, BodyLimit] | None = None,
     ) -> None:
         if (
             isinstance(max_concurrent, bool)
@@ -139,6 +140,9 @@ class VideoUploadBodyLimitMiddleware:
         self._max_body_bytes = max_body_bytes
         self._max_other_body_bytes = max_other_body_bytes
         self._paths = frozenset(str(path) for path in paths)
+        self._path_body_limits = dict(path_body_limits or {})
+        if not set(self._path_body_limits).issubset(self._paths):
+            raise ValueError("path_body_limits must refer to upload paths")
         # A threading semaphore is not bound to one asyncio loop.  The single
         # middleware instance therefore enforces the same process-local cap
         # across all request threads/event loops without parking a worker.
@@ -173,7 +177,11 @@ class VideoUploadBodyLimitMiddleware:
             return
 
         if is_video_upload:
-            limit = self._limit(self._max_body_bytes, "video upload")
+            configured_limit = self._path_body_limits.get(
+                str(scope.get("path")),
+                self._max_body_bytes,
+            )
+            limit = self._limit(configured_limit, "file upload")
             too_large_error = "video-upload-too-large"
         else:
             limit = self._limit(
