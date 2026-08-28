@@ -89,6 +89,7 @@ except Exception:
 
 
 _ANPR_V3_DETECTOR_MIGRATION = "migration_anpr_v3_yolo11n_default_v1"
+_ANPR_V2_SAFE_SHADOW_MIGRATION = "migration_anpr_v2_safe_shadow_v1"
 APP_RELEASE_LABEL = (
     "RC" + APP_VERSION.rsplit("-rc", 1)[1]
     if "-rc" in APP_VERSION
@@ -292,8 +293,18 @@ def _migrate_anpr_v3_detector_selection():
     return True
 
 
+def _migrate_anpr_v2_to_safe_shadow():
+    """Demote every installed V2 primary setting exactly once."""
+    if get_setting(_ANPR_V2_SAFE_SHADOW_MIGRATION, "") == "1":
+        return False
+    set_setting("anpr_engine_v2_shadow", "0")
+    set_setting(_ANPR_V2_SAFE_SHADOW_MIGRATION, "1")
+    return True
+
+
 init_db()
 _migrate_anpr_v3_detector_selection()
+_migrate_anpr_v2_to_safe_shadow()
 
 
 @asynccontextmanager
@@ -2952,7 +2963,6 @@ def settings(request:Request,saved:int=0,restart:int=0,error:str='',password_req
     usage=_path_usage(root)
     usage_html=(f"<div class='drive-card'><div class='meter-label'><b>{escape(usage['path'])}</b><span>{usage['percent']}٪</span></div><div class='storage-progress'><span style='width:{usage['percent']}%'></span></div><span class='muted'>آزاد: {_fmt_bytes(usage['free'])} از {_fmt_bytes(usage['total'])}</span></div>" if usage['ok'] else f"<div class='alert'>مسیر ذخیره‌سازی در دسترس نیست: {escape(usage.get('error',''))}</div>")
     checked=lambda k: 'checked' if get_setting(k,'0')=='1' else ''
-    checked_on=lambda k: 'checked' if get_setting(k,'1')=='1' else ''
     selected=lambda k,v: 'selected' if get_setting(k,'')==v else ''
     training=latest_training_status(); training_run=training.get('run')
     with connect() as con:
@@ -3062,11 +3072,11 @@ name='anpr_auto_confirm_guesses' value='1'
 اپراتور به دیتاست آموزشی اضافه نخواهند شد.</p>
 <label><input style='width:auto' type='checkbox'
 name='anpr_engine_v2_shadow' value='1'
-{checked_on('anpr_engine_v2_shadow')}>
-استفاده از Engine V2 به‌عنوان موتور اصلی</label>
-<p class='muted'>Engine V2 تشخیص، رهگیری و رأی‌گیری چندفریمی را انجام می‌دهد
-و رویداد نهایی را از مسیر پایدار فعلی در دیتابیس ثبت می‌کند. موتور قبلی فقط
-هنگام آماده‌سازی یا خطای V2 به‌عنوان fallback اجرا می‌شود.</p>
+{checked('anpr_engine_v2_shadow')}>
+اجرای آزمایشی Engine V2 در حالت Shadow</label>
+<p class='muted'>موتور قدیمی Production همیشه پلاک‌ها را می‌خواند و ثبت
+می‌کند. Engine V2 فقط هم‌زمان مقایسه و Overlay تولید می‌کند و هیچ رویدادی
+در دیتابیس ثبت نمی‌کند.</p>
 <button>ذخیره تنظیمات AI</button>
 </form>
 </div>
@@ -3169,12 +3179,17 @@ async def install_update_zip(
             f"-{secrets.token_hex(4)}.db"
         )
         create_database_backup(backup_file)
-        launch_staged_update(staged)
         audit(
             request,
             'software_update',
             f'{staged.version_label} SHA256={staged.sha256}',
         )
+        await _quiesce_services_for_update()
+        try:
+            launch_staged_update(staged)
+        except BaseException:
+            await _resume_services_after_update_abort()
+            raise
         threading.Thread(
             target=exit_after_update_launch,
             name='bcvision-update-exit',
@@ -3188,13 +3203,46 @@ async def install_update_zip(
             u,
             request,
         )
-    except (OSError, UpdatePackageError) as exc:
+    except (OSError, StoragePolicyError, UpdatePackageError) as exc:
         return RedirectResponse(
             '/settings?error=' + quote(f'فایل آپدیت رد شد: {exc}'),
             303,
         )
     finally:
         _UPDATE_UPLOAD_LOCK.release()
+
+
+async def _resume_services_after_update_abort():
+    """Restore live processing when an updater could not be launched."""
+    from app.ai.live_worker import start_live_anpr_worker
+
+    await asyncio.to_thread(start_live_anpr_worker)
+    await asyncio.to_thread(manager.start_enabled_cameras)
+
+
+async def _quiesce_services_for_update():
+    """Stop every camera and ANPR producer before setup touches runtime files."""
+    from app.ai.live_worker import shutdown_live_anpr_worker
+
+    stop_attempted = False
+    try:
+        stop_attempted = True
+        if await asyncio.to_thread(manager.stop_all) is not True:
+            raise UpdatePackageError(
+                'یک یا چند جریان دوربین کامل متوقف نشد؛ آپدیت لغو شد.'
+            )
+        if not await asyncio.to_thread(
+            shutdown_live_anpr_worker,
+            retry_timeout=5.0,
+        ):
+            raise UpdatePackageError(
+                'سرویس پلاک‌خوان کامل متوقف نشد؛ آپدیت لغو شد.'
+            )
+        await asyncio.to_thread(require_media_writes_quiescent)
+    except BaseException:
+        if stop_attempted:
+            await _resume_services_after_update_abort()
+        raise
 
 @app.post('/settings/display')
 def save_display_settings(request:Request,dashboard_grid:int=Form(2),dashboard_event_rows:int=Form(12),live_fps:int=Form(5),stream_width:int=Form(640),jpeg_quality:int=Form(70),new_password:str=Form('')):
@@ -3749,8 +3797,8 @@ def save_ai_settings(request:Request, ai_accelerator:str=Form('auto'), ai_qualit
         'anpr_engine_v2_shadow',
         (
             ('enabled' if shadow_enabled else 'disabled')
-            + '; persistence=' + ('true' if shadow_enabled else 'false')
-            + '; mode=' + ('primary-v2' if shadow_enabled else 'baseline')
+            + '; persistence=false'
+            + '; mode=shadow-v2; primary=baseline'
             + '; detector=' + detector_model
         ),
     )
