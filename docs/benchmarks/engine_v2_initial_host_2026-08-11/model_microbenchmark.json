@@ -1,0 +1,51 @@
+{
+  "schema": "bcvision.anpr.model-microbenchmark/v1",
+  "input_kind": "deterministic-synthetic-pixels",
+  "production_evidence": false,
+  "accuracy_evidence": false,
+  "decode_included": false,
+  "logical_cpu_count": 9,
+  "shared_session_count": 2,
+  "sessions_per_camera": 0,
+  "detector": {
+    "name": "shared-yolo-plate-detector",
+    "calls": 100,
+    "wall_seconds": 3.183908,
+    "inferences_per_second": 31.4079,
+    "average_latency_ms": 31.838,
+    "p95_latency_ms": 49.8079,
+    "process_cpu_percent": 710.6921,
+    "normalized_host_cpu_percent": 78.9658,
+    "process_maxrss_mb": 167.9219,
+    "ram_source": "resource.getrusage.maxrss"
+  },
+  "ocr": {
+    "name": "shared-ctc-plate-ocr",
+    "calls": 100,
+    "wall_seconds": 1.297316,
+    "inferences_per_second": 77.0822,
+    "average_latency_ms": 12.9715,
+    "p95_latency_ms": 35.3618,
+    "process_cpu_percent": 563.343,
+    "normalized_host_cpu_percent": 62.5937,
+    "process_maxrss_mb": 167.9219,
+    "ram_source": "resource.getrusage.maxrss"
+  },
+  "provider": {
+    "detector_backend": "onnxruntime",
+    "detector_device": "CPU",
+    "detector_providers": [
+      "CPUExecutionProvider"
+    ],
+    "ocr_backend": "onnxruntime",
+    "ocr_device": "CPU",
+    "ocr_providers": [
+      "CPUExecutionProvider"
+    ]
+  },
+  "notes": [
+    "Measures shared model preprocessing plus inference plus postprocessing only.",
+    "Synthetic pixels do not measure detection/OCR accuracy or end-to-end camera capacity.",
+    "No RTSP or hardware/software video decode is included."
+  ]
+}

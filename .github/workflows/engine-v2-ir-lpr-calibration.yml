@@ -1,0 +1,155 @@
+name: Engine V2 IR-LPR calibration
+
+on:
+  push:
+    branches:
+      - agent/anpr-engine-v2-event-driven
+    paths:
+      - ".github/workflows/engine-v2-ir-lpr-calibration.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-v2-ir-lpr-calibration
+  cancel-in-progress: true
+
+jobs:
+  hezar-v2-static-ocr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - name: Checkout exact branch revision
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          version: "0.12.0"
+          enable-cache: true
+          cache-python: true
+          cache-dependency-glob: requirements-ai-lock.txt
+
+      - name: Create isolated Python environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv python install 3.12
+          uv venv --python 3.12 --seed .venv
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install pinned inference and export dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --upgrade pip --quiet
+          python -m pip install -r requirements-ai-lock.txt --quiet
+          python -m pip install gdown==5.2.0 --quiet
+          python -m pip check
+
+      - name: Export and verify pinned Hezar v2 ONNX
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/models" "$RUNNER_TEMP/hezar-cache"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          from app.ai.hezar_export import export_pinned_model
+
+          output = Path(__import__("os").environ["RUNNER_TEMP"]) / "models" / "crnn_fa_v2.onnx"
+          cache = Path(__import__("os").environ["RUNNER_TEMP"]) / "hezar-cache"
+          print(json.dumps(export_pinned_model(output, cache), ensure_ascii=False, indent=2))
+          PY
+
+      - name: Download and verify official IR-LPR plate archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ir-lpr-zips" "$RUNNER_TEMP/ir-lpr/train" "$RUNNER_TEMP/ir-lpr/validation" "$RUNNER_TEMP/ir-lpr/test"
+          python -m gdown --fuzzy "https://drive.google.com/file/d/1ubkg7E2vGEOqS4K_quwf9Vl-i8IVpklM/view" -O "$RUNNER_TEMP/ir-lpr-zips/train.zip"
+          python -m gdown --fuzzy "https://drive.google.com/file/d/1AL5Zsg2hDqcwF8ZmR0MJTbjgXIoE5W-I/view" -O "$RUNNER_TEMP/ir-lpr-zips/validation.zip"
+          python -m gdown --fuzzy "https://drive.google.com/file/d/1lLh_kxrHy1teUB2NguHVuOZwA5rjL5kx/view" -O "$RUNNER_TEMP/ir-lpr-zips/test.zip"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import zipfile
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          for split in ("train", "validation", "test"):
+              source = root / "ir-lpr-zips" / f"{split}.zip"
+              with zipfile.ZipFile(source) as archive:
+                  bad_member = archive.testzip()
+                  if bad_member:
+                      raise SystemExit(f"Corrupt IR-LPR member: {bad_member}")
+                  archive.extractall(root / "ir-lpr" / split)
+              print(f"Verified and extracted: {split}")
+          PY
+
+      - name: Collect Hezar v2 static OCR trace
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/engine-v2-ir-lpr"
+          python tools/calibrate_engine_v2_tcam.py collect-ir-lpr \
+            --dataset-root "$RUNNER_TEMP/ir-lpr" \
+            --ocr-runtime hezar \
+            --ocr-model "$RUNNER_TEMP/models/crnn_fa_v2.onnx" \
+            --backend onnxruntime \
+            --device CPU \
+            --profile day \
+            --skip-invalid \
+            --output "$RUNNER_TEMP/engine-v2-ir-lpr/hezar-v2-trace.json" \
+            --static-report-output "$RUNNER_TEMP/engine-v2-ir-lpr/hezar-v2-report.json"
+
+      - name: Verify fail-closed calibration report
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "engine-v2-ir-lpr"
+          trace = json.loads((root / "hezar-v2-trace.json").read_text(encoding="utf-8"))
+          report = json.loads((root / "hezar-v2-report.json").read_text(encoding="utf-8"))
+          tracks = trace.get("tracks", [])
+          if len(tracks) < 10_000:
+              raise SystemExit(f"Unexpectedly small IR-LPR trace: {len(tracks)}")
+          if report.get("promotion_eligible") is not False:
+              raise SystemExit("Static IR-LPR evidence must never become promotion eligible")
+          if report.get("overall", {}).get("observations") != len(tracks):
+              raise SystemExit("Trace/report observation count mismatch")
+          summary = {
+              "dataset_id": trace.get("dataset_id"),
+              "tracks": len(tracks),
+              "skipped_annotations": len(trace.get("metadata", {}).get("skipped_annotations", [])),
+              "model_sha256": trace.get("metadata", {}).get("ocr_model_sha256"),
+              "exact_accuracy": report["overall"]["exact_accuracy"],
+              "mean_character_error_rate": report["overall"]["mean_character_error_rate"],
+              "brier_score": report["overall"]["brier_score"],
+              "expected_calibration_error": report["overall"]["expected_calibration_error"],
+              "promotion_eligible": report["promotion_eligible"],
+          }
+          (root / "SUMMARY.json").write_text(
+              json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload immutable calibration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-v2-ir-lpr-hezar-v2-${{ github.sha }}
+          path: ${{ runner.temp }}/engine-v2-ir-lpr
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 6

@@ -1,0 +1,83 @@
+{
+  "schema": "bcvision.anpr.initial-runtime-benchmark-metadata/v1",
+  "input_kind": "deterministic-synthetic-pixels-no-video-decode",
+  "production_evidence": false,
+  "production_decision_allowed": false,
+  "scenario": {
+    "matrices": [
+      "fixed-active-idle-scaling",
+      "all-active-busy-scaling"
+    ],
+    "camera_counts": [
+      1,
+      4,
+      8,
+      16,
+      32
+    ],
+    "nominal_seconds_each": 3.0,
+    "ticks_per_second": 5,
+    "producer_burst": 2,
+    "realtime_pacing": true,
+    "warmup_detector_calls": 5,
+    "warmup_ocr_calls": 2,
+    "admission": "runtime ProducerCadencePolicy plus AdaptiveFrameAdmissionController",
+    "sequence_mode": "natural-newest-survivor-gaps"
+  },
+  "engine_config": {
+    "load_control_enabled": true,
+    "model_threads": "onnxruntime-default",
+    "detector_input": [
+      320,
+      320
+    ],
+    "detector_stream_shape": [
+      360,
+      640
+    ],
+    "main_stream_shape": [
+      720,
+      1280
+    ]
+  },
+  "shared_models": {
+    "session_count": 2,
+    "sessions_per_camera": 0,
+    "detector": {
+      "path": "BCVision_2.2.0-rc18_FastVideo_Source/.model-seed/plate/plate_yolo.onnx",
+      "sha256": "a54e475c402e6036bb5c70f1a6ff75179e76098a5c8039bb5d148c0b6421f5c6",
+      "backend": "onnxruntime",
+      "device": "CPU",
+      "providers": [
+        "CPUExecutionProvider"
+      ],
+      "available_devices": [],
+      "available_providers": [
+        "AzureExecutionProvider",
+        "CPUExecutionProvider"
+      ],
+      "initialization_ms": 239.76658300125564,
+      "fallback_log": [
+        "openvino: ModuleNotFoundError: No module named 'openvino'"
+      ]
+    },
+    "ocr": {
+      "path": "BCVision_2.2.0-rc18_FastVideo_Source/.model-seed/crnn/ocr_crnn.onnx",
+      "sha256": "45f8c45f29eb1ee91f6274cb8d9c328da1a2050ea7d8596bae61f4a6b9f9fb1e",
+      "backend": "onnxruntime",
+      "device": "CPU",
+      "providers": [
+        "CPUExecutionProvider"
+      ],
+      "available_devices": [],
+      "available_providers": [
+        "AzureExecutionProvider",
+        "CPUExecutionProvider"
+      ],
+      "initialization_ms": 68.49218800016388,
+      "fallback_log": [
+        "openvino: ModuleNotFoundError: No module named 'openvino'"
+      ]
+    }
+  }
+}

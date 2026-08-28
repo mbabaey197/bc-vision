@@ -1,0 +1,106 @@
+{
+  "schema": "bcvision.anpr.accuracy-manifest/v1",
+  "dataset_id": "REPLACE_WITH_DATASET_ID",
+  "description": "Template only. Keep IDs neutral/opaque, replace every path/hash/size, verify every label, set label_status to verified, enable samples, and remove template=true before materializing the dataset. The disabled known-positive example demonstrates a non-exhaustive positive label; it must stay non-null and requires --allow-partial-coverage when run.",
+  "label_source": "REPLACE_WITH_OPERATOR_OR_REVIEW_RECORD",
+  "training_allowed": false,
+  "template": true,
+  "samples": [
+    {
+      "id": "sample-001",
+      "category": "clear_plate",
+      "input": {"path": "REPLACE/clear-001.mp4", "media_type": "video", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "size_bytes": 0},
+      "expected_plate": null,
+      "label_status": "pending",
+      "label_scope": "exhaustive",
+      "enabled": false
+    },
+    {
+      "id": "sample-002",
+      "category": "night",
+      "input": {"path": "REPLACE/night-001.mp4", "media_type": "video", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "size_bytes": 0},
+      "expected_plate": null,
+      "label_status": "pending",
+      "label_scope": "exhaustive",
+      "enabled": false
+    },
+    {
+      "id": "sample-003",
+      "category": "overexposure",
+      "input": {"path": "REPLACE/overexposure-001.mp4", "media_type": "video", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "size_bytes": 0},
+      "expected_plate": null,
+      "label_status": "pending",
+      "label_scope": "exhaustive",
+      "enabled": false
+    },
+    {
+      "id": "sample-004",
+      "category": "motion_blur",
+      "input": {"path": "REPLACE/motion-blur-001.mp4", "media_type": "video", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "size_bytes": 0},
+      "expected_plate": null,
+      "label_status": "pending",
+      "label_scope": "exhaustive",
+      "enabled": false
+    },
+    {
+      "id": "sample-005",
+      "category": "angled_plate",
+      "input": {"path": "REPLACE/angled-001.mp4", "media_type": "video", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "size_bytes": 0},
+      "expected_plate": null,
+      "label_status": "pending",
+      "label_scope": "exhaustive",
+      "enabled": false
+    },
+    {
+      "id": "sample-006",
+      "category": "multiple_vehicles",
+      "input": {"path": "REPLACE/multiple-001.mp4", "media_type": "video", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "size_bytes": 0},
+      "expected_events": [
+        {"plate": "REPLACE_VERIFIED_PLATE_1", "start_ms": 0, "end_ms": 1000},
+        {"plate": "REPLACE_VERIFIED_PLATE_2", "start_ms": 1001, "end_ms": 2000}
+      ],
+      "label_status": "pending",
+      "label_scope": "exhaustive",
+      "enabled": false
+    },
+    {
+      "id": "sample-007",
+      "category": "fast_vehicle",
+      "input": {"path": "REPLACE/fast-001.mp4", "media_type": "video", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "size_bytes": 0},
+      "expected_plate": null,
+      "label_status": "pending",
+      "label_scope": "exhaustive",
+      "enabled": false
+    },
+    {
+      "id": "sample-008",
+      "category": "partial_dirty_plate",
+      "input": {"path": "REPLACE/partial-dirty-001.mp4", "media_type": "video", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "size_bytes": 0},
+      "expected_plate": null,
+      "label_status": "pending",
+      "label_scope": "exhaustive",
+      "enabled": false
+    },
+    {
+      "id": "sample-009",
+      "category": "clear_plate",
+      "input": {"path": "REPLACE/known-positive-example-001.mp4", "media_type": "video", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "size_bytes": 0},
+      "expected_events": [
+        {"plate": "REPLACE_VERIFIED_POSITIVE_PLATE", "start_ms": 0, "end_ms": 1000}
+      ],
+      "label_status": "pending",
+      "label_scope": "known_positives",
+      "notes": "Example only: use known_positives when trusted positive events are not a complete inventory; never use it for a negative/null label.",
+      "enabled": false
+    },
+    {
+      "id": "sample-010",
+      "category": "clear_plate",
+      "input": {"path": "REPLACE/verified-empty-lane.mp4", "media_type": "video", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "size_bytes": 0},
+      "expected_plate": null,
+      "label_status": "pending",
+      "label_scope": "exhaustive",
+      "enabled": false
+    }
+  ]
+}

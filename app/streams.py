@@ -847,6 +847,29 @@ class CameraStream:
         except Exception:
             pass
 
+        # Engine V2 publishes only transient Shadow rows. Pull them on every
+        # display pass so a V2 event is visible even when the baseline worker
+        # is in idle backoff and has not advanced its snapshot revision.
+        try:
+            from app.ai.live_worker import live_anpr_detections
+
+            shadow_rows = [
+                dict(row)
+                for row in live_anpr_detections(self.camera_id)
+                if str(row.get("engine_lane") or "") == "shadow-v2"
+            ]
+            if shadow_rows:
+                self._overlay_rows = [
+                    row
+                    for row in self._overlay_rows
+                    if str(row.get("engine_lane") or "") != "shadow-v2"
+                ] + shadow_rows
+                self._overlay_updated_at = now
+                self._overlay_gray = self._gray(frame)
+                received_new_snapshot = True
+        except Exception:
+            pass
+
         if not self._overlay_rows and self._overlay_revision == 0:
             try:
                 from app.ai.live_worker import live_anpr_detections
@@ -883,17 +906,27 @@ class CameraStream:
                 # confidence. Confirmed reads stay green; experimental raw
                 # guesses are amber and explicitly labelled GUESS.
                 experimental = bool(result.get("experimental"))
+                engine_lane = str(result.get("engine_lane") or "baseline")
+                shadow_v2 = engine_lane == "shadow-v2"
                 color = (
-                    (24, 178, 255)
-                    if experimental
-                    else (36, 220, 96)
+                    (214, 84, 214)
+                    if shadow_v2
+                    else (
+                        (24, 178, 255)
+                        if experimental
+                        else (36, 220, 96)
+                    )
                 )
                 cv2.rectangle(display, (x1, y1), (x2, y2), color, 3)
                 confidence = int(float(result.get("confidence", 0)) * 100)
                 label = (
-                    f"GUESS {confidence}%"
-                    if experimental
-                    else f"PLATE {confidence}%"
+                    f"V2 {confidence}%"
+                    if shadow_v2
+                    else (
+                        f"GUESS {confidence}%"
+                        if experimental
+                        else f"PLATE {confidence}%"
+                    )
                 )
                 top = max(24, y1)
                 cv2.rectangle(

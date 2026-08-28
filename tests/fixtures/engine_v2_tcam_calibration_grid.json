@@ -1,0 +1,20 @@
+{
+  "day": {
+    "provisional_confidence": [0.72, 0.75, 0.78],
+    "lock_confidence": [0.84, 0.86, 0.88],
+    "express_lock_confidence": [0.93, 0.95, 0.97],
+    "min_slot_confidence": [0.76, 0.78, 0.82],
+    "min_slot_margin": [0.12, 0.16, 0.2],
+    "min_ocr_quality": [0.28, 0.32, 0.36],
+    "soft_lock_hold_seconds": [0.08, 0.12, 0.2]
+  },
+  "night": {
+    "provisional_confidence": [0.72, 0.75, 0.78],
+    "lock_confidence": [0.84, 0.86, 0.88],
+    "express_lock_confidence": [0.93, 0.95, 0.97],
+    "min_slot_confidence": [0.76, 0.78, 0.82],
+    "min_slot_margin": [0.12, 0.16, 0.2],
+    "min_ocr_quality": [0.28, 0.32, 0.36],
+    "soft_lock_hold_seconds": [0.08, 0.12, 0.2]
+  }
+}

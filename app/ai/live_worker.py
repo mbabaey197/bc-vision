@@ -279,6 +279,8 @@ class LiveANPRWorker:
         self._model_state_at = 0.0
         self._model_state_variant = ""
         self._detector_generation = 0
+        self._shadow_enabled_cache = False
+        self._shadow_setting_at = -1e12
         self._state_scope = uuid4().hex
         self._outbox_required = retry_outbox_path is not None
         self._outbox = None
@@ -563,6 +565,135 @@ class LiveANPRWorker:
             return normalize_detector_variant(
                 self._setting("anpr_detector_model", "yolo11n")
             )
+
+    @staticmethod
+    def _truthy_setting(value) -> bool:
+        return str(value or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "enabled",
+        }
+
+    def _engine_v2_shadow_enabled(self, now=None) -> bool:
+        override = os.environ.get("BCVISION_ENGINE_V2_SHADOW")
+        if override is not None:
+            return self._truthy_setting(override)
+        timestamp = time.monotonic() if now is None else float(now)
+        with self._lock:
+            if timestamp - self._shadow_setting_at >= 2.0:
+                self._shadow_enabled_cache = self._truthy_setting(
+                    self._setting("anpr_engine_v2_shadow", "0")
+                )
+                self._shadow_setting_at = timestamp
+            return self._shadow_enabled_cache
+
+    def configure_engine_v2_shadow(self, enabled: bool) -> None:
+        with self._lock:
+            self._shadow_enabled_cache = bool(enabled)
+            self._shadow_setting_at = time.monotonic()
+            detector_variant = self._selected_detector_variant()
+        from app.engine_v2.live_shadow import configure_live_shadow
+
+        configure_live_shadow(bool(enabled), detector_variant)
+
+    def _submit_engine_v2_shadow(
+        self,
+        camera_id: int,
+        frame,
+        timestamp: float,
+        roi: tuple[int, int, int, int],
+        state: _CameraState,
+    ) -> None:
+        if not self._engine_v2_shadow_enabled(timestamp):
+            return
+        try:
+            from app.engine_v2.live_shadow import submit_live_shadow_frame
+
+            accepted = submit_live_shadow_frame(
+                camera_id,
+                frame,
+                ts=timestamp,
+                roi=roi,
+                detector_variant=self._selected_detector_variant(),
+            )
+            state.shadow_frames += int(bool(accepted))
+        except Exception:
+            state.shadow_errors += 1
+
+    def _observe_engine_v2_baseline(
+        self,
+        camera_id: int,
+        rows: list,
+        timestamp: float,
+        state: _CameraState,
+    ) -> None:
+        if not self._engine_v2_shadow_enabled(timestamp):
+            return
+        try:
+            from app.engine_v2.live_shadow import observe_live_shadow_baseline
+
+            observe_live_shadow_baseline(
+                camera_id,
+                rows,
+                ts=timestamp,
+            )
+        except Exception:
+            state.shadow_errors += 1
+
+    def _shadow_status(
+        self,
+        camera_id: int,
+        state: _CameraState | None = None,
+    ) -> dict:
+        if not self._engine_v2_shadow_enabled():
+            return {
+                "enabled": False,
+                "ready": False,
+                "side_effects": False,
+                "persistence": False,
+                "frames": state.shadow_frames if state else 0,
+                "candidates": state.shadow_candidates if state else 0,
+                "events": state.shadow_candidates if state else 0,
+                "errors": state.shadow_errors if state else 0,
+            }
+        try:
+            from app.engine_v2.live_shadow import live_shadow_status
+
+            result = dict(live_shadow_status(camera_id))
+            result["candidates"] = int(result.get("events", 0))
+            return result
+        except Exception as exc:
+            if state is not None:
+                state.shadow_errors += 1
+            return {
+                "enabled": True,
+                "ready": False,
+                "side_effects": False,
+                "persistence": False,
+                "frames": state.shadow_frames if state else 0,
+                "candidates": state.shadow_candidates if state else 0,
+                "events": state.shadow_candidates if state else 0,
+                "errors": (state.shadow_errors if state else 0) + 1,
+                "last_error": f"{type(exc).__name__}: {exc}",
+            }
+
+    def _merge_shadow_detections(
+        self,
+        camera_id: int,
+        baseline: list,
+    ) -> list:
+        rows = [dict(row) for row in baseline]
+        if not self._engine_v2_shadow_enabled():
+            return rows
+        try:
+            from app.engine_v2.live_shadow import live_shadow_detections
+
+            rows.extend(live_shadow_detections(camera_id))
+        except Exception:
+            pass
+        return rows
 
     def _event_commit_lock(self, camera_id: int) -> threading.RLock:
         """Return a lock that survives per-camera state recreation."""
@@ -2256,7 +2387,20 @@ class LiveANPRWorker:
                 self._retry_wakeup.set()
                 return
             selection_score = self._selection_score(frame, config)
-            activity_source, _, _ = self._roi_frame(frame, config)
+            activity_source, roi_x, roi_y = self._roi_frame(frame, config)
+            shadow_roi = (
+                roi_x,
+                roi_y,
+                roi_x + int(activity_source.shape[1]),
+                roi_y + int(activity_source.shape[0]),
+            )
+            self._submit_engine_v2_shadow(
+                int(camera_id),
+                frame,
+                now,
+                shadow_roi,
+                state,
+            )
             activity = state.activity.observe(activity_source)
             state.motion_score = float(activity.motion_score)
             state.overlay_mask_pixels = (
@@ -3030,6 +3174,12 @@ class LiveANPRWorker:
                 else row
                 for row in stable
             ]
+            self._observe_engine_v2_baseline(
+                camera_id,
+                stable,
+                timestamp,
+                state,
+            )
             overlay_rows = self._overlay_candidates(
                 state,
                 display_rows,
@@ -3287,12 +3437,9 @@ class LiveANPRWorker:
                         or self._outbox_error
                     ),
                     "anpr_engine": self._exclusive_engine_status(),
-                    "shadow": {
-                        "enabled": False,
-                        "frames": 0,
-                        "candidates": 0,
-                        "errors": 0,
-                    },
+                    "shadow": self._shadow_status(
+                        camera_id,
+                    ),
                     "models": self._models(),
                     "ocr_ab": {
                         "whole_plate_attempts": 0,
@@ -3366,12 +3513,10 @@ class LiveANPRWorker:
                 "motion_wakeups": state.motion_wakeups,
                 "overlay_mask_pixels": state.overlay_mask_pixels,
                 "anpr_engine": self._exclusive_engine_status(),
-                "shadow": {
-                    "enabled": False,
-                    "frames": state.shadow_frames,
-                    "candidates": state.shadow_candidates,
-                    "errors": state.shadow_errors,
-                },
+                "shadow": self._shadow_status(
+                    camera_id,
+                    state,
+                ),
                 "consensus_window_seconds": round(
                     state.tracker.max_age_seconds,
                     2,
@@ -3396,13 +3541,14 @@ class LiveANPRWorker:
     def detections(self, camera_id: int, max_age=1.6) -> list:
         with self._lock:
             state = self._states.get(int(camera_id))
+            baseline = []
             if (
-                not state
-                or time.time() - state.latest_detections_at
-                > float(max_age)
+                state
+                and time.time() - state.latest_detections_at
+                <= float(max_age)
             ):
-                return []
-            return [dict(row) for row in state.latest_detections]
+                baseline = state.latest_detections
+            return self._merge_shadow_detections(camera_id, baseline)
 
     def detection_snapshot(
         self,
@@ -3425,9 +3571,10 @@ class LiveANPRWorker:
                 }
             return {
                 "revision": state.detection_revision,
-                "detections": [
-                    dict(row) for row in state.latest_detections
-                ],
+                "detections": self._merge_shadow_detections(
+                    camera_id,
+                    state.latest_detections,
+                ),
                 "frame": (
                     state.latest_detection_frame.copy()
                     if state.latest_detection_frame is not None
@@ -3446,6 +3593,12 @@ class LiveANPRWorker:
         camera_id = int(camera_id)
         with self._lock:
             state = self._states.pop(camera_id, None)
+        try:
+            from app.engine_v2.live_shadow import stop_live_shadow_camera
+
+            stop_live_shadow_camera(camera_id)
+        except Exception:
+            pass
         if state is None:
             return True
         # The commit lock is stable for the lifetime of this detached state.
@@ -3473,6 +3626,13 @@ class LiveANPRWorker:
 
     def shutdown(self, retry_timeout=2.0) -> bool:
         self._stopped = True
+        if self._shadow_enabled_cache:
+            try:
+                from app.engine_v2.live_shadow import shutdown_live_shadow
+
+                shutdown_live_shadow()
+            except Exception:
+                pass
         self._retry_stop.set()
         self._retry_wakeup.set()
         if (
@@ -3646,6 +3806,10 @@ def live_anpr_detection_snapshot(camera_id, after_revision=0):
 
 def stop_live_camera(camera_id):
     return _running_live_anpr_worker().remove(camera_id)
+
+
+def configure_live_engine_v2_shadow(enabled):
+    _running_live_anpr_worker().configure_engine_v2_shadow(bool(enabled))
 
 
 def invalidate_live_anpr_model_cache(
