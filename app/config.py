@@ -5,7 +5,7 @@ from app.file_identity import descriptor_file_identity, path_file_identity
 
 COMPANY_NAME = "گیلاس آبی البرز"
 APP_NAME = "BC Vision"
-APP_VERSION = "2.2.0-rc31.2"
+APP_VERSION = "2.2.0-rc31.3"
 HOST = "127.0.0.1"
 PORT = 8000
 MAX_STORAGE_CONFIG_BYTES = 64 * 1024

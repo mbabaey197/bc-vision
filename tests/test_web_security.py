@@ -44,6 +44,14 @@ def _as_role(monkeypatch, role):
     )
 
 
+def test_authenticated_shell_shows_installed_release_number():
+    response = main.page("داشبورد", "<main>ok</main>", "admin")
+    rendered = response.body.decode("utf-8")
+
+    assert "نسخه نصب‌شده" in rendered
+    assert main.APP_RELEASE_LABEL in rendered
+
+
 def _insert_admin(password, *, must_change_password=False):
     with database.connect() as connection:
         connection.execute(
