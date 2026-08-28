@@ -3169,12 +3169,17 @@ async def install_update_zip(
             f"-{secrets.token_hex(4)}.db"
         )
         create_database_backup(backup_file)
-        launch_staged_update(staged)
         audit(
             request,
             'software_update',
             f'{staged.version_label} SHA256={staged.sha256}',
         )
+        await _quiesce_services_for_update()
+        try:
+            launch_staged_update(staged)
+        except BaseException:
+            await _resume_services_after_update_abort()
+            raise
         threading.Thread(
             target=exit_after_update_launch,
             name='bcvision-update-exit',
@@ -3188,13 +3193,46 @@ async def install_update_zip(
             u,
             request,
         )
-    except (OSError, UpdatePackageError) as exc:
+    except (OSError, StoragePolicyError, UpdatePackageError) as exc:
         return RedirectResponse(
             '/settings?error=' + quote(f'فایل آپدیت رد شد: {exc}'),
             303,
         )
     finally:
         _UPDATE_UPLOAD_LOCK.release()
+
+
+async def _resume_services_after_update_abort():
+    """Restore live processing when an updater could not be launched."""
+    from app.ai.live_worker import start_live_anpr_worker
+
+    await asyncio.to_thread(start_live_anpr_worker)
+    await asyncio.to_thread(manager.start_enabled_cameras)
+
+
+async def _quiesce_services_for_update():
+    """Stop every camera and ANPR producer before setup touches runtime files."""
+    from app.ai.live_worker import shutdown_live_anpr_worker
+
+    stop_attempted = False
+    try:
+        stop_attempted = True
+        if await asyncio.to_thread(manager.stop_all) is not True:
+            raise UpdatePackageError(
+                'یک یا چند جریان دوربین کامل متوقف نشد؛ آپدیت لغو شد.'
+            )
+        if not await asyncio.to_thread(
+            shutdown_live_anpr_worker,
+            retry_timeout=5.0,
+        ):
+            raise UpdatePackageError(
+                'سرویس پلاک‌خوان کامل متوقف نشد؛ آپدیت لغو شد.'
+            )
+        await asyncio.to_thread(require_media_writes_quiescent)
+    except BaseException:
+        if stop_attempted:
+            await _resume_services_after_update_abort()
+        raise
 
 @app.post('/settings/display')
 def save_display_settings(request:Request,dashboard_grid:int=Form(2),dashboard_event_rows:int=Form(12),live_fps:int=Form(5),stream_width:int=Form(640),jpeg_quality:int=Form(70),new_password:str=Form('')):
