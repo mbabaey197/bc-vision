@@ -563,7 +563,7 @@ class LiveANPRWorker:
 
         with self._lock:
             return normalize_detector_variant(
-                self._setting("anpr_detector_model", "yolo11n")
+                self._setting("anpr_detector_model", "yolov8n")
             )
 
     @staticmethod

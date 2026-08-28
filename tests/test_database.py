@@ -203,7 +203,7 @@ def test_old_database_migrates_without_data_loss(
         assert con.execute(
             "SELECT value FROM settings "
             "WHERE key='anpr_detector_model'"
-        ).fetchone()[0] == "yolo11n"
+        ).fetchone()[0] == "yolov8n"
         indexes = {
             row[1]
             for row in con.execute(

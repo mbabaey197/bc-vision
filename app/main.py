@@ -89,6 +89,7 @@ except Exception:
 
 
 _ANPR_V3_DETECTOR_MIGRATION = "migration_anpr_v3_yolo11n_default_v1"
+_ANPR_LIVE_RESTORE_MIGRATION = "migration_anpr_live_restore_yolov8n_v1"
 _ANPR_V2_SAFE_SHADOW_MIGRATION = "migration_anpr_v2_safe_shadow_v1"
 APP_RELEASE_LABEL = (
     "RC" + APP_VERSION.rsplit("-rc", 1)[1]
@@ -293,6 +294,19 @@ def _migrate_anpr_v3_detector_selection():
     return True
 
 
+def _migrate_anpr_live_detector_restore():
+    """Undo the forced YOLO11 selection that broke upgraded live installs."""
+    if get_setting(_ANPR_LIVE_RESTORE_MIGRATION, "") == "1":
+        return False
+    if (
+        get_setting(_ANPR_V3_DETECTOR_MIGRATION, "") == "1"
+        and get_setting("anpr_detector_model", "yolov8n") == "yolo11n"
+    ):
+        set_setting("anpr_detector_model", "yolov8n")
+    set_setting(_ANPR_LIVE_RESTORE_MIGRATION, "1")
+    return True
+
+
 def _migrate_anpr_v2_to_safe_shadow():
     """Demote every installed V2 primary setting exactly once."""
     if get_setting(_ANPR_V2_SAFE_SHADOW_MIGRATION, "") == "1":
@@ -303,7 +317,7 @@ def _migrate_anpr_v2_to_safe_shadow():
 
 
 init_db()
-_migrate_anpr_v3_detector_selection()
+_migrate_anpr_live_detector_restore()
 _migrate_anpr_v2_to_safe_shadow()
 
 
@@ -3041,13 +3055,13 @@ def settings(request:Request,saved:int=0,restart:int=0,error:str='',password_req
 <form method='post' action='/settings/ai'>
 <label>مدل تشخیص پلاک</label>
 <select name='anpr_detector_model'>
-<option value='yolo11n' {selected('anpr_detector_model','yolo11n')}>YOLO11n (پیش‌فرض پیشنهادی)</option>
-<option value='yolov8n' {selected('anpr_detector_model','yolov8n')}>YOLOv8n</option>
+<option value='yolov8n' {selected('anpr_detector_model','yolov8n')}>YOLOv8n (پیش‌فرض سازگار)</option>
+<option value='yolo11n' {selected('anpr_detector_model','yolo11n')}>YOLO11n</option>
 <option value='yolox' {selected('anpr_detector_model','yolox')}>YOLOX اختصاصی</option>
 </select>
-<p class='muted'>مسیر پیشنهادی فعلی: YOLO11n برای تشخیص کادر، سپس Hezar v2
-برای خواندن پلاک و فقط در صورت رد یا خطای آن، Platrix ثابت. فقط تشخیصگر
-انتخاب‌شده اجرا می‌شود و مدل دیگری پنهانی وارد پردازش نمی‌شود.</p>
+<p class='muted'>مسیر سازگار زنده: YOLOv8n برای تشخیص کادر، سپس Hezar v2،
+Platrix ثابت و در پایان خوانش کاراکتر‌به‌کاراکتر. فقط تشخیصگر انتخاب‌شده
+اجرا می‌شود.</p>
 <label>روش پردازش AI</label>
 <select name='ai_accelerator'>
 <option value='auto'>Auto (پیشنهادی)</option>
@@ -3734,7 +3748,7 @@ def export_events(request:Request):
     )
 
 @app.post('/settings/ai')
-def save_ai_settings(request:Request, ai_accelerator:str=Form('auto'), ai_quality:str=Form('balanced'), ai_confidence:int=Form(85), ai_frames:int=Form(5), anpr_auto_confirm_guesses:str|None=Form(None), anpr_detector_model:str=Form('yolo11n'), anpr_engine_v2_shadow:str|None=Form(None)):
+def save_ai_settings(request:Request, ai_accelerator:str=Form('auto'), ai_quality:str=Form('balanced'), ai_confidence:int=Form(85), ai_frames:int=Form(5), anpr_auto_confirm_guesses:str|None=Form(None), anpr_detector_model:str=Form('yolov8n'), anpr_engine_v2_shadow:str|None=Form(None)):
     u=auth(request)
     if not u:return RedirectResponse('/login',302)
     if not has_permission(request,'system.manage'):return access_denied()
@@ -3755,7 +3769,7 @@ def save_ai_settings(request:Request, ai_accelerator:str=Form('auto'), ai_qualit
                 303,
             )
     detector_changed=(
-        get_setting('anpr_detector_model','yolo11n') != detector_model
+        get_setting('anpr_detector_model','yolov8n') != detector_model
     )
     if detector_changed:
         from app.ai.live_worker import switch_live_anpr_detector
