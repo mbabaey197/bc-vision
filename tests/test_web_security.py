@@ -52,6 +52,69 @@ def test_authenticated_shell_shows_installed_release_number():
     assert main.APP_RELEASE_LABEL in rendered
 
 
+def test_update_quiescence_stops_cameras_then_anpr_worker(monkeypatch):
+    from app.ai import live_worker
+
+    calls = []
+    monkeypatch.setattr(
+        main.manager,
+        "stop_all",
+        lambda: calls.append("cameras-stop") or True,
+    )
+    monkeypatch.setattr(
+        live_worker,
+        "shutdown_live_anpr_worker",
+        lambda retry_timeout: calls.append(
+            f"anpr-stop-{retry_timeout:g}"
+        ) or True,
+    )
+    monkeypatch.setattr(
+        main,
+        "require_media_writes_quiescent",
+        lambda: calls.append("media-idle"),
+    )
+
+    asyncio.run(main._quiesce_services_for_update())
+
+    assert calls == ["cameras-stop", "anpr-stop-5", "media-idle"]
+
+
+def test_failed_update_quiescence_restores_live_services(monkeypatch):
+    from app.ai import live_worker
+
+    calls = []
+    monkeypatch.setattr(
+        main.manager,
+        "stop_all",
+        lambda: calls.append("cameras-stop") or True,
+    )
+    monkeypatch.setattr(
+        live_worker,
+        "shutdown_live_anpr_worker",
+        lambda retry_timeout: calls.append("anpr-stop") or False,
+    )
+    monkeypatch.setattr(
+        live_worker,
+        "start_live_anpr_worker",
+        lambda: calls.append("anpr-start"),
+    )
+    monkeypatch.setattr(
+        main.manager,
+        "start_enabled_cameras",
+        lambda: calls.append("cameras-start"),
+    )
+
+    with pytest.raises(main.UpdatePackageError, match="سرویس پلاک‌خوان"):
+        asyncio.run(main._quiesce_services_for_update())
+
+    assert calls == [
+        "cameras-stop",
+        "anpr-stop",
+        "anpr-start",
+        "cameras-start",
+    ]
+
+
 def _insert_admin(password, *, must_change_password=False):
     with database.connect() as connection:
         connection.execute(
