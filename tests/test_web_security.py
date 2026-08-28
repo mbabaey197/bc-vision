@@ -500,7 +500,7 @@ def test_system_role_can_change_ai_settings(monkeypatch):
                 "ai_quality": "balanced",
                 "ai_confidence": "80",
                 "ai_frames": "7",
-                "anpr_detector_model": "yolov8n",
+                "anpr_detector_model": "yolo11n",
             },
             follow_redirects=False,
         )
@@ -508,17 +508,17 @@ def test_system_role_can_change_ai_settings(monkeypatch):
     assert response.status_code == 302
     assert ("ai_accelerator", "cpu") in writes
     assert ("ai_confidence", 80) in writes
-    assert ("anpr_detector_model", "yolov8n") in writes
-    assert switches == ["yolov8n"]
+    assert ("anpr_detector_model", "yolo11n") in writes
+    assert switches == ["yolo11n"]
     assert audits == [
         (
             "anpr_detector_switch",
-            "yolov8n; execution=exclusive-baseline",
+            "yolo11n; execution=exclusive-baseline",
         ),
         (
             "anpr_engine_v2_shadow",
             "disabled; persistence=false; mode=shadow-v2; "
-            "primary=baseline; detector=yolov8n",
+            "primary=baseline; detector=yolo11n",
         ),
     ]
 
@@ -3712,3 +3712,28 @@ def test_v2_safety_migration_demotes_existing_primary_setting(monkeypatch):
     assert settings["anpr_engine_v2_shadow"] == "0"
     assert settings[main._ANPR_V2_SAFE_SHADOW_MIGRATION] == "1"
     assert main._migrate_anpr_v2_to_safe_shadow() is False
+
+
+def test_live_restore_migration_undoes_forced_yolo11_once(monkeypatch):
+    settings = {
+        main._ANPR_V3_DETECTOR_MIGRATION: "1",
+        "anpr_detector_model": "yolo11n",
+    }
+    monkeypatch.setattr(
+        main,
+        "get_setting",
+        lambda key, default="": settings.get(key, default),
+    )
+    monkeypatch.setattr(
+        main,
+        "set_setting",
+        lambda key, value: settings.__setitem__(key, str(value)),
+    )
+
+    assert main._migrate_anpr_live_detector_restore() is True
+    assert settings["anpr_detector_model"] == "yolov8n"
+    assert settings[main._ANPR_LIVE_RESTORE_MIGRATION] == "1"
+
+    settings["anpr_detector_model"] = "yolo11n"
+    assert main._migrate_anpr_live_detector_restore() is False
+    assert settings["anpr_detector_model"] == "yolo11n"
