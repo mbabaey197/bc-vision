@@ -646,7 +646,6 @@ class LiveANPRWorker:
                 state.shadow_candidates += 1
 
     def _observe_engine_v2_baseline(
-    def _observe_engine_v2_baseline(
         self,
         camera_id: int,
         rows: list,
