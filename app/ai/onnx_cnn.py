@@ -326,7 +326,12 @@ def _softmax(values: np.ndarray) -> np.ndarray:
 
 
 def _decode(probs: np.ndarray) -> tuple[str, float]:
-    if len(probs) != 8:
+    if (
+        probs.shape != (8, len(CNN_LABELS))
+        or not np.isfinite(probs).all()
+        or np.any(probs < 0)
+        or np.any(probs > 1)
+    ):
         return "", 0.0
     digit_indices = [
         index
@@ -343,6 +348,11 @@ def _decode(probs: np.ndarray) -> tuple[str, float]:
     for position, row in enumerate(probs):
         allowed = letter_indices if position == 2 else digit_indices
         selected = max(allowed, key=lambda index: float(row[index]))
+        # Require absolute evidence for EVERY glyph, not a high mean hiding
+        # an unreadable slot. Competing classes include the wrong slot type.
+        runner = max(float(value) for i, value in enumerate(row) if i != selected)
+        if float(row[selected]) < 0.55 or float(row[selected]) - runner < 0.12:
+            return "", 0.0
         characters.append(CNN_LABELS[selected])
         confidences.append(float(row[selected]))
     text = "".join(characters)

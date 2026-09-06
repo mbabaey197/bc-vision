@@ -144,7 +144,8 @@ def test_below_camera_gate_downgrades_auto_confirmed_review_result():
     ("camera_gate", "confidence", "ocr_confidence", "review_only"),
     [
         (0.50, 0.92, 0.90, False),
-        (0.85, 0.55, 0.45, True),
+        # Readable OCR, but still below the camera's separate emission gate.
+        (0.85, 0.55, 0.60, True),
     ],
 )
 def test_failed_first_persist_retries_same_tracker_emission(

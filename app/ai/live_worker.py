@@ -3229,6 +3229,7 @@ class LiveANPRWorker:
                         "needs_review": bool(
                             row.get("needs_review")
                         ),
+                        "identity_conflict": bool(row.get("identity_conflict")),
                         "ocr_engine": row.get(
                             "ocr_engine",
                             "",

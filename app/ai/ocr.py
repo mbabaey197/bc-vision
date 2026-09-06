@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import product
+import math
 from typing import Iterable, Sequence
 
 import cv2
@@ -28,7 +29,7 @@ from .onnx_crnn import (
 )
 from .onnx_cnn import (
     get_cnn_status,
-    read_plate_cnn,  # compatibility diagnostic API
+    read_plate_cnn,  # guarded character-by-character fallback
 )
 from .onnx_hezar import (
     PRIMARY_ENGINE as HEZAR_ENGINE,
@@ -538,7 +539,7 @@ def read_plate_candidate(
 
     Hezar v2 and the fixed Platrix model remain the preferred readers.  When
     both reject a mature live crop, ``allow_legacy`` enables the bundled
-    character CNN so existing cameras keep the proven per-position fallback.
+    character CNN with per-position confidence and ambiguity guards.
     """
 
     def result(text, confidence, engine, hypotheses=()):
@@ -670,7 +671,13 @@ def read_plate_candidate(
             image,
             engine_key=engine_key,
         )
-        if plausible_plate(cnn_text):
+        # Layout validity alone is not reading evidence. Match the existing
+        # conservative fallback floor; field calibration remains separate.
+        if (
+            plausible_plate(cnn_text)
+            and math.isfinite(float(cnn_confidence))
+            and PLATRIX_MIN_CONFIDENCE <= float(cnn_confidence) <= 1.0
+        ):
             cnn_norm = normalize_plate(cnn_text)
             hypotheses = list(hezar_hypotheses)
             if all(

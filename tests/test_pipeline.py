@@ -503,7 +503,7 @@ def test_sequential_same_lane_vehicles_get_distinct_tracks():
     assert second_rows[0]["plate_norm"] == "98م76543"
 
 
-def test_similar_plate_after_emission_gets_a_new_track():
+def test_similar_plate_after_emission_and_observed_gap_gets_a_new_track():
     tracker = PlateConsensusTracker(
         max_age_seconds=3.0,
         min_confirmation_span_seconds=0.10,
@@ -516,6 +516,10 @@ def test_similar_plate_after_emission_gets_a_new_track():
                 timestamp=timestamp,
             )
         )
+    # Text alone cannot distinguish OCR jitter from a following vehicle.
+    # Require observed absence for this same-box, one-slot identity change.
+    tracker.update([], timestamp=0.25)
+    tracker.update([], timestamp=0.30)
     second_rows = []
     for timestamp in (0.4, 0.5, 0.6):
         second_rows.extend(
@@ -1081,7 +1085,7 @@ def test_below_emit_gate_waits_for_clearer_consensus():
     for index in range(3):
         low = result("31-ط-556-74", 0.55)
         low.update({
-            "ocr_confidence": 0.45,
+            "ocr_confidence": 0.60,
             "detector_confidence": 0.55,
         })
         review_rows.extend(tracker.update(
@@ -1126,7 +1130,7 @@ def test_expired_consensus_preserves_below_emit_gate_marker():
     for index in range(3):
         low = result("31-ط-556-74", 0.55)
         low.update({
-            "ocr_confidence": 0.45,
+            "ocr_confidence": 0.60,
             "detector_confidence": 0.55,
         })
         tracker.update(

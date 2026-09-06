@@ -94,20 +94,23 @@ accepts only the fixed ONNX hash above. Portable builds ship that ONNX file in
 `model-seed`; the live camera path does not load PyTorch or the Hezar Python
 package.
 
-The fixed Platrix CRNN remains the only production fallback:
+RC32 restores the fixed Platrix CRNN and eight-glyph CNN as production fallbacks:
 
 - `ocr_crnn.onnx`: full-plate CRNN, 10452525 bytes,
   SHA-256
   `45F8C45F29EB1EE91F6274CB8D9C328DA1A2050EA7D8596BAE61F4A6B9F9FB1E`
-- `ocr_cnn.onnx`: diagnostic-only eight-glyph Iranian CNN, 2226402 bytes,
+- `ocr_cnn.onnx`: eight-glyph Iranian CNN, 2226402 bytes,
   SHA-256
   `7D573C51CC855A8E080F1F88597477F4FB5A2B9CAFA1BB125BD6038E441F5BCA`
 
-Production OCR order is immutable: Hezar v2, then the fixed Platrix CRNN only
-after Hezar rejects or errors. Every candidate must still satisfy the
-eight-position Iranian plate layout and the Platrix confidence floor. Missing
-characters are never invented. The promoted custom CRNN and character CNN are
-available only to explicit training/diagnostic APIs. Legacy
+Production OCR order is Hezar v2, then the fixed Platrix CRNN after Hezar rejects
+or errors, then the CNN after both reject. Every accepted fallback must still
+satisfy the eight-position Iranian plate layout and the 0.55 confidence floor.
+The RC32 consensus fix also requires CNN confidence of at least 0.55 for each
+glyph and a 0.12 margin over every competing class, including wrong-slot classes.
+Exactly eight segmented glyphs are required; missing characters are never
+invented. These are engineering guards, not a measured real-camera accuracy.
+The promoted custom CRNN remains limited to training/diagnostic APIs. Legacy
 `BCVISION_OCR_ENGINE` values are ignored by the production route.
 
 ## Persistent Windows paths
