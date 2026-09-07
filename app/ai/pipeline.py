@@ -24,6 +24,16 @@ MIN_OCR_CROP_WIDTH = 64
 MIN_OCR_CROP_ASPECT = 1.8
 MAX_OCR_CROP_ASPECT = 8.5
 MIN_OCR_CROP_QUALITY = 0.20
+MIN_ACCEPTED_OCR_CONFIDENCE = 0.55
+
+
+def _absolute_ocr_confidence(row: dict) -> float:
+    """Do not replace an explicit zero/invalid OCR score with detector score."""
+    try:
+        value = float(row.get("ocr_confidence", row.get("confidence", 0.0)))
+    except (TypeError, ValueError):
+        return 0.0
+    return value if math.isfinite(value) and 0.0 <= value <= 1.0 else 0.0
 
 
 def image_quality(image) -> dict:
@@ -896,6 +906,7 @@ class PlateConsensusTracker:
         )
         self._tracks: dict[int, _Track] = {}
         self._next_track_id = 1
+        self._last_observation_timestamp = float("-inf")
 
     @staticmethod
     def _capture_score(result: dict, frame) -> float:
@@ -1114,15 +1125,17 @@ class PlateConsensusTracker:
             left != right
             for left, right in zip(anchored, observed)
         )
-        # Once an event has been emitted, its identity is immutable. A later
-        # strong full-plate read with even one changed slot must start a new
-        # physical track instead of being swallowed by the one-shot emitter.
-        if plausible_plate(track.emitted_plate):
-            return True
         # A short detection gap is also a vehicle-boundary signal. It lets two
         # very similar plates use the same lane without treating ordinary
         # one-frame OCR noise as a new vehicle.
         if track.misses >= 2:
+            return True
+        if distance == 1 and bbox_iou(
+            track.predicted_bbox or track.bbox, result["bbox"]
+        ) >= 0.50:
+            # OCR jitter in a continuous box is not a vehicle boundary.
+            return False
+        if plausible_plate(track.emitted_plate):
             return True
         return bool(
             distance >= 3
@@ -1482,6 +1495,10 @@ class PlateConsensusTracker:
             row.get("valid")
             and (include_rejected or consensus_allowed)
             and plausible_plate(primary)
+            and (
+                include_rejected
+                or _absolute_ocr_confidence(row) >= MIN_ACCEPTED_OCR_CONFIDENCE
+            )
         ):
             candidates[primary] = max(
                 0.05,
@@ -1674,9 +1691,8 @@ class PlateConsensusTracker:
         if not plausible_plate(winner_norm):
             return None
 
-        # Positional voting may only resolve characters after the same complete
-        # plate has appeared as the top full-plate observation in independent
-        # frames. This prevents a synthetic hybrid that never existed.
+        # Prefer complete-plate support. Unseen whole plates need the stricter
+        # five-frame recovery gate below, not just a weak positional majority.
         whole_plate_support = []
         for row in evidence:
             candidates = set()
@@ -1701,6 +1717,41 @@ class PlateConsensusTracker:
                 )
             if winner_norm in candidates:
                 whole_plate_support.append(row)
+        # Recover a plate not seen whole only from five strong, near-complete
+        # independent observations with >=80% support at EVERY position.
+        # This excludes weak top-k paths and 3/5 Frankenstein majorities.
+        positional_recovery = False
+        if len(whole_plate_support) < self.min_votes and len(evidence) >= 5:
+            recovery_support = []
+            for row in evidence:
+                primary = normalize_plate(row.get("plate_norm") or row.get("plate"))
+                if (
+                    row.get("valid") and not row.get("needs_review")
+                    and plausible_plate(primary)
+                    and sum(a != b for a, b in zip(primary, winner_norm)) <= 1
+                    and _absolute_ocr_confidence(row) >= 0.75
+                    and float(row.get("quality_score", 0.0)) >= MIN_OCR_CROP_QUALITY
+                ):
+                    recovery_support.append(row)
+            if (
+                len(recovery_support) >= 5
+                and all(
+                    detail["votes"] >= 4
+                    and detail["ratio"] >= 0.80
+                    and detail["margin"] >= 0.60
+                    for detail in position_details
+                )
+                and all(
+                    sum(
+                        normalize_plate(row.get("plate_norm") or row.get("plate"))[position]
+                        == character
+                        for row in recovery_support
+                    ) >= 4
+                    for position, character in enumerate(winner_norm)
+                )
+            ):
+                whole_plate_support = recovery_support
+                positional_recovery = True
         support_times = [
             float(row.get("_observed_at", track.last_seen))
             for row in whole_plate_support
@@ -1737,6 +1788,13 @@ class PlateConsensusTracker:
         support_confidences = []
         for row in whole_plate_support:
             winner_confidences = []
+            if positional_recovery:
+                # Conservatively discount a row for its disagreeing slot;
+                # this is an engineering score, not calibrated accuracy.
+                matching = sum(a == b for a, b in zip(
+                    normalize_plate(row.get("plate_norm") or row.get("plate")), winner_norm
+                ))
+                winner_confidences.append(_absolute_ocr_confidence(row) * matching / 8)
             if (
                 row.get("valid")
                 and winner_norm in {
@@ -1816,6 +1874,7 @@ class PlateConsensusTracker:
         result["confidence"] = round(
             min(
                 1.0,
+                weighted_ocr_confidence,
                 0.72 * weighted_confidence
                 + 0.18 * average_agreement
                 + 0.10 * min(1.0, minimum_margin / 0.50),
@@ -1823,6 +1882,7 @@ class PlateConsensusTracker:
             4,
         )
         result["consensus_votes"] = min(winner_counts)
+        result["consensus_kind"] = "position-recovery" if positional_recovery else "whole-plate"
         result["consensus_observations"] = len(evidence)
         result["position_agreement"] = position_details
         result["ambiguity_margin"] = round(minimum_margin, 4)
@@ -2118,12 +2178,15 @@ class PlateConsensusTracker:
                     for hypothesis in hypotheses
                 )
                 candidates = set()
-                if row.get("valid") and not row.get("needs_review"):
+                if (
+                    row.get("valid") and not row.get("needs_review")
+                    and _absolute_ocr_confidence(row) >= MIN_ACCEPTED_OCR_CONFIDENCE
+                ):
                     candidates.update({
                         normalize_plate(row.get("plate")),
                         normalize_plate(row.get("plate_norm")),
                     })
-                elif not explicit_temporal_policy:
+                elif not explicit_temporal_policy and not row.get("valid"):
                     # Preserve the legacy candidate-shadow review workflow.
                     # Production Hezar evidence has explicit temporal flags
                     # and may only auto-confirm through strict consensus.
@@ -2174,6 +2237,14 @@ class PlateConsensusTracker:
         min_emit_confidence=0.0,
     ):
         timestamp = time.monotonic() if timestamp is None else float(timestamp)
+        # Drop duplicate/out-of-order frames before they alter association,
+        # misses, expiry or Kalman state, not merely before counting OCR votes.
+        if (
+            not math.isfinite(timestamp)
+            or timestamp <= self._last_observation_timestamp
+        ):
+            return []
+        self._last_observation_timestamp = timestamp
         min_emit_confidence = min(
             1.0,
             max(0.0, float(min_emit_confidence)),
@@ -2212,6 +2283,13 @@ class PlateConsensusTracker:
             observation = deepcopy(result)
             observation["_observed_at"] = timestamp
             track.observations.append(observation)
+            if (
+                track.emitted_plate and result.get("valid")
+                and normalize_plate(result.get("plate_norm")) != track.emitted_plate
+            ):
+                result["identity_conflict"] = True
+                result["needs_review"] = True
+                result["ocr_alternative"] = format_iran_plate(track.emitted_plate)
             capture_improved = self._consider_capture(track, result, frame)
             consensus = self._consensus(track)
             if consensus is None:
