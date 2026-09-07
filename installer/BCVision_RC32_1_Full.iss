@@ -22,7 +22,6 @@ ArchitecturesInstallIn64BitMode=x64compatible
 CloseApplications=yes
 RestartApplications=no
 SetupLogging=yes
-DiskSpaceWarning=yes
 ExtraDiskSpaceRequired=2147483648
 
 [Files]
