@@ -234,16 +234,17 @@ def test_shadow_module_has_no_database_or_persistence_dependency():
     assert "callback(event, callback_frame)" in source
 
 
-def test_live_worker_observes_v2_before_baseline_persistence():
+def test_live_worker_defers_shadow_observation_until_camera_lock_is_released():
     source = Path("app/ai/live_worker.py").read_text(encoding="utf-8")
     process_source = source[source.index("    def _process(") :]
 
-    observe_at = process_source.index("self._observe_engine_v2_baseline(")
-    persist_at = process_source.index(
-        "self._enqueue_persistence_retry(",
-        observe_at,
-    )
-    assert observe_at < persist_at
+    capture_at = process_source.index("shadow_observation = (camera_id, stable, timestamp, state)")
+    persist_at = process_source.index("self._enqueue_persistence_retry(", capture_at)
+    release_at = process_source.index("state.model_switch_lock.release()", persist_at)
+    observe_at = process_source.index("self._observe_engine_v2_baseline(*shadow_observation)")
+    # Capture baseline candidates before persistence but consult the shadow
+    # setting only outside the camera lock (submission uses worker -> camera).
+    assert capture_at < persist_at < release_at < observe_at
     assert "submit_live_shadow_frame" in source
     assert "configure_live_engine_v2_shadow" in source
     shadow_helpers = source[

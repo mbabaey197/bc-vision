@@ -19,6 +19,7 @@ import numpy as np
 
 from app.config import DATA_DIR, PLATE_DIR, SNAPSHOT_DIR
 from app.cpu_budget import parallel_camera_limit, threads_per_camera
+from app.runtime_diagnostics import diagnosed, logger
 from app.media_storage import (
     finalize_pending_media,
     save_event_images,
@@ -2948,6 +2949,7 @@ class LiveANPRWorker:
                 selected, discarded = scheduled, pending
             return self._merge_payload_wake(selected, discarded)
 
+    @diagnosed('ANPR frame')
     def _process(self, state: _CameraState, payload):
         payload = self._claim_latest_payload(state, payload)
         camera_id, camera_name, frame, timestamp = payload[:4]
@@ -2966,6 +2968,7 @@ class LiveANPRWorker:
             float(payload[7]) if len(payload) > 7 else time.time()
         )
         model_switch_locked = False
+        shadow_observation = None
         started = time.perf_counter()
         try:
             config = state.config or {}
@@ -3197,12 +3200,10 @@ class LiveANPRWorker:
                 else row
                 for row in stable
             ]
-            self._observe_engine_v2_baseline(
-                camera_id,
-                stable,
-                timestamp,
-                state,
-            )
+            # The observer reads settings under the worker-wide lock. Never
+            # call it under model_switch_lock: submit/status take those locks
+            # in the opposite order when reading persistence retry entries.
+            shadow_observation = (camera_id, stable, timestamp, state)
             overlay_rows = self._overlay_candidates(
                 state,
                 display_rows,
@@ -3369,6 +3370,7 @@ class LiveANPRWorker:
                 state.last_error = ""
         except Exception as exc:
             if detector_generation == self._detector_generation:
+                logger.exception('ANPR camera %s processing failed', camera_id)
                 error = f"{type(exc).__name__}: {exc}"
                 state.last_error = error
                 state.processing_errors += 1
@@ -3376,6 +3378,15 @@ class LiveANPRWorker:
         finally:
             if model_switch_locked:
                 state.model_switch_lock.release()
+            if (
+                shadow_observation is not None
+                and not state.retired
+                and detector_generation == self._detector_generation
+            ):
+                try:
+                    self._observe_engine_v2_baseline(*shadow_observation)
+                except Exception:
+                    logger.exception('Shadow observation failed for camera %s', camera_id)
             with self._lock:
                 if (
                     state.retired

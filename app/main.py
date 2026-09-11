@@ -324,6 +324,10 @@ _migrate_anpr_v2_to_safe_shadow()
 @asynccontextmanager
 async def _application_lifespan(_app):
     from app.ai.live_worker import start_live_anpr_worker
+    from app.runtime_diagnostics import RuntimeDiagnostics
+
+    diagnostics = RuntimeDiagnostics(DATA_DIR)
+    await diagnostics.start()
 
     worker_started=False
     try:
@@ -336,15 +340,18 @@ async def _application_lifespan(_app):
         await asyncio.to_thread(run_retention_cleanup)
         start_live_anpr_worker()
         worker_started=True
-        manager.start_enabled_cameras()
+        await asyncio.to_thread(manager.start_enabled_cameras)
         yield
     finally:
         from app.ai.live_worker import shutdown_live_anpr_worker
 
-        manager.stop_all()
-        if worker_started:
-            shutdown_live_anpr_worker(retry_timeout=5.0)
-        close_pending_feedback_source_pins()
+        try:
+            await asyncio.to_thread(manager.stop_all)
+            if worker_started:
+                await asyncio.to_thread(shutdown_live_anpr_worker, retry_timeout=5.0)
+            close_pending_feedback_source_pins()
+        finally:
+            await diagnostics.stop()
 
 
 app = FastAPI(
